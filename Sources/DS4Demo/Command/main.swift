@@ -659,18 +659,26 @@ do {
                 ? ", esperti in streaming SSD"
                     + (laguna.expertCacheSlots > 0
                            ? " · cache \(laguna.expertCacheSlots) slot"
+                               + (laguna.isMultiQuantExpertCacheEnabled
+                                    ? " mixed \(laguna.expertCacheCompatibleSlotRange.lowerBound)"
+                                        + "...\(laguna.expertCacheCompatibleSlotRange.upperBound)/classe"
+                                    : "")
+                               + " (\(laguna.expertCacheAllocatedBytes >> 20) MiB)"
                            : "")
                     + (laguna.isExpertPreadEnabled
                            ? " · pread×\(laguna.expertPreadSplit)"
                            : " · mmap")
                     + (laguna.isMetalIOEnabled ? " · MetalIO" : "")
                 : ""
+            let effectiveChunk = laguna.effectivePrefillChunkSize
             log(String(
                 format: "DS4Demo: Laguna caricato in %.1fs (%d layer · top-%d"
-                    + " · chunk %d%@ · KV %d MiB · decode %@%@"
+                    + " · chunk %d%@%@ · KV %d MiB · decode %@%@"
                     + " · weights %@ · mmap %@)",
                 loadSeconds, laguna.loadedLayerCount,
                 laguna.activeExpertCount, laguna.prefillChunkSize,
+                effectiveChunk == laguna.prefillChunkSize
+                    ? "" : "→\(effectiveChunk)",
                 streamingNote,
                 laguna.allocatedKVCacheBytes >> 20,
                 laguna.isChainedDecodeEnabled ? "chained" : "sync",
@@ -693,12 +701,40 @@ do {
                 + (laguna.isSharedExpertIOOverlapEnabled ? "on" : "off"))
             // The reference CLI passes the Poolside default system prompt
             // into `ds4_encode_chat_prompt` when none is given.
-            let tokens = try tokenizer.encodeChatPrompt(
+            var tokens = try tokenizer.encodeChatPrompt(
                 system: environment["DS4_SYSTEM"]
                     ?? LagunaConversationProtocol.defaultSystemPrompt,
                 prompt: prompt,
                 reasoning: reasoning
             )
+            if let target = syntheticLiveContext {
+                guard target >= tokens.count,
+                      target + maxNew + 1 <= maxKeys else {
+                    log("DS4Demo: il contesto sintetico Laguna deve essere "
+                        + "almeno \(tokens.count) token e lasciare spazio a "
+                        + "DS4_MAX_NEW+1 entro DS4_DEMO_CONTEXT")
+                    exit(2)
+                }
+                // Keep the complete, valid chat frame and insert ordinary
+                // prompt pieces immediately before Assistant/Think. This is
+                // a performance frontier, not a semantic quality benchmark.
+                let suffixCount = 2
+                let suffix = Array(tokens.suffix(suffixCount))
+                var synthetic = Array(tokens.dropLast(suffixCount))
+                let encodedFiller = tokenizer.tokenize(prompt + " ")
+                let filler = encodedFiller.isEmpty
+                    ? [tokenizer.special.endOfSequence] : encodedFiller
+                let contentEnd = target - suffixCount
+                var fillerIndex = 0
+                while synthetic.count < contentEnd {
+                    synthetic.append(filler[fillerIndex % filler.count])
+                    fillerIndex += 1
+                }
+                synthetic.append(contentsOf: suffix)
+                tokens = synthetic
+                log("DS4Demo: contesto sintetico Laguna esatto: "
+                    + "\(tokens.count) token")
+            }
             let prefillStart = Date()
             var logits = try laguna.prefill(tokens)
             let prefillSeconds = Date().timeIntervalSince(prefillStart)
@@ -728,6 +764,7 @@ do {
                 logits = try laguna.forwardNext(next)
                 if generated.count == warmup {
                     steadyStart = Date()
+                    laguna.resetProfile()
                 }
             }
             FileHandle.standardOutput.write(Data("\n".utf8))

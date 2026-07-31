@@ -149,6 +149,60 @@ final class LagunaKernelsTests: XCTestCase {
         }
     }
 
+    func testFusedRopeStoreVariantsMatchOracleAndWriteTheRing() throws {
+        let runtime = try makeRuntime()
+        var generator = Generator(seed: 0x4C41_4755_4E41_0013)
+        for (name, spec) in [
+            ("full", fullSpec(cacheCapacity: 8)),
+            ("sliding", slidingSpec(cacheCapacity: 4)),
+        ] {
+            let position = spec.cacheCapacity + 2
+            let query = generator.vector(spec.queryWidth)
+            let key = generator.vector(spec.keyValueWidth)
+            let value = generator.vector(spec.keyValueWidth)
+            let queryWeight = generator.vector(spec.headDim).map { $0 + 1.5 }
+            let keyWeight = generator.vector(spec.headDim).map { $0 + 1.5 }
+            let expectedQuery =
+                try LagunaLayerReference.projectionHeadRMSNormRope(
+                    query, weight: queryWeight,
+                    headCount: spec.headCount, spec: spec,
+                    position: position)
+            let expectedKey =
+                try LagunaLayerReference.projectionHeadRMSNormRope(
+                    key, weight: keyWeight,
+                    headCount: spec.kvHeadCount, spec: spec,
+                    position: position)
+            for simd in [false, true] {
+                let mode = simd ? "simd" : "legacy"
+                let cache = try runtime.lagunaKVCache(
+                    capacity: spec.cacheCapacity,
+                    rowWidth: spec.keyValueWidth)
+                let got = try runtime.lagunaQKHeadRMSNormRopeStore(
+                    query: query, key: key, value: value,
+                    queryWeight: queryWeight, keyWeight: keyWeight,
+                    spec: spec, cache: cache, position: position,
+                    simd: simd)
+                assertClose(
+                    got.query, expectedQuery, "\(name).\(mode).q")
+                assertClose(
+                    got.key, expectedKey, "\(name).\(mode).k")
+
+                let row = position % spec.cacheCapacity
+                let keyBits = cache.keyBits()
+                let valueBits = cache.valueBits()
+                for column in 0..<spec.keyValueWidth {
+                    let index = row * spec.keyValueWidth + column
+                    XCTAssertEqual(
+                        keyBits[index], Half.bits(expectedKey[column]),
+                        "\(name).\(mode).cache.k[\(column)]")
+                    XCTAssertEqual(
+                        valueBits[index], Half.bits(value[column]),
+                        "\(name).\(mode).cache.v[\(column)]")
+                }
+            }
+        }
+    }
+
     // MARK: KV store
 
     func testStoreKVWritesF16RowsIntoTheRing() throws {
@@ -264,6 +318,19 @@ final class LagunaKernelsTests: XCTestCase {
             spec: gqa6,
             seed: 0x4C41_4755_4E41_0011,
             label: "gqa6")
+
+        let gqa3 = LagunaAttentionSpec(
+            headCount: 3, kvHeadCount: 1,
+            headDim: 128, rotationDims: 128,
+            cacheCapacity: 4,
+            ropeFrequencyBase: 10_000, ropeFrequencyScale: 1,
+            extrapolationFactor: 0, attentionFactor: 1,
+            betaFast: 0, betaSlow: 0,
+            ropeOriginalContext: 262_144, rmsEpsilon: 1e-6)
+        try prefillAttentionParity(
+            spec: gqa3,
+            seed: 0x4C41_4755_4E41_0014,
+            label: "gqa3")
     }
 
     // MARK: Routed MoE prefill

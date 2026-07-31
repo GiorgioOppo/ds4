@@ -25,17 +25,23 @@ public final class LagunaInferenceService: @unchecked Sendable {
     /// the preset of the previously loaded backend.
     public static let guiEnvironmentDefaults: [String: String] = [
         DS4RuntimeKnob.ssdStream.rawValue: "1",
-        DS4RuntimeKnob.expertCacheMB.rawValue: "2048",
-        DS4RuntimeKnob.activeExperts.rawValue: "6",
+        DS4RuntimeKnob.expertCacheMB.rawValue: "3072",
+        DS4RuntimeKnob.multiQuantExpertCache.rawValue: "1",
+        DS4RuntimeKnob.activeExperts.rawValue: "10",
         DS4RuntimeKnob.residentLayers.rawValue: "0",
         DS4RuntimeKnob.kvInitial.rawValue: "512",
         DS4RuntimeKnob.prefillChunk.rawValue: "256",
         DS4RuntimeKnob.prefillBatch.rawValue: "1",
         DS4RuntimeKnob.prefillDenseMM.rawValue: "1",
+        DS4RuntimeKnob.prefillAttentionMultiKey.rawValue: "1",
+        DS4RuntimeKnob.prefillLastRow.rawValue: "1",
         DS4RuntimeKnob.prefillMoEBatch.rawValue: "0",
         DS4RuntimeKnob.decodeChained.rawValue: "0",
         DS4RuntimeKnob.decodeSplitK.rawValue: "0",
         DS4RuntimeKnob.decodeSplitKMinimum.rawValue: "384",
+        DS4RuntimeKnob.decodeSWAGQA3.rawValue: "0",
+        DS4RuntimeKnob.decodeFusedRopeKV.rawValue: "0",
+        DS4RuntimeKnob.ropeSIMD.rawValue: "0",
         DS4RuntimeKnob.sharedExpertOverlap.rawValue: "0",
         DS4RuntimeKnob.indexedAttention.rawValue: "1",
         DS4RuntimeKnob.longAttentionBlock.rawValue: "16",
@@ -80,9 +86,8 @@ public final class LagunaInferenceService: @unchecked Sendable {
     /// ~3 GiB does not fit physical RAM (the 45 GiB mixed recipe on 16/32 GB
     /// machines). Environment knobs stay authoritative:
     /// DS4_SSD_STREAM forces the mode, and DS4_EXPERT_CACHE_MB sizes the
-    /// LRU slot cache (default 2048
-    /// while streaming, selected by end-to-end prefill/decode timing on the
-    /// 16 GB target; larger budgets remain available for explicit A/B runs).
+    /// LRU slot cache (the engine fallback remains 2048 MiB; the measured GUI
+    /// profile installs 3072 MiB on the target with about 10 GiB free).
     public static func defaultOptions(modelPath: String, contextSize: Int)
         -> LagunaResidentModelOptions {
         let environment = ProcessInfo.processInfo.environment

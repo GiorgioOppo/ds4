@@ -37,12 +37,15 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
     case activeExperts = "DS4_ACTIVE_EXPERTS"
     case expertCacheSlots = "DS4_EXPERT_CACHE_SLOTS"
     case expertCacheMB = "DS4_EXPERT_CACHE_MB"
+    case multiQuantExpertCache = "DS4_MULTI_QUANT_CACHE"
     case residentLayers = "DS4_RESIDENT_LAYERS"
     case streamSlots = "DS4_STREAM_SLOTS"
     case ssdStream = "DS4_SSD_STREAM"
 
     case prefillBatch = "DS4_PREFILL_BATCH"
+    case prefillAttentionMultiKey = "DS4_PREFILL_ATTN_MULTIKEY"
     case prefillDenseMM = "DS4_PREFILL_DENSE_MM"
+    case prefillLastRow = "DS4_PREFILL_LAST_ROW"
     case prefillMoEBatch = "DS4_PREFILL_MOE_BATCH"
     case prefillRouteBatch = "DS4_PREFILL_ROUTE_BATCH"
     case prefillChunk = "DS4_PREFILL_CHUNK"
@@ -65,10 +68,13 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
     case longAttentionRecent = "DS4_LONG_ATTN_RECENT"
     case longAttentionThreshold = "DS4_LONG_ATTN_THRESHOLD"
     case rawRing = "DS4_RAW_RING"
+    case ropeSIMD = "DS4_ROPE_SIMD"
 
     case sharedExpertOverlap = "DS4_SHARED_EXPERT_OVERLAP"
     case speculativeTokens = "DS4_SPEC_K"
     case decodeChained = "DS4_DECODE_CHAINED"
+    case decodeFusedRopeKV = "DS4_DECODE_FUSED_ROPE_KV"
+    case decodeSWAGQA3 = "DS4_DECODE_SWA_GQA3"
     case decodeSplitK = "DS4_DECODE_SPLIT_K"
     case decodeSplitKMinimum = "DS4_DECODE_SPLIT_K_MIN"
     case discardUploadPages = "DS4_DISCARD_UPLOAD_PAGES"
@@ -79,10 +85,12 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
         let area: DS4RuntimeKnobArea
         switch self {
         case .activeExperts, .expertCacheSlots, .expertCacheMB,
+             .multiQuantExpertCache,
              .sharedExpertOverlap, .partitionExpertCache:
             area = .experts
-        case .prefillBatch, .prefillDenseMM, .prefillMoEBatch,
-             .prefillRouteBatch, .prefillChunk, .prefillUnion:
+        case .prefillBatch, .prefillAttentionMultiKey, .prefillDenseMM,
+             .prefillLastRow, .prefillMoEBatch, .prefillRouteBatch,
+             .prefillChunk, .prefillUnion:
             area = .prefill
         case .residentLayers, .streamSlots, .ssdStream, .expertPread,
              .preadSplit, .willNeedExperts, .metalIO, .mlock,
@@ -92,10 +100,10 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
         case .kvInitial, .indexedAttention, .indexerTopKFast,
              .longAttentionBlock,
              .longAttentionTopBlocks, .longAttentionRecent,
-             .longAttentionThreshold, .rawRing:
+             .longAttentionThreshold, .rawRing, .ropeSIMD:
             area = .attention
-        case .speculativeTokens, .decodeChained, .decodeSplitK,
-             .decodeSplitKMinimum:
+        case .speculativeTokens, .decodeChained, .decodeFusedRopeKV,
+             .decodeSWAGQA3, .decodeSplitK, .decodeSplitKMinimum:
             area = .decode
         }
 

@@ -13741,7 +13741,7 @@ struct ds4_metal_args_laguna_norm_rope {
     float    attn_factor;
     float    beta_fast;
     float    beta_slow;
-    uint32_t pad0;
+    uint32_t cache_row;
 };
 
 static inline void laguna_head_rms_norm_rope_neox(
@@ -13807,6 +13807,93 @@ static inline void laguna_head_rms_norm_rope_neox(
     row[tid + half_rot] = x0 * sin_theta + x1 * cos_theta;
 }
 
+// Laguna always uses 128-wide heads, with either 64 or 128 rotary
+// dimensions. One SIMD lane can therefore own {lane, lane+32, lane+64,
+// lane+96}: the complete RMS reduction is one simd_sum and both elements of
+// each NeoX pair remain in registers. This is the portable part of the
+// mlxfast branch's barrier-free path and works on pre-Metal-4 Apple GPUs.
+static inline float4 laguna_head_rms_norm_rope_neox_simd(
+        constant ds4_metal_args_laguna_norm_rope &args,
+        device float       *row,
+        device const float *weight,
+        ushort lane,
+        uint token) {
+    const uint d0 = lane;
+    const uint d1 = lane + 32u;
+    const uint d2 = lane + 64u;
+    const uint d3 = lane + 96u;
+    float4 values = float4(row[d0], row[d1], row[d2], row[d3]);
+    const float square_sum = simd_sum(
+        values.x * values.x + values.y * values.y
+        + values.z * values.z + values.w * values.w);
+    const float inv = rsqrt(square_sum / 128.0f + args.eps);
+    values *= inv * float4(
+        weight[d0], weight[d1], weight[d2], weight[d3]);
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (args.ext_factor != 0.0f) {
+        rope_yarn_corr_dims((int)args.n_rot,
+                            (int)args.n_ctx_orig,
+                            args.freq_base,
+                            args.beta_fast,
+                            args.beta_slow,
+                            corr_dims);
+    }
+    const float inv_ndims = -1.0f / (float)args.n_rot;
+    const float pos = (float)(args.pos0 + token);
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+    const float log2_base = log2(args.freq_base);
+#define DS4_LAGUNA_ROPE_THETA(rel) \
+        (pos * exp2(inv_ndims * (float)(rel) * log2_base))
+#else
+#define DS4_LAGUNA_ROPE_THETA(rel) \
+        (pos * pow(args.freq_base, inv_ndims * (float)(rel)))
+#endif
+    if (args.n_rot == 128u) {
+        float cos_theta;
+        float sin_theta;
+        int rel_i0 = (int)(2u * lane);
+        rope_yarn(DS4_LAGUNA_ROPE_THETA(rel_i0),
+                  args.freq_scale, corr_dims, rel_i0,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float x0 = values.x;
+        const float x1 = values.z;
+        values.x = x0 * cos_theta - x1 * sin_theta;
+        values.z = x0 * sin_theta + x1 * cos_theta;
+
+        rel_i0 = (int)(2u * (lane + 32u));
+        rope_yarn(DS4_LAGUNA_ROPE_THETA(rel_i0),
+                  args.freq_scale, corr_dims, rel_i0,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float y0 = values.y;
+        const float y1 = values.w;
+        values.y = y0 * cos_theta - y1 * sin_theta;
+        values.w = y0 * sin_theta + y1 * cos_theta;
+    } else {
+        // n_rot == 64: the upper half of the head remains unrotated.
+        float cos_theta;
+        float sin_theta;
+        const int rel_i0 = (int)(2u * lane);
+        rope_yarn(DS4_LAGUNA_ROPE_THETA(rel_i0),
+                  args.freq_scale, corr_dims, rel_i0,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float x0 = values.x;
+        const float x1 = values.y;
+        values.x = x0 * cos_theta - x1 * sin_theta;
+        values.y = x0 * sin_theta + x1 * cos_theta;
+    }
+#undef DS4_LAGUNA_ROPE_THETA
+
+    row[d0] = values.x;
+    row[d1] = values.y;
+    row[d2] = values.z;
+    row[d3] = values.w;
+    return values;
+}
+
 // Laguna uses Qwen-style per-head RMSNorm and NeoX rotary pairs. Rotary
 // dimensions occupy the prefix of each head; any remaining dimensions are
 // normalized but left unrotated.
@@ -13862,6 +13949,185 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_neox(
     device const float *weight = is_q ? q_weight : k_weight;
     laguna_head_rms_norm_rope_neox(
         args, row, weight, scratch, tid, ntg_u.x, token);
+}
+
+// Decode fusion retaining the legacy reduction order. This is the preferred
+// M1 path: it removes the standalone KV-store dispatch without forcing the
+// four-head SIMD scheduling that is beneficial only on newer GPUs.
+kernel void kernel_laguna_qk_head_rms_norm_rope_store_neox(
+        constant ds4_metal_args_laguna_norm_rope &args,
+        device float       *q,
+        device float       *k,
+        device const float *q_weight,
+        device const float *k_weight,
+        constant uint      &n_q_head,
+        device const float *v,
+        device half        *key_cache,
+        device half        *value_cache,
+        threadgroup float  *scratch [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 threads_per_group [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint combined_head = tgpig.x;
+    const uint thread_count = threads_per_group.x;
+    if (combined_head >= args.n_head || args.n_tokens != 1u ||
+        n_q_head >= args.n_head || args.head_dim == 0u ||
+        args.n_rot > args.head_dim || (args.n_rot & 1u) != 0u) {
+        return;
+    }
+
+    const bool is_q = combined_head < n_q_head;
+    const uint tensor_head = is_q ? combined_head : combined_head - n_q_head;
+    const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
+    device float *row = (is_q ? q : k) +
+        (uint64_t)tensor_head * args.head_dim;
+    device const float *weight = is_q ? q_weight : k_weight;
+
+    float square_sum = 0.0f;
+    for (uint i = tid; i < args.head_dim; i += thread_count) {
+        const float value = row[i];
+        square_sum += value * value;
+    }
+    scratch[tid] = square_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = thread_count >> 1u; step != 0u; step >>= 1u) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv = rsqrt(
+        scratch[0] / (float)args.head_dim + args.eps);
+    for (uint i = tid; i < args.head_dim; i += thread_count) {
+        row[i] = row[i] * inv * weight[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    const uint half_rot = args.n_rot >> 1u;
+    if (tid < half_rot) {
+        float corr_dims[2] = {0.0f, 0.0f};
+        if (args.ext_factor != 0.0f) {
+            rope_yarn_corr_dims((int)args.n_rot,
+                                (int)args.n_ctx_orig,
+                                args.freq_base,
+                                args.beta_fast,
+                                args.beta_slow,
+                                corr_dims);
+        }
+        const int rel_i0 = (int)(tid * 2u);
+        const float inv_ndims = -1.0f / (float)args.n_rot;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = (float)args.pos0 *
+            exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+#else
+        const float theta = (float)args.pos0 *
+            pow(args.freq_base, inv_ndims * (float)rel_i0);
+#endif
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta,
+                  args.freq_scale,
+                  corr_dims,
+                  rel_i0,
+                  args.ext_factor,
+                  args.attn_factor,
+                  &cos_theta,
+                  &sin_theta);
+        const float x0 = row[tid];
+        const float x1 = row[tid + half_rot];
+        row[tid] = x0 * cos_theta - x1 * sin_theta;
+        row[tid + half_rot] = x0 * sin_theta + x1 * cos_theta;
+    }
+    if (is_q) return;
+
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint width = tensor_n_head * args.head_dim;
+    const uint64_t dst =
+        (uint64_t)args.cache_row * width
+        + (uint64_t)tensor_head * args.head_dim;
+    device const float *v_row =
+        v + (uint64_t)tensor_head * args.head_dim;
+    for (uint i = tid; i < args.head_dim; i += thread_count) {
+        key_cache[dst + i] = (half)row[i];
+        value_cache[dst + i] = (half)v_row[i];
+    }
+}
+
+// Four heads per threadgroup, one independent SIMD group per head. Keeping
+// the legacy kernels above provides an A/B and correctness escape hatch.
+kernel void kernel_laguna_qk_head_rms_norm_rope_simd(
+        constant ds4_metal_args_laguna_norm_rope &args,
+        device float       *q,
+        device float       *k,
+        device const float *q_weight,
+        device const float *k_weight,
+        constant uint      &n_q_head,
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint combined_head = tgpig.x * 4u + (uint)simd_group;
+    const uint token = tgpig.y;
+    if (combined_head >= args.n_head || token >= args.n_tokens ||
+        n_q_head >= args.n_head || args.head_dim != 128u ||
+        (args.n_rot != 64u && args.n_rot != 128u)) {
+        return;
+    }
+
+    const bool is_q = combined_head < n_q_head;
+    const uint tensor_head = is_q ? combined_head : combined_head - n_q_head;
+    const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
+    device float *row = (is_q ? q : k) +
+        ((uint64_t)token * tensor_n_head + tensor_head) * args.head_dim;
+    laguna_head_rms_norm_rope_neox_simd(
+        args, row, is_q ? q_weight : k_weight, lane, token);
+}
+
+// Decode-only fusion: K is converted directly from its freshly roped
+// registers to the F16 ring, while the same K row remains available in float
+// for diagnostics. V is committed by the K-head SIMD groups in the same
+// dispatch. No inter-group barrier is required.
+kernel void kernel_laguna_qk_head_rms_norm_rope_store_simd(
+        constant ds4_metal_args_laguna_norm_rope &args,
+        device float       *q,
+        device float       *k,
+        device const float *q_weight,
+        device const float *k_weight,
+        constant uint      &n_q_head,
+        device const float *v,
+        device half        *key_cache,
+        device half        *value_cache,
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint combined_head = tgpig.x * 4u + (uint)simd_group;
+    if (combined_head >= args.n_head || args.n_tokens != 1u ||
+        n_q_head >= args.n_head || args.head_dim != 128u ||
+        (args.n_rot != 64u && args.n_rot != 128u)) {
+        return;
+    }
+
+    const bool is_q = combined_head < n_q_head;
+    const uint tensor_head = is_q ? combined_head : combined_head - n_q_head;
+    const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
+    device float *row = (is_q ? q : k) +
+        (uint64_t)tensor_head * args.head_dim;
+    const float4 roped = laguna_head_rms_norm_rope_neox_simd(
+        args, row, is_q ? q_weight : k_weight, lane, 0u);
+    if (is_q) return;
+
+    const uint width = tensor_n_head * args.head_dim;
+    const uint64_t dst =
+        (uint64_t)args.cache_row * width
+        + (uint64_t)tensor_head * args.head_dim;
+    device const float *v_row =
+        v + (uint64_t)tensor_head * args.head_dim;
+    key_cache[dst + lane] = (half)roped.x;
+    key_cache[dst + lane + 32u] = (half)roped.y;
+    key_cache[dst + lane + 64u] = (half)roped.z;
+    key_cache[dst + lane + 96u] = (half)roped.w;
+    value_cache[dst + lane] = (half)v_row[lane];
+    value_cache[dst + lane + 32u] = (half)v_row[lane + 32u];
+    value_cache[dst + lane + 64u] = (half)v_row[lane + 64u];
+    value_cache[dst + lane + 96u] = (half)v_row[lane + 96u];
 }
 """###,
         "laguna_kv": ###"""
@@ -14342,7 +14608,94 @@ kernel void kernel_laguna_attention_prefill_gqa3_f16(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
-    for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
+    uint key_pos = key_start;
+    // Four keys per pass overlap the SIMD reduction and exp dependency
+    // chains. pad0 is an A/B switch; the scalar tail below is also the exact
+    // legacy path when multi-key attention is disabled.
+    if ((args.pad0 & 1u) != 0u) {
+        for (; key_pos + 4u <= query_pos + 1u; key_pos += 4u) {
+            uint64_t key_bases[4];
+            bool current_rows[4];
+            FOR_UNROLL (short key_index = 0; key_index < 4; key_index++) {
+                const uint position = key_pos + (uint)key_index;
+                current_rows[key_index] = position >= args.pos0;
+                const uint source_row = current_rows[key_index]
+                    ? position - args.pos0 : position % args.cache_cap;
+                key_bases[key_index] =
+                    (uint64_t)source_row * cache_width
+                    + (uint64_t)kv_head * args.head_dim;
+            }
+
+            float4 partial0 = float4(0.0f);
+            float4 partial1 = float4(0.0f);
+            float4 partial2 = float4(0.0f);
+            for (uint d = lane; d < args.head_dim; d += 32u) {
+                const float query0 = qh0[d];
+                const float query1 = qh1[d];
+                const float query2 = qh2[d];
+                FOR_UNROLL (short key_index = 0;
+                            key_index < 4; key_index++) {
+                    const float key_value = current_rows[key_index]
+                        ? (float)staged_key[key_bases[key_index] + d]
+                        : (float)key_cache[key_bases[key_index] + d];
+                    partial0[key_index] += query0 * key_value;
+                    partial1[key_index] += query1 * key_value;
+                    partial2[key_index] += query2 * key_value;
+                }
+            }
+            const float4 scores0 = simd_sum(partial0) * args.scale;
+            const float4 scores1 = simd_sum(partial1) * args.scale;
+            const float4 scores2 = simd_sum(partial2) * args.scale;
+            const float next_max0 = max(
+                max0, max(max(scores0.x, scores0.y),
+                          max(scores0.z, scores0.w)));
+            const float next_max1 = max(
+                max1, max(max(scores1.x, scores1.y),
+                          max(scores1.z, scores1.w)));
+            const float next_max2 = max(
+                max2, max(max(scores2.x, scores2.y),
+                          max(scores2.z, scores2.w)));
+            const float old_scale0 = max0 == -INFINITY
+                ? 0.0f : exp(max0 - next_max0);
+            const float old_scale1 = max1 == -INFINITY
+                ? 0.0f : exp(max1 - next_max1);
+            const float old_scale2 = max2 == -INFINITY
+                ? 0.0f : exp(max2 - next_max2);
+            const float4 scales0 = exp(scores0 - next_max0);
+            const float4 scales1 = exp(scores1 - next_max1);
+            const float4 scales2 = exp(scores2 - next_max2);
+            sum0 = sum0 * old_scale0
+                + (scales0.x + scales0.y) + (scales0.z + scales0.w);
+            sum1 = sum1 * old_scale1
+                + (scales1.x + scales1.y) + (scales1.z + scales1.w);
+            sum2 = sum2 * old_scale2
+                + (scales2.x + scales2.y) + (scales2.z + scales2.w);
+            acc0 *= old_scale0;
+            acc1 *= old_scale1;
+            acc2 *= old_scale2;
+            FOR_UNROLL (short key_index = 0;
+                        key_index < 4; key_index++) {
+                const uint d0 = lane;
+                const uint64_t base = key_bases[key_index];
+                const float4 value = current_rows[key_index]
+                    ? float4((float)staged_value[base + d0],
+                             (float)staged_value[base + d0 + 32u],
+                             (float)staged_value[base + d0 + 64u],
+                             (float)staged_value[base + d0 + 96u])
+                    : float4((float)value_cache[base + d0],
+                             (float)value_cache[base + d0 + 32u],
+                             (float)value_cache[base + d0 + 64u],
+                             (float)value_cache[base + d0 + 96u]);
+                acc0 += value * scales0[key_index];
+                acc1 += value * scales1[key_index];
+                acc2 += value * scales2[key_index];
+            }
+            max0 = next_max0;
+            max1 = next_max1;
+            max2 = next_max2;
+        }
+    }
+    for (; key_pos <= query_pos; key_pos++) {
         const bool current = key_pos >= args.pos0;
         const uint source_row = current ?
             key_pos - args.pos0 : key_pos % args.cache_cap;
@@ -14483,7 +14836,115 @@ kernel void kernel_laguna_attention_prefill_gqa6_f16(
     float sum3 = 0.0f;
     float sum4 = 0.0f;
     float sum5 = 0.0f;
-    for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
+    uint key_pos = key_start;
+    // Six heads already consume substantial register space, so pair two keys
+    // instead of four. The scalar loop remains the disabled path and tail.
+    if ((args.pad0 & 1u) != 0u) {
+        for (; key_pos + 2u <= query_pos + 1u; key_pos += 2u) {
+            uint64_t key_bases[2];
+            bool current_rows[2];
+            FOR_UNROLL (short key_index = 0; key_index < 2; key_index++) {
+                const uint position = key_pos + (uint)key_index;
+                current_rows[key_index] = position >= args.pos0;
+                const uint source_row = current_rows[key_index]
+                    ? position - args.pos0 : position % args.cache_cap;
+                key_bases[key_index] =
+                    (uint64_t)source_row * cache_width
+                    + (uint64_t)kv_head * args.head_dim;
+            }
+
+            float2 partial0 = float2(0.0f);
+            float2 partial1 = float2(0.0f);
+            float2 partial2 = float2(0.0f);
+            float2 partial3 = float2(0.0f);
+            float2 partial4 = float2(0.0f);
+            float2 partial5 = float2(0.0f);
+            for (uint d = lane; d < args.head_dim; d += 32u) {
+                const float2 key_value = float2(
+                    current_rows[0]
+                        ? (float)staged_key[key_bases[0] + d]
+                        : (float)key_cache[key_bases[0] + d],
+                    current_rows[1]
+                        ? (float)staged_key[key_bases[1] + d]
+                        : (float)key_cache[key_bases[1] + d]);
+                partial0 += qh0[d] * key_value;
+                partial1 += qh1[d] * key_value;
+                partial2 += qh2[d] * key_value;
+                partial3 += qh3[d] * key_value;
+                partial4 += qh4[d] * key_value;
+                partial5 += qh5[d] * key_value;
+            }
+            const float2 scores0 = simd_sum(partial0) * args.scale;
+            const float2 scores1 = simd_sum(partial1) * args.scale;
+            const float2 scores2 = simd_sum(partial2) * args.scale;
+            const float2 scores3 = simd_sum(partial3) * args.scale;
+            const float2 scores4 = simd_sum(partial4) * args.scale;
+            const float2 scores5 = simd_sum(partial5) * args.scale;
+            const float next_max0 = max(max0, max(scores0.x, scores0.y));
+            const float next_max1 = max(max1, max(scores1.x, scores1.y));
+            const float next_max2 = max(max2, max(scores2.x, scores2.y));
+            const float next_max3 = max(max3, max(scores3.x, scores3.y));
+            const float next_max4 = max(max4, max(scores4.x, scores4.y));
+            const float next_max5 = max(max5, max(scores5.x, scores5.y));
+            const float old_scale0 = max0 == -INFINITY
+                ? 0.0f : exp(max0 - next_max0);
+            const float old_scale1 = max1 == -INFINITY
+                ? 0.0f : exp(max1 - next_max1);
+            const float old_scale2 = max2 == -INFINITY
+                ? 0.0f : exp(max2 - next_max2);
+            const float old_scale3 = max3 == -INFINITY
+                ? 0.0f : exp(max3 - next_max3);
+            const float old_scale4 = max4 == -INFINITY
+                ? 0.0f : exp(max4 - next_max4);
+            const float old_scale5 = max5 == -INFINITY
+                ? 0.0f : exp(max5 - next_max5);
+            const float2 scales0 = exp(scores0 - next_max0);
+            const float2 scales1 = exp(scores1 - next_max1);
+            const float2 scales2 = exp(scores2 - next_max2);
+            const float2 scales3 = exp(scores3 - next_max3);
+            const float2 scales4 = exp(scores4 - next_max4);
+            const float2 scales5 = exp(scores5 - next_max5);
+            sum0 = sum0 * old_scale0 + scales0.x + scales0.y;
+            sum1 = sum1 * old_scale1 + scales1.x + scales1.y;
+            sum2 = sum2 * old_scale2 + scales2.x + scales2.y;
+            sum3 = sum3 * old_scale3 + scales3.x + scales3.y;
+            sum4 = sum4 * old_scale4 + scales4.x + scales4.y;
+            sum5 = sum5 * old_scale5 + scales5.x + scales5.y;
+            acc0 *= old_scale0;
+            acc1 *= old_scale1;
+            acc2 *= old_scale2;
+            acc3 *= old_scale3;
+            acc4 *= old_scale4;
+            acc5 *= old_scale5;
+            FOR_UNROLL (short key_index = 0;
+                        key_index < 2; key_index++) {
+                const uint d0 = lane;
+                const uint64_t base = key_bases[key_index];
+                const float4 value = current_rows[key_index]
+                    ? float4((float)staged_value[base + d0],
+                             (float)staged_value[base + d0 + 32u],
+                             (float)staged_value[base + d0 + 64u],
+                             (float)staged_value[base + d0 + 96u])
+                    : float4((float)value_cache[base + d0],
+                             (float)value_cache[base + d0 + 32u],
+                             (float)value_cache[base + d0 + 64u],
+                             (float)value_cache[base + d0 + 96u]);
+                acc0 += value * scales0[key_index];
+                acc1 += value * scales1[key_index];
+                acc2 += value * scales2[key_index];
+                acc3 += value * scales3[key_index];
+                acc4 += value * scales4[key_index];
+                acc5 += value * scales5[key_index];
+            }
+            max0 = next_max0;
+            max1 = next_max1;
+            max2 = next_max2;
+            max3 = next_max3;
+            max4 = next_max4;
+            max5 = next_max5;
+        }
+    }
+    for (; key_pos <= query_pos; key_pos++) {
         const bool current = key_pos >= args.pos0;
         const uint source_row = current ?
             key_pos - args.pos0 : key_pos % args.cache_cap;

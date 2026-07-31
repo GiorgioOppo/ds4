@@ -222,6 +222,24 @@ public final class LagunaResidentModel {
         !expertStaging.isEmpty || !expertSlots.isEmpty
     }
     public var expertCacheSlots: Int { expertSlots.count }
+    public var expertCacheAllocatedBytes: Int {
+        return expertSlots.reduce(0) {
+            $0 + $1.gate.length + $1.up.length + $1.down.length
+        }
+    }
+    public var isMultiQuantExpertCacheEnabled: Bool {
+        Self.multiQuantExpertCache
+            && expertSlots.contains { $0.cacheClass != nil }
+    }
+    public var expertCacheCompatibleSlotRange: ClosedRange<Int> {
+        let counts = expertCandidateIndicesByLayer.values.map(\.count)
+        let lower = counts.min() ?? expertSlots.count
+        let upper = counts.max() ?? expertSlots.count
+        return lower...upper
+    }
+    public var effectivePrefillChunkSize: Int {
+        layerMajorChunkSize()
+    }
     public var isExpertCacheLayerPartitioned: Bool {
         !expertLayerSlotRanges.isEmpty
     }
@@ -231,7 +249,16 @@ public final class LagunaResidentModel {
     public var isExpertPreadEnabled: Bool { streamFD >= 0 }
     public var isMetalIOEnabled: Bool { metalIO != nil }
     public var isDecodeSplitKEnabled: Bool { Self.decodeSplitK }
+    public var isDecodeFusedRopeKVEnabled: Bool {
+        Self.decodeFusedRopeKV
+    }
+    public var isDecodeSWAGQA3Enabled: Bool { Self.decodeSWAGQA3 }
     public var isChainedDecodeEnabled: Bool { Self.chainedDecode }
+    public var isPrefillAttentionMultiKeyEnabled: Bool {
+        Self.prefillAttentionMultiKey
+    }
+    public var isPrefillLastRowEnabled: Bool { Self.prefillLastRow }
+    public var isRopeSIMDEnabled: Bool { Self.ropeSIMD }
     public var isSharedExpertIOOverlapEnabled: Bool {
         Self.sharedExpertIOOverlap
     }
@@ -296,6 +323,30 @@ public final class LagunaResidentModel {
             .prefillBatch,
             backend: .laguna,
             default: true)
+    /// Evaluate four keys per SIMD reduction for GQA3 and two for GQA6.
+    /// The scalar tail remains in the same kernel and DS4_PREFILL_ATTN_MULTIKEY
+    /// provides a real-model A/B escape hatch.
+    private static let prefillAttentionMultiKey =
+        DS4RuntimeEnvironment.flag(
+            .prefillAttentionMultiKey,
+            backend: .laguna,
+            default: true)
+    /// A plain prefill only needs the last prompt row after the final layer's
+    /// KV store. Earlier chunks skip that layer's tail; the final chunk runs
+    /// it for one row. forwardBatch keeps all rows for scoring.
+    private static let prefillLastRow =
+        DS4RuntimeEnvironment.flag(
+            .prefillLastRow,
+            backend: .laguna,
+            default: true)
+    /// Store mixed Q2_K/Q3_K expert slots at their real byte size. The
+    /// legacy path allocates every slot at the largest Q3_K size and remains
+    /// available for exact A/B.
+    private static let multiQuantExpertCache =
+        DS4RuntimeEnvironment.flag(
+            .multiQuantExpertCache,
+            backend: .laguna,
+            default: true)
     /// Experimental expert-major MoE prefill. The real-model A/B currently
     /// shows a regression, so it remains opt-in for further kernel tuning.
     private static let batchedPrefillMoE =
@@ -338,7 +389,7 @@ public final class LagunaResidentModel {
             default: false)
     /// Long-context full-attention decode. The grouped kernel evaluates three
     /// query heads sharing one KV head, then a specialized reducer applies the
-    /// learned gate. Sliding-window layers keep the ring-aware legacy kernel.
+    /// learned gate. A full sliding ring may opt into the same kernel below.
     private static let decodeSplitK =
         DS4RuntimeEnvironment.flag(
             .decodeSplitK,
@@ -350,6 +401,30 @@ public final class LagunaResidentModel {
             .decodeSplitKMinimum,
             backend: .laguna) ?? 384)
     private static let decodeSplitKMaximumWorkgroups = 32
+    /// Full SWA rings contain exactly the live key set, so their physical
+    /// order is irrelevant to unmasked attention and the GQA3 split kernel
+    /// can share each K/V row across three query heads. Opt-in on M1: at the
+    /// fixed 512-token window its 32-workgroup reduction costs more than it
+    /// saves, while newer GPUs can still A/B the path.
+    private static let decodeSWAGQA3 =
+        DS4RuntimeEnvironment.flag(
+            .decodeSWAGQA3,
+            backend: .laguna,
+            default: false)
+    /// SIMD-resident per-head RMSNorm/RoPE. Correct on M1 as well as newer
+    /// Metal devices, but opt-in because the M1 Pro A/B regresses.
+    private static let ropeSIMD =
+        DS4RuntimeEnvironment.flag(
+            .ropeSIMD,
+            backend: .laguna,
+            default: false)
+    /// Decode-only fusion that commits K/V from the RoPE dispatch. Kept
+    /// opt-in because both the SIMD and legacy-order variants regress on M1.
+    private static let decodeFusedRopeKV =
+        DS4RuntimeEnvironment.flag(
+            .decodeFusedRopeKV,
+            backend: .laguna,
+            default: false)
     /// Queue the expert tail of layer N without a CPU wait, then append the
     /// attention/router trunk of N+1 on the same in-order Metal queue. Waiting
     /// for the latter completes both, halving decode wait round-trips while
@@ -458,15 +533,33 @@ public final class LagunaResidentModel {
     /// Reuse is safe because the expert batch is waited on before the next
     /// layer's gather can evict anything. Empty = cache disabled
     /// (`expertStaging` triples carry the token instead).
+    private struct ExpertCacheClass: Hashable {
+        let routedType: UInt32
+        let gateUpBytes: Int
+        let downBytes: Int
+
+        var payloadBytes: Int {
+            2 * gateUpBytes + downBytes
+        }
+    }
+
     private struct ExpertSlot {
         let gate: MTLBuffer
         let up: MTLBuffer
         let down: MTLBuffer
+        let gateOffset: Int
+        let upOffset: Int
+        let downOffset: Int
+        let cacheClass: ExpertCacheClass?
         var key = -1        // layer << 16 | expert, -1 = never filled
         var lastUse = 0
     }
     private var expertSlots: [ExpertSlot] = []
     private var expertSlotIndex: [Int: Int] = [:]
+    /// Compatible victim indices per streamed layer. The mixed cache maps
+    /// layers onto their real quant-size class; the legacy cache maps every
+    /// layer onto the complete max-size pool.
+    private var expertCandidateIndicesByLayer: [Int: [Int]] = [:]
     /// When the budget can provide at least `activeExperts` slots to every
     /// streamed layer, keep disjoint per-layer ranges. A small global LRU
     /// otherwise thrashes deterministically: layer 47 evicts layer 1 before
@@ -712,7 +805,9 @@ public final class LagunaResidentModel {
         self.routerWeights = try scratch(activeExperts, "router weights")
         self.routerProbs = try scratch(LagunaRouterReference.expertCount, "router probabilities")
         self.logits = try scratch(Int(shape.nVocab), "logits")
-        let splitRows = Int(shape.nHeadFull)
+        // The same split-K scratch is shared by the 48-head global layers
+        // and the 72-head sliding-window GQA3 path.
+        let splitRows = Int(max(shape.nHead, shape.nHeadFull))
         let splitWorkgroups = Self.decodeSplitKMaximumWorkgroups
         let splitValues = splitRows * Int(shape.nHeadDim) * splitWorkgroups
         let splitStats = splitRows * 2 * splitWorkgroups
@@ -835,6 +930,157 @@ public final class LagunaResidentModel {
         self.layers = layers
 
         if options.expertStreaming, maxGateUpExpertBytes + maxDownExpertBytes > 0 {
+            let streamedClassesByLayer: [(layer: Int,
+                                          cacheClass: ExpertCacheClass)] =
+                layers.compactMap { layer in
+                    guard case .moe(
+                        let routedType, _, _, let routed,
+                        let gateUpBytes, let downBytes, _, _, _
+                    ) = layer.ffn,
+                          case .streamed = routed else {
+                        return nil
+                    }
+                    return (
+                        layer.index,
+                        ExpertCacheClass(
+                            routedType: routedType,
+                            gateUpBytes: gateUpBytes,
+                            downBytes: downBytes)
+                    )
+                }
+            let streamedLayerIndices =
+                streamedClassesByLayer.map(\.layer)
+
+            // Mixed Q2_K/Q3_K pool. Balance slots by coverage per layer so
+            // every quant class retains approximately the same number of
+            // routed selections per layer under one exact byte budget.
+            if Self.multiQuantExpertCache,
+               !streamedClassesByLayer.isEmpty {
+                let alignment = 256
+                func aligned(_ value: Int) -> Int {
+                    (value + alignment - 1) & ~(alignment - 1)
+                }
+                func recordBytes(_ cacheClass: ExpertCacheClass) -> Int {
+                    aligned(cacheClass.gateUpBytes)
+                        + aligned(cacheClass.gateUpBytes)
+                        + aligned(cacheClass.downBytes)
+                }
+
+                var layerCounts: [ExpertCacheClass: Int] = [:]
+                for row in streamedClassesByLayer {
+                    layerCounts[row.cacheClass, default: 0] += 1
+                }
+                let classes = layerCounts.keys.sorted {
+                    if $0.routedType != $1.routedType {
+                        return $0.routedType < $1.routedType
+                    }
+                    if $0.gateUpBytes != $1.gateUpBytes {
+                        return $0.gateUpBytes < $1.gateUpBytes
+                    }
+                    return $0.downBytes < $1.downBytes
+                }
+                var counts = Dictionary(
+                    uniqueKeysWithValues: classes.map {
+                        ($0, activeExperts)
+                    })
+                var totalSlots = activeExperts * classes.count
+                var totalBytes = classes.reduce(0) {
+                    $0 + activeExperts * recordBytes($1)
+                }
+                let explicitSlotLimit =
+                    options.expertCacheSlots.map { max(0, $0) }
+                let byteLimit = options.expertCacheMB > 0
+                    ? options.expertCacheMB << 20 : 0
+                let minimumFits =
+                    (explicitSlotLimit != nil || byteLimit > 0) &&
+                    (explicitSlotLimit.map { totalSlots <= $0 } ?? true)
+                    && (byteLimit == 0 || totalBytes <= byteLimit)
+
+                if minimumFits {
+                    while true {
+                        let candidates = classes.filter { cacheClass in
+                            let withinSlots = explicitSlotLimit.map {
+                                totalSlots < $0
+                            } ?? true
+                            let withinBytes = byteLimit == 0
+                                || totalBytes + recordBytes(cacheClass)
+                                    <= byteLimit
+                            return withinSlots && withinBytes
+                        }
+                        guard let chosen = candidates.min(by: { a, b in
+                            // Compare slots/layer without floating point.
+                            let lhs = (counts[a] ?? 0)
+                                * (layerCounts[b] ?? 1)
+                            let rhs = (counts[b] ?? 0)
+                                * (layerCounts[a] ?? 1)
+                            if lhs != rhs { return lhs < rhs }
+                            return recordBytes(a) < recordBytes(b)
+                        }) else { break }
+                        counts[chosen, default: 0] += 1
+                        totalSlots += 1
+                        totalBytes += recordBytes(chosen)
+                    }
+
+                    if totalSlots >= activeExperts * classes.count {
+                        var slots: [ExpertSlot] = []
+                        slots.reserveCapacity(totalSlots)
+                        var classIndices:
+                            [ExpertCacheClass: [Int]] = [:]
+                        var allocationFailed = false
+                        allocation: for cacheClass in classes {
+                            let count = counts[cacheClass] ?? 0
+                            classIndices[cacheClass] = []
+                            classIndices[cacheClass]?.reserveCapacity(count)
+                            for _ in 0..<count {
+                                guard let gate = runtime.device.makeBuffer(
+                                          length: cacheClass.gateUpBytes,
+                                          options: .storageModeShared),
+                                      let up = runtime.device.makeBuffer(
+                                          length: cacheClass.gateUpBytes,
+                                          options: .storageModeShared),
+                                      let down = runtime.device.makeBuffer(
+                                          length: cacheClass.downBytes,
+                                          options: .storageModeShared) else {
+                                    allocationFailed = true
+                                    break allocation
+                                }
+                                let index = slots.count
+                                slots.append(ExpertSlot(
+                                    gate: gate, up: up, down: down,
+                                    gateOffset: 0,
+                                    upOffset: 0,
+                                    downOffset: 0,
+                                    cacheClass: cacheClass))
+                                classIndices[cacheClass, default: []]
+                                    .append(index)
+                            }
+                        }
+                        if !allocationFailed {
+                            self.expertSlots = slots
+                            self.expertSlotIndex = Dictionary(
+                                minimumCapacity: slots.count)
+                            for row in streamedClassesByLayer {
+                                // A larger Q3_K record can safely host a
+                                // Q2_K payload. Smaller classes borrow every
+                                // capacity-compatible slot.
+                                self.expertCandidateIndicesByLayer[row.layer] =
+                                    classes.flatMap { candidateClass in
+                                        guard candidateClass.gateUpBytes
+                                                >= row.cacheClass.gateUpBytes,
+                                              candidateClass.downBytes
+                                                >= row.cacheClass.downBytes
+                                        else {
+                                            return [Int]()
+                                        }
+                                        return classIndices[candidateClass]
+                                            ?? []
+                                    }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Slot cache first: when the budget yields at least one slot per
             // active-expert rank the slots replace the staging triples (they
             // are the staging, plus persistence across tokens). Allocation
@@ -844,7 +1090,7 @@ public final class LagunaResidentModel {
             let requested = options.expertCacheSlots.map { max(0, $0) }
                 ?? (options.expertCacheMB > 0
                     ? (options.expertCacheMB << 20) / slotBytes : 0)
-            if requested >= activeExperts {
+            if expertSlots.isEmpty, requested >= activeExperts {
                 var slots: [ExpertSlot] = []
                 slots.reserveCapacity(requested)
                 for _ in 0..<requested {
@@ -857,22 +1103,15 @@ public final class LagunaResidentModel {
                           let down = runtime.device.makeBuffer(
                             length: maxDownExpertBytes,
                             options: .storageModeShared) else { break }
-                    slots.append(ExpertSlot(gate: gate, up: up, down: down))
+                    slots.append(ExpertSlot(
+                        gate: gate, up: up, down: down,
+                        gateOffset: 0, upOffset: 0, downOffset: 0,
+                        cacheClass: nil))
                 }
                 if slots.count >= activeExperts {
                     self.expertSlots = slots
                     self.expertSlotIndex = Dictionary(
                         minimumCapacity: slots.count)
-                    let streamedLayerIndices = layers.compactMap {
-                        layer -> Int? in
-                        guard case .moe(
-                            _, _, _, let routed, _, _, _, _, _
-                        ) = layer.ffn,
-                              case .streamed = routed else {
-                            return nil
-                        }
-                        return layer.index
-                    }
                     let minimumPartitioned = activeExperts
                         * streamedLayerIndices.count
                     if Self.partitionExpertCache,
@@ -889,6 +1128,17 @@ public final class LagunaResidentModel {
                             self.expertLayerSlotRanges[layerIndex] =
                                 start..<(start + count)
                             start += count
+                        }
+                    }
+                    let allIndices = Array(slots.indices)
+                    for layerIndex in streamedLayerIndices {
+                        if let range =
+                            self.expertLayerSlotRanges[layerIndex] {
+                            self.expertCandidateIndicesByLayer[layerIndex] =
+                                Array(range)
+                        } else {
+                            self.expertCandidateIndicesByLayer[layerIndex] =
+                                allIndices
                         }
                     }
                 }
@@ -1453,10 +1703,19 @@ public final class LagunaResidentModel {
         while done < tokens.count {
             let chunk = Array(tokens[done ..< min(done + chunkSize,
                                                   tokens.count)])
-            let lastPlane = try sweepChunk(chunk, planes: planes) { _ in
-                layerSteps += 1
-                onLayerProgress?(layerSteps, totalLayerSteps)
+            let isFinalChunk = done + chunk.count == tokens.count
+            let finalTail: PrefillFinalTail
+            if collectLogits || !Self.prefillLastRow {
+                finalTail = .allRows
+            } else {
+                finalTail = isFinalChunk ? .lastRow : .skip
             }
+            let lastPlane = try sweepChunk(
+                chunk, planes: planes, finalTail: finalTail
+            ) { _ in
+                    layerSteps += 1
+                    onLayerProgress?(layerSteps, totalLayerSteps)
+                }
             done += chunk.count
             if collectLogits {
                 for i in 0..<chunk.count {
@@ -1494,7 +1753,10 @@ public final class LagunaResidentModel {
         guard isExpertStreaming else { return cap }
         guard !expertSlots.isEmpty else { return 1 }
         let used = activeExperts
-        let spare = expertSlots.count - used
+        let compatibleCount =
+            expertCandidateIndicesByLayer.values.map(\.count).min()
+                ?? expertSlots.count
+        let spare = compatibleCount - used
         if spare >= LagunaRouterReference.expertCount { return cap }
         return max(1, min(cap, spare / used))
     }
@@ -1594,9 +1856,16 @@ public final class LagunaResidentModel {
         return planes
     }
 
+    private enum PrefillFinalTail: Equatable {
+        case allRows
+        case lastRow
+        case skip
+    }
+
     /// One layer-major sweep of `chunk` through every layer. Returns the
     /// plane holding the chunk's final hidden states (after the swaps).
     private func sweepChunk(_ chunk: [Int32], planes: PrefillPlanes,
+                            finalTail: PrefillFinalTail,
                             onLayer: (Int) -> Void) throws -> MTLBuffer {
         var planes = planes
         let n = chunk.count
@@ -1617,6 +1886,8 @@ public final class LagunaResidentModel {
         for layer in layers {
             try Task.checkCancellation()
             let spec = layer.spec
+            let layerTail = layer.index == layers.last?.index
+                ? finalTail : .allRows
             let queryWidth = spec.queryWidth
             let kvWidth = spec.keyValueWidth
             // The batch QK/RoPE and attention kernels use tightly packed
@@ -1747,42 +2018,56 @@ public final class LagunaResidentModel {
                 }
             }
 
-            if denseMM {
+            if layerTail == .skip {
+                try endCommands(commands, phase: .attention)
+                profile.routeS += Date().timeIntervalSince(phaseStart)
+                profile.layers += n
+                swap(&planes.hidden, &planes.hiddenNext)
+                onLayer(layer.index)
+                continue
+            }
+
+            let tailCount = layerTail == .lastRow ? 1 : n
+            let tailDenseMM = denseMM && layerTail == .allRows
+            if tailDenseMM {
                 try encodeQ8MatmulRows(
                     commands, weights: layer.attnOutput,
                     input: planes.heads, output: planes.attnOut,
-                    inputWidth: queryWidth, outputWidth: embd, count: n)
+                    inputWidth: queryWidth, outputWidth: embd,
+                    count: tailCount)
                 try encodeAdd(
                     commands, a: planes.hidden, b: planes.attnOut,
-                    out: planes.afterAttn, count: n * embd)
+                    out: planes.afterAttn, count: tailCount * embd)
             } else {
-                for i in 0..<n {
+                for destinationToken in 0..<tailCount {
+                    let sourceToken = layerTail == .lastRow
+                        ? n - 1 : destinationToken
                     try encodeQuantMatvec(
                         commands, type: Self.q8Type,
                         rows: embd, inputWidth: queryWidth,
                         weights: layer.attnOutput,
                         input: planes.heads,
-                        inputOffset: i * queryRowBytes,
+                        inputOffset: sourceToken * queryRowBytes,
                         output: planes.attnOut,
-                        outputOffset: i * planes.embdBytes,
+                        outputOffset: destinationToken * planes.embdBytes,
                         accumulate: false)
                     try encodeAdd(
                         commands, a: planes.hidden,
-                        aOffset: i * planes.embdBytes,
+                        aOffset: sourceToken * planes.embdBytes,
                         b: planes.attnOut,
-                        bOffset: i * planes.embdBytes,
+                        bOffset: destinationToken * planes.embdBytes,
                         out: planes.afterAttn,
-                        outOffset: i * planes.embdBytes,
+                        outOffset: destinationToken * planes.embdBytes,
                         count: embd)
                 }
             }
-            if denseMM {
+            if tailDenseMM {
                 try encodeRMSNormRows(
                     commands, input: planes.afterAttn,
                     weight: layer.ffnNorm, output: planes.ffnNormed,
-                    width: embd, count: n)
+                    width: embd, count: tailCount)
             } else {
-                for i in 0..<n {
+                for i in 0..<tailCount {
                     try encodeRMSNorm(commands, input: planes.afterAttn,
                                       inputOffset: i * planes.embdBytes,
                                       weight: layer.ffnNorm,
@@ -1793,23 +2078,23 @@ public final class LagunaResidentModel {
             }
             if case .moe(_, let routerRows, let routerBias,
                          _, _, _, _, _, _) = layer.ffn {
-                if denseMM {
+                if tailDenseMM {
                     try encodeF32MatvecRows(
                         commands, rows: routerRows,
                         rowCount: LagunaRouterReference.expertCount,
                         inputWidth: embd,
                         input: planes.ffnNormed,
                         output: planes.routerLogits,
-                        count: n)
+                        count: tailCount)
                     try encodeRouterSelect(
                         commands, bias: routerBias,
                         logits: planes.routerLogits, logitsOffset: 0,
                         selected: planes.routerSelected, selectedOffset: 0,
                         weights: planes.routerWeights, weightsOffset: 0,
                         probs: planes.routerProbs, probsOffset: 0,
-                        count: n)
+                        count: tailCount)
                 } else {
-                    for i in 0..<n {
+                    for i in 0..<tailCount {
                         try encodeF32Matvec(
                             commands, rows: routerRows,
                             rowCount: LagunaRouterReference.expertCount,
@@ -1835,31 +2120,31 @@ public final class LagunaResidentModel {
             switch layer.ffn {
             case .dense(let gate, let up, let down):
                 let intermediate = Int(shape.nFFDense)
-                if denseMM {
+                if tailDenseMM {
                     try encodeQ8MatmulRows(
                         commands, weights: gate,
                         input: planes.ffnNormed, output: planes.ffnMid,
                         inputWidth: embd, outputWidth: intermediate,
-                        count: n)
+                        count: tailCount)
                     try encodeQ8MatmulRows(
                         commands, weights: up,
                         input: planes.ffnNormed, output: planes.ffnUp,
                         inputWidth: embd, outputWidth: intermediate,
-                        count: n)
+                        count: tailCount)
                     try encodeSwiGLURows(
                         commands, gate: planes.ffnMid, up: planes.ffnUp,
                         output: planes.ffnMid, width: intermediate,
-                        count: n)
+                        count: tailCount)
                     try encodeQ8MatmulRows(
                         commands, weights: down,
                         input: planes.ffnMid, output: planes.ffnOut,
                         inputWidth: intermediate, outputWidth: embd,
-                        count: n)
+                        count: tailCount)
                     try encodeAdd(
                         commands, a: planes.afterAttn, b: planes.ffnOut,
-                        out: planes.hiddenNext, count: n * embd)
+                        out: planes.hiddenNext, count: tailCount * embd)
                 } else {
-                    for i in 0..<n {
+                    for i in 0..<tailCount {
                         try encodePairSwiGLU(commands, type: Self.q8Type,
                                              rows: intermediate,
                                              inputWidth: embd,
@@ -1895,19 +2180,25 @@ public final class LagunaResidentModel {
                       let sharedGate, let sharedUp, let sharedDown):
                 try endCommands(commands, phase: .attention)
                 let selPointer = planes.routerSelected.contents()
-                    .bindMemory(to: Int32.self, capacity: n * used)
+                    .bindMemory(to: Int32.self, capacity: tailCount * used)
                 let weightPointer = planes.routerWeights.contents()
-                    .bindMemory(to: Float.self, capacity: n * used)
+                    .bindMemory(to: Float.self, capacity: tailCount * used)
                 profile.routeS += Date().timeIntervalSince(phaseStart)
 
                 try encodeChunkExperts(
-                    layer: layer, planes: planes, count: n,
+                    layer: layer, planes: planes, count: tailCount,
                     routedType: routedType, routed: routed,
                     gateUpExpertBytes: gateUpExpertBytes,
                     downExpertBytes: downExpertBytes,
                     sharedGate: sharedGate, sharedUp: sharedUp,
                     sharedDown: sharedDown,
                     selected: selPointer, routeWeights: weightPointer)
+            }
+            if layerTail == .lastRow, n > 1 {
+                _ = memcpy(
+                    planes.hiddenNext.contents() + (n - 1) * planes.embdBytes,
+                    planes.hiddenNext.contents(),
+                    planes.embdBytes)
             }
             profile.layers += n
             swap(&planes.hidden, &planes.hiddenNext)
@@ -1953,6 +2244,9 @@ public final class LagunaResidentModel {
             isStreamed = true
             let slabBytes = 2 * gateUpExpertBytes + downExpertBytes
             expertClock += 1
+            let candidateSlots =
+                expertCandidateIndicesByLayer[layer.index]
+                    ?? Array(expertSlots.indices)
             var missIndexOfKey: [Int: Int] = [:]
             for i in 0..<n {
                 var worst = 0
@@ -1975,7 +2269,7 @@ public final class LagunaResidentModel {
                     }
                     var victim = -1
                     var oldest = Int.max
-                    for index in expertSlots.indices
+                    for index in candidateSlots
                     where expertSlots[index].lastUse < expertClock
                         && expertSlots[index].lastUse < oldest {
                         victim = index
@@ -1995,15 +2289,18 @@ public final class LagunaResidentModel {
                     rankReady[i * used + r] = missIndex + 1
                     missReads.append([
                         ExpertRead(
-                            buffer: slot.gate, bufferOffset: 0,
+                            buffer: slot.gate,
+                            bufferOffset: slot.gateOffset,
                             fileOffset: gateBase + e * gateUpExpertBytes,
                             bytes: gateUpExpertBytes),
                         ExpertRead(
-                            buffer: slot.up, bufferOffset: 0,
+                            buffer: slot.up,
+                            bufferOffset: slot.upOffset,
                             fileOffset: upBase + e * gateUpExpertBytes,
                             bytes: gateUpExpertBytes),
                         ExpertRead(
-                            buffer: slot.down, bufferOffset: 0,
+                            buffer: slot.down,
+                            bufferOffset: slot.downOffset,
                             fileOffset: downBase + e * downExpertBytes,
                             bytes: downExpertBytes),
                     ])
@@ -2172,26 +2469,28 @@ public final class LagunaResidentModel {
             let commands = Commands(buffer: buffer, encoder: encoder)
             for r in 0..<used {
                 let gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer
-                let gateUpOffset: Int, downOffset: Int
+                let gateOffset: Int, upOffset: Int, downOffset: Int
                 switch routed {
                 case .resident(let residentGate, let residentUp,
                                let residentDown):
                     let e = Int(selected[i * used + r])
                     gate = residentGate; up = residentUp
                     down = residentDown
-                    gateUpOffset = e * gateUpExpertBytes
+                    gateOffset = e * gateUpExpertBytes
+                    upOffset = e * gateUpExpertBytes
                     downOffset = e * downExpertBytes
                 case .streamed:
                     let slot = expertSlots[rankSlot[i * used + r]]
                     gate = slot.gate; up = slot.up; down = slot.down
-                    gateUpOffset = 0
-                    downOffset = 0
+                    gateOffset = slot.gateOffset
+                    upOffset = slot.upOffset
+                    downOffset = slot.downOffset
                 }
                 try encodePairSwiGLU(
                     commands, type: routedType, rows: expertWidth,
                     inputWidth: embd,
-                    gateRows: gate, gateOffset: gateUpOffset,
-                    upRows: up, upOffset: gateUpOffset,
+                    gateRows: gate, gateOffset: gateOffset,
+                    upRows: up, upOffset: upOffset,
                     input: planes.ffnNormed,
                     inputOffset: i * planes.embdBytes,
                     routeWeight: routeWeights[i * used + r],
@@ -2590,7 +2889,8 @@ public final class LagunaResidentModel {
             let gate: MTLBuffer
             let up: MTLBuffer
             let down: MTLBuffer
-            let gateUpOffset: Int
+            let gateOffset: Int
+            let upOffset: Int
             let downOffset: Int
             switch routed {
             case .resident(let residentGate, let residentUp,
@@ -2598,15 +2898,17 @@ public final class LagunaResidentModel {
                 gate = residentGate
                 up = residentUp
                 down = residentDown
-                gateUpOffset = entry.expert * gateUpExpertBytes
+                gateOffset = entry.expert * gateUpExpertBytes
+                upOffset = entry.expert * gateUpExpertBytes
                 downOffset = entry.expert * downExpertBytes
             case .streamed:
                 let slot = expertSlots[entry.slot]
                 gate = slot.gate
                 up = slot.up
                 down = slot.down
-                gateUpOffset = 0
-                downOffset = 0
+                gateOffset = slot.gateOffset
+                upOffset = slot.upOffset
+                downOffset = slot.downOffset
             }
             try encodePrefillExpertApplications(
                 commands,
@@ -2619,9 +2921,9 @@ public final class LagunaResidentModel {
                 appWeights: appWeightsBuffer,
                 inputs: planes.ffnNormed,
                 gate: gate,
-                gateOffset: gateUpOffset,
+                gateOffset: gateOffset,
                 up: up,
-                upOffset: gateUpOffset,
+                upOffset: upOffset,
                 down: down,
                 downOffset: downOffset,
                 mids: mids,
@@ -2793,13 +3095,25 @@ public final class LagunaResidentModel {
                              typeA: Self.q8Type, rowsA: kvWidth, weightsA: layer.value,
                              typeB: Self.q8Type, rowsB: spec.headCount, weightsB: layer.gate,
                              inputWidth: embd, outA: valueRows, outB: gateRows)
-        try encodeQKNormRope(commands, spec: spec, position: position,
-                             queryNorm: layer.queryNorm, keyNorm: layer.keyNorm,
-                             query: queryRows, queryOffset: 0,
-                             key: keyRows, keyOffset: 0)
-        try encodeStoreKV(commands, cache: layer.cache, position: position,
-                          key: keyRows, keyOffset: 0,
-                          value: valueRows, valueOffset: 0)
+        if Self.decodeFusedRopeKV {
+            try encodeQKNormRopeStore(
+                commands, spec: spec, cache: layer.cache,
+                position: position,
+                queryNorm: layer.queryNorm, keyNorm: layer.keyNorm,
+                query: queryRows, queryOffset: 0,
+                key: keyRows, keyOffset: 0,
+                value: valueRows, valueOffset: 0)
+        } else {
+            try encodeQKNormRope(
+                commands, spec: spec, position: position,
+                queryNorm: layer.queryNorm, keyNorm: layer.keyNorm,
+                query: queryRows, queryOffset: 0,
+                key: keyRows, keyOffset: 0)
+            try encodeStoreKV(
+                commands, cache: layer.cache, position: position,
+                key: keyRows, keyOffset: 0,
+                value: valueRows, valueOffset: 0)
+        }
         if let longIndex = layer.longAttentionIndex {
             try encodeLongAttentionIndexUpdate(
                 commands, cache: layer.cache, index: longIndex,
@@ -2839,16 +3153,17 @@ public final class LagunaResidentModel {
                   let sharedGate, let sharedUp, let sharedDown):
             // Phase A ends with the router: selection is read back on the
             // host to address the expert slabs (GLM chained-decode pattern).
-            try encodeF32Matvec(commands, rows: routerRows,
-                                rowCount: LagunaRouterReference.expertCount,
-                                inputWidth: embd, x: ffnNormed,
-                                out: routerLogits)
-            try encodeRouterSelect(commands, bias: routerBias,
-                                   logits: routerLogits, logitsOffset: 0,
-                                   selected: routerSelected,
-                                   selectedOffset: 0,
-                                   weights: routerWeights, weightsOffset: 0,
-                                   probs: routerProbs, probsOffset: 0)
+            try encodeF32Matvec(
+                commands, rows: routerRows,
+                rowCount: LagunaRouterReference.expertCount,
+                inputWidth: embd, x: ffnNormed,
+                out: routerLogits)
+            try encodeRouterSelect(
+                commands, bias: routerBias,
+                logits: routerLogits, logitsOffset: 0,
+                selected: routerSelected, selectedOffset: 0,
+                weights: routerWeights, weightsOffset: 0,
+                probs: routerProbs, probsOffset: 0)
             try endCommands(commands, phase: .attention)
 
             let used = activeExperts
@@ -2919,8 +3234,9 @@ public final class LagunaResidentModel {
                         }
                         var victim = -1
                         var oldest = Int.max
-                        let candidates = expertLayerSlotRanges[layer.index]
-                            ?? 0..<expertSlots.count
+                        let candidates =
+                            expertCandidateIndicesByLayer[layer.index]
+                                ?? Array(expertSlots.indices)
                         for index in candidates
                         where expertSlots[index].lastUse < expertClock
                             && expertSlots[index].lastUse < oldest {
@@ -2939,16 +3255,19 @@ public final class LagunaResidentModel {
                         let slot = expertSlots[victim]
                         rankReads[rank] = [
                             ExpertRead(
-                                buffer: slot.gate, bufferOffset: 0,
+                                buffer: slot.gate,
+                                bufferOffset: slot.gateOffset,
                                 fileOffset: gateBase
                                     + e * gateUpExpertBytes,
                                 bytes: gateUpExpertBytes),
                             ExpertRead(
-                                buffer: slot.up, bufferOffset: 0,
+                                buffer: slot.up,
+                                bufferOffset: slot.upOffset,
                                 fileOffset: upBase + e * gateUpExpertBytes,
                                 bytes: gateUpExpertBytes),
                             ExpertRead(
-                                buffer: slot.down, bufferOffset: 0,
+                                buffer: slot.down,
+                                bufferOffset: slot.downOffset,
                                 fileOffset: downBase + e * downExpertBytes,
                                 bytes: downExpertBytes),
                         ]
@@ -2966,30 +3285,35 @@ public final class LagunaResidentModel {
                                   rank: Int) throws {
                 let e = Int(selected[rank])
                 let gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer
-                let gateUpOffset: Int, downOffset: Int
+                let gateOffset: Int, upOffset: Int, downOffset: Int
                 switch routed {
                 case .resident(let residentGate, let residentUp,
                                let residentDown):
                     gate = residentGate; up = residentUp; down = residentDown
-                    gateUpOffset = e * gateUpExpertBytes
+                    gateOffset = e * gateUpExpertBytes
+                    upOffset = e * gateUpExpertBytes
                     downOffset = e * downExpertBytes
                 case .streamed:
                     if expertSlots.isEmpty {
                         let staging = expertStaging[rank]
                         gate = staging.gate; up = staging.up
                         down = staging.down
+                        gateOffset = 0
+                        upOffset = 0
+                        downOffset = 0
                     } else {
                         let slot = expertSlots[streamedRankSlots[rank]]
                         gate = slot.gate; up = slot.up; down = slot.down
+                        gateOffset = slot.gateOffset
+                        upOffset = slot.upOffset
+                        downOffset = slot.downOffset
                     }
-                    gateUpOffset = 0
-                    downOffset = 0
                 }
                 try encodePairSwiGLU(
                     commands, type: routedType, rows: expertWidth,
                     inputWidth: embd,
-                    gateRows: gate, gateOffset: gateUpOffset,
-                    upRows: up, upOffset: gateUpOffset,
+                    gateRows: gate, gateOffset: gateOffset,
+                    upRows: up, upOffset: upOffset,
                     input: ffnNormed, routeWeight: routeWeights[rank],
                     mid: ffnMid
                 )
@@ -3648,7 +3972,10 @@ public final class LagunaResidentModel {
                                   keyNorm: MTLBuffer,
                                   query: MTLBuffer, queryOffset: Int,
                                   key: MTLBuffer, keyOffset: Int) throws {
-        let pipeline = try runtime.pipeline("kernel_laguna_qk_head_rms_norm_rope_neox")
+        let pipeline = try runtime.pipeline(
+            Self.ropeSIMD
+                ? "kernel_laguna_qk_head_rms_norm_rope_simd"
+                : "kernel_laguna_qk_head_rms_norm_rope_neox")
         let encoder = commands.encoder
         encoder.setComputePipelineState(pipeline)
         let combinedHeads = spec.headCount + spec.kvHeadCount
@@ -3674,10 +4001,75 @@ public final class LagunaResidentModel {
         var queryHeads = UInt32(spec.headCount)
         encoder.setBytes(&queryHeads, length: MemoryLayout<UInt32>.stride,
                          index: 5)
-        encoder.setThreadgroupMemoryLength(128 * MemoryLayout<Float>.stride,
-                                           index: 0)
+        if !Self.ropeSIMD {
+            encoder.setThreadgroupMemoryLength(
+                128 * MemoryLayout<Float>.stride, index: 0)
+        }
         encoder.dispatchThreadgroups(
-            MTLSize(width: combinedHeads, height: 1, depth: 1),
+            MTLSize(
+                width: Self.ropeSIMD
+                    ? (combinedHeads + 3) / 4 : combinedHeads,
+                height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+    }
+
+    private func encodeQKNormRopeStore(
+        _ commands: Commands,
+        spec: LagunaAttentionSpec,
+        cache: LagunaMetalKVCache,
+        position: Int,
+        queryNorm: MTLBuffer,
+        keyNorm: MTLBuffer,
+        query: MTLBuffer,
+        queryOffset: Int,
+        key: MTLBuffer,
+        keyOffset: Int,
+        value: MTLBuffer,
+        valueOffset: Int
+    ) throws {
+        let pipeline = try runtime.pipeline(
+            Self.ropeSIMD
+                ? "kernel_laguna_qk_head_rms_norm_rope_store_simd"
+                : "kernel_laguna_qk_head_rms_norm_rope_store_neox")
+        let encoder = commands.encoder
+        encoder.setComputePipelineState(pipeline)
+        let combinedHeads = spec.headCount + spec.kvHeadCount
+        var arguments = [UInt32](repeating: 0, count: 14)
+        arguments[0] = 1
+        arguments[1] = UInt32(combinedHeads)
+        arguments[2] = UInt32(spec.headDim)
+        arguments[3] = UInt32(spec.rotationDims)
+        arguments[4] = UInt32(position)
+        arguments[5] = UInt32(spec.ropeOriginalContext)
+        arguments[6] = spec.rmsEpsilon.bitPattern
+        arguments[7] = spec.ropeFrequencyBase.bitPattern
+        arguments[8] = spec.ropeFrequencyScale.bitPattern
+        arguments[9] = spec.extrapolationFactor.bitPattern
+        arguments[10] = spec.attentionFactor.bitPattern
+        arguments[11] = spec.betaFast.bitPattern
+        arguments[12] = spec.betaSlow.bitPattern
+        arguments[13] = UInt32(position % cache.capacity)
+        setArguments(encoder, arguments)
+        encoder.setBuffer(query, offset: queryOffset, index: 1)
+        encoder.setBuffer(key, offset: keyOffset, index: 2)
+        encoder.setBuffer(queryNorm, offset: 0, index: 3)
+        encoder.setBuffer(keyNorm, offset: 0, index: 4)
+        var queryHeads = UInt32(spec.headCount)
+        encoder.setBytes(&queryHeads, length: MemoryLayout<UInt32>.stride,
+                         index: 5)
+        encoder.setBuffer(value, offset: valueOffset, index: 6)
+        encoder.setBuffer(cache.keys, offset: 0, index: 7)
+        encoder.setBuffer(cache.values, offset: 0, index: 8)
+        if !Self.ropeSIMD {
+            encoder.setThreadgroupMemoryLength(
+                128 * MemoryLayout<Float>.stride, index: 0)
+        }
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: Self.ropeSIMD
+                    ? (combinedHeads + 3) / 4 : combinedHeads,
+                height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
         )
     }
@@ -3693,7 +4085,9 @@ public final class LagunaResidentModel {
         key: MTLBuffer
     ) throws {
         let pipeline = try runtime.pipeline(
-            "kernel_laguna_qk_head_rms_norm_rope_neox")
+            Self.ropeSIMD
+                ? "kernel_laguna_qk_head_rms_norm_rope_simd"
+                : "kernel_laguna_qk_head_rms_norm_rope_neox")
         let encoder = commands.encoder
         encoder.setComputePipelineState(pipeline)
         let combinedHeads = spec.headCount + spec.kvHeadCount
@@ -3719,10 +4113,15 @@ public final class LagunaResidentModel {
         var queryHeads = UInt32(spec.headCount)
         encoder.setBytes(&queryHeads, length: MemoryLayout<UInt32>.stride,
                          index: 5)
-        encoder.setThreadgroupMemoryLength(128 * MemoryLayout<Float>.stride,
-                                           index: 0)
+        if !Self.ropeSIMD {
+            encoder.setThreadgroupMemoryLength(
+                128 * MemoryLayout<Float>.stride, index: 0)
+        }
         encoder.dispatchThreadgroups(
-            MTLSize(width: combinedHeads, height: count, depth: 1),
+            MTLSize(
+                width: Self.ropeSIMD
+                    ? (combinedHeads + 3) / 4 : combinedHeads,
+                height: count, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
         )
     }
@@ -3754,6 +4153,7 @@ public final class LagunaResidentModel {
         arguments[4] = UInt32(spec.kvHeadCount)
         arguments[5] = UInt32(spec.headDim)
         arguments[6] = (1 / Float(spec.headDim).squareRoot()).bitPattern
+        arguments[7] = Self.prefillAttentionMultiKey ? 1 : 0
 
         let encoder = commands.encoder
         let stage = try runtime.pipeline("kernel_laguna_stage_kv_f16")
@@ -3910,12 +4310,16 @@ public final class LagunaResidentModel {
             return
         }
         let headsPerKV = spec.headCount / max(1, spec.kvHeadCount)
-        if Self.decodeSplitK,
-           spec.headCount == Int(shape.nHeadFull),
+        let globalSplitK = Self.decodeSplitK
+            && spec.headCount == Int(shape.nHeadFull)
+            && keyStart == 0
+        let fullSlidingRing = Self.decodeSWAGQA3
+            && spec.headCount == Int(shape.nHead)
+            && keyCount == cache.capacity
+        if globalSplitK || fullSlidingRing,
            spec.headDim == 128,
            spec.headCount % 3 == 0,
            headsPerKV % 3 == 0,
-           keyStart == 0,
            keyCount >= Self.decodeSplitKMinimumKeys {
             try encodeAttentionSplitK(
                 commands, spec: spec, cache: cache, keyCount: keyCount,

@@ -11,13 +11,16 @@ final class LagunaChatServiceSmokeTests: XCTestCase {
     func testGUIProfilePinsMeasuredLagunaOverrides() {
         let profile = LagunaInferenceService.guiEnvironmentDefaults
         XCTAssertEqual(profile["DS4_SSD_STREAM"], "1")
-        XCTAssertEqual(profile["DS4_EXPERT_CACHE_MB"], "2048")
-        XCTAssertEqual(profile["DS4_ACTIVE_EXPERTS"], "6")
+        XCTAssertEqual(profile["DS4_EXPERT_CACHE_MB"], "3072")
+        XCTAssertEqual(profile["DS4_MULTI_QUANT_CACHE"], "1")
+        XCTAssertEqual(profile["DS4_ACTIVE_EXPERTS"], "10")
         XCTAssertEqual(profile["DS4_RESIDENT_LAYERS"], "0")
         XCTAssertEqual(profile["DS4_KV_INITIAL"], "512")
         XCTAssertEqual(profile["DS4_PREFILL_CHUNK"], "256")
         XCTAssertEqual(profile["DS4_PREFILL_BATCH"], "1")
         XCTAssertEqual(profile["DS4_PREFILL_DENSE_MM"], "1")
+        XCTAssertEqual(profile["DS4_PREFILL_ATTN_MULTIKEY"], "1")
+        XCTAssertEqual(profile["DS4_PREFILL_LAST_ROW"], "1")
         XCTAssertEqual(profile["DS4_PREFILL_MOE_BATCH"], "0")
         XCTAssertEqual(profile["DS4_EXPERT_PREAD"], "1")
         XCTAssertEqual(profile["DS4_PREAD_SPLIT"], "1")
@@ -26,6 +29,9 @@ final class LagunaChatServiceSmokeTests: XCTestCase {
         XCTAssertEqual(profile["DS4_NSG"], "4")
         XCTAssertEqual(profile["DS4_DECODE_CHAINED"], "0")
         XCTAssertEqual(profile["DS4_DECODE_SPLIT_K"], "0")
+        XCTAssertEqual(profile["DS4_DECODE_SWA_GQA3"], "0")
+        XCTAssertEqual(profile["DS4_DECODE_FUSED_ROPE_KV"], "0")
+        XCTAssertEqual(profile["DS4_ROPE_SIMD"], "0")
         XCTAssertFalse(profile.keys.contains {
             $0.hasPrefix("DS4_LAGUNA_")
         })

@@ -226,9 +226,10 @@ interna. Promette la stessa intenzione operativa: per esempio
 |---|---:|---|
 | `DS4_LAGUNA_RUNTIME` | off | Gate esplicito del backend. |
 | `DS4_SSD_STREAM` | on nel preset GUI, off nella demo | Streaming degli esperti routed; i chiamanti senza preset usano la selezione automatica file/RAM. |
-| `DS4_EXPERT_CACHE_MB` | `2048` con streaming | Budget globale cache esperti. |
+| `DS4_EXPERT_CACHE_MB` | `3072` nel preset GUI, `2048` nel motore | Budget globale cache esperti. Sul target M1 Pro con circa 10 GiB liberi, l’A/B top-10 favorisce 3 GiB; 4 GiB aumenta gli hit ma introduce pressione memoria. |
 | `DS4_EXPERT_CACHE_SLOTS` | derivato dai MiB | Numero esplicito di slot globali; ha precedenza sul budget. |
-| `DS4_ACTIVE_EXPERTS` | `10` nel motore/demo, `6` nel preset GUI | Top-N routed realmente eseguito (`1...10`), con rinormalizzazione dei pesi. |
+| `DS4_MULTI_QUANT_CACHE` | on | Dimensiona gli slot Q2_K/Q3_K sui byte reali mantenendo lo stesso budget; `0` ripristina gli slot legacy tutti grandi come Q3_K. |
+| `DS4_ACTIVE_EXPERTS` | `10` | Top-N routed realmente eseguito (`1...10`), con rinormalizzazione dei pesi. |
 | `DS4_RESIDENT_LAYERS` | `0` con streaming | Prefisso di layer routed i cui esperti restano residenti. |
 | `DS4_LAGUNA_LAYERS` | tutti | Tronca lo stack per bring-up. |
 | `DS4_KV_INITIAL` | `512` | Righe iniziali dei 12 layer full-attention; crescita geometrica fino al contesto configurato. Evita di riservare subito la KV massima. |
@@ -256,7 +257,7 @@ interna. Promette la stessa intenzione operativa: per esempio
 | `DS4_NSG` | `4` | SIMD group per threadgroup (`1...8`). |
 
 Il preset GUI per M1 Pro con circa 10 GiB disponibili usa streaming SSD,
-cache esperti 2.048 MiB, top-6, nessun layer routed residente, chunk 256,
+cache esperti 3.072 MiB multi-quant, top-10, nessun layer routed residente, chunk 256,
 attention e proiezioni dense batchate, MoE expert-major disattivato,
 KV full-attention lazy da 512 righe, decode chained/split-K e rilascio
 pagine upload disattivati, `pread×1`,

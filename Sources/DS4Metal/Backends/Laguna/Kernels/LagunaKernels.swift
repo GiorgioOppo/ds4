@@ -26,6 +26,13 @@ public struct LagunaMetalKVCache {
         return Array(UnsafeBufferPointer(start: pointer,
                                          count: capacity * rowWidth))
     }
+
+    public func valueBits() -> [UInt16] {
+        let pointer = values.contents().bindMemory(
+            to: UInt16.self, capacity: capacity * rowWidth)
+        return Array(UnsafeBufferPointer(
+            start: pointer, count: capacity * rowWidth))
+    }
 }
 
 extension MetalRuntime {
@@ -48,7 +55,7 @@ extension MetalRuntime {
 
     // MARK: Per-head RMSNorm + RoPE
 
-    /// Dispatch `kernel_laguna_qk_head_rms_norm_rope_neox` for one token:
+    /// Dispatch the SIMD-resident Laguna Q/K norm+RoPE kernel for one token:
     /// per-head RMS norm of Q and K with their shared per-dimension weights,
     /// then NeoX rotation on the head prefix with the spec's YaRN parameters.
     public func lagunaQKHeadRMSNormRope(
@@ -89,7 +96,7 @@ extension MetalRuntime {
             throw MetalError.bufferAlloc
         }
 
-        // ds4_metal_args_laguna_norm_rope: six uint32, seven float, one pad.
+        // ds4_metal_args_laguna_norm_rope: six uint32, seven float, cache row.
         let combinedHeads = spec.headCount + spec.kvHeadCount
         var arguments = [UInt32](repeating: 0, count: 14)
         arguments[0] = 1 // n_tokens
@@ -106,13 +113,9 @@ extension MetalRuntime {
         arguments[11] = spec.betaFast.bitPattern
         arguments[12] = spec.betaSlow.bitPattern
 
-        let pipeline = try pipeline("kernel_laguna_qk_head_rms_norm_rope_neox")
-        // The in-threadgroup reduction assumes a power-of-two thread count.
-        let threadCount = min(128, pipeline.maxTotalThreadsPerThreadgroup)
-        guard threadCount >= spec.rotationDims / 2,
-              threadCount & (threadCount - 1) == 0 else {
-            throw MetalError.unsupported("Laguna norm/rope thread count \(threadCount)")
-        }
+        let pipeline = try pipeline(
+            "kernel_laguna_qk_head_rms_norm_rope_simd")
+        let threadCount = 128
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw MetalError.bufferAlloc
@@ -127,11 +130,8 @@ extension MetalRuntime {
         encoder.setBuffer(keyWeightBuffer, offset: 0, index: 4)
         var queryHeads = UInt32(spec.headCount)
         encoder.setBytes(&queryHeads, length: MemoryLayout<UInt32>.stride, index: 5)
-        encoder.setThreadgroupMemoryLength(
-            threadCount * MemoryLayout<Float>.stride, index: 0
-        )
         encoder.dispatchThreadgroups(
-            MTLSize(width: combinedHeads, height: 1, depth: 1),
+            MTLSize(width: (combinedHeads + 3) / 4, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadCount, height: 1, depth: 1)
         )
         encoder.endEncoding()
@@ -146,6 +146,111 @@ extension MetalRuntime {
         return (
             Array(UnsafeBufferPointer(start: queryPointer, count: query.count)),
             Array(UnsafeBufferPointer(start: keyPointer, count: key.count))
+        )
+    }
+
+    /// Decode fusion used by the resident engine: normalize/rotate Q and K,
+    /// then commit the roped K and untouched V directly to the F16 ring.
+    public func lagunaQKHeadRMSNormRopeStore(
+        query: [Float],
+        key: [Float],
+        value: [Float],
+        queryWeight: [Float],
+        keyWeight: [Float],
+        spec: LagunaAttentionSpec,
+        cache: LagunaMetalKVCache,
+        position: Int,
+        simd: Bool = true
+    ) throws -> (query: [Float], key: [Float]) {
+        guard query.count == spec.queryWidth,
+              key.count == spec.keyValueWidth,
+              value.count == spec.keyValueWidth,
+              queryWeight.count == spec.headDim,
+              keyWeight.count == spec.headDim,
+              cache.rowWidth == spec.keyValueWidth,
+              cache.capacity == spec.cacheCapacity,
+              position >= 0 else {
+            throw MetalError.unsupported(
+                "Laguna fused norm/rope/store: inconsistent shapes")
+        }
+        guard let queryBuffer = device.makeBuffer(
+                  bytes: query, length: query.count * 4,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: key, length: key.count * 4,
+                  options: .storageModeShared),
+              let valueBuffer = device.makeBuffer(
+                  bytes: value, length: value.count * 4,
+                  options: .storageModeShared),
+              let queryWeightBuffer = device.makeBuffer(
+                  bytes: queryWeight, length: queryWeight.count * 4,
+                  options: .storageModeShared),
+              let keyWeightBuffer = device.makeBuffer(
+                  bytes: keyWeight, length: keyWeight.count * 4,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw MetalError.bufferAlloc
+        }
+
+        let combinedHeads = spec.headCount + spec.kvHeadCount
+        var arguments = [UInt32](repeating: 0, count: 14)
+        arguments[0] = 1
+        arguments[1] = UInt32(combinedHeads)
+        arguments[2] = UInt32(spec.headDim)
+        arguments[3] = UInt32(spec.rotationDims)
+        arguments[4] = UInt32(position)
+        arguments[5] = UInt32(spec.ropeOriginalContext)
+        arguments[6] = spec.rmsEpsilon.bitPattern
+        arguments[7] = spec.ropeFrequencyBase.bitPattern
+        arguments[8] = spec.ropeFrequencyScale.bitPattern
+        arguments[9] = spec.extrapolationFactor.bitPattern
+        arguments[10] = spec.attentionFactor.bitPattern
+        arguments[11] = spec.betaFast.bitPattern
+        arguments[12] = spec.betaSlow.bitPattern
+        arguments[13] = UInt32(position % cache.capacity)
+
+        let pipeline = try pipeline(
+            simd
+                ? "kernel_laguna_qk_head_rms_norm_rope_store_simd"
+                : "kernel_laguna_qk_head_rms_norm_rope_store_neox")
+        encoder.setComputePipelineState(pipeline)
+        arguments.withUnsafeBytes {
+            encoder.setBytes($0.baseAddress!, length: $0.count, index: 0)
+        }
+        encoder.setBuffer(queryBuffer, offset: 0, index: 1)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 2)
+        encoder.setBuffer(queryWeightBuffer, offset: 0, index: 3)
+        encoder.setBuffer(keyWeightBuffer, offset: 0, index: 4)
+        var queryHeads = UInt32(spec.headCount)
+        encoder.setBytes(
+            &queryHeads, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBuffer(valueBuffer, offset: 0, index: 6)
+        encoder.setBuffer(cache.keys, offset: 0, index: 7)
+        encoder.setBuffer(cache.values, offset: 0, index: 8)
+        if !simd {
+            encoder.setThreadgroupMemoryLength(
+                128 * MemoryLayout<Float>.stride, index: 0)
+        }
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: simd ? (combinedHeads + 3) / 4 : combinedHeads,
+                height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+
+        let queryPointer = queryBuffer.contents().bindMemory(
+            to: Float.self, capacity: query.count)
+        let keyPointer = keyBuffer.contents().bindMemory(
+            to: Float.self, capacity: key.count)
+        return (
+            Array(UnsafeBufferPointer(
+                start: queryPointer, count: query.count)),
+            Array(UnsafeBufferPointer(
+                start: keyPointer, count: key.count))
         )
     }
 
@@ -208,13 +313,8 @@ extension MetalRuntime {
         arguments[12] = spec.betaSlow.bitPattern
 
         let pipeline = try pipeline(
-            "kernel_laguna_qk_head_rms_norm_rope_neox")
-        let threadCount = min(128, pipeline.maxTotalThreadsPerThreadgroup)
-        guard threadCount >= spec.rotationDims / 2,
-              threadCount & (threadCount - 1) == 0 else {
-            throw MetalError.unsupported(
-                "Laguna batch norm/rope thread count \(threadCount)")
-        }
+            "kernel_laguna_qk_head_rms_norm_rope_simd")
+        let threadCount = 128
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw MetalError.bufferAlloc
@@ -230,10 +330,9 @@ extension MetalRuntime {
         var queryHeads = UInt32(spec.headCount)
         encoder.setBytes(
             &queryHeads, length: MemoryLayout<UInt32>.stride, index: 5)
-        encoder.setThreadgroupMemoryLength(
-            threadCount * MemoryLayout<Float>.stride, index: 0)
         encoder.dispatchThreadgroups(
-            MTLSize(width: combinedHeads, height: count, depth: 1),
+            MTLSize(width: (combinedHeads + 3) / 4,
+                    height: count, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: threadCount, height: 1, depth: 1))
         encoder.endEncoding()
@@ -327,7 +426,8 @@ extension MetalRuntime {
         queries: [[Float]], gates: [[Float]],
         keyRows: [[Float]], valueRows: [[Float]],
         cache: LagunaMetalKVCache, position: Int,
-        spec: LagunaAttentionSpec
+        spec: LagunaAttentionSpec,
+        multiKey: Bool = true
     ) throws -> [[Float]] {
         let count = queries.count
         guard count > 0, count <= cache.capacity,
@@ -389,6 +489,7 @@ extension MetalRuntime {
         arguments[4] = UInt32(spec.kvHeadCount)
         arguments[5] = UInt32(spec.headDim)
         arguments[6] = (1 / Float(spec.headDim).squareRoot()).bitPattern
+        arguments[7] = multiKey ? 1 : 0
         func setArguments() {
             arguments.withUnsafeBytes {
                 encoder.setBytes($0.baseAddress!, length: $0.count, index: 0)
