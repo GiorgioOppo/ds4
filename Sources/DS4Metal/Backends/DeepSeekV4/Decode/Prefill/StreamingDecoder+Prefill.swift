@@ -831,8 +831,10 @@ extension StreamingDecoder {
                         var weights = rwT[j]
                         while remapped.count < d.k { remapped.append(0); weights.append(0) }
                         remapped.withUnsafeBytes {
-                            memcpy(stage.ids[j].buffer.contents() + stage.ids[j].byteOffset,
-                                   $0.baseAddress!, $0.count)
+                            _ = memcpy(
+                                stage.ids[j].buffer.contents()
+                                    + stage.ids[j].byteOffset,
+                                $0.baseAddress!, $0.count)
                         }
                         writeFloats(weights, into: stage.rw[j])
                     }

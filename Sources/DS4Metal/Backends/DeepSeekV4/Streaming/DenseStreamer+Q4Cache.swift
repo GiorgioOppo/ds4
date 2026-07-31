@@ -115,10 +115,11 @@ extension DenseStreamer {
         }
         var out = [GPUTensor?](repeating: nil, count: jobs.count)
         let lock = NSLock()
-        // nonisolated(unsafe): scritture su indici DISGIUNTI (buf[i]), records
-        // e rt in sola lettura, flag di errore protetto dal lock.
+        // Scritture su indici DISGIUNTI (buf[i]); records e' Sendable e in
+        // sola lettura, mentre flag di errore e runtime conservano le sole
+        // annotazioni unsafe necessarie (il flag e' protetto dal lock).
         nonisolated(unsafe) var failed = false
-        nonisolated(unsafe) let recs = records
+        let recs = records
         nonisolated(unsafe) let rtRef = rt
         out.withUnsafeMutableBufferPointer { buf in
             nonisolated(unsafe) let bufBase = buf.baseAddress!

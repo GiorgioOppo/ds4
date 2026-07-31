@@ -197,7 +197,7 @@ final class BenchController {
                 // No-op se il motore è già caldo: il PRIMO punto del grafico
                 // non deve misurare la creazione dei pool esperti (partenza
                 // fredda) al posto del regime.
-                await svc.warmup()
+                _ = await svc.warmup()
                 for c in frontiers {
                     try Task.checkCancellation()
                     onLog("context \(c): prefill + \(gen) tokens...\n")
@@ -227,7 +227,7 @@ final class BenchController {
         let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
             do {
                 onLog("Running on the shared GLM streaming engine (no second model copy)...\n")
-                await svc.warmup()
+                _ = await svc.warmup()
                 for c in frontiers {
                     try Task.checkCancellation()
                     onLog("context \(c): prefill + \(gen) tokens...\n")
@@ -257,7 +257,7 @@ final class BenchController {
         let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
             do {
                 onLog("Running on the shared Laguna engine (no second model copy)...\n")
-                await svc.warmup()
+                _ = await svc.warmup()
                 for c in frontiers {
                     try Task.checkCancellation()
                     onLog("context \(c): prefill + \(gen) tokens...\n")

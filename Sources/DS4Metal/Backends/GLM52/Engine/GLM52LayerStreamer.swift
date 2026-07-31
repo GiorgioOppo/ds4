@@ -93,8 +93,11 @@ struct GLM52StreamedBigTensors {
     let sharedDown: MTLBuffer
 }
 
-public final class GLM52LayerStreamer {
-    private final class Slot {
+/// @unchecked Sendable: queue-visible mutable state is guarded by
+/// `stateLock`; each slot is handed to one fill at a time and publishes its
+/// result through `ready` before the consumer can reuse it.
+public final class GLM52LayerStreamer: @unchecked Sendable {
+    private final class Slot: @unchecked Sendable {
         let buffers: GLM52StreamedBigTensors
         let ready = DispatchSemaphore(value: 0)
         var layer = -1
@@ -359,7 +362,7 @@ public final class GLM52LayerStreamer {
         try plan(tensors.sharedUp, slot.buffers.sharedUp)
         try plan(tensors.sharedDown, slot.buffers.sharedDown)
 
-        func read(_ job: Chunk) throws {
+        @Sendable func read(_ job: Chunk) throws {
             try reader.read(job.descriptor, byteOffset: job.offset,
                             byteCount: job.length,
                             into: UnsafeMutableRawBufferPointer(

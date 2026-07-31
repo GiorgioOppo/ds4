@@ -2357,8 +2357,8 @@ public final class LagunaResidentModel {
                 expertEventBase += UInt64(missReads.count)
                 let base = eventBase
                 ioGroup.enter()
-                nonisolated(unsafe) let sharedEvent = event
-                nonisolated(unsafe) let missGroups = groups
+                let sharedEvent = event
+                let missGroups = groups
                 DispatchQueue.global(qos: .userInitiated).async {
                     for (index, group) in missGroups.enumerated() {
                         group.wait()
@@ -3418,8 +3418,8 @@ public final class LagunaResidentModel {
                 nonisolated(unsafe) var ioDone = Date()
                 let ioGroup = DispatchGroup()
                 ioGroup.enter()
-                nonisolated(unsafe) let sharedEvent = event
-                nonisolated(unsafe) let rankGroups = groups
+                let sharedEvent = event
+                let rankGroups = groups
                 DispatchQueue.global(qos: .userInitiated).async {
                     for (rank, group) in rankGroups.enumerated() {
                         group.wait()

@@ -56,7 +56,7 @@ extension GraphContext {
     func runCompressor(x: GPUTensor, kv: GPUTensor, gate: GPUTensor, ape: GPUTensor, normW: GPUTensor,
                        comp: CompressorState, rope: RopeParams, pos: Int, rmsEps: Float, nRot: Int,
                        finalize: CompressorFinalize, q8Weights: Bool = false) throws -> Int {
-        let h = comp.headDim, ratio = comp.ratio, width = comp.width
+        let width = comp.width
         // 1) project x -> kv_cur / sc_cur. Both F16 matrices have the same
         // shape and activation: the paired path shares activation reads and a
         // dispatch while retaining the two original dot-product orders.

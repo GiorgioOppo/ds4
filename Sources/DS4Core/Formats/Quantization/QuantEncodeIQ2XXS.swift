@@ -219,7 +219,7 @@ extension QuantEncode {
                     }
                     if data.map[u] < 0 {
                         let offset = Int(-data.map[u]) - 1
-                        xval.withUnsafeBufferPointer { xp in
+                        _ = xval.withUnsafeBufferPointer { xp in
                             waux.withUnsafeBufferPointer { wp in
                                 Laux.withUnsafeMutableBufferPointer { lp in
                                     findBestNeighbour(

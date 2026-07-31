@@ -33,7 +33,7 @@ extension DenseStreamer {
             let lock = NSLock()
             nonisolated(unsafe) var firstError: Error?
             nonisolated(unsafe) let rtRef = rt
-            nonisolated(unsafe) let js = jobs
+            let js = jobs
             try out.withUnsafeMutableBufferPointer { buf in
                 nonisolated(unsafe) let base = buf.baseAddress!
                 DispatchQueue.concurrentPerform(iterations: jobs.count) { i in

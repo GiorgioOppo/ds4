@@ -19,7 +19,10 @@ public enum GLM52StreamedExpertProviderError: Error, Sendable, Equatable,
     }
 }
 
-public final class GLM52StreamedExpertProvider {
+/// @unchecked Sendable: descriptors/readers are immutable and use positional
+/// reads; access to the only mutable component, the LRU slot cache, is
+/// serialized by `lock`.
+public final class GLM52StreamedExpertProvider: @unchecked Sendable {
     /// Types the validated MoE kernels dispatch today — including IQ2_XXS,
     /// the routed type of the published GGUF. Anything else is refused at
     /// load: silently wrong output is worse than an error.

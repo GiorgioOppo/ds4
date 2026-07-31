@@ -304,10 +304,11 @@ public final class DenseStreamer: @unchecked Sendable {
                                "salvata — il requant procede solo in memoria e si ripeterà al prossimo avvio")
                 }
                 let lock = NSLock()
-                // nonisolated(unsafe): ogni iterazione scrive SOLO out[i] (indici
-                // disgiunti), jobs/rt/model sono letti e basta, l'errore e'
-                // protetto dal lock.
-                nonisolated(unsafe) let jobs = q4Jobs
+                // Ogni iterazione scrive SOLO out[i] (indici disgiunti),
+                // jobs/rt/model sono letti e basta, l'errore e' protetto dal
+                // lock. L'array di job e' Sendable; i riferimenti runtime e
+                // model mantengono l'annotazione unsafe dedicata.
+                let jobs = q4Jobs
                 nonisolated(unsafe) let rtRef = rt
                 nonisolated(unsafe) let modelRef = model
                 // A BATCH con checkpoint: dopo ogni batch la cache parziale

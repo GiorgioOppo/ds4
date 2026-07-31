@@ -108,8 +108,8 @@ extension StreamingDecoder {
     private static func writeBack(_ a: [Float], into t: GPUTensor) {
         guard !a.isEmpty else { return }
         a.withUnsafeBufferPointer {
-            memcpy(t.buffer.contents().advanced(by: t.byteOffset),
-                   $0.baseAddress!, a.count * 4)
+            _ = memcpy(t.buffer.contents().advanced(by: t.byteOffset),
+                       $0.baseAddress!, a.count * 4)
         }
     }
 }

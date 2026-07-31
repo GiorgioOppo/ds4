@@ -22,7 +22,9 @@ import Metal
 // the layer's synchronous commit, and eviction needs the slot to fall out
 // of the LRU across LATER selections first.
 
-final class GLM52ExpertArena {
+/// @unchecked Sendable: all LRU metadata is protected by `lock`; concurrent
+/// fills write disjoint reserved ranges of the immutable shared buffer.
+final class GLM52ExpertArena: @unchecked Sendable {
     struct Stats: Sendable {
         var hitBytes: UInt64 = 0
         var readBytes: UInt64 = 0
@@ -149,7 +151,8 @@ final class GLM52ExpertArena {
     /// fresh key of this call is scrubbed (waiters see the miss and re-read)
     /// and the first error is thrown to a throwing caller.
     private func fill(_ fresh: [Reservation], layer: Int, recordBytes: Int,
-                      read: (UInt32, UnsafeMutableRawBufferPointer) throws
+                      read: @Sendable (
+                          UInt32, UnsafeMutableRawBufferPointer) throws
                           -> Void) throws {
         guard !fresh.isEmpty else { return }
         nonisolated(unsafe) var failure: Error?
@@ -191,7 +194,8 @@ final class GLM52ExpertArena {
     /// the records not already resident. Blocks until every record —
     /// including any still being speculatively filled — holds real bytes.
     func stage(layer: Int, ids: [UInt32], recordBytes: Int,
-               read: (UInt32, UnsafeMutableRawBufferPointer) throws -> Void)
+               read: @Sendable (
+                   UInt32, UnsafeMutableRawBufferPointer) throws -> Void)
         throws -> [Int] {
         guard recordBytes <= slotBytes else {
             throw MetalError.unsupported(
@@ -242,8 +246,8 @@ final class GLM52ExpertArena {
     /// Best-effort background warm-up: reserve and fill only the missing
     /// records of a GUESSED selection; never waits, errors only scrub.
     func speculate(layer: Int, ids: [UInt32], recordBytes: Int,
-                   read: (UInt32, UnsafeMutableRawBufferPointer) throws
-                       -> Void) {
+                   read: @Sendable (
+                       UInt32, UnsafeMutableRawBufferPointer) throws -> Void) {
         guard recordBytes <= slotBytes else { return }
         let reservations = reserve(layer: layer, ids: ids,
                                    recordBytes: recordBytes,
