@@ -105,7 +105,10 @@ struct DownloadView: View {
             }
 
             HStack(spacing: 12) {
-                if entry.artifacts.count > 1 {
+                if entry.isSplitFragmentPackage {
+                    Label("GGUF diviso · \(entry.artifacts.count) parti consecutive",
+                          systemImage: "rectangle.split.3x1")
+                } else if entry.artifacts.count > 1 {
                     Label("Pacchetto split distribuito · \(entry.artifacts.count) shard",
                           systemImage: "rectangle.split.2x1")
                 } else if entry.isSelectable {

@@ -44,6 +44,8 @@ final class ModelArchitectureTests: XCTestCase {
         XCTAssertEqual(ModelArchitectureID("  DeepSeek-V4\n"), .deepSeekV4)
         XCTAssertEqual(ModelArchitectureID("GLM_DSA"), .glmDSA)
         XCTAssertEqual(ModelArchitectureID.glmDSA.ggufMetadataNamespace, "glm-dsa")
+        XCTAssertEqual(ModelArchitectureID("KIMI_K3"), .kimiK3)
+        XCTAssertEqual(ModelArchitectureID.kimiK3.ggufMetadataNamespace, "kimi-k3")
         XCTAssertEqual(ModelArchitectureID("QWEN_2.MOE").rawValue, "qwen2moe")
         XCTAssertEqual(ModelArchitectureID.normalize(" Qwen 3 "), "qwen3")
     }
@@ -131,6 +133,32 @@ final class ModelArchitectureTests: XCTestCase {
                 }
                 XCTAssertEqual(id, .laguna)
                 XCTAssertEqual(family, .laguna)
+            }
+        }
+    }
+
+    func testRecognizesKimiK3WithoutClaimingRuntimeSupport() throws {
+        for value in ["kimi-k3", "KIMI_K3", " kimi.k3 "] {
+            let detected = try ModelArchitectureDetector.detect(
+                generalArchitecture: value)
+            XCTAssertEqual(detected.id, .kimiK3, value)
+            XCTAssertEqual(detected.id.ggufMetadataNamespace, "kimi-k3", value)
+            XCTAssertEqual(detected.family, .kimi, value)
+            XCTAssertEqual(
+                detected.backendAvailability,
+                .recognizedButNotImplemented,
+                value)
+
+            XCTAssertThrowsError(
+                try ModelArchitectureDetector.requireImplemented(detected)
+            ) { error in
+                guard case ModelArchitectureError.backendNotImplemented(
+                    let id, let family
+                ) = error else {
+                    return XCTFail("unexpected error for \(value): \(error)")
+                }
+                XCTAssertEqual(id, .kimiK3)
+                XCTAssertEqual(family, .kimi)
             }
         }
     }

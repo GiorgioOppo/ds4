@@ -91,6 +91,124 @@ final class GLM52IndexerTopKTests: XCTestCase {
         XCTAssertEqual(gpu.map(Int.init), oracle)
     }
 
+    func testSpecializedTopK2048MatchesGenericAtBoundaries() throws {
+        let runtime = try makeRuntime()
+        for rowCount in [2_048, 2_049, 4_096, 4_097, 8_192, 8_193] {
+            let scores = distinctScores(
+                count: rowCount, seed: 2_048 + UInt64(rowCount))
+            if rowCount > 8_192 {
+                XCTAssertTrue(
+                    try runtime.glm52SupportsFastIndexerTopK(
+                        rowCount: rowCount),
+                    "the test device cannot exercise the fast path at "
+                        + "\(rowCount) rows")
+            }
+
+            let fast = try runtime.glm52IndexerTopK(
+                scores: scores,
+                rowCount: rowCount,
+                tokenCount: 1,
+                topK: 2_048,
+                preferFastPath: true)
+            let generic = try runtime.glm52IndexerTopK(
+                scores: scores,
+                rowCount: rowCount,
+                tokenCount: 1,
+                topK: 2_048,
+                preferFastPath: false)
+            XCTAssertEqual(
+                fast, generic,
+                "specialized top-2048 diverges at \(rowCount) rows")
+        }
+    }
+
+    /// Opt-in microbenchmark used for the implementation A/B:
+    /// `DS4_TOPK_AB_BENCH=1 swift test -c release
+    ///   --filter GLM52IndexerTopKTests/testTopK2048ABBenchmark`
+    func testTopK2048ABBenchmark() throws {
+        guard ProcessInfo.processInfo.environment["DS4_TOPK_AB_BENCH"] == "1"
+        else {
+            throw XCTSkip("set DS4_TOPK_AB_BENCH=1 to run the top-k A/B")
+        }
+        let runtime = try makeRuntime()
+        let topK = 2_048
+        for rowCount in [4_096, 8_192, 8_193, 12_288, 16_384, 32_768] {
+            let scores = distinctScores(
+                count: rowCount, seed: 10 * UInt64(rowCount))
+            let scoreBuffer = try runtime.glm52GraphBuffer(scores)
+            let fastOutput = try runtime.glm52GraphOutputBuffer(floats: topK)
+            let genericOutput = try runtime.glm52GraphOutputBuffer(floats: topK)
+            let scratch = try runtime.glm52GraphOutputBuffer(
+                floats: 2 * rowCount)
+            let supportsFast = try runtime.glm52SupportsFastIndexerTopK(
+                rowCount: rowCount,
+                outputBytes: fastOutput.length,
+                scratchBytes: scratch.length)
+
+            func run(
+                preferFastPath: Bool,
+                iterations: Int
+            ) throws -> Double {
+                let start = Date()
+                for _ in 0..<iterations {
+                    guard let commandBuffer =
+                            runtime.queue.makeCommandBuffer()
+                    else { throw MetalError.bufferAlloc }
+                    try runtime.glm52EncodeIndexerTopK(
+                        into: commandBuffer,
+                        scores: scoreBuffer,
+                        rowCount: rowCount,
+                        topK: topK,
+                        output: preferFastPath
+                            ? fastOutput : genericOutput,
+                        sortScratch: scratch,
+                        preferFastPath: preferFastPath)
+                    try runtime.glm52GraphCommit(commandBuffer)
+                }
+                return Date().timeIntervalSince(start) / Double(iterations)
+            }
+
+            _ = try run(preferFastPath: true, iterations: 1)
+            _ = try run(preferFastPath: false, iterations: 1)
+            let iterations = 20
+            var fastSamples = [Double]()
+            var genericSamples = [Double]()
+            for round in 0..<7 {
+                if round.isMultiple(of: 2) {
+                    fastSamples.append(try run(
+                        preferFastPath: true, iterations: iterations))
+                    genericSamples.append(try run(
+                        preferFastPath: false, iterations: iterations))
+                } else {
+                    genericSamples.append(try run(
+                        preferFastPath: false, iterations: iterations))
+                    fastSamples.append(try run(
+                        preferFastPath: true, iterations: iterations))
+                }
+            }
+            fastSamples.sort()
+            genericSamples.sort()
+            let fastSeconds = fastSamples[fastSamples.count / 2]
+            let genericSeconds = genericSamples[genericSamples.count / 2]
+
+            let fast = fastOutput.contents()
+                .bindMemory(to: UInt32.self, capacity: topK)
+            let generic = genericOutput.contents()
+                .bindMemory(to: UInt32.self, capacity: topK)
+            XCTAssertEqual(
+                Array(UnsafeBufferPointer(start: fast, count: topK)),
+                Array(UnsafeBufferPointer(start: generic, count: topK)))
+            print(String(
+                format: "GLM52 top-k %d A/B (%@): fast %.3f ms, "
+                    + "generic %.3f ms, speedup %.2fx",
+                rowCount,
+                supportsFast ? "compact" : "same generic",
+                fastSeconds * 1_000,
+                genericSeconds * 1_000,
+                genericSeconds / fastSeconds))
+        }
+    }
+
     func testValidationRejectsBadGeometry() throws {
         let runtime = try makeRuntime()
         let scores = distinctScores(count: 32, seed: 5)

@@ -499,7 +499,7 @@ public final class GLM52ResidentModel {
                      "DS4_GLM_SG", "DS4_NSG", "DS4_GLM_NOCACHE",
                      "DS4_MLOCK", "DS4_GLM_MOE_BATCH",
                      "DS4_GLM_GPU_ROUTER", "DS4_GLM_LAYERQ4",
-                     "DS4_USAGE_FILE"]
+                     "DS4_INDEXER_TOPK_FAST", "DS4_USAGE_FILE"]
         let env = ProcessInfo.processInfo.environment
         DS4Log.info("glm", "knob " + knobs
             .map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  "))

@@ -76,5 +76,9 @@ final class DS4RuntimeEnvironmentTests: XCTestCase {
             DS4RuntimeKnob.metalIO.definition.valueKind, .boolean)
         XCTAssertEqual(
             DS4RuntimeKnob.prefillChunk.definition.area, .prefill)
+        XCTAssertEqual(
+            DS4RuntimeKnob.indexerTopKFast.definition.area, .attention)
+        XCTAssertEqual(
+            DS4RuntimeKnob.indexerTopKFast.definition.valueKind, .boolean)
     }
 }

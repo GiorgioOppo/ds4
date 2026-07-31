@@ -429,6 +429,22 @@ public actor GLM52ChatService {
         return best.map(\.id)
     }
 
+    /// Live GUI status during decode. Keep the completed prefill measurement
+    /// attached to every decode update: the first sampled token is available
+    /// immediately after prefill and otherwise overwrites its status before
+    /// SwiftUI has a chance to render it.
+    static func decodeProgressSummary(
+        produced: Int,
+        elapsed: TimeInterval,
+        prefillSummary: String
+    ) -> String {
+        String(
+            format: "%d tok · %.2f tok/s — %@",
+            produced,
+            Double(produced) / max(elapsed, 0.001),
+            prefillSummary)
+    }
+
     public func setAgent(systemPrompt: String?) {
         self.systemPrompt = systemPrompt
     }
@@ -556,12 +572,20 @@ public actor GLM52ChatService {
         transcript.append(.assistant(text: assistant, toolCalls: calls))
     }
 
-    /// Splits the raw token stream into reasoning/text events on the GLM
-    /// `<think>` markers, holding back a short tail so a marker split across
-    /// token boundaries is never emitted as text.
-    private struct StreamSplitter {
+    /// Splits the raw token bytes into reasoning/text events on the GLM
+    /// `<think>` markers.
+    ///
+    /// Token bytes are not necessarily valid UTF-8 in isolation (byte-level
+    /// BPE can split one scalar across tokens), so `utf8Pending` bridges token
+    /// boundaries. Once decoded, only a suffix that is an ACTUAL prefix of the
+    /// next marker is retained. The former fixed 12-character tail delayed
+    /// every visible response by many decode steps — tens of seconds at GLM's
+    /// streamed-model speed — even when the text could not possibly be a
+    /// marker.
+    struct StreamSplitter {
         var inThink = false
         var pending = ""
+        var utf8Pending: [UInt8] = []
 
         /// Col think ATTIVO il prompt renderizzato termina con `<think>`:
         /// la generazione comincia già DENTRO il blocco e contiene solo il
@@ -571,8 +595,15 @@ public actor GLM52ChatService {
         init(startsInThink: Bool) {
             inThink = startsInThink
         }
-        mutating func feed(_ piece: String) -> [GenEvent] {
-            pending += piece
+
+        mutating func feed(_ bytes: [UInt8]) -> [GenEvent] {
+            utf8Pending.append(contentsOf: bytes)
+            guard let decoded = takeDecodableUTF8Prefix() else { return [] }
+            pending += decoded
+            return drainDecodedText()
+        }
+
+        private mutating func drainDecodedText() -> [GenEvent] {
             var events: [GenEvent] = []
             while true {
                 let marker = inThink
@@ -586,7 +617,11 @@ public actor GLM52ChatService {
                 pending = String(pending[range.upperBound...])
                 inThink.toggle()
             }
-            let hold = 12
+
+            let marker = inThink
+                ? GLM52ConversationProtocol.thinkClose
+                : GLM52ConversationProtocol.thinkOpen
+            let hold = markerPrefixSuffixLength(marker)
             if pending.count > hold {
                 let cut = pending.index(pending.endIndex, offsetBy: -hold)
                 let emit = String(pending[..<cut])
@@ -597,7 +632,44 @@ public actor GLM52ChatService {
             }
             return events
         }
+
+        /// Longest suffix of `pending` that could still become `marker`.
+        /// Usually zero; a trailing "<", "</", "<t" and so on is the only
+        /// text delayed until the next token.
+        private func markerPrefixSuffixLength(_ marker: String) -> Int {
+            let limit = min(pending.count, max(0, marker.count - 1))
+            guard limit > 0 else { return 0 }
+            for length in stride(from: limit, through: 1, by: -1) {
+                if pending.suffix(length) == marker.prefix(length) {
+                    return length
+                }
+            }
+            return 0
+        }
+
+        /// Decode the largest valid UTF-8 prefix, retaining at most the
+        /// incomplete scalar at the end for the next token.
+        private mutating func takeDecodableUTF8Prefix() -> String? {
+            guard !utf8Pending.isEmpty else { return nil }
+            let maxHold = min(3, utf8Pending.count)
+            for hold in 0...maxHold {
+                let end = utf8Pending.count - hold
+                guard let decoded = String(
+                    bytes: utf8Pending[..<end], encoding: .utf8
+                ) else { continue }
+                if end > 0 {
+                    utf8Pending.removeFirst(end)
+                }
+                return decoded.isEmpty ? nil : decoded
+            }
+            return nil
+        }
+
         mutating func flush() -> [GenEvent] {
+            if !utf8Pending.isEmpty {
+                pending += String(decoding: utf8Pending, as: UTF8.self)
+                utf8Pending.removeAll(keepingCapacity: true)
+            }
             guard !pending.isEmpty else { return [] }
             let event: GenEvent = inThink
                 ? .reasoning(pending) : .text(pending)
@@ -711,10 +783,15 @@ public actor GLM52ChatService {
                     var logits = try service.engine.prefill(suffix)
                     let prefillSeconds = max(
                         Date().timeIntervalSince(prefillStart), 0.001)
-                    continuation.yield(.progress(String(
+                    // Keep this summary in every subsequent decode update.
+                    // Yielding it only here made it practically invisible:
+                    // sampling the first token overwrote the status before
+                    // SwiftUI could draw a frame.
+                    let prefillSummary = String(
                         format: "prefill %d tok in %.1fs · %.2f tok/s",
                         suffix.count, prefillSeconds,
-                        Double(suffix.count) / prefillSeconds)))
+                        Double(suffix.count) / prefillSeconds)
+                    continuation.yield(.progress(prefillSummary))
 
                     var fed = tokens
                     var produced = 0
@@ -757,17 +834,18 @@ public actor GLM52ChatService {
                                 continuation.yield(event)
                             }
                             splitter.inThink = token == specials.thinkOpen
-                        } else if let piece = String(bytes: bytes,
-                                                     encoding: .utf8) {
-                            for event in splitter.feed(piece) {
+                        } else {
+                            for event in splitter.feed(bytes) {
                                 continuation.yield(event)
                             }
                         }
                         let elapsed = max(
                             Date().timeIntervalSince(decodeStart), 0.001)
-                        continuation.yield(.progress(String(
-                            format: "%d tok · %.2f tok/s",
-                            produced, Double(produced) / elapsed)))
+                        continuation.yield(.progress(
+                            Self.decodeProgressSummary(
+                                produced: produced,
+                                elapsed: elapsed,
+                                prefillSummary: prefillSummary)))
                         if produced == budget || Task.isCancelled { break }
                         logits = try service.engine.forwardNext(token)
                         fed.append(token)

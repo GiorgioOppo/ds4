@@ -2,14 +2,14 @@
 
 # ModelManagement/Catalog
 
-Contiene il catalogo tipizzato cross-family usato dalla GUI. Le tre varianti
-complete DeepSeek V4 Flash e il Pro Q2 in un singolo GGUF sono scaricabili e
-selezionabili. Il package PRO Q4 e i tre GGUF monolitici GLM 5.2 sono visibili e
-scaricabili, ma non avviabili dal runtime corrente.
+Contiene il catalogo tipizzato cross-family usato dalla GUI. Oltre ai modelli
+monolitici e ai package a shard include Kimi K3, pubblicato come cinque
+frammenti consecutivi di un unico GGUF.
 
 Ogni `ModelCatalogEntry` raggruppa uno o più `ModelTarget`: un modello completo
-ha un solo artefatto principale, mentre PRO Q4 è un package di due shard. MTP è
-un accessorio separato e non compare nel catalogo dei modelli principali.
+ha un solo artefatto principale, PRO Q4 è un package di due shard indipendenti
+e Kimi K3 usa cinque target `splitFragment` ordinati. MTP è un accessorio
+separato e non compare nel catalogo dei modelli principali.
 
 Il nome remoto, sorgente/revisione Hugging Face, identificatore, dimensione
 esatta disponibile e digest SHA-256 sono centralizzati qui: la GUI non deve
@@ -27,11 +27,18 @@ duplicare nomi file o dedurre il supporto dal filename.
 | `glm-5.2-iq2-xxs` | GLM 5.2 | un GGUF IQ2_XXS | `downloadOnly` |
 | `glm-5.2-q2-k` | GLM 5.2 | un GGUF Q2_K | `downloadOnly` |
 | `glm-5.2-q4-k` | GLM 5.2 | un GGUF Q4_K | `downloadOnly` |
+| `kimi-k3-iq2-xxs-q2-k` | Kimi K3 | un GGUF in cinque parti consecutive | `downloadOnly` |
 
 `ModelCatalogEntry.isSelectable` richiede runtime `runnable`, un solo artefatto
 e ruolo `mainModel`. Questa regola impedisce a un package split o a un
 accessorio di diventare un modello locale. `DeepSeekV4AccessoryCatalog.mtp`
 resta separato e non viene iterato da `ModelCatalogRegistry.entries`.
+
+`KimiK3ModelCatalog` fissa revisione, dimensione e SHA-256 di ogni parte,
+oltre a dimensione e digest del flusso ricostruito. Il downloader conserva le
+parti separate: concatenarle oggi richiederebbe temporaneamente altri 858,8 GB.
+Il futuro lettore virtuale mapperà gli offset logici sulle cinque parti senza
+duplicare il modello.
 
 La disponibilità dei profili singolo-file deriva da
 `DeepSeekV4BackendDefinition.locallyRunnableVariants`; il catalogo non mantiene

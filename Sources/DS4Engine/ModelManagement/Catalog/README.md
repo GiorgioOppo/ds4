@@ -2,14 +2,14 @@
 
 # ModelManagement/Catalog
 
-Contains the typed cross-family catalog used by the GUI. The three complete
-DeepSeek V4 Flash variants and the single-GGUF Pro Q2 are downloadable and
-selectable. The PRO Q4 package and the three monolithic GLM 5.2 GGUFs are
-visible and downloadable, but not startable by the current runtime.
+Contains the typed cross-family catalog used by the GUI. In addition to
+monolithic models and independent shard packages, it includes Kimi K3 as five
+consecutive fragments of one logical GGUF.
 
 Each `ModelCatalogEntry` groups one or more `ModelTarget`s: a complete model
-has a single main artifact, while PRO Q4 is a package of two shards. MTP is a
-separate accessory and does not appear in the main model catalog.
+has one main artifact, PRO Q4 is a package of two independent shards, and
+Kimi K3 uses five ordered `splitFragment` targets. MTP is a separate accessory
+and does not appear in the main model catalog.
 
 The remote name, Hugging Face source/revision, identifier, exact available
 size and SHA-256 digest are centralized here: the GUI must not duplicate file
@@ -27,11 +27,17 @@ names or infer support from the filename.
 | `glm-5.2-iq2-xxs` | GLM 5.2 | one IQ2_XXS GGUF | `downloadOnly` |
 | `glm-5.2-q2-k` | GLM 5.2 | one Q2_K GGUF | `downloadOnly` |
 | `glm-5.2-q4-k` | GLM 5.2 | one Q4_K GGUF | `downloadOnly` |
+| `kimi-k3-iq2-xxs-q2-k` | Kimi K3 | one GGUF in five consecutive parts | `downloadOnly` |
 
 `ModelCatalogEntry.isSelectable` requires a `runnable` runtime, a single
 artifact and the `mainModel` role. This rule prevents a split package or an
 accessory from becoming a local model. `DeepSeekV4AccessoryCatalog.mtp`
 remains separate and is not iterated by `ModelCatalogRegistry.entries`.
+
+`KimiK3ModelCatalog` pins the revision, byte size and SHA-256 of every part,
+plus the reconstructed stream size and digest. The downloader keeps the parts
+separate: concatenating them today would temporarily require another 858.8 GB.
+The future virtual reader will map logical offsets across the five files.
 
 The availability of the single-file profiles derives from
 `DeepSeekV4BackendDefinition.locallyRunnableVariants`; the catalog does not

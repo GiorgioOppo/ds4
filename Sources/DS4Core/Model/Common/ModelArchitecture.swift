@@ -20,6 +20,7 @@ public struct ModelArchitectureID: RawRepresentable, Hashable, Sendable, Codable
     public static let deepSeekV4 = ModelArchitectureID("deepseek4")
     public static let glmDSA = ModelArchitectureID("glm-dsa")
     public static let laguna = ModelArchitectureID("laguna")
+    public static let kimiK3 = ModelArchitectureID("kimi-k3")
 
     public var description: String { rawValue }
 
@@ -35,6 +36,7 @@ public struct ModelArchitectureID: RawRepresentable, Hashable, Sendable, Codable
         case .deepSeekV4: return "deepseek4"
         case .glmDSA: return "glm-dsa"
         case .laguna: return "laguna"
+        case .kimiK3: return "kimi-k3"
         default: return rawValue
         }
     }
@@ -60,6 +62,7 @@ public enum ModelFamily: String, Sendable, Codable, Equatable {
     case deepSeek
     case glm
     case laguna
+    case kimi
     case qwen
     case unknown
 }
@@ -180,6 +183,7 @@ public enum ModelArchitectureDetector {
         if id == .deepSeekV4 || id.rawValue.hasPrefix("deepseek4") { return .deepSeek }
         if id == .glmDSA { return .glm }
         if id == .laguna { return .laguna }
+        if id == .kimiK3 { return .kimi }
         if id.rawValue.hasPrefix("qwen") { return .qwen }
         return .unknown
     }
@@ -189,7 +193,7 @@ public enum ModelArchitectureDetector {
         -> ModelBackendAvailability {
         if id == .deepSeekV4 { return .implemented }
         switch family ?? self.family(for: id) {
-        case .glm, .laguna, .qwen: return .recognizedButNotImplemented
+        case .glm, .laguna, .kimi, .qwen: return .recognizedButNotImplemented
         case .deepSeek, .unknown: return .unknown
         }
     }

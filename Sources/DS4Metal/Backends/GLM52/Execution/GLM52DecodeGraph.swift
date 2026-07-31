@@ -52,6 +52,16 @@ enum GLM52GpuRouterDispatch {
         .environment["DS4_GLM_GPU_ROUTER"] != "0"
 }
 
+/// Top-2048 specializzato per l'indexer GLM. Il nome è intenzionalmente
+/// backend-agnostico: futuri modelli con la stessa semantica possono
+/// riutilizzarlo. `0` conserva il percorso argsort/merge generico per A/B.
+enum GLM52IndexerTopKDispatch {
+    nonisolated(unsafe) static var enabled = DS4RuntimeEnvironment.flag(
+        .indexerTopKFast,
+        backend: .glm52,
+        default: true)
+}
+
 /// Rilegge TUTTI i knob di dispatch dall'ambiente — chiamata all'init di
 /// ogni motore (disciplina single-driver: mai durante un decode).
 public enum GLM52DispatchKnobs {
@@ -69,6 +79,11 @@ public enum GLM52DispatchKnobs {
             default: true,
             environment: env)
         GLM52GpuRouterDispatch.enabled = env["DS4_GLM_GPU_ROUTER"] != "0"
+        GLM52IndexerTopKDispatch.enabled = DS4RuntimeEnvironment.flag(
+            .indexerTopKFast,
+            backend: .glm52,
+            default: true,
+            environment: env)
         GLM52ResidentWiring.enabled = DS4RuntimeEnvironment.flag(
             .mlock, backend: .glm52,
             default: true, environment: env)

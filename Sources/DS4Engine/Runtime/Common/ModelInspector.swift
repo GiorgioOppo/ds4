@@ -17,7 +17,10 @@ public enum ModelInspector {
             name: name,
             layerCount: model.u32("\(prefix).block_count").map(Int.init),
             embeddingLength: model.u32("\(prefix).embedding_length").map(Int.init),
-            vocabularySize: model.u32("\(prefix).vocab_size").map(Int.init),
+            vocabularySize: (
+                model.u32("\(prefix).vocab_size")
+                    ?? model.u32("\(prefix).vocabulary_size")
+            ).map(Int.init),
             capabilities: modelCapabilities(for: detected)
         )
         return RuntimeModelDescriptor(
@@ -56,6 +59,8 @@ public enum ModelInspector {
             return GLM52BackendDefinition.modelCapabilities
         case .laguna:
             return LagunaBackendDefinition.modelCapabilities
+        case .kimi:
+            return KimiK3BackendDefinition.modelCapabilities
         case .qwen:
             return QwenBackendDefinition.modelCapabilities(for: detected.id)
         case .unknown:
@@ -74,6 +79,9 @@ public enum ModelInspector {
         case .implemented where detected.family == .laguna,
              .recognizedButNotImplemented where detected.family == .laguna:
             return LagunaBackendDefinition.runtimeCapabilities
+        case .implemented where detected.family == .kimi,
+             .recognizedButNotImplemented where detected.family == .kimi:
+            return KimiK3BackendDefinition.runtimeCapabilities
         case .implemented, .recognizedButNotImplemented, .unknown:
             return QwenBackendDefinition.runtimeCapabilities
         }
@@ -96,6 +104,9 @@ public enum ModelInspector {
         case .laguna:
             gated = detected.id == LagunaBackendDefinition.supportedArchitecture
                 && LagunaBackendDefinition.runtimeEnabled
+        case .kimi:
+            gated = detected.id == KimiK3BackendDefinition.supportedArchitecture
+                && KimiK3BackendDefinition.runtimeEnabled
         case .deepSeek, .qwen, .unknown:
             gated = false
         }
@@ -113,6 +124,7 @@ public enum ModelInspector {
         case .deepSeek: return "DeepSeek V4"
         case .glm: return "GLM 5.2"
         case .laguna: return "Laguna S 2.1"
+        case .kimi: return "Kimi K3"
         case .qwen: return "Qwen (\(detected.id.rawValue))"
         case .unknown: return detected.id.rawValue.isEmpty ? "Modello GGUF" : detected.id.rawValue
         }

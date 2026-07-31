@@ -177,6 +177,8 @@ final class DownloadRunner {
                 notices[key] = onSelectableModel(path)
                     ? "Già installato: è stato selezionato senza scaricarlo di nuovo."
                     : "Il file è installato, ma la validazione del runtime ne ha impedito la selezione."
+            } else if entry.isSplitFragmentPackage {
+                notices[key] = "Tutte le parti consecutive del GGUF sono già installate."
             } else if entry.artifacts.count > 1 {
                 notices[key] = "Tutti gli shard del pacchetto distribuito sono già installati."
             } else {
@@ -229,6 +231,8 @@ final class DownloadRunner {
                     } else {
                         self.notices[key] = "Download completato, ma la validazione del runtime ne ha impedito la selezione."
                     }
+                } else if entry.isSplitFragmentPackage {
+                    self.notices[key] = "Download delle parti completato. Il futuro lettore Kimi le esporrà come un unico GGUF senza duplicarle."
                 } else if entry.artifacts.count > 1 {
                     self.notices[key] = "Download del pacchetto distribuito completato. Gli shard non sono selezionabili come un GGUF locale."
                 } else {

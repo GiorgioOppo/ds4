@@ -4,6 +4,7 @@ public enum DS4RuntimeBackend: String, Sendable {
     case deepSeekV4
     case glm52
     case laguna
+    case kimiK3
 }
 
 public enum DS4RuntimeKnobArea: String, Sendable {
@@ -58,6 +59,7 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
 
     case kvInitial = "DS4_KV_INITIAL"
     case indexedAttention = "DS4_INDEXED_ATTN"
+    case indexerTopKFast = "DS4_INDEXER_TOPK_FAST"
     case longAttentionBlock = "DS4_LONG_ATTN_BLOCK"
     case longAttentionTopBlocks = "DS4_LONG_ATTN_TOP_BLOCKS"
     case longAttentionRecent = "DS4_LONG_ATTN_RECENT"
@@ -87,7 +89,8 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
              .bundleDirectory, .usageFile, .simdgroups,
              .discardUploadPages, .residentPrivate:
             area = .memoryIO
-        case .kvInitial, .indexedAttention, .longAttentionBlock,
+        case .kvInitial, .indexedAttention, .indexerTopKFast,
+             .longAttentionBlock,
              .longAttentionTopBlocks, .longAttentionRecent,
              .longAttentionThreshold, .rawRing:
             area = .attention

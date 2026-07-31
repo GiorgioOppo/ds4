@@ -32,7 +32,8 @@ final class ModelDownloaderTests: XCTestCase {
         XCTAssertEqual(DeepSeekV4ModelCatalog.entries.count, 5)
         XCTAssertEqual(GLM52ModelCatalog.entries.count, 3)
         XCTAssertEqual(LagunaModelCatalog.entries.count, 2)
-        XCTAssertEqual(ModelCatalogRegistry.entries.count, 10)
+        XCTAssertEqual(KimiK3ModelCatalog.entries.count, 1)
+        XCTAssertEqual(ModelCatalogRegistry.entries.count, 11)
         XCTAssertEqual(
             Set(ModelCatalogRegistry.selectableEntries.map(\.id)),
             Set([.flashQ2Imatrix, .flashQ2Q4Imatrix, .flashQ4Imatrix, .proQ2Imatrix,
@@ -184,6 +185,52 @@ final class ModelDownloaderTests: XCTestCase {
                     (DeepSeekV4ModelCatalog.entries + GLM52ModelCatalog.entries).map(\.id)
                 ))
         )
+    }
+
+    func testKimiK3CatalogPinsFiveConsecutiveFragments() throws {
+        let entry = try XCTUnwrap(
+            ModelCatalogRegistry.entry(.kimiK3IQ2XXSQ2K))
+        XCTAssertEqual(entry.profile, .kimiK3)
+        XCTAssertEqual(entry.profile.familyDisplayName, "Kimi K3")
+        XCTAssertFalse(entry.isSelectable)
+        XCTAssertFalse(entry.runtimeAvailability.isRunnable)
+        XCTAssertTrue(entry.isSplitFragmentPackage)
+        XCTAssertEqual(entry.artifacts.count, 5)
+        XCTAssertTrue(entry.artifacts.allSatisfy {
+            $0.role == .splitFragment && $0.source == .kimiK3
+        })
+        XCTAssertEqual(
+            entry.artifacts.map(\.file),
+            (1...5).map {
+                "Kimi-K3-IQ2_XXS-Q2_K.gguf.part-"
+                    + String(format: "%02d", $0) + "-of-05"
+            })
+        XCTAssertEqual(
+            entry.expectedSizeBytes,
+            KimiK3ModelCatalog.reconstructedSizeBytes)
+        XCTAssertEqual(
+            KimiK3ModelCatalog.reconstructedSizeBytes,
+            858_760_729_248)
+        XCTAssertEqual(
+            KimiK3ModelCatalog.reconstructedSHA256,
+            "58d7624a421149e65b430c20f3fa388886f565ea1e5a3410adeb8ce2d62caa19")
+
+        let first = try XCTUnwrap(entry.artifacts.first)
+        XCTAssertEqual(first.expectedSizeBytes, 171_752_145_849)
+        XCTAssertEqual(
+            first.sha256,
+            "2a9ce3dc3754c1766eaff124d1c39610f6870873b61c2fd276e398196cc91198")
+        XCTAssertEqual(
+            ModelDownloader.resolveURL(first).absoluteString,
+            "https://huggingface.co/antirez/kimi-k3-gguf/resolve/"
+                + "b06d5a51043f84bce980cc31cf63ac645efb3a76/"
+                + first.file)
+
+        let last = try XCTUnwrap(entry.artifacts.last)
+        XCTAssertEqual(last.expectedSizeBytes, 171_752_145_852)
+        XCTAssertEqual(
+            last.sha256,
+            "e67274e7d2e2c4536f05ca15e38f873e2ea3731606b27f1a33ccb35e34c2e7e7")
     }
 
     func testTokenResolution() {

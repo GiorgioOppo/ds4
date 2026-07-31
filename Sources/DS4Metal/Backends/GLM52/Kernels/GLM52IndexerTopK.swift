@@ -2,31 +2,42 @@ import DS4Core
 import Foundation
 import Metal
 
-// Multi-block descending top-k for the GLM 5.2 indexer, the faithful port of
-// upstream's ds4_gpu_indexer_topk_tensor: bitonic-argsort each block of a
-// score row, then iteratively merge the sorted runs (binary-search partition)
-// until one run remains, writing the first top-k indices per token. It reuses
-// the vendored kernel_argsort_f32_i32_desc / kernel_argsort_merge_f32_i32_desc
-// kernels the DeepSeek router already dispatches — no GLM-specific kernel.
+// Multi-block descending top-k for the GLM 5.2 indexer. The generic path is the
+// faithful port of upstream's ds4_gpu_indexer_topk_tensor: bitonic-argsort each
+// score-row block, then iteratively merge the sorted runs. GLM's production
+// geometry has a much more useful invariant, though: topK is always 2048.
+// Above 8192 rows the optimized path truncates and compacts every intermediate
+// merge run to 2048 entries, avoiding needless comparisons and scratch traffic.
+// DS4_INDEXER_TOPK_FAST=0 forces the generic path for reproducible A/B tests.
 //
 // Causality is encoded upstream of this call: future rows carry -INFINITY
 // scores (see kernel_glm52_indexer_scores_f16) and sink to the end of the
 // descending order. The caller must therefore keep topK at or below the
 // number of finite rows; the architecture cap is the indexer's top-2048.
-// Ties are resolved by the bitonic network, not by the CPU oracle's
-// lowest-index rule — validation fixtures use distinct scores.
+// The initial bitonic runs do not promise the CPU oracle's lowest-index tie
+// order; the compact merge inherits that limitation, so cross-path fixtures
+// use distinct scores.
+
+private struct GLM52IndexerTopKLayout {
+    let sortThreads: Int
+    let blockCount: Int
+    let blockTopK: Int
+    let workWidth: Int
+
+    var onePass: Bool { blockCount <= 1 }
+    var scratchRowBytes: Int {
+        workWidth * MemoryLayout<Int32>.stride
+    }
+}
 
 extension MetalRuntime {
-    /// Variante ENCODE del top-k: gli STESSI stadi del wrapper standalone
-    /// qui sotto, ma dentro il command buffer del chiamante — gli score
-    /// restano sul device (niente readback + re-upload né secondo command
-    /// buffer) e il chiamante rilegge SOLO i topK indici dopo il commit.
-    /// `sortScratch` deve tenere 2×workWidth int32 (lo scratch del decode
-    /// è dimensionato a 2×scoreCapacity).
-    func glm52EncodeIndexerTopK(into commandBuffer: MTLCommandBuffer,
-                                scores: MTLBuffer, rowCount: Int, topK: Int,
-                                output: MTLBuffer,
-                                sortScratch: MTLBuffer) throws {
+    private static let glm52TopK2048 = 2_048
+    private static let glm52TopKCompactMinimum = 8_193
+
+    private func glm52IndexerTopKLayout(
+        rowCount: Int,
+        topK: Int
+    ) throws -> GLM52IndexerTopKLayout {
         let sortPipeline = try pipeline("kernel_argsort_f32_i32_desc")
         var maxThreads = sortPipeline.maxTotalThreadsPerThreadgroup
         if maxThreads == 0 { maxThreads = 256 }
@@ -40,7 +51,85 @@ extension MetalRuntime {
             workWidth = (blockCount - 1) * blockTopK
                 + min(lastBlock, blockTopK)
         }
-        let onePass = blockCount <= 1
+        return GLM52IndexerTopKLayout(
+            sortThreads: nth,
+            blockCount: blockCount,
+            blockTopK: blockTopK,
+            workWidth: workWidth)
+    }
+
+    /// True only when the exact GLM top-2048 geometry has enough merge levels
+    /// and scratch for compaction to help. Kept internal so parity/benchmark
+    /// tests can distinguish a real fast-path run from the portable fallback.
+    func glm52SupportsFastIndexerTopK(
+        rowCount: Int,
+        tokenCount: Int = 1,
+        outputBytes: Int = .max,
+        scratchBytes: Int = .max
+    ) throws -> Bool {
+        guard rowCount >= Self.glm52TopKCompactMinimum,
+              tokenCount > 0,
+              outputBytes >= tokenCount * Self.glm52TopK2048
+                * MemoryLayout<UInt32>.stride else {
+            return false
+        }
+        let layout = try glm52IndexerTopKLayout(
+            rowCount: rowCount, topK: Self.glm52TopK2048)
+        guard layout.blockCount > 1,
+              scratchBytes >= 2 * layout.scratchRowBytes * tokenCount else {
+            return false
+        }
+        return try pipeline(
+            "kernel_glm52_indexer_topk_merge_compact"
+        ).maxTotalThreadsPerThreadgroup > 0
+    }
+
+    /// Variante ENCODE del top-k: gli STESSI stadi del wrapper standalone
+    /// qui sotto, ma dentro il command buffer del chiamante — gli score
+    /// restano sul device (niente readback + re-upload né secondo command
+    /// buffer) e il chiamante rilegge SOLO i topK indici dopo il commit.
+    /// `sortScratch` deve tenere 2×workWidth int32 per riga (lo scratch del
+    /// decode è dimensionato a 2×scoreCapacity). `preferFastPath` è esposto
+    /// internamente per i test A/B: nil usa il knob latched, false forza il
+    /// fallback, true lo preferisce ma rispetta comunque i limiti hardware.
+    func glm52EncodeIndexerTopK(into commandBuffer: MTLCommandBuffer,
+                                scores: MTLBuffer, rowCount: Int, topK: Int,
+                                output: MTLBuffer,
+                                sortScratch: MTLBuffer,
+                                tokenCount: Int = 1,
+                                preferFastPath: Bool? = nil) throws {
+        guard rowCount > 0, tokenCount > 0, topK > 0,
+              topK <= rowCount,
+              scores.length >= rowCount * tokenCount
+                * MemoryLayout<Float>.stride,
+              output.length >= tokenCount * topK
+                * MemoryLayout<UInt32>.stride else {
+            throw MetalError.unsupported(
+                "GLM 5.2 encoded top-k buffer geometry is invalid")
+        }
+
+        let layout = try glm52IndexerTopKLayout(
+            rowCount: rowCount, topK: topK)
+        let wantsFast = preferFastPath ?? GLM52IndexerTopKDispatch.enabled
+        let useCompactMerge: Bool
+        if wantsFast && topK == Self.glm52TopK2048 {
+            useCompactMerge = try glm52SupportsFastIndexerTopK(
+                rowCount: rowCount,
+                tokenCount: tokenCount,
+                outputBytes: output.length,
+                scratchBytes: sortScratch.length)
+        } else {
+            useCompactMerge = false
+        }
+        let onePass = layout.onePass
+        let requiredScratch = onePass
+            ? 0
+            : 2 * layout.scratchRowBytes * tokenCount
+        guard sortScratch.length >= requiredScratch else {
+            throw MetalError.unsupported(
+                "GLM 5.2 top-k scratch \(sortScratch.length) B, "
+                + "required \(requiredScratch) B")
+        }
         func words(_ bytes: [UInt8]) -> [UInt32] {
             bytes.withUnsafeBytes { raw in
                 (0..<bytes.count / 4).map {
@@ -52,21 +141,97 @@ extension MetalRuntime {
         try glm52GraphEncode(
             into: commandBuffer,
             pipelineName: "kernel_argsort_f32_i32_desc",
-            arguments: words(Self.argsortArgs(n: rowCount, rows: 1,
-                                              ne0: workWidth,
-                                              topK: blockTopK)),
+            arguments: words(Self.argsortArgs(
+                n: rowCount,
+                rows: tokenCount,
+                ne0: layout.workWidth,
+                topK: layout.blockTopK)),
             buffers: [scores, onePass ? output : sortScratch],
-            threadgroups: MTLSize(width: blockCount, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1),
+            threadgroups: MTLSize(
+                width: layout.blockCount * tokenCount,
+                height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: layout.sortThreads, height: 1, depth: 1),
             threadgroupMemoryLength:
-                ((nth * MemoryLayout<Int32>.stride) + 15) & ~15)
-        let scratchRowBytes = workWidth * MemoryLayout<Int32>.stride
+                ((layout.sortThreads * MemoryLayout<Int32>.stride) + 15)
+                    & ~15)
+
+        if useCompactMerge {
+            var currentOffset = 0
+            var nextOffset = layout.scratchRowBytes * tokenCount
+            var currentSetCount = layout.blockCount
+            var currentStride = layout.blockTopK
+            var currentTotal = layout.workWidth
+            var currentRowStride = layout.workWidth
+            let mergePipeline = try pipeline(
+                "kernel_glm52_indexer_topk_merge_compact")
+            var mergeThreads =
+                mergePipeline.maxTotalThreadsPerThreadgroup
+            if mergeThreads == 0 || mergeThreads > 512 {
+                mergeThreads = 512
+            }
+            mergeThreads = max(1, min(mergeThreads, topK))
+
+            while currentSetCount > 1 {
+                let nextSetCount = (currentSetCount + 1) / 2
+                var nextTotal = 0
+                for outputSet in 0..<nextSetCount {
+                    let first = 2 * outputSet * currentStride
+                    let left = first < currentTotal
+                        ? min(currentStride, currentTotal - first) : 0
+                    let second = first + currentStride
+                    let right = second < currentTotal
+                        ? min(currentStride, currentTotal - second) : 0
+                    nextTotal += min(topK, left + right)
+                }
+                let finalMerge = nextSetCount == 1
+                let outputRowStride = finalMerge ? topK : nextTotal
+                try glm52GraphEncode(
+                    into: commandBuffer,
+                    pipelineName:
+                        "kernel_glm52_indexer_topk_merge_compact",
+                    arguments: [
+                        UInt32(rowCount),
+                        UInt32(tokenCount),
+                        UInt32(currentTotal),
+                        UInt32(currentSetCount),
+                        UInt32(currentStride),
+                        UInt32(currentRowStride),
+                        UInt32(topK),
+                        UInt32(outputRowStride),
+                    ],
+                    buffers: [
+                        scores,
+                        sortScratch,
+                        finalMerge ? output : sortScratch,
+                    ],
+                    offsets: [
+                        0,
+                        currentOffset,
+                        finalMerge ? 0 : nextOffset,
+                    ],
+                    threadgroups: MTLSize(
+                        width: nextSetCount * tokenCount,
+                        height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: mergeThreads, height: 1, depth: 1))
+                if !finalMerge {
+                    swap(&currentOffset, &nextOffset)
+                }
+                currentSetCount = nextSetCount
+                currentStride = topK
+                currentTotal = nextTotal
+                currentRowStride = outputRowStride
+            }
+            return
+        }
+
         var currentOffset = 0
-        var nextOffset = scratchRowBytes
-        var runLength = blockTopK
+        var nextOffset = layout.scratchRowBytes * tokenCount
+        var runLength = layout.blockTopK
         let mergePipeline = try pipeline("kernel_argsort_merge_f32_i32_desc")
-        while runLength < workWidth {
-            let mergeCount = (workWidth + 2 * runLength - 1)
+        while runLength < layout.workWidth {
+            let mergeCount = (layout.workWidth + 2 * runLength - 1)
                 / (2 * runLength)
             let finalMerge = mergeCount == 1
             var mergeThreads = mergePipeline.maxTotalThreadsPerThreadgroup
@@ -76,14 +241,16 @@ extension MetalRuntime {
                 into: commandBuffer,
                 pipelineName: "kernel_argsort_merge_f32_i32_desc",
                 arguments: words(Self.glm52ArgsortMergeArgs(
-                    n: rowCount, rows: 1, ne0: workWidth,
-                    topK: finalMerge ? topK : workWidth,
+                    n: rowCount, rows: tokenCount,
+                    ne0: layout.workWidth,
+                    topK: finalMerge ? topK : layout.workWidth,
                     runLength: runLength)),
                 buffers: [scores, sortScratch,
                           finalMerge ? output : sortScratch],
                 offsets: [0, currentOffset, finalMerge ? 0 : nextOffset],
-                threadgroups: MTLSize(width: mergeCount, height: 1,
-                                      depth: 1),
+                threadgroups: MTLSize(
+                    width: mergeCount * tokenCount,
+                    height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: mergeThreads,
                                                height: 1, depth: 1))
             swap(&currentOffset, &nextOffset)
@@ -97,7 +264,9 @@ extension MetalRuntime {
     public func glm52IndexerTopK(scores: [Float],
                                  rowCount: Int,
                                  tokenCount: Int,
-                                 topK: Int) throws -> [UInt32] {
+                                 topK: Int,
+                                 preferFastPath: Bool? = nil) throws
+        -> [UInt32] {
         guard rowCount > 0, tokenCount > 0,
               scores.count == rowCount * tokenCount else {
             throw MetalError.unsupported(
@@ -113,25 +282,9 @@ extension MetalRuntime {
             throw MetalError.unsupported("GLM 5.2 top-k geometry overflows Int32")
         }
 
-        let sortPipeline = try pipeline("kernel_argsort_f32_i32_desc")
-        let mergePipeline = try pipeline("kernel_argsort_merge_f32_i32_desc")
-
-        // Block width: largest power of two the sort threadgroup can hold.
-        var maxThreads = sortPipeline.maxTotalThreadsPerThreadgroup
-        if maxThreads == 0 { maxThreads = 256 }
-        var nth = 1
-        while nth < rowCount && 2 * nth <= maxThreads { nth *= 2 }
-        let blockCount = (rowCount + nth - 1) / nth
-        let blockTopK = min(topK, nth)
-        var workWidth = topK
-        if blockCount > 1 {
-            let lastBlock = rowCount - (blockCount - 1) * nth
-            workWidth = (blockCount - 1) * blockTopK + min(lastBlock, blockTopK)
-        }
-        let onePass = blockCount <= 1
-
+        let layout = try glm52IndexerTopKLayout(
+            rowCount: rowCount, topK: topK)
         let outputCount = tokenCount * topK
-        let scratchRowBytes = workWidth * MemoryLayout<Int32>.stride
         guard let scoreBuffer = device.makeBuffer(
                   bytes: scores,
                   length: scores.count * MemoryLayout<Float>.stride,
@@ -141,80 +294,29 @@ extension MetalRuntime {
                   options: .storageModeShared) else {
             throw MetalError.bufferAlloc
         }
-        var scratchBuffer: MTLBuffer?
-        if !onePass {
-            scratchBuffer = device.makeBuffer(
-                length: 2 * scratchRowBytes * tokenCount,
-                options: .storageModeShared)
-            guard scratchBuffer != nil else { throw MetalError.bufferAlloc }
+        // Both merge policies ping-pong inside two workWidth-sized Int32
+        // planes; compaction only reduces the live prefix at later levels.
+        let scratchBytes = max(
+            16, 2 * layout.scratchRowBytes * tokenCount)
+        guard let scratchBuffer = device.makeBuffer(
+            length: scratchBytes,
+            options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
         }
 
         guard let commandBuffer = queue.makeCommandBuffer() else {
             throw MetalError.bufferAlloc
         }
-
-        // Stage 1: sort every nth-wide block of every token row.
-        let sortArguments = Self.argsortArgs(
-            n: rowCount, rows: tokenCount, ne0: workWidth, topK: blockTopK)
-        guard let sortEncoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw MetalError.bufferAlloc
-        }
-        sortEncoder.setComputePipelineState(sortPipeline)
-        sortArguments.withUnsafeBytes {
-            sortEncoder.setBytes($0.baseAddress!, length: $0.count, index: 0)
-        }
-        sortEncoder.setBuffer(scoreBuffer, offset: 0, index: 1)
-        sortEncoder.setBuffer(onePass ? selectedBuffer : scratchBuffer!,
-                              offset: 0, index: 2)
-        sortEncoder.setThreadgroupMemoryLength(
-            ((nth * MemoryLayout<Int32>.stride) + 15) & ~15, index: 0)
-        sortEncoder.dispatchThreadgroups(
-            MTLSize(width: blockCount * tokenCount, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
-        sortEncoder.endEncoding()
-
-        // Stage 2: merge sorted runs, ping-ponging the scratch halves; the
-        // final merge lands directly in the packed [token][topK] output.
-        var currentOffset = 0
-        var nextOffset = scratchRowBytes * tokenCount
-        var runLength = blockTopK
-        while runLength < workWidth {
-            let mergeCount = (workWidth + 2 * runLength - 1) / (2 * runLength)
-            let finalMerge = mergeCount == 1
-            var mergeThreads = mergePipeline.maxTotalThreadsPerThreadgroup
-            if mergeThreads == 0 || mergeThreads > 512 { mergeThreads = 512 }
-            mergeThreads = max(1, min(mergeThreads, runLength))
-
-            let mergeArguments = Self.glm52ArgsortMergeArgs(
-                n: rowCount,
-                rows: tokenCount,
-                ne0: workWidth,
-                topK: finalMerge ? topK : workWidth,
-                runLength: runLength)
-            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-                throw MetalError.bufferAlloc
-            }
-            encoder.setComputePipelineState(mergePipeline)
-            mergeArguments.withUnsafeBytes {
-                encoder.setBytes($0.baseAddress!, length: $0.count, index: 0)
-            }
-            encoder.setBuffer(scoreBuffer, offset: 0, index: 1)
-            encoder.setBuffer(scratchBuffer!, offset: currentOffset, index: 2)
-            encoder.setBuffer(finalMerge ? selectedBuffer : scratchBuffer!,
-                              offset: finalMerge ? 0 : nextOffset, index: 3)
-            encoder.dispatchThreadgroups(
-                MTLSize(width: mergeCount * tokenCount, height: 1, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: mergeThreads,
-                                               height: 1, depth: 1))
-            encoder.endEncoding()
-
-            swap(&currentOffset, &nextOffset)
-            runLength <<= 1
-        }
-
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error { throw error }
+        try glm52EncodeIndexerTopK(
+            into: commandBuffer,
+            scores: scoreBuffer,
+            rowCount: rowCount,
+            topK: topK,
+            output: selectedBuffer,
+            sortScratch: scratchBuffer,
+            tokenCount: tokenCount,
+            preferFastPath: preferFastPath)
+        try glm52GraphCommit(commandBuffer)
 
         let pointer = selectedBuffer.contents().bindMemory(
             to: Int32.self, capacity: outputCount)

@@ -35,7 +35,7 @@ public enum ConversationBackendPolicy {
         if detected.id == .laguna { return .lagunaNative }
 
         switch detected.family {
-        case .qwen:
+        case .kimi, .qwen:
             throw ConversationBackendSelectionError.conversationBackendNotImplemented(
                 detected.id, family: detected.family
             )

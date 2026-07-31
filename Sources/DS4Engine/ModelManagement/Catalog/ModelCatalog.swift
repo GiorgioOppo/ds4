@@ -14,6 +14,7 @@ public enum ModelCatalogID: String, CaseIterable, Identifiable, Sendable, Hashab
     case glm52Q4K = "glm-5.2-q4-k"
     case lagunaQ4 = "laguna-q4"
     case lagunaQ2Q3 = "laguna-q2-q3"
+    case kimiK3IQ2XXSQ2K = "kimi-k3-iq2-xxs-q2-k"
 
     public var id: String { rawValue }
 }
@@ -31,12 +32,14 @@ public enum ModelCatalogProfile: Sendable, Hashable {
     case deepSeekV4(DeepSeekV4Edition)
     case glm52
     case laguna
+    case kimiK3
 
     public var familyDisplayName: String {
         switch self {
         case .deepSeekV4: "DeepSeek V4"
         case .glm52: "GLM 5.2"
         case .laguna: "Laguna S 2.1"
+        case .kimiK3: "Kimi K3"
         }
     }
 }
@@ -76,6 +79,15 @@ public struct HuggingFaceSource: Sendable, Hashable {
     public static let lagunaAntirez = Self(
         repository: "antirez/Laguna-S-2.1-GGUF"
     )
+
+    /// Five consecutive byte ranges of one GGUF. The commit, fragment sizes
+    /// and LFS digests are pinned from the Hugging Face API; changing any part
+    /// therefore creates a new catalog revision instead of silently mixing
+    /// bytes from different uploads.
+    public static let kimiK3 = Self(
+        repository: "antirez/kimi-k3-gguf",
+        revision: "b06d5a51043f84bce980cc31cf63ac645efb3a76"
+    )
 }
 
 /// Whether this build can load an entry after downloading it.
@@ -97,6 +109,10 @@ public enum ModelRuntimeAvailability: Sendable, Hashable {
 public enum ModelArtifactRole: String, Sendable, Hashable {
     case mainModel
     case distributedShard
+    /// Consecutive byte fragment of one logical GGUF, not an independent GGUF
+    /// shard. Keep every fragment in catalog order for the future virtual file
+    /// reader; concatenating today would temporarily duplicate ~859 GB.
+    case splitFragment
     case optionalComponent
 }
 
@@ -180,6 +196,13 @@ public struct ModelCatalogEntry: Sendable, Identifiable, Hashable {
     public var primaryArtifact: ModelTarget? {
         guard isSelectable else { return nil }
         return artifacts[0]
+    }
+
+    /// Raw consecutive pieces of one GGUF. They are deliberately kept
+    /// separate on disk until the virtual multi-part reader exists.
+    public var isSplitFragmentPackage: Bool {
+        artifacts.count > 1
+            && artifacts.allSatisfy { $0.role == .splitFragment }
     }
 
     public var approximateSizeGB: Int {
@@ -453,7 +476,7 @@ public enum LagunaModelCatalog {
 public enum ModelCatalogRegistry {
     public static let entries: [ModelCatalogEntry] =
         DeepSeekV4ModelCatalog.entries + GLM52ModelCatalog.entries
-            + LagunaModelCatalog.entries
+            + LagunaModelCatalog.entries + KimiK3ModelCatalog.entries
 
     public static let selectableEntries: [ModelCatalogEntry] = entries.filter(\.isSelectable)
     public static let allArtifacts: [ModelTarget] = entries.flatMap(\.artifacts)

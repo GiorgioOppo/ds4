@@ -55,6 +55,7 @@ public enum BackendSelector {
             return .laguna
         }
         if descriptor.family == .glm || descriptor.family == .laguna
+            || descriptor.family == .kimi
             || descriptor.family == .qwen {
             throw BackendSelectionError.backendNotImplemented(descriptor.architecture)
         }

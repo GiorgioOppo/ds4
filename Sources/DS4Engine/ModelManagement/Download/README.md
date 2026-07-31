@@ -79,5 +79,10 @@ models are selectable, while the PRO Q4 package and the three GLM 5.2 remain
 `downloadOnly`. MTP is a separate accessory and does not appear among the GUI
 models.
 
+For Kimi K3 the GUI acquires five ordered `splitFragment` targets. Every part
+has independent resume, byte-size and SHA-256 validation, and the package is
+installed only when all five are present. Parts are not concatenated, avoiding
+a temporary second copy of the 858.8 GB model.
+
 Related settings are in the
 [Configuration Reference](../../../../README.md#configuration-reference).

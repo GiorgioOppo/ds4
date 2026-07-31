@@ -76,5 +76,10 @@ principale dichiara il supporto runtime per entry: i tre Flash e PRO Q2
 singolo-file sono selezionabili, mentre il package PRO Q4 e i tre GLM 5.2
 restano `downloadOnly`. MTP è un accessorio separato e non compare tra i modelli GUI.
 
+Per Kimi K3 la GUI acquisisce in ordine cinque `splitFragment`. Ogni parte ha
+resume, dimensione e SHA-256 indipendenti; il package risulta installato solo
+quando sono presenti tutte e cinque. Le parti non vengono concatenate, evitando
+di raddoppiare temporaneamente gli 858,8 GB del modello.
+
 Le impostazioni correlate sono nella
 [Configuration Reference](../../../../README.it.md#riferimento-di-configurazione).

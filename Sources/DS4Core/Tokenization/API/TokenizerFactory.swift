@@ -40,7 +40,7 @@ public enum TokenizerFactory {
         if detected.id == .laguna { return .laguna }
 
         switch detected.family {
-        case .qwen:
+        case .kimi, .qwen:
             throw TokenizerFactoryError.tokenizerNotImplemented(
                 detected.id, family: detected.family
             )

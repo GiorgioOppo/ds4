@@ -6,7 +6,8 @@ import DS4Core
 // specials). Architecture-aware: the GGUF's `general.architecture` selects
 // the DeepSeek, GLM or Laguna tokenizer/renderer, so a non-DeepSeek file
 // never hits the DeepSeek validator and its misleading `deepseek4.*`
-// errors. No subprocess.
+// errors. Recognized frontend scaffolds such as Kimi fail explicitly until
+// their tokenizer exists. No subprocess.
 
 public enum Diagnostics {
     /// Tokenize `text` with the model's tokenizer and return a readable dump
@@ -15,7 +16,8 @@ public enum Diagnostics {
         let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
         let ids: [Int32]
         let textOf: (Int32) -> [UInt8]
-        switch try ModelArchitectureDetector.detect(in: model).family {
+        let detected = try ModelArchitectureDetector.detect(in: model)
+        switch detected.family {
         case .glm:
             let tok = try GLM52Tokenizer(model: model)
             ids = tok.tokenizeRenderedChat(text)
@@ -24,10 +26,15 @@ public enum Diagnostics {
             let tok = try LagunaTokenizer(model: model)
             ids = tok.tokenizeRenderedChat(text)
             textOf = tok.tokenText
-        default:
+        case .deepSeek:
             let tok = try Tokenizer(model: model)
             ids = tok.tokenizeRenderedChat(text)
             textOf = tok.tokenText
+        case .kimi, .qwen:
+            throw TokenizerFactoryError.tokenizerNotImplemented(
+                detected.id, family: detected.family)
+        case .unknown:
+            throw TokenizerFactoryError.unsupportedArchitecture(detected.id)
         }
         var out = "\(ids.count) token\n\n"
         for id in ids {
@@ -45,13 +52,21 @@ public enum Diagnostics {
     /// currently render with tools (so the two can be compared).
     public static func dumpChatTemplate(modelPath: String) throws -> String {
         let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
-        switch try ModelArchitectureDetector.detect(in: model).family {
+        let detected = try ModelArchitectureDetector.detect(in: model)
+        switch detected.family {
         case .glm:
             return try dumpGLMChatTemplate(model: model)
         case .laguna:
             return try dumpLagunaChatTemplate(model: model)
-        default:
+        case .deepSeek:
             break
+        case .kimi, .qwen:
+            throw ConversationBackendSelectionError
+                .conversationBackendNotImplemented(
+                    detected.id, family: detected.family)
+        case .unknown:
+            throw ConversationBackendSelectionError
+                .unsupportedArchitecture(detected.id)
         }
         let tok = try Tokenizer(model: model)
 
