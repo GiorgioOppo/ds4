@@ -41,6 +41,13 @@ public final class ExpertSlotCache: @unchecked Sendable {
         var owner: [Int32]            // slot -> expert id (-1 = free)
         var lastUse: [UInt64]         // slot -> LRU tick
         var slotOf: [Int32: Int]      // expert id -> slot
+        /// Historical popularity rank (0 = hottest). Used only by the opt-in
+        /// frequency-aware eviction A/B; residency and numerics are unchanged.
+        var hotRank: [Int32: Int] = [:]
+        /// Last observed reuse interval per expert. The opt-in reuse policy
+        /// predicts the next touch from this short-term cadence.
+        var reuseGap: [Int32: UInt64] = [:]
+        var previousUse: [Int32: UInt64] = [:]
         /// Tick of the most recent DEMAND acquire: those slots may still be
         /// read by an in-flight command buffer — a late speculative prefill
         /// must never evict them (see ensureResident).
@@ -116,6 +123,8 @@ public final class ExpertSlotCache: @unchecked Sendable {
     /// Optional warm-set provider: historically hottest experts of a layer (from
     /// the persisted usage stats); pre-filled into the pool on first use.
     private let warm: ((_ layer: Int) -> [Int32])?
+    private let frequencyAwareEviction: Bool
+    private let reuseAwareEviction: Bool
 
     public init(slotsPerLayer: Int,
                 bytesPerExpert: Int = 0,
@@ -126,7 +135,9 @@ public final class ExpertSlotCache: @unchecked Sendable {
                 prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)? = nil,
                 warm: ((_ layer: Int) -> [Int32])? = nil,
                 slotsFor: ((_ layer: Int) -> Int)? = nil,
-                slotsPlan: (() -> [Int: Int])? = nil) {
+                slotsPlan: (() -> [Int: Int])? = nil,
+                frequencyAwareEviction: Bool? = nil,
+                reuseAwareEviction: Bool? = nil) {
         self.slotsPerLayer = max(8, slotsPerLayer)   // ≥ k+2 so this tick's ids never starve eviction
         self.bytesPerExpert = bytesPerExpert
         self.isLayerAware = false
@@ -135,6 +146,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
         self.fillBatch = fillBatch
         self.prefetch = prefetch
         self.warm = warm
+        self.frequencyAwareEviction = frequencyAwareEviction
+            ?? (ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_HOT_EVICTION"] == "1")
+        self.reuseAwareEviction = reuseAwareEviction
+            ?? (ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_REUSE_EVICTION"] == "1")
         self.slotsFor = slotsFor
         self.slotsPlan = slotsPlan
         self.bytesFor = nil
@@ -157,7 +172,9 @@ public final class ExpertSlotCache: @unchecked Sendable {
                 prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)? = nil,
                 warm: ((_ layer: Int) -> [Int32])? = nil,
                 slotsFor: ((_ layer: Int) -> Int)? = nil,
-                slotsPlan: (() -> [Int: Int])? = nil) {
+                slotsPlan: (() -> [Int: Int])? = nil,
+                frequencyAwareEviction: Bool? = nil,
+                reuseAwareEviction: Bool? = nil) {
         self.slotsPerLayer = max(8, slotsPerLayer)
         self.bytesPerExpert = bytesPerExpert
         self.isLayerAware = true
@@ -166,6 +183,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
         self.fillBatch = fillBatch
         self.prefetch = prefetch
         self.warm = warm
+        self.frequencyAwareEviction = frequencyAwareEviction
+            ?? (ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_HOT_EVICTION"] == "1")
+        self.reuseAwareEviction = reuseAwareEviction
+            ?? (ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_REUSE_EVICTION"] == "1")
         self.slotsFor = slotsFor
         self.slotsPlan = slotsPlan
         self.bytesFor = bytesPerExpertForLayer
@@ -349,7 +370,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
             // Pre-warm with the historically hottest experts (usage-stats prior):
             // they start as the oldest entries, so a wrong prior is evicted fast.
             if let warm {
-                let warmIds = Array(warm(layer).prefix(S))
+                let rankedIds = warm(layer)
+                fresh.hotRank = Dictionary(uniqueKeysWithValues:
+                    rankedIds.enumerated().map { ($0.element, $0.offset) })
+                let warmIds = Array(rankedIds.prefix(S))
                 try fillAll(layer: layer,
                             pairs: warmIds.enumerated().map { (id: $1, slot: $0) }, pool: fresh)
                 for (s, id) in warmIds.enumerated() {
@@ -375,6 +399,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
         var missIdx: [Int] = []
         for (j, id) in ids.enumerated() {
             if let s = pool.slotOf[id] {
+                if let previous = pool.previousUse[id], now > previous {
+                    pool.reuseGap[id] = now - previous
+                }
+                pool.previousUse[id] = now
                 pool.lastUse[s] = now
                 slots[j] = Int32(s)
             } else {
@@ -393,18 +421,18 @@ public final class ExpertSlotCache: @unchecked Sendable {
             // a late prefill (queue backlog) can run while the FFN command
             // buffer reading those slots is still on the GPU. Best-effort:
             // when no safe victim exists the id is simply skipped.
-            var victim = -1
-            var best = UInt64.max
-            for s in 0..<pool.owner.count
-            where pool.lastUse[s] != now && !(speculative && pool.lastUse[s] == pool.lastDemand) {
-                if pool.owner[s] < 0 { victim = s; break }
-                if pool.lastUse[s] < best { best = pool.lastUse[s]; victim = s }
-            }
+            let victim = Self.chooseVictim(
+                owner: pool.owner, lastUse: pool.lastUse, hotRank: pool.hotRank,
+                reuseGap: pool.reuseGap,
+                now: now, lastDemand: pool.lastDemand, speculative: speculative,
+                frequencyAware: frequencyAwareEviction,
+                reuseAware: reuseAwareEviction)
             if speculative && victim < 0 { continue }
             precondition(victim >= 0, "expert cache: no evictable slot (S too small)")
             if pool.owner[victim] >= 0 { pool.slotOf.removeValue(forKey: pool.owner[victim]) }
             pool.owner[victim] = id
             pool.slotOf[id] = victim
+            pool.previousUse[id] = now
             pool.lastUse[victim] = now
             slots[j] = Int32(victim)
             toFill.append((id: id, slot: victim))
@@ -463,5 +491,39 @@ public final class ExpertSlotCache: @unchecked Sendable {
         _missBytes += missIdx.count * pool.bytesPerExpert
         stateLock.unlock()
         return (pool, slots)
+    }
+
+    /// Pure victim selector kept internal so the A/B policy is unit-testable
+    /// without allocating Metal buffers. Hot eviction chooses the coldest
+    /// historical rank first and uses LRU only to break equal-rank ties.
+    static func chooseVictim(owner: [Int32], lastUse: [UInt64], hotRank: [Int32: Int],
+                             reuseGap: [Int32: UInt64] = [:],
+                             now: UInt64, lastDemand: UInt64, speculative: Bool,
+                             frequencyAware: Bool, reuseAware: Bool = false) -> Int {
+        var victim = -1
+        var oldest = UInt64.max
+        var worstRank = Int.min
+        var farthestReuse = UInt64.min
+        for s in owner.indices
+        where lastUse[s] != now && !(speculative && lastUse[s] == lastDemand) {
+            if owner[s] < 0 { return s }
+            let rank = hotRank[owner[s]] ?? Int.max
+            if reuseAware {
+                // No observed reuse is the weakest evidence and is evicted
+                // first. Otherwise retain experts whose recent cadence predicts
+                // an earlier next touch. LRU breaks equal predictions.
+                let predicted = reuseGap[owner[s]].map { lastUse[s] &+ $0 } ?? UInt64.max
+                if predicted > farthestReuse || (predicted == farthestReuse && lastUse[s] < oldest) {
+                    victim = s; farthestReuse = predicted; oldest = lastUse[s]
+                }
+            } else if frequencyAware {
+                if rank > worstRank || (rank == worstRank && lastUse[s] < oldest) {
+                    victim = s; worstRank = rank; oldest = lastUse[s]
+                }
+            } else if lastUse[s] < oldest {
+                victim = s; oldest = lastUse[s]
+            }
+        }
+        return victim
     }
 }

@@ -65,9 +65,8 @@ M1PRO16_MIXED_PRESET: dict[str, str] = {
     "DS4_EXPERT_CACHE_UNIFORM": "1",
     "DS4_MULTI_QUANT_CACHE": "1",
     "DS4_EXPERT_PREAD": "1",
-    "DS4_PREAD_SPLIT": "1",
+    "DS4_PREAD_SPLIT": "3",
     "DS4_WILLNEED_EXPERTS": "1",
-    "DS4_EXPERT_BUNDLE": "0",
     "DS4_MTLIO": "0",
     "DS4_POOL_INTERLEAVE": "1",
     "DS4_PREFETCH": "0",
@@ -141,10 +140,10 @@ def string_values(values: Iterable[int]) -> tuple[str, ...]:
 
 PARAMETERS: tuple[Parameter, ...] = (
     Parameter(
-        "DS4_PREAD_SPLIT", string_values(range(1, 9)), "1",
+        "DS4_PREAD_SPLIT", string_values(range(1, 9)), "3",
         profiles=("io", "standard", "full"),
         description="NVMe queue depth for direct expert pread",
-        requires=(("DS4_EXPERT_PREAD", "1"), ("DS4_EXPERT_BUNDLE", "0")),
+        requires=(("DS4_EXPERT_PREAD", "1"),),
         search="sweep",
     ),
     Parameter(

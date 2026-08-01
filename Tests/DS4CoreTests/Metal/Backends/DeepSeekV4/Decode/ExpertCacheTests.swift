@@ -7,6 +7,53 @@ import Foundation
 /// EXACT same result as running over the full expert set with the real ids. This
 /// is the core of the expert-cache: stream ~K/256 of each layer's expert weight.
 final class ExpertCacheTests: XCTestCase {
+    func testFrequencyAwareVictimProtectsHistoricalHotExpert() {
+        let owners: [Int32] = [10, 20, 30]
+        let uses: [UInt64] = [1, 5, 9]
+        let ranks: [Int32: Int] = [10: 0, 20: 1, 30: 50]
+
+        XCTAssertEqual(
+            ExpertSlotCache.chooseVictim(owner: owners, lastUse: uses, hotRank: ranks,
+                                         now: 10, lastDemand: 0, speculative: false,
+                                         frequencyAware: false),
+            0, "pure LRU evicts the oldest slot even when it is historically hottest")
+        XCTAssertEqual(
+            ExpertSlotCache.chooseVictim(owner: owners, lastUse: uses, hotRank: ranks,
+                                         now: 10, lastDemand: 0, speculative: false,
+                                         frequencyAware: true),
+            2, "hot eviction preserves the hot expert and removes the coldest rank")
+    }
+
+    func testVictimPoliciesPreserveSafetyAndPreferFreeSlots() {
+        let owners: [Int32] = [10, -1, 30]
+        let uses: [UInt64] = [4, 0, 7]
+        for frequencyAware in [false, true] {
+            XCTAssertEqual(
+                ExpertSlotCache.chooseVictim(owner: owners, lastUse: uses, hotRank: [10: 0],
+                                             now: 9, lastDemand: 7, speculative: true,
+                                             frequencyAware: frequencyAware),
+                1)
+        }
+    }
+
+    func testReuseAwareVictimUsesRecentCadence() {
+        let owners: [Int32] = [10, 20, 30]
+        let uses: [UInt64] = [10, 12, 14]
+        let gaps: [Int32: UInt64] = [10: 2, 20: 20, 30: 3]
+        XCTAssertEqual(
+            ExpertSlotCache.chooseVictim(owner: owners, lastUse: uses, hotRank: [:],
+                                         reuseGap: gaps, now: 15, lastDemand: 0,
+                                         speculative: false, frequencyAware: false,
+                                         reuseAware: true),
+            1, "the expert whose cadence predicts the farthest next reuse is evicted")
+        XCTAssertEqual(
+            ExpertSlotCache.chooseVictim(owner: owners, lastUse: uses, hotRank: [:],
+                                         reuseGap: [10: 2, 20: 20], now: 15,
+                                         lastDemand: 0, speculative: false,
+                                         frequencyAware: false, reuseAware: true),
+            2, "an expert never reused is evicted before one with observed cadence")
+    }
+
     private func makeRuntime() throws -> MetalRuntime {
         do { return try MetalRuntime() }
         catch { throw XCTSkip("Metal unavailable: \(error)") }

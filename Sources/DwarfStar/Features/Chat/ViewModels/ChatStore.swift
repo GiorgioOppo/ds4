@@ -136,11 +136,19 @@ final class ChatStore {
         if !UserDefaults.standard.bool(forKey: "DS4RigorousAutoTune2026_07_16") {
             UserDefaults.standard.set(true, forKey: "DS4RigorousAutoTune2026_07_16")
             rawRingEnabled = true
-            preadSplit = 4
+            preadSplit = 3
             denseQ4NSG = 4
             UserDefaults.standard.set(true, forKey: "DS4RawRing")
-            UserDefaults.standard.set(4, forKey: "DS4PreadSplit")
+            UserDefaults.standard.set(3, forKey: "DS4PreadSplit")
             UserDefaults.standard.set(4, forKey: "DS4DenseQ4NSG")
+        }
+        // Migrazione v9: A/B reale sul GGUF DeepSeek senza sidecar. split 3
+        // porta il gather a 4.44 GB/s e 2.56 tok/s; split 4 è più lento e
+        // instabile. Aggiorna anche le installazioni che avevano persistito 4.
+        if !UserDefaults.standard.bool(forKey: "DS4PreadSplit3_2026_08_01") {
+            UserDefaults.standard.set(true, forKey: "DS4PreadSplit3_2026_08_01")
+            preadSplit = 3
+            UserDefaults.standard.set(3, forKey: "DS4PreadSplit")
         }
         // The mixed-quant cache was promoted after an exact-logit A/B on the
         // 37/43-layer IQ2/Q4 Flash GGUF (2026-07-16): +28.9% decode, -31.1%
@@ -168,7 +176,6 @@ final class ChatStore {
         _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)                            // K-split Q8; escluso dal tuner exact
         _ = setenv("DS4_MOE_NSG", String(moeNSG), 1)                          // occupancy kernel MoE/Q4 (auto-tune)
         _ = setenv("DS4_DENSE_Q4_NSG", String(denseQ4NSG), 1)                 // occupancy Q4 densa, auto-tune
-        _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
         _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)              // Metal fast resource loading (A/B sperimentale)
         _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)                           // M1 Pro: pread arriva a ~5 GB/s
         _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)                            // un record contiguo per slot/esperto
@@ -535,7 +542,7 @@ final class ChatStore {
     /// Numero di range pread concorrenti per slab esperto. Stessi byte e stessa
     /// numerica; cambia soltanto la queue depth NVMe. Il punto migliore dipende
     /// dall'SSD e viene cercato dall'auto-tune record-holder.
-    var preadSplit: Int = (UserDefaults.standard.object(forKey: "DS4PreadSplit") as? Int) ?? 4 {
+    var preadSplit: Int = (UserDefaults.standard.object(forKey: "DS4PreadSplit") as? Int) ?? 3 {
         didSet {
             UserDefaults.standard.set(preadSplit, forKey: "DS4PreadSplit")
             _ = setenv("DS4_PREAD_SPLIT", String(preadSplit), 1)
@@ -606,20 +613,6 @@ final class ChatStore {
             _ = setenv("DS4_DENSE_Q4_NSG", String(denseQ4NSG), 1)
         }
     }
-    /// Sidecar expert-bundle (DS4_EXPERT_BUNDLE): gli slab gate/up/down di ogni
-    /// esperto riimpacchettati CONTIGUI in <gguf>.expbundle — un miss della
-    /// cache diventa un burst sequenziale da ~7 MB invece di 3 letture sparse.
-    /// MISURATO: gather 2.7 → 4.8 GB/s (79% del tetto SSD), 2.10 → 2.66 tok/s.
-    /// Stessi byte, numeriche identiche. DEFAULT ON: al load il file viene
-    /// cercato (accanto al GGUF, poi in Application Support), costruito una
-    /// tantum se assente — e SALTATO con log esplicito quando mancano i ~73 GB
-    /// liberi che il sidecar duplica su disco. Si applica al prossimo load.
-    var expertBundleEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? true {
-        didSet {
-            UserDefaults.standard.set(expertBundleEnabled, forKey: "DS4ExpertBundle")
-            _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
-        }
-    }
     /// Metal fast resource loading: batch di range dell'expert-bundle caricati
     /// direttamente negli MTLBuffer della slot cache durante il decode. Il
     /// prefill resta sul percorso pread. Default ON nel preset 16 GB misurato;
@@ -673,13 +666,6 @@ final class ChatStore {
 
 
 
-    /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
-    var bundleBuildStatus: String?
-    /// A bundle build can stream tens of gigabytes from the same GGUF/SSD used by
-    /// inference. Keep its task visible and hold the engine-activity lease until
-    /// the underlying synchronous builder has really returned.
-    var bundleBuildRunning = false
-    var bundleBuildTask: Task<Void, Never>?
 
 
     /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,

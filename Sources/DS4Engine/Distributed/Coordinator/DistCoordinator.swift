@@ -32,8 +32,8 @@ public final class DistCoordinator: @unchecked Sendable {
         public var workerCacheSlots: Int
         /// Disk-KV token budget ASSIGNed to each worker's shard (0 = disabled).
         public var diskKVBudgetTokens: Int
-        /// Workers should use the expert-bundle sidecar (the coordinator's
-        /// bundle is offered for transfer when it exists on disk).
+        /// Retained in the wire-facing configuration for compatibility.
+        /// Current coordinators always disable the removed expert bundle.
         public var useExpertBundle: Bool
         /// Workers should use the Q4 dense requant; the coordinator's cache
         /// file is offered so no worker pays the minutes-long requant again.
@@ -49,7 +49,7 @@ public final class DistCoordinator: @unchecked Sendable {
             self.returnHost = returnHost; self.returnPort = returnPort
             self.workerCacheSlots = max(0, workerCacheSlots)
             self.diskKVBudgetTokens = max(0, diskKVBudgetTokens)
-            self.useExpertBundle = useExpertBundle
+            self.useExpertBundle = false
             self.useDenseQ4 = useDenseQ4
         }
     }

@@ -57,6 +57,14 @@ enum CatalogInstallState: Equatable {
     }
 }
 
+enum CatalogUpdateState: Equatable {
+    case unknown
+    case checking
+    case current
+    case available
+    case failed(String)
+}
+
 struct InvalidCatalogArtifact {
     let path: String
     let reason: String
@@ -90,9 +98,15 @@ struct CatalogInstallation {
 final class DownloadRunner {
     private enum RunnerError: LocalizedError {
         case incompletePackage
+        case incompleteRemoteMetadata(String)
 
         var errorDescription: String? {
-            "Il download è terminato, ma uno o più file attesi non sono presenti."
+            switch self {
+            case .incompletePackage:
+                "Il download è terminato, ma uno o più file attesi non sono presenti."
+            case .incompleteRemoteMetadata(let file):
+                "Hugging Face non ha restituito SHA-256 e dimensione per \(file)."
+            }
         }
     }
 
@@ -119,12 +133,14 @@ final class DownloadRunner {
     private(set) var errors: [String: String] = [:]
     private(set) var notices: [String: String] = [:]
     private(set) var availableBytes: Int64 = 0
+    private(set) var updates: [String: CatalogUpdateState] = [:]
 
     private var searchDirectories: [URL] = []
     private var destination = AppEnvironment.modelDownloadDirectory
     private var task: Task<Void, Never>?
+    private var remoteEntries: [String: ModelCatalogEntry] = [:]
 
-    var isRunning: Bool { active != nil }
+    var isRunning: Bool { task != nil }
 
     func configure(searchDirectories: [URL], destination: URL) {
         self.destination = destination.standardizedFileURL
@@ -148,10 +164,49 @@ final class DownloadRunner {
         active?.entryID == entry.id.rawValue
     }
 
+    func updateState(for entry: ModelCatalogEntry) -> CatalogUpdateState {
+        updates[entry.id.rawValue] ?? .unknown
+    }
+
+    /// Compare catalog artifacts with the live Hugging Face manifest. The API
+    /// exposes the LFS SHA-256 and exact size, so no model payload is downloaded.
+    func checkForUpdates() {
+        guard task == nil else { return }
+        refresh()
+        let installedEntries = ModelCatalogRegistry.entries.filter {
+            installation(for: $0).state == .installed
+        }
+        guard !installedEntries.isEmpty else { return }
+        for entry in installedEntries { updates[entry.id.rawValue] = .checking }
+
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { self.task = nil }
+            for entry in installedEntries {
+                do {
+                    let refreshed = try await self.remoteEntry(for: entry)
+                    self.remoteEntries[entry.id.rawValue] = refreshed
+                    self.updates[entry.id.rawValue] = (self.matchesInstalledReceipt(refreshed)
+                        || refreshed.artifacts == entry.artifacts)
+                        ? .current : .available
+                } catch {
+                    self.updates[entry.id.rawValue] = .failed(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func installUpdate(_ entry: ModelCatalogEntry,
+                       onSelectableModel: @escaping @MainActor (String) -> Bool) {
+        guard let remote = remoteEntries[entry.id.rawValue], task == nil else { return }
+        acquire(remote, replacing: true, onSelectableModel: onSelectableModel)
+    }
+
     func refresh() {
         var next: [String: CatalogInstallation] = [:]
         for entry in ModelCatalogRegistry.entries {
-            next[entry.id.rawValue] = inspect(entry)
+            let effective = remoteEntries[entry.id.rawValue] ?? effectiveInstalledEntry(entry)
+            next[entry.id.rawValue] = inspect(effective)
         }
         installations = next
         availableBytes = Self.availableCapacity(at: destination)
@@ -164,6 +219,11 @@ final class DownloadRunner {
     /// after either the reuse or download path succeeds.
     func acquire(_ entry: ModelCatalogEntry,
                  onSelectableModel: @escaping @MainActor (String) -> Bool) {
+        acquire(entry, replacing: false, onSelectableModel: onSelectableModel)
+    }
+
+    private func acquire(_ entry: ModelCatalogEntry, replacing: Bool,
+                         onSelectableModel: @escaping @MainActor (String) -> Bool) {
         guard task == nil else { return }
         let key = entry.id.rawValue
         errors[key] = nil
@@ -172,7 +232,7 @@ final class DownloadRunner {
         let initial = inspect(entry)
         installations[key] = initial
         guard initial.state != .invalidLocalFile else { return }
-        if initial.state == .installed {
+        if initial.state == .installed && !replacing {
             if let path = selectablePath(for: entry, installation: initial) {
                 notices[key] = onSelectableModel(path)
                     ? "Già installato: è stato selezionato senza scaricarlo di nuovo."
@@ -210,13 +270,18 @@ final class DownloadRunner {
                 var downloaded = false
                 for (index, target) in entry.artifacts.enumerated() {
                     try Task.checkCancellation()
-                    if self.existingFile(for: target) != nil {
+                    let catalogTarget = ModelCatalogRegistry.entry(entry.id)?.artifacts
+                        .first(where: { $0.id == target.id })
+                    let replaceArtifact = replacing && catalogTarget != target
+                    if !replaceArtifact, self.existingFile(for: target) != nil {
                         self.updateSkippedArtifact(entry: entry, target: target, index: index)
                         continue
                     }
                     downloaded = true
-                    try await self.acquireArtifact(target, entry: entry, index: index)
+                    try await self.acquireArtifact(target, entry: entry, index: index,
+                                                   replacing: replaceArtifact)
                 }
+                self.updates[key] = .current
 
                 let installed = self.inspect(entry)
                 self.installations[key] = installed
@@ -257,7 +322,8 @@ final class DownloadRunner {
 
     private func acquireArtifact(_ target: ModelTarget,
                                  entry: ModelCatalogEntry,
-                                 index: Int) async throws {
+                                 index: Int,
+                                 replacing: Bool = false) async throws {
         let count = max(entry.artifacts.count, 1)
         active = ActiveProgress(
             entryID: entry.id.rawValue,
@@ -279,19 +345,31 @@ final class DownloadRunner {
         let relay = DownloadCallbackRelay(continuation)
         let directory = destination
         let token = HFTokenStore.load()
+        let final = try ModelDownloader.destinationURL(for: target, in: directory)
+        let backup = directory.appendingPathComponent(target.file + ".previous")
+        if replacing, FileManager.default.fileExists(atPath: final.path) {
+            guard !FileManager.default.fileExists(atPath: backup.path) else {
+                throw RunnerError.incompletePackage
+            }
+            try FileManager.default.moveItem(at: final, to: backup)
+        }
         async let result: ModelDownloadResult = {
             defer { continuation.finish() } // also finish on error/cancellation
-            return try await ModelDownloader.acquire(
-                target: target,
-                ggufDirectory: directory,
-                token: token,
-                onProgress: { progress in
-                    relay.yield(progress: progress)
-                },
-                onState: { state in
-                    relay.yield(state: state)
+            do {
+                let value = try await ModelDownloader.acquire(
+                    target: target, ggufDirectory: directory, token: token,
+                    onProgress: { relay.yield(progress: $0) },
+                    onState: { relay.yield(state: $0) })
+                if replacing { try? FileManager.default.removeItem(at: backup) }
+                return value
+            } catch {
+                if replacing,
+                   !FileManager.default.fileExists(atPath: final.path),
+                   FileManager.default.fileExists(atPath: backup.path) {
+                    try? FileManager.default.moveItem(at: backup, to: final)
                 }
-            )
+                throw error
+            }
         }()
 
         for await event in stream {
@@ -345,6 +423,102 @@ final class DownloadRunner {
             try? await Task.sleep(for: .milliseconds(125))
         }
         _ = try await result
+        rememberInstalled(target)
+    }
+
+    private static let receiptDefaultsKey = "ds4.modelArtifactReceipts.v1"
+
+    private func rememberInstalled(_ target: ModelTarget) {
+        guard let sha = target.sha256, let size = target.expectedSizeBytes else { return }
+        var receipts = UserDefaults.standard.dictionary(forKey: Self.receiptDefaultsKey)
+            as? [String: String] ?? [:]
+        receipts[target.id] = "\(sha.lowercased())|\(size)"
+        UserDefaults.standard.set(receipts, forKey: Self.receiptDefaultsKey)
+    }
+
+    private func matchesInstalledReceipt(_ entry: ModelCatalogEntry) -> Bool {
+        let receipts = UserDefaults.standard.dictionary(forKey: Self.receiptDefaultsKey)
+            as? [String: String] ?? [:]
+        return entry.artifacts.allSatisfy { target in
+            guard let sha = target.sha256, let size = target.expectedSizeBytes else { return false }
+            return receipts[target.id] == "\(sha.lowercased())|\(size)"
+        }
+    }
+
+    private func effectiveInstalledEntry(_ entry: ModelCatalogEntry) -> ModelCatalogEntry {
+        let receipts = UserDefaults.standard.dictionary(forKey: Self.receiptDefaultsKey)
+            as? [String: String] ?? [:]
+        let artifacts = entry.artifacts.map { target -> ModelTarget in
+            guard let value = receipts[target.id],
+                  let separator = value.lastIndex(of: "|"),
+                  let size = Int64(value[value.index(after: separator)...]) else { return target }
+            return ModelTarget(
+                id: target.id, file: target.file, approxGB: target.approxGB, note: target.note,
+                sha256: String(value[..<separator]), expectedSizeBytes: size,
+                role: target.role, source: target.source)
+        }
+        return ModelCatalogEntry(
+            id: entry.id, displayName: entry.displayName, profile: entry.profile,
+            summary: entry.summary, artifacts: artifacts,
+            runtimeAvailability: entry.runtimeAvailability)
+    }
+
+    private struct HFManifest: Decodable {
+        struct Sibling: Decodable {
+            /// Current HF model manifests call the digest `sha256`; older API
+            /// responses and some compatible hubs use `oid` instead.
+            struct LFS: Decodable {
+                let sha256: String?
+                let oid: String?
+                let size: Int64?
+            }
+            let rfilename: String
+            let lfs: LFS?
+            let size: Int64?
+        }
+        let siblings: [Sibling]
+    }
+
+    private func remoteEntry(for entry: ModelCatalogEntry) async throws -> ModelCatalogEntry {
+        var manifests: [HuggingFaceSource: HFManifest] = [:]
+        var artifacts: [ModelTarget] = []
+        for target in entry.artifacts {
+            let manifest: HFManifest
+            if let cached = manifests[target.source] {
+                manifest = cached
+            } else {
+                let repo = target.source.repository
+                    .split(separator: "/").map(String.init)
+                    .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? $0 }
+                    .joined(separator: "/")
+                let revision = target.source.revision
+                    .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? target.source.revision
+                var request = URLRequest(url: URL(string: "https://huggingface.co/api/models/\(repo)/revision/\(revision)?blobs=true")!)
+                if let token = HFTokenStore.load() {
+                    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                }
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    throw URLError(.badServerResponse)
+                }
+                manifest = try JSONDecoder().decode(HFManifest.self, from: data)
+                manifests[target.source] = manifest
+            }
+            guard let remote = manifest.siblings.first(where: { $0.rfilename == target.file }) else {
+                throw URLError(.fileDoesNotExist)
+            }
+            guard let digest = remote.lfs?.sha256 ?? remote.lfs?.oid,
+                  let byteCount = remote.lfs?.size ?? remote.size else {
+                throw RunnerError.incompleteRemoteMetadata(target.file)
+            }
+            artifacts.append(ModelTarget(
+                id: target.id, file: target.file, approxGB: target.approxGB, note: target.note,
+                sha256: digest, expectedSizeBytes: byteCount,
+                role: target.role, source: target.source))
+        }
+        return ModelCatalogEntry(id: entry.id, displayName: entry.displayName,
+            profile: entry.profile, summary: entry.summary, artifacts: artifacts,
+            runtimeAvailability: entry.runtimeAvailability)
     }
 
     private func updateSkippedArtifact(entry: ModelCatalogEntry,

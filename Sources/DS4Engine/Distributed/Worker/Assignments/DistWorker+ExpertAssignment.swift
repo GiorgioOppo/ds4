@@ -38,11 +38,8 @@ extension DistWorker {
         for (k, v) in assign.envKnobs where allowedKnobs.contains(k) && v.count <= 256 {
             _ = setenv(k, v, 1)
         }
-        _ = setenv("DS4_EXPERT_BUNDLE", assign.useExpertBundle ? "1" : "0", 1)
-        if assign.useExpertBundle,
-           let bundlePath = resolvedFiles[sanitizedName + ".expbundle"] {
-            _ = setenv("DS4_BUNDLE_DIR", (bundlePath as NSString).deletingLastPathComponent, 1)
-        }
+        // `useExpertBundle` is accepted only for compatibility with older
+        // coordinators; expert shards now read directly from the GGUF.
         guard claimShardLoad() else {
             try await conn.sendFrame(.error, Data("worker busy loading an expert shard".utf8))
             return

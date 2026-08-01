@@ -10,6 +10,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case server = "Server"
     case distributed = "Worker"
     case benchmark = "Benchmark"
+    case conversion = "Conversione"
     case diagnostics = "Diagnostics"
 
     var id: String { rawValue }
@@ -24,6 +25,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .server: return "server.rack"
         case .distributed: return "cpu"
         case .benchmark: return "gauge.with.dots.needle.67percent"
+        case .conversion: return "arrow.triangle.2.circlepath"
         case .diagnostics: return "stethoscope"
         }
     }
@@ -39,6 +41,7 @@ struct RootView: View {
     @State private var server: ServerController
     @State private var bench: BenchController
     @State private var diagnostics: DiagnosticsController
+    @State private var conversion = SafetensorsConversionController()
     @State private var selection: AppSection? = .chat
 
     init(store: ChatStore, settings: AppSettings, mcp: MCPStore) {
@@ -101,6 +104,8 @@ struct RootView: View {
                         WorkerView(controller: distributed)
                     case .benchmark:
                         BenchView(controller: bench)
+                    case .conversion:
+                        SafetensorsConversionView(controller: conversion)
                     case .diagnostics:
                         DiagnosticsView(controller: diagnostics)
                     }

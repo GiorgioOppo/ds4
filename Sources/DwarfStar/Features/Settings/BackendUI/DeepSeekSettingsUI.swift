@@ -116,32 +116,8 @@ private struct DeepSeekMemorySection: View {
             if store.expertPreadEnabled {
                 Stepper("Pread split: \(store.preadSplit)", value: $store.preadSplit,
                         in: 1...8, step: 1)
-                Text(store.expertBundleEnabled
-                     ? "Il bundle/MetalIO bypassa questo split durante il decode; l'auto-tune lo salta finché il bundle è ON."
-                     : "Queue depth NVMe per slab; stessi byte e stessa numerica.")
+                Text("Queue depth NVMe per slab; default 3, stessi byte e stessa numerica.")
                     .font(.caption).foregroundStyle(.secondary)
-            }
-            Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
-            if store.expertBundleEnabled {
-                Toggle("MetalIO direct SSD → GPU buffers (recommended preset)", isOn: $store.metalIOEnabled)
-                Text("Loads expert records directly into MTLBuffer cache slots. Enabled by the measured preset; automatically falls back to pread on an error or low bandwidth. Prefill continues to use parallel pread. Applies on the next model load.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Label("Reuses <model>.expbundle next to the GGUF when readable (e.g. built by the demo); otherwise the first load builds it under Application Support. Same bytes reordered so a cache miss is ONE sequential ~7 MB read (measured: gather 2.7→4.8 GB/s, +27% tok/s). Duplicates the expert region on disk (tens of GB); skipped automatically when space is short. Check the engine log for 'DS4 expbundle:' lines.",
-                      systemImage: "externaldrive.badge.plus")
-                    .font(.caption).foregroundStyle(.orange)
-                HStack(spacing: 6) {
-                    Text("Bundle dir: \(ChatStore.bundleDirectory.path)")
-                        .font(.caption2).foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
-                        .lineLimit(2)
-                    Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([ChatStore.bundleDirectory])
-                    }
-                    .font(.caption2)
-                }
-                BundleBuildButton(store: store,
-                                  idleTitle: "Generate expert bundle now",
-                                  busyTitle: "Generating expert bundle…")
             }
             Toggle("Dense-weight streaming (reads layer i+1 while computing layer i) - recommended <=16 GB", isOn: $store.denseStreamEnabled)
             Toggle("Pin hot buffers in RAM (mlock ~3.3 GB, keeps the memory compressor away)", isOn: $store.mlockEnabled)
@@ -279,27 +255,5 @@ struct DeepSeekTuningPanel: View {
         // switch cannot create a hybrid candidate or mutate UserDefaults
         // behind the run journal.
         .disabled(store.benchRunning || EngineActivityGate.shared.activeOwner == .autoTune)
-    }
-}
-
-/// Bottone di build del sidecar condiviso dai due backend (ExpertBundleTool
-/// smista da solo su bundle DeepSeek o sidecar unificato GLM).
-struct BundleBuildButton: View {
-    @Bindable var store: ChatStore
-    let idleTitle: String
-    let busyTitle: String
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Button(store.bundleBuildRunning ? busyTitle : idleTitle) {
-                store.buildExpertBundleNow()
-            }
-            .disabled(store.bundleBuildRunning || store.phase == .loading)
-            .font(.caption)
-            if let status = store.bundleBuildStatus {
-                Text(status).font(.caption2).foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-        }
     }
 }

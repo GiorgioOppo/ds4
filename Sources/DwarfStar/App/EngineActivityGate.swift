@@ -15,14 +15,12 @@ final class EngineActivityGate {
         case autoTune
         case benchmark
         case server
-        case expertBundleBuild
 
         var displayName: String {
             switch self {
             case .autoTune:  return "machine auto-tune"
             case .benchmark: return "benchmark"
             case .server:    return "local HTTP server"
-            case .expertBundleBuild: return "expert-bundle build"
             }
         }
     }

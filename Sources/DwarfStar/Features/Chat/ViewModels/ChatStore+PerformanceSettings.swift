@@ -23,14 +23,13 @@ extension ChatStore {
         prefillChunk = 2048        // leve 1-8: 4096 rende di più in demo nuda, ma con
                                    // lo stack decode i transienti stringono i 16 GB
         prefillRouteBatch = 128    // misurato 2026-07-22: 21.4 → 24.2 t/s su 2.7k reali
-        expertBundleEnabled = true
         metalIOEnabled = true      // fallback automatico a pread sotto 4.0 GB/s sul M1 Pro
         expertLookahead = 12       // A/B 2026-07-26: +9.1% decode a contesto lungo (nasconde I/O esperti sotto il compute), neutro a corto
         denseAhead = 2             // staging un layer avanti: +1,5% misurato
         asyncFFNEnabled = true     // pipeline FFN asincrona: +10% misurato, parita' certificata
         q8NSG = 4
         moeNSG = 4
-        preadSplit = 4
+        preadSplit = 3
         denseQ4NSG = 4
         if persistExplicitly {
             let d = UserDefaults.standard
@@ -48,14 +47,13 @@ extension ChatStore {
             d.set(192, forKey: "DS4PrefillUnion")
             d.set(2048, forKey: "DS4PrefillChunk")
             d.set(128, forKey: "DS4PrefillRouteBatch")
-            d.set(true, forKey: "DS4ExpertBundle")
             d.set(true, forKey: "DS4MetalIO")
             d.set(12, forKey: "DS4ExpertLookahead")
             d.set(2, forKey: "DS4DenseAhead")
             d.set(true, forKey: "DS4AsyncFFN")
             d.set(4, forKey: "DS4Q8NSG")
             d.set(4, forKey: "DS4MoeNSG")
-            d.set(4, forKey: "DS4PreadSplit")
+            d.set(3, forKey: "DS4PreadSplit")
             d.set(4, forKey: "DS4DenseQ4NSG")
             _ = setenv("DS4_RAW_RING", "1", 1)
             _ = setenv("DS4_MULTI_QUANT_CACHE", "1", 1)
@@ -70,7 +68,6 @@ extension ChatStore {
             _ = setenv("DS4_PREFILL_UNION", "192", 1)
             _ = setenv("DS4_PREFILL_CHUNK", "2048", 1)
             _ = setenv("DS4_PREFILL_ROUTE_BATCH", "128", 1)
-            _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
             _ = setenv("DS4_MTLIO", "1", 1)
             _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)
             _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)
@@ -88,7 +85,7 @@ extension ChatStore {
             _ = setenv("DS4_ASYNC_FFN", "1", 1)
             _ = setenv("DS4_Q8_NSG", "4", 1)
             _ = setenv("DS4_MOE_NSG", "4", 1)
-            _ = setenv("DS4_PREAD_SPLIT", "4", 1)
+            _ = setenv("DS4_PREAD_SPLIT", "3", 1)
             _ = setenv("DS4_DENSE_Q4_NSG", "4", 1)
         }
     }

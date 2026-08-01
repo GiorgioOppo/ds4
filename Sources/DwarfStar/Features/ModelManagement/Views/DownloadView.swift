@@ -51,9 +51,9 @@ struct DownloadView: View {
                 }
                 Spacer()
                 Button {
-                    runner.refresh()
+                    runner.checkForUpdates()
                 } label: {
-                    Label("Aggiorna", systemImage: "arrow.clockwise")
+                    Label("Controlla aggiornamenti", systemImage: "arrow.clockwise")
                 }
                 .disabled(runner.isRunning)
             }
@@ -151,6 +151,8 @@ struct DownloadView: View {
                 }
             }
 
+            updateLabel(for: entry)
+
             let packageBytes = entry.expectedSizeBytes
                 ?? Int64(entry.approximateSizeGB) * 1_000_000_000
             let estimatedRequired = ModelDownloader.requiredFreeSpace(
@@ -229,18 +231,30 @@ struct DownloadView: View {
             }
         } else if installation.state == .installed, entry.isSelectable,
                   let path = selectedPath(for: entry, installation: installation) {
-            Button {
-                selectCatalogPath(path)
-            } label: {
-                Label(isSelected ? "Selezionato" : "Seleziona",
-                      systemImage: isSelected ? "checkmark.circle.fill" : "circle")
+            HStack {
+                if runner.updateState(for: entry) == .available {
+                    Button { runner.installUpdate(entry, onSelectableModel: selectCatalogPath) } label: {
+                        Label("Aggiorna modello", systemImage: "arrow.down.circle.fill")
+                    }
+                }
+                Button { selectCatalogPath(path) } label: {
+                    Label(isSelected ? "Selezionato" : "Seleziona",
+                          systemImage: isSelected ? "checkmark.circle.fill" : "circle")
+                }
+                .disabled(isSelected || runner.isRunning)
             }
-            .disabled(isSelected || runner.isRunning)
         } else if installation.state == .installed {
-            Label("Download completo · non selezionabile",
-                  systemImage: "checkmark.circle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if runner.updateState(for: entry) == .available {
+                Button { runner.installUpdate(entry, onSelectableModel: selectCatalogPath) } label: {
+                    Label("Aggiorna pacchetto", systemImage: "arrow.down.circle.fill")
+                }
+                .disabled(runner.isRunning)
+            } else {
+                Label("Download completo · non selezionabile",
+                      systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         } else if installation.state == .invalidLocalFile,
                   let invalid = installation.invalidArtifacts.values.first {
             Button {
@@ -260,6 +274,27 @@ struct DownloadView: View {
                       systemImage: retry ? "arrow.clockwise" : "arrow.down.circle")
             }
             .disabled(runner.isRunning)
+        }
+    }
+
+    @ViewBuilder
+    private func updateLabel(for entry: ModelCatalogEntry) -> some View {
+        switch runner.updateState(for: entry) {
+        case .unknown: EmptyView()
+        case .checking:
+            Label("Controllo versione remota…", systemImage: "arrow.clockwise")
+                .font(.caption).foregroundStyle(.secondary)
+        case .current:
+            Label("Versione più recente", systemImage: "checkmark.shield")
+                .font(.caption).foregroundStyle(.green)
+        case .available:
+            Label("È disponibile una versione aggiornata del modello.",
+                  systemImage: "arrow.down.circle.fill")
+                .font(.caption).foregroundStyle(.orange)
+        case .failed(let message):
+            Label("Controllo aggiornamenti non riuscito: \(message)",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption).foregroundStyle(.orange)
         }
     }
 

@@ -57,15 +57,12 @@ messages.
 
 ## Derived artifacts
 
-`ExpertBundleTool.ensure` opens the GGUF via mmap, derives the experts'
-geometry and quantization and calls `ExpertBundle.openOrBuild`. The sidecar and
-the dense-Q4 cache are rebuildable: the GGUF always remains the primary
-source.
+The dense-Q4 cache is rebuildable; the GGUF always remains the primary source.
 
 ## Local and distributed use
 
-The local service resolves the sidecars from the configured directory. In
-distributed mode the coordinator includes the active artifacts in the manifest
+The local service resolves supported derived caches from the configured directory. In
+distributed mode the coordinator includes the active caches in the manifest
 and the worker downloads only those not already verified. The assignment
 configuration decides whether the worker must use them.
 

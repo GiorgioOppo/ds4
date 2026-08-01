@@ -164,7 +164,7 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
-            .disabled(store.benchRunning || store.bundleBuildRunning)
+            .disabled(store.benchRunning)
             backendUI.benchmarkSection()
             backendUI.memorySection()
         }

@@ -10,8 +10,6 @@ Raccoglie operazioni sul modello che non fanno parte del ciclo di inferenza.
   e GLM 5.2, artefatti e disponibilità nel runtime corrente.
 - [`Download`](Download/README.it.md): credenziali, download GGUF riprendibile e
   stato consumato dalla GUI.
-- `ExpertBundleTool.swift`: verifica o costruisce il sidecar degli esperti senza
-  caricare il decoder completo.
 - `ModelFileDiagnostics.swift`: pre-flight del percorso modello — spiega la
   causa reale di un open fallito (file assente, `.part` orfano da riprendere,
   file nella Application Support legacy invisibile alla sandbox) con il rimedio

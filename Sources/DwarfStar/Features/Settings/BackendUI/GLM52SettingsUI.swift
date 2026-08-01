@@ -120,9 +120,6 @@ private struct GLM52MemorySection: View {
             Text("Parametri del backend GLM 5.2, applicati al prossimo caricamento. Layer residenti 0 = adattivo: su RAM stretta resta al minimo dei 3 layer dense — misurato: pochi residenti extra vengono paginati dal sistema e costano ~750 ms/token di residency ai commit, più di quanto risparmino di SSD. Arena esperti: ~10 MiB per slot, più riuso nel prefill. Slot streaming: ~250 MiB l'uno (con la fusione commit il motore ne usa almeno 4). Tensori Q4 OFF = layer Q8 dal GGUF (gli esperti unificati del sidecar restano attivi: sono lossless).")
                 .font(.caption).foregroundStyle(.secondary)
             diskKVRows
-            BundleBuildButton(store: store,
-                              idleTitle: "Genera sidecar GLM ora",
-                              busyTitle: "Generazione sidecar GLM…")
             Text("Sidecar unificato (esperti contigui + tensori layer Q4), stessa politica del bundle DeepSeek: riusa quello accanto al GGUF quando già esiste (es. costruito dalla demo); altrimenti l'app lo possiede in Application Support senza toccare la cartella del modello. Ripremere riprende dal primo layer mancante; QUALSIASI sottoinsieme di layer è utile.")
                 .font(.caption).foregroundStyle(.secondary)
             if !store.modelPath.isEmpty {

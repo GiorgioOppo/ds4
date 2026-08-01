@@ -29,7 +29,7 @@ public enum DeepSeekV4BackendDefinition {
 
     public static let runtimeCapabilities: BackendCapabilities = [
         .generation, .reasoning, .tools, .diskKV,
-        .expertRouting, .expertBundle, .deepSeekPerformanceTuning,
+        .expertRouting, .deepSeekPerformanceTuning,
         .distributedPipeline, .expertParallel,
     ]
 }

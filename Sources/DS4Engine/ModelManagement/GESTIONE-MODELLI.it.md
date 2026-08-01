@@ -58,14 +58,12 @@ incluso nei messaggi di errore.
 
 ## Artefatti derivati
 
-`ExpertBundleTool.ensure` apre il GGUF in mmap, deriva geometria e
-quantizzazione degli esperti e chiama `ExpertBundle.openOrBuild`. Il sidecar e
-la cache dense-Q4 sono ricostruibili: il GGUF resta sempre la fonte primaria.
+La cache dense-Q4 è ricostruibile; il GGUF resta sempre la fonte primaria.
 
 ## Uso locale e distribuito
 
-Il servizio locale risolve i sidecar dalla directory configurata. In modalità
-distribuita il coordinator include gli artefatti attivi nel manifest e il
+Il servizio locale risolve le cache derivate supportate dalla directory configurata. In modalità
+distribuita il coordinator include le cache attive nel manifest e il
 worker scarica soltanto quelli non già verificati. La configurazione di
 assegnazione decide se il worker deve usarli.
 

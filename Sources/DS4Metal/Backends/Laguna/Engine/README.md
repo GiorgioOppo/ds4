@@ -96,6 +96,8 @@ Q8_0 signal path stays resident and the selected routed-expert slabs are
 read with `pread`/`F_NOCACHE` directly into an LRU cache of shared Metal
 buffers. Hits skip both I/O and copying. Demo and GUI default to 2,048 MiB
 while streaming (529 slots on the tested mixed GGUF);
+
+Laguna's parallel top-10 gather reaches the SSD ceiling directly from the GGUF.
 `DS4_EXPERT_CACHE_MB=3072` remains available for A/B runs and `=0`
 disables the cache. On the 16 GB M1 Pro, 3,072 MiB raises hits from 46% to
 53% and cuts gather traffic, but its memory pressure hurts both prefill and

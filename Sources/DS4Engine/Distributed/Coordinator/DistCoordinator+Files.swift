@@ -4,8 +4,7 @@ import DS4Core
 extension DistCoordinator {
     // MARK: File distribution (the workers receive everything from here)
 
-    /// The distributable file set: the gguf, plus the expert-bundle sidecar
-    /// when enabled and present (next to the gguf, else in DS4_BUNDLE_DIR).
+    /// The distributable file set: the GGUF plus supported derived caches.
     /// Hashes come from the persistent cache; the first run streams the file
     /// once to compute them (logged — it can take minutes on a 100+ GB gguf).
     func buildFileOffer(onLog: @Sendable (String) -> Void) throws -> [DistFileEntry] {
@@ -18,13 +17,6 @@ extension DistCoordinator {
             throw DistError.sliceGap("cannot read/hash the gguf at \(config.modelPath)")
         }
         var entries = [DistFileEntry(kind: .gguf, name: ggufName, size: size, sha256: sha, chain: chain)]
-        if config.useExpertBundle,
-           let bundle = findLocalPath(kind: .expertBundle),
-           let (bSize, _) = DistFileHash.stat(bundle),
-           let (bSha, bChain) = DistFileHash.cachedOrComputeWithChain(path: bundle, onLog: onLog) {
-            entries.append(DistFileEntry(kind: .expertBundle, name: ggufName + ".expbundle",
-                                         size: bSize, sha256: bSha, chain: bChain))
-        }
         // The Q4 requant cache is derived and deterministic: ~1.4 GB on the
         // wire beats minutes of re-requant on every worker.
         if config.useDenseQ4,

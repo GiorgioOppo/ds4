@@ -101,6 +101,8 @@ percorso "segnale" Q8_0 resta residente e gli slab degli esperti instradati
 vengono letti con `pread`/`F_NOCACHE` direttamente in una cache LRU di buffer
 Metal shared. Gli hit saltano completamente I/O e copia. Demo e GUI usano
 2.048 MiB per default durante lo streaming (529 slot sul GGUF misto provato);
+
+Il gather top-10 parallelo di Laguna raggiunge il tetto SSD direttamente dal GGUF.
 `DS4_EXPERT_CACHE_MB=3072` è disponibile per gli A/B e `=0` disabilita
 la cache. Sul target M1 Pro 16 GB, 3.072 MiB alza gli hit dal 46% al 53% e
 riduce il gather, ma la pressione memoria peggiora sia il prefill sia il

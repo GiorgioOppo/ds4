@@ -10,8 +10,6 @@ Gathers model operations that are not part of the inference cycle.
   GLM 5.2 catalogs, artifacts and availability in the current runtime.
 - [`Download`](Download/README.md): credentials, resumable GGUF download and
   state consumed by the GUI.
-- `ExpertBundleTool.swift`: verifies or builds the expert sidecar without
-  loading the full decoder.
 - `ModelFileDiagnostics.swift`: pre-flight of the model path — explains the
   real cause of a failed open (missing file, orphaned `.part` to resume, file
   in the legacy Application Support invisible to the sandbox) with the remedy

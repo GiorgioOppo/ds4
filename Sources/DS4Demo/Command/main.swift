@@ -1260,16 +1260,16 @@ do {
                 }
             }
             // Verdetto: banda effettiva del gather vs tetto sequenziale del disco.
-            // Sotto ~60% del tetto il sidecar expert-bundle (slab contigui) può
-            // ancora rendere; sopra, il gather è vicino alla fisica del disco e
-            // conviene puntare su hit-rate (slot) o decodifica speculativa (MTP).
+            // Sotto ~60% del tetto conviene aumentare la profondità delle pread;
+            // sopra, il gather è vicino alla fisica del disco e conviene puntare
+            // su hit-rate (slot) o decodifica speculativa (MTP).
             if dec.profile.gatherBytes > 0, dec.profile.gatherS > 0 {
                 let eff = Double(dec.profile.gatherBytes) / dec.profile.gatherS / 1e9
                 if diskCeilingGBs > 0 {
                     let pct = eff / diskCeilingGBs * 100
                     log(String(format: "  gather effettivo %.2f GB/s = %.0f%% del tetto SSD (%.2f GB/s) -> %@",
                                eff, pct, diskCeilingGBs,
-                               pct < 60 ? "margine: prova DS4_EXPERT_BUNDLE=1 (slab contigui)"
+                               pct < 60 ? "margine: prova DS4_PREAD_SPLIT=3"
                                         : "vicino alla fisica del disco: puntare su hit-rate/MTP"))
                 } else {
                     log(String(format: "  gather effettivo %.2f GB/s (banda SSD non misurata)", eff))

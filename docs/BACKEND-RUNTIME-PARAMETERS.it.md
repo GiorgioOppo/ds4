@@ -121,6 +121,7 @@ interna. Promette la stessa intenzione operativa: per esempio
 | `DS4_ACTIVE_EXPERTS` | `6` | Esperti routed realmente eseguiti. |
 | `DS4_EXPERT_CACHE_SLOTS` | `0` | Slot LRU per layer. |
 | `DS4_EXPERT_CACHE_UNIFORM` | off | Distribuzione uniforme invece che usage-aware. |
+| `DS4_EXPERT_CACHE_HOT_EVICTION` | off | A/B lossless: protegge gli esperti storicamente caldi, espellendo prima il rango più freddo e usando LRU come spareggio. |
 | `DS4_EXPERT_CACHE_NO_CLAMP` | off | Disabilita il clamp di sicurezza del pool. |
 | `DS4_MULTI_QUANT_CACHE` | off | Pool corretti per tipi quant misti. |
 | `DS4_EXPERT_BUNDLE` | off | Sidecar esperti contigui. |

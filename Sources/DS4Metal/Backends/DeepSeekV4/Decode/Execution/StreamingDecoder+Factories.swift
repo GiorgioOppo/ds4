@@ -286,36 +286,8 @@ extension StreamingDecoder {
                 offClass.insert(il)
             }
         }
-        // DS4_EXPERT_BUNDLE=1: sidecar with each expert's gate|up|down slabs
-        // CONTIGUOUS — a miss becomes one ~7 MB sequential burst instead of
-        // three scattered ~2 MB reads (measured gather at ~49% of the SSD's
-        // parallel ceiling without it). Built once next to the model; any
-        // failure falls back to the plain GGUF reads below. Same bytes.
-        let bundleEnabled = ProcessInfo.processInfo.environment["DS4_EXPERT_BUNDLE"] == "1"
-        let bundle: ExpertBundle? = bundleEnabled
-            ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
-                                       gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
-            : nil
-        // Pread splitting still matters when the sidecar is unavailable or
-        // when mixed-precision/off-class layers must fall back to the GGUF.
-        let usesDirectExpertPread = uncachedFD != nil && (bundle == nil || !offClass.isEmpty)
-        // The bundle STATE must be visible in the engine log at EVERY load —
-        // silence ("is it even on?") is the one outcome that cannot be triaged.
-        if !bundleEnabled {
-            ExpertBundle.log("disattivato (DS4_EXPERT_BUNDLE≠1) — gather dal GGUF")
-        } else if bundle == nil {
-            ExpertBundle.log("NON attivo per questo load (motivo nelle righe sopra) — gather dal GGUF")
-        }
-        let metalIORequested = ProcessInfo.processInfo.environment["DS4_MTLIO"] == "1"
-        if metalIORequested {
-            if let bundle { _ = bundle.enableMetalIO(device: rt.device) }
-            else {
-                ExpertBundle.log("DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF")
-            }
-        }
+        let usesDirectExpertPread = uncachedFD != nil
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            if !offClass.contains(il), let b = bundle,
-               let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
             return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
                                                       willNeed: willNeed, uncachedFD: uncachedFD)
         }
@@ -411,19 +383,6 @@ extension StreamingDecoder {
             slotStride = !multiCacheActive && interleave ? recordBytes : nil
             let fillOne: (Int, Int32, ExpertSlotCache.LayerPool, Int) throws -> Void = { il, id, pool, slot in
                 let layout = multiCacheActive ? layouts[il] : baseLayout
-                // Sidecar bundle first: layout del record == layout dello slot
-                // interleaved -> UNA pread; col layout storico restano i 3
-                // pread adiacenti (comunque un burst sequenziale).
-                if let b = bundle, !offClass.contains(il) {
-                    if interleave, b.copyExpertInterleaved(layer: il, id: id, dst: pool.gate,
-                                                           slot: slot, stride: layout.record) {
-                        return
-                    }
-                    if !interleave, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
-                                                 upDst: pool.up, downDst: pool.down, slot: slot) {
-                        return
-                    }
-                }
                 // The 3 slabs (gate/up/down) of a missing expert are read
                 // CONCURRENTLY: with fillAll's parallelism across misses this
                 // raises the NVMe queue depth from ~misses to ~3×misses. It
@@ -451,18 +410,7 @@ extension StreamingDecoder {
                 }
                 if let e = firstError { throw e }
             }
-            let fillBatch: ((Int, [(id: Int32, slot: Int)], ExpertSlotCache.LayerPool) throws -> Void)? =
-                metalIORequested && bundle != nil ? { il, pairs, pool in
-                    let layout = multiCacheActive ? layouts[il] : baseLayout
-                    if !offClass.contains(il), bundle!.copyExpertsMetalIO(layer: il, pairs: pairs,
-                                                   gateDst: pool.gate, upDst: pool.up, downDst: pool.down,
-                                                   slotStride: interleave ? layout.record : nil) {
-                        return
-                    }
-                    // Backend unavailable/failed: preserve the exact historical
-                    // fallback for every slot (bundle pread, then GGUF pread).
-                    for pair in pairs { try fillOne(il, pair.id, pool, pair.slot) }
-                } : nil
+            let fillBatch: ((Int, [(id: Int32, slot: Int)], ExpertSlotCache.LayerPool) throws -> Void)? = nil
             let warm: (Int) -> [Int32] = { il in
                 usage.top(layer: il, n: 128).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
             }
@@ -686,14 +634,9 @@ extension StreamingDecoder {
     // MARK: Stack di gather per lo SHARD VERTICALE (expert parallelism, D2)
 
     /// Assembla per un consumatore ESTERNO (l'expert shard del worker
-    /// verticale, modulo DS4Engine) la stessa terna del motore locale:
-    /// gather con bundle sidecar, slot-cache LRU con pool interleaved e fill
-    /// a pread concorrenti, pre-warm e allocazione per-layer dalla usage
-    /// imatrix. DUPLICA volutamente l'assemblaggio della factory locale
-    /// invece di rifattorizzarla (zero rischio di regressione sul percorso
-    /// caldo); stessa semantica degli stessi env: DS4_EXPERT_BUNDLE,
-    /// DS4_EXPERT_PREAD, DS4_WILLNEED_EXPERTS, DS4_POOL_INTERLEAVE,
-    /// DS4_EXPERT_CACHE_UNIFORM (MLOCK via `lockResident`).
+    /// verticale, modulo DS4Engine) lo stack di gather diretto dal GGUF:
+    /// slot-cache LRU, fill a pread concorrenti, pre-warm e allocazione
+    /// per-layer dalla usage imatrix.
     public static func makeExpertGatherStack(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims,
                                              nLayers: Int, slots: Int, usage: ExpertUsageStats,
                                              lockResident: Bool)
@@ -705,19 +648,7 @@ extension StreamingDecoder {
         let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
         let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
         let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
-        let bundleEnabled = env["DS4_EXPERT_BUNDLE"] == "1"
-        let bundle: ExpertBundle? = bundleEnabled
-            ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
-                                       gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
-            : nil
-        if env["DS4_MTLIO"] == "1" {
-            if let bundle { _ = bundle.enableMetalIO(device: rt.device) }
-            else {
-                ExpertBundle.log("DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF")
-            }
-        }
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
             return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
                                                       willNeed: willNeed, uncachedFD: uncachedFD)
         }
@@ -759,16 +690,6 @@ extension StreamingDecoder {
             }
         }
         let fillOne: (Int, Int32, ExpertSlotCache.LayerPool, Int) throws -> Void = { il, id, pool, slot in
-            if let b = bundle {
-                if interleave, b.copyExpertInterleaved(layer: il, id: id, dst: pool.gate,
-                                                       slot: slot, stride: recordBytes) {
-                    return
-                }
-                if !interleave, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
-                                             upDst: pool.up, downDst: pool.down, slot: slot) {
-                    return
-                }
-            }
             nonisolated(unsafe) let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
                 ("blk.\(il).ffn_gate_exps.weight", gateBytes, pool.gate),
                 ("blk.\(il).ffn_up_exps.weight", upBytes, pool.up),
@@ -789,15 +710,7 @@ extension StreamingDecoder {
             }
             if let e = firstError { throw e }
         }
-        let fillBatch: ((Int, [(id: Int32, slot: Int)], ExpertSlotCache.LayerPool) throws -> Void)? =
-            env["DS4_MTLIO"] == "1" && bundle != nil ? { il, pairs, pool in
-                if bundle!.copyExpertsMetalIO(layer: il, pairs: pairs,
-                                               gateDst: pool.gate, upDst: pool.up, downDst: pool.down,
-                                               slotStride: interleave ? recordBytes : nil) {
-                    return
-                }
-                for pair in pairs { try fillOne(il, pair.id, pool, pair.slot) }
-            } : nil
+        let fillBatch: ((Int, [(id: Int32, slot: Int)], ExpertSlotCache.LayerPool) throws -> Void)? = nil
         let cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
                                     fill: fillOne, fillBatch: fillBatch, prefetch: fillPrefetch,
            warm: { il in

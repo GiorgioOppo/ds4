@@ -64,15 +64,8 @@ extension DistWorker {
         if !appliedKnobs.isEmpty {
             onLog("knob dal coordinatore: " + appliedKnobs.joined(separator: " ") + "\n")
         }
-        // Sidecar/derived caches: coordinator-decided. The env is read at
-        // ENGINE LOAD; pointing the cache-dir vars at the transferred files'
-        // directory covers the case where the gguf resolved elsewhere (the
-        // sibling rule would miss them).
-        _ = setenv("DS4_EXPERT_BUNDLE", assign.useExpertBundle ? "1" : "0", 1)
-        if assign.useExpertBundle,
-           let bundlePath = resolvedFiles[sanitizedName + ".expbundle"] {
-            _ = setenv("DS4_BUNDLE_DIR", (bundlePath as NSString).deletingLastPathComponent, 1)
-        }
+        // `useExpertBundle` remains in the wire format for compatibility with
+        // older coordinators, but current workers intentionally ignore it.
         _ = setenv("DS4_DENSE_Q4", assign.useDenseQ4 ? "1" : "0", 1)
         if assign.useDenseQ4,
            let q4Path = resolvedFiles[sanitizedName + ".q4dense"] {
@@ -82,7 +75,7 @@ extension DistWorker {
         }
         let wanted = Assignment(resolvedModelPath: resolved, contextSize: assign.contextSize,
                                 expertCacheSlots: assign.expertCacheSlots,
-                                useExpertBundle: assign.useExpertBundle,
+                                useExpertBundle: false,
                                 useDenseQ4: assign.useDenseQ4,
                                 layerStart: assign.layerStart, layerEnd: assign.layerEnd,
                                 hasOutput: assign.hasOutput)

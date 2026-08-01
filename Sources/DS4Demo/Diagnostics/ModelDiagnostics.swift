@@ -26,7 +26,7 @@ func knobReport() -> String {
                  "DS4_RESIDENT_LAYERS", "DS4_STREAM_SLOTS",
                  "DS4_EXPERT_CACHE_UNIFORM", "DS4_MULTI_QUANT_CACHE",
                  "DS4_EXPERT_PREAD", "DS4_PREAD_SPLIT",
-                 "DS4_EXPERT_BUNDLE", "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
+                 "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
                  "DS4_EXPERT_LOOKAHEAD", "DS4_ASYNC_FFN", "DS4_ASYNC_ROUTE",
                  "DS4_PREFILL_UNION", "DS4_PREFILL_BATCH",
                  "DS4_PREFILL_MOE_BATCH", "DS4_PREFILL_FFN_BATCH",
@@ -48,7 +48,8 @@ func knobReport() -> String {
                  "DS4_MTLIO", "DS4_MTLIO_MIN_GBS", "DS4_MLOCK", "DS4_RESIDENT_COMP", "DS4_PROFILE_ROUTE", "DS4_SPEC_K", "DS4_SPEC_DRAFT", "DS4_SPEC_DRAFT_EXPERTS", "DS4_SPEC_VERIFY_BATCH", "DS4_MTP_GGUF",
                  "DS4_DEMO_TEMPERATURE", "DS4_DEMO_TOP_K", "DS4_DEMO_TOP_P", "DS4_DEMO_MIN_P",
                  "DS4_DEMO_REPEAT_PENALTY", "DS4_DEMO_REPEAT_LAST_N",
-                 "DS4_WARMUP", "DS4_USAGE_FILE", "DS4_AB_TRACE", "DS4_AB_TRACE_FRAMES"]
+                 "DS4_WARMUP", "DS4_USAGE_FILE", "DS4_AB_TRACE", "DS4_AB_TRACE_FRAMES",
+                 "DS4_EXPERT_CACHE_HOT_EVICTION", "DS4_EXPERT_CACHE_REUSE_EVICTION"]
     let env = ProcessInfo.processInfo.environment
     return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
 }

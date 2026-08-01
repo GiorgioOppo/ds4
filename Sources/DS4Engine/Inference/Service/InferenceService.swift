@@ -93,8 +93,8 @@ public actor InferenceService: DS4Logging {
         Self.log("revisione \(Self.engineRevision)")
         // Active DS4_* knobs, in the log of EVERY consumer (GUI included): "does
         // the app even see the env vars?" must be answerable from the log alone.
-        let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_MULTI_QUANT_CACHE", "DS4_EXPERT_PREAD",
-                     "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
+        let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_CACHE_HOT_EVICTION", "DS4_EXPERT_CACHE_REUSE_EVICTION", "DS4_MULTI_QUANT_CACHE", "DS4_EXPERT_PREAD",
+                     "DS4_WILLNEED_EXPERTS",
                      "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_EXPERT_LOOKAHEAD", "DS4_ASYNC_FFN", "DS4_ASYNC_ROUTE", "DS4_PREFILL_UNION",
                      "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH", "DS4_PREFILL_CHUNK",
                      "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG", "DS4_MOE_NSG", "DS4_DENSE_Q4_NSG",

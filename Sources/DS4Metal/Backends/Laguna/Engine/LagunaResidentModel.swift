@@ -81,7 +81,7 @@ public struct LagunaResidentModelOptions: Sendable {
     /// It is intentionally ignored by the direct-pread path.
     public var willNeedExperts = true
     /// Concurrent ranges per expert slab for the direct-pread path.
-    public var preadSplit = 1
+    public var preadSplit = 3
     /// Apple Metal fast resource loading for streamed expert misses. It is
     /// opt-in; any initialization or read failure falls back to pread/mmap.
     public var metalIO = false

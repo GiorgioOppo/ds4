@@ -372,7 +372,7 @@ public enum GGUFWeights {
     /// richieste in volo (il probe DS4_DIAG "random parallelo"): spezzare ogni
     /// slab in N range DISGIUNTI letti in parallelo alza la profondità di coda
     /// a parità di byte. 1 (default) = una pread per slab, percorso storico.
-    static let preadSplit = max(1, min(8, ProcessInfo.processInfo.environment["DS4_PREAD_SPLIT"].flatMap(Int.init) ?? 1))
+    static let preadSplit = max(1, min(8, ProcessInfo.processInfo.environment["DS4_PREAD_SPLIT"].flatMap(Int.init) ?? 3))
 
     /// preadFull spezzata in `parts` range disgiunti letti CONCORRENTEMENTE
     /// (stesso fd: pread ha l'offset esplicito, niente cursore condiviso).
