@@ -100,6 +100,37 @@ public enum ToolCallParser {
         return (calls, visible)
     }
 
+    /// Conservative recovery for a common low-bit model defect: every invoke
+    /// and parameter is complete, but generation ends immediately after the
+    /// final `</invoke>` and omits only the outer `</tool_calls>` envelope.
+    ///
+    /// The normal strict parser remains unchanged. Callers must supply an
+    /// explicit read-only allow-list; a write/edit/delete invocation is never
+    /// made executable by this repair path.
+    public static func parseRepairingReadOnlyEnvelope(
+        _ text: String,
+        markup m: ToolMarkup,
+        allowedToolNames: Set<String>
+    ) throws -> (calls: [ToolCall], visibleText: String) {
+        do { return try parseStrict(text, markup: m) }
+        catch let originalError {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.contains(m.callsOpen),
+                  !trimmed.contains(m.callsClose),
+                  trimmed.hasSuffix(m.invokeClose) else {
+                throw originalError
+            }
+
+            let repaired = trimmed + m.callsClose
+            let parsed = try parseStrict(repaired, markup: m)
+            guard !parsed.calls.isEmpty,
+                  parsed.calls.allSatisfy({ allowedToolNames.contains($0.name) }) else {
+                throw originalError
+            }
+            return parsed
+        }
+    }
+
     /// Defensive display cleanup: remove (possibly malformed) tool-call markup the
     /// model spelled out as plain text — a leaked ｜DSML｜ fragment or a degraded
     /// "<tool_c:…>" that did NOT parse into a real call. Cuts from the first such
@@ -197,11 +228,19 @@ public enum ToolCallParser {
         let tagEnd = try openingTagEnd(in: text, from: cursor, limit: limit)
         let tag = String(text[cursor...tagEnd])
         let attributes = try strictAttributes(in: tag, element: "parameter", markup: m)
-        guard attributes.keys.count == 2,
-              let name = attributes["name"],
-              let stringFlag = attributes["string"] else {
+        let names = Set(attributes.keys)
+        let standardShape = names == Set(["name", "string"])
+        // DeepSeek V4 occasionally substitutes the attribute name `array` for
+        // `string` while keeping the trained `false` value around a JSON array.
+        // It carries exactly the same unquoted-JSON meaning and is safe to
+        // normalize only in this two-attribute, false-valued shape.
+        let arrayAliasShape = names == Set(["name", "array"])
+            && attributes["array"] == "false"
+        guard (standardShape || arrayAliasShape),
+              let name = attributes["name"] else {
             throw StrictError.malformed("parameter requires exactly name and string attributes")
         }
+        let stringFlag = standardShape ? (attributes["string"] ?? "") : "false"
         guard isValidIdentifier(name) else {
             throw StrictError.malformed("parameter has an invalid or empty name")
         }

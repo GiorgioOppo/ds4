@@ -6,69 +6,74 @@ import DS4Core
 
 /// Lightweight Markdown renderer for assistant messages: fenced code blocks,
 /// headings, bullet/ordered lists, blockquotes, and paragraphs with inline
-/// markdown (bold/italic/`code`/links). Re-parses on each update — cheap at chat
-/// length and streaming-friendly. Avoids a dependency; AttributedString handles
-/// the inline syntax, this splits the block structure SwiftUI's Text won't.
+/// markdown (bold/italic/`code`/links). The entire answer is emitted as one
+/// attributed `Text`, so AppKit can keep a selection across paragraph and block
+/// boundaries instead of limiting it to one rendered Markdown block.
 struct MarkdownView: View {
-    let text: String
-    /// Parsed ONCE per text value (in init): SwiftUI can re-evaluate `body`
+    /// Parsed and attributed ONCE per text value (in init): SwiftUI can re-evaluate `body`
     /// several times per update, and during streaming the view is recreated
     /// at every token — parsing there made the per-token UI cost grow with
     /// the message length.
-    private let blocks: [Block]
+    private let attributedText: AttributedString
 
     init(text: String) {
-        self.text = text
-        self.blocks = Self.parse(text)
+        self.attributedText = Self.render(Self.parse(text))
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                render(block)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        Text(attributedText)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder
-    private func render(_ block: Block) -> some View {
-        switch block {
-        case .code(let code):
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(code)
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-            }
-            .padding(8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.black.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-        case .heading(let level, let s):
-            Text(Self.inline(s))
-                .font(level <= 1 ? .title3.bold() : (level == 2 ? .headline : .subheadline.bold()))
-                .textSelection(.enabled)
-        case .list(let items, let ordered):
-            VStack(alignment: .leading, spacing: 3) {
-                ForEach(Array(items.enumerated()), id: \.offset) { i, item in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(ordered ? "\(i + 1)." : "•")
-                            .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        Text(Self.inline(item)).textSelection(.enabled)
-                    }
+    /// Build one text storage for the full response. Besides enabling continuous
+    /// selection, this retains the inline Markdown attributes while applying the
+    /// block-level appearance that SwiftUI's `Text` does not infer by itself.
+    private static func render(_ blocks: [Block]) -> AttributedString {
+        var result = AttributedString()
+
+        for (blockIndex, block) in blocks.enumerated() {
+            if blockIndex > 0 { result += AttributedString("\n\n") }
+
+            switch block {
+            case .code(let code):
+                var value = AttributedString(code)
+                value.font = .system(.callout, design: .monospaced)
+                value.backgroundColor = Color.black.opacity(0.06)
+                result += value
+
+            case .heading(let level, let string):
+                var value = inline(string)
+                value.font = level <= 1
+                    ? .title3.bold()
+                    : (level == 2 ? .headline : .subheadline.bold())
+                result += value
+
+            case .list(let items, let ordered):
+                for (itemIndex, item) in items.enumerated() {
+                    if itemIndex > 0 { result += AttributedString("\n") }
+                    var marker = AttributedString(ordered ? "\(itemIndex + 1). " : "• ")
+                    marker.font = .callout.monospacedDigit()
+                    marker.foregroundColor = .secondary
+                    result += marker
+                    result += inline(item)
                 }
+
+            case .quote(let string):
+                var marker = AttributedString("│ ")
+                marker.foregroundColor = .secondary.opacity(0.5)
+                var value = inline(string)
+                value.foregroundColor = .secondary
+                result += marker
+                result += value
+
+            case .paragraph(let string):
+                result += inline(string)
             }
-        case .quote(let s):
-            Text(Self.inline(s))
-                .foregroundStyle(.secondary)
-                .padding(.leading, 10)
-                .overlay(alignment: .leading) {
-                    Rectangle().frame(width: 3).foregroundStyle(.secondary.opacity(0.4))
-                }
-        case .paragraph(let s):
-            Text(Self.inline(s)).textSelection(.enabled)
         }
+
+        return result
     }
 
     /// Inline markdown (bold/italic/code/links), whitespace preserved, never throws.
@@ -151,4 +156,3 @@ struct MarkdownView: View {
         return String(t[t.index(after: dot)...]).trimmingCharacters(in: .whitespaces)
     }
 }
-

@@ -9,11 +9,14 @@ putting the entire repository into the prompt.
 
 - `project_inspect`: preferred read-only batch surface. One bounded request can
   combine Git change scope, tree/list orientation, path/content searches, and
-  multiple source ranges (12 operations, 48,000-character hard cap).
+  multiple source ranges (24 operations, 48,000-character hard cap). `search`
+  accepts strings or `{query,path}` objects; `read` accepts paths or range
+  objects, as either a singleton or an array.
 - `project_tree`, `project_list`, `project_find`: orientation and paths.
 - `project_read`, `project_search`: bounded reads and search optionally
-  restricted to a subfolder. Retained as compatibility primitives; default
-  project agents use `project_inspect` to avoid one inference round per file.
+  restricted to a subfolder. `project_search` accepts up to eight queries in
+  one call. Retained as compatibility primitives; default project agents use
+  `project_inspect` to avoid one inference round per file.
 - `project_write`, `project_edit`: writing and exact replacement.
 - `project_reload`: index rebuild after external changes.
 

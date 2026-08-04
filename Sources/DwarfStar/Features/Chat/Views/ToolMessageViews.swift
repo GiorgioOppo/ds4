@@ -102,14 +102,25 @@ struct SubAgentView: View {
 /// The result of a tool, fed back to the model.
 struct ToolResultRow: View {
     let text: String
+    private var isMalformedCall: Bool {
+        text.hasPrefix("Chiamata tool incompleta o non valida")
+    }
+
     var body: some View {
-        Label(text, systemImage: "arrow.uturn.left")
-            .font(.system(.caption, design: .monospaced))
-            .foregroundStyle(.secondary)
-            .padding(8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.green.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: isMalformedCall ? "exclamationmark.triangle.fill" : "arrow.uturn.left")
+                .padding(.top, 1)
+            Text(text)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.system(.caption, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background((isMalformedCall ? Color.orange : Color.green).opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -135,4 +146,3 @@ struct ReasoningView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
-

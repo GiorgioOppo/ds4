@@ -208,8 +208,15 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         var visible = ""
         var toolBytes: [UInt8] = []
         var toolEmitted = 0
+        var toolBlockClosed = false
         let dsmlId = tok.dsmlId
         let lt = UInt8(ascii: "<")
+        // The ordinary answer budget must not cut a tool invocation immediately
+        // after its opener. Once a possible '<' or real DSML block is in flight,
+        // allow a bounded continuation exclusively to finish the outer block.
+        let toolTokenGrace = 2_048
+        let hardToolTokenLimit = maxTokens > Int.max - toolTokenGrace
+            ? Int.max : maxTokens + toolTokenGrace
 
         func flush(_ asReasoning: Bool) {
             guard !pending.isEmpty, let s = String(bytes: pending, encoding: .utf8) else { return }
@@ -242,7 +249,11 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         var sampleS = 0.0                          // CPU sampler (full-vocab sort at temp>0)
         var lastProgress = Date(timeIntervalSince1970: 0)
         var regimeStart: Date?                     // timestamp after token 4 (demo's REGIME cut)
-        while produced < maxTokens && pos < contextSize {
+        while pos < contextSize && (
+            produced < maxTokens
+            || ((inTool || pending.last == lt) && !toolBlockClosed
+                && produced < hardToolTokenLimit)
+        ) {
             if Task.isCancelled {
                 // A inizio giro il KV corrisponde ESATTAMENTE a committedIds
                 // (l'ultimo token generato è stato forwardato E committato):
@@ -274,6 +285,10 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             } else if inTool {
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
                 streamTool()
+                // Inspect only a small tail: the closing tag can straddle token
+                // pieces, but cannot start farther back once this token arrived.
+                let tail = String(decoding: toolBytes.suffix(256), as: UTF8.self)
+                toolBlockClosed = tail.contains(markup.callsClose)
             } else if Int32(next) == tok.thinkStartId {
                 // The model opened a reasoning block on its own (even with think
                 // off): route it to the reasoning stream, don't show the tag.
@@ -292,6 +307,7 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
             committedIds.append(next)           // the generated token is now in the KV
             pos += 1
+            if toolBlockClosed { break }
             // THROTTLED progress (max ~4/s): every yield is a MainActor hop + a
             // SwiftUI invalidation in the GUI — per-token it costs main-thread
             // time that competes with the decode's own CPU work.
@@ -346,10 +362,33 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             do {
                 calls = try ToolCallParser.parseStrict(visible + block, markup: markup).calls
             } catch {
-                // The model opened a DSML block we could not parse: surface it
-                // instead of dropping it silently. Strict parsing is deliberately
-                // all-or-nothing: a truncated write/edit call is never executed.
-                continuation.yield(.text("\n[chiamata tool incompleta o non valida: non eseguita]\n" + block))
+                // A quantized model sometimes closes every parameter and invoke
+                // but omits only the outer envelope. Recover that exact shape for
+                // the read-only batch inspector; never repair mutations.
+                if let repaired = try? ToolCallParser.parseRepairingReadOnlyEnvelope(
+                    visible + block,
+                    markup: markup,
+                    allowedToolNames: ["project_inspect"]
+                ) {
+                    calls = repaired.calls
+                    continuation.yield(.progress("chiamata project_inspect recuperata…"))
+                } else {
+                    // The model opened a DSML block we could not parse: surface it
+                    // instead of dropping it silently. Strict parsing is deliberately
+                    // all-or-nothing: a truncated write/edit call is never executed.
+                    // The raw block already travels through .toolStream and is shown
+                    // by the GUI in its own selectable card. Repeating it in .text
+                    // made stripLeakedMarkup cut at DSML and leave only a stray '<'.
+                    let stop: String
+                    if pos >= contextSize {
+                        stop = "contesto esaurito"
+                    } else if produced >= hardToolTokenLimit {
+                        stop = "limite di sicurezza della chiamata raggiunto"
+                    } else {
+                        stop = "markup incompleto o non valido"
+                    }
+                    continuation.yield(.text("\n[chiamata tool non eseguita: \(stop)]\n"))
+                }
             }
         } else {
             // Some quantized models spell DSML with ordinary BPE pieces instead

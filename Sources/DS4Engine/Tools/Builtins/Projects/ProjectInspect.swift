@@ -8,7 +8,7 @@ extension ToolRegistry {
     static let projectInspect = BuiltinTool(
         spec: ToolSpec(
             name: "project_inspect",
-            description: "Batch READ-ONLY project inspection in one call: optional Git changes, tree, folder listings, path finds, content searches, and multiple file ranges. Prefer this over one project_* call per file. At most 12 operations and 48,000 output characters.",
+            description: "Batch READ-ONLY project inspection in one call: optional Git changes, tree, folder listings, path finds, content searches, and multiple file ranges. 'search' accepts one query or an array; 'read' accepts one path or an array. Objects remain available for per-search paths and line ranges. Prefer this over multiple project_* invokes. At most 24 operations and 48,000 output characters.",
             parametersJSON: #"""
             {
               "type": "object",
@@ -37,30 +37,45 @@ extension ToolRegistry {
                   "description": "File-name/path patterns; '*' is supported."
                 },
                 "search": {
-                  "type": "array",
-                  "maxItems": 8,
+                  "type": ["array", "string", "object"],
+                  "maxItems": 16,
                   "items": {
-                    "type": "object",
-                    "properties": {
-                      "query": {"type": "string"},
-                      "path": {"type": "string", "description": "Optional relative folder or file."}
-                    },
-                    "required": ["query"]
-                  }
+                    "oneOf": [
+                      {"type": "string"},
+                      {
+                        "type": "object",
+                        "properties": {
+                          "query": {"type": "string"},
+                          "pattern": {"type": "string", "description": "Safe pattern alias: '|' means alternatives and '.*' an ordered gap."},
+                          "path": {"type": "string", "description": "Optional relative folder or file."}
+                        },
+                        "anyOf": [
+                          {"required": ["query"]},
+                          {"required": ["pattern"]}
+                        ]
+                      }
+                    ]
+                  },
+                  "description": "One query string/object, or an array mixing both (max 16). Objects allow a per-query path and accept query or safe pattern."
                 },
                 "read": {
-                  "type": "array",
-                  "maxItems": 8,
+                  "type": ["array", "string", "object"],
+                  "maxItems": 12,
                   "items": {
-                    "type": "object",
-                    "properties": {
-                      "path": {"type": "string"},
-                      "from_line": {"type": "integer", "minimum": 1},
-                      "lines": {"type": "integer", "minimum": 1, "maximum": 240}
-                    },
-                    "required": ["path"]
+                    "oneOf": [
+                      {"type": "string"},
+                      {
+                        "type": "object",
+                        "properties": {
+                          "path": {"type": "string"},
+                          "from_line": {"type": "integer", "minimum": 1},
+                          "lines": {"type": "integer", "minimum": 1, "maximum": 240}
+                        },
+                        "required": ["path"]
+                      }
+                    ]
                   },
-                  "description": "Independent indexed file ranges; default 160 lines each, hard-capped at 240."
+                  "description": "One path/range object, or an array mixing both (max 12). Plain paths use the default 160 lines; objects select from_line/lines, hard-capped at 240."
                 },
                 "max_chars": {
                   "type": "integer",
@@ -77,7 +92,7 @@ extension ToolRegistry {
 }
 
 private enum ProjectInspection {
-    private static let maxOperations = 12
+    private static let maxOperations = 24
     private static let defaultOutputCharacters = 32_000
     private static let maxOutputCharacters = 48_000
     private static let defaultReadLines = 160
@@ -118,7 +133,7 @@ private enum ProjectInspection {
 
         // Put requested source evidence before discovery output. If the global
         // character budget is reached, concrete review evidence survives.
-        for request in objectArray(args["read"]) {
+        for request in readRequests(args["read"]) {
             guard let path = request["path"] as? String, !path.isEmpty else {
                 add("Read", "Missing 'path' in read request.")
                 continue
@@ -129,15 +144,49 @@ private enum ProjectInspection {
                 ProjectCache.shared.readTool(path: path, fromLine: from, maxLines: lines))
         }
 
-        for request in objectArray(args["search"]) {
-            guard let query = request["query"] as? String, !query.isEmpty else {
-                add("Search", "Missing 'query' in search request.")
+        let requestedSearches = searchRequests(args["search"])
+        let availableSearchSlots = max(0, maxOperations - operations)
+        let executableSearches = Array(requestedSearches.prefix(availableSearchSlots))
+        omittedOperations += max(0, requestedSearches.count - executableSearches.count)
+
+        // Group equal scopes so every file is decoded/lowercased only once for
+        // all queries in that scope. Result slots restore the requested order.
+        struct SearchScope: Hashable { let path: String? }
+        var grouped: [SearchScope: [(index: Int, query: String)]] = [:]
+        var searchOutputs = [String?](repeating: nil, count: executableSearches.count)
+        for (index, request) in executableSearches.enumerated() {
+            if let query = request["query"] as? String, !query.isEmpty {
+                grouped[SearchScope(path: request["path"] as? String), default: []]
+                    .append((index, query))
+            } else if let pattern = request["pattern"] as? String, !pattern.isEmpty {
+                searchOutputs[index] = ProjectCache.shared.searchPatternTool(
+                    pattern: pattern, pathPrefix: request["path"] as? String
+                )
+            } else {
+                searchOutputs[index] = "Missing 'query' or 'pattern' in search request."
+            }
+        }
+        for (scope, group) in grouped {
+            let results = ProjectCache.shared.searchTools(
+                queries: group.map(\.query), pathPrefix: scope.path
+            )
+            for (item, result) in zip(group, results) {
+                searchOutputs[item.index] = result
+            }
+        }
+        for (index, request) in executableSearches.enumerated() {
+            let label: String
+            if let query = request["query"] as? String, !query.isEmpty {
+                label = query
+            } else if let pattern = request["pattern"] as? String, !pattern.isEmpty {
+                label = "pattern \(pattern)"
+            } else {
+                add("Search", searchOutputs[index] ?? "Missing 'query' or 'pattern' in search request.")
                 continue
             }
             let path = request["path"] as? String
             let scope = path.map { " in \($0)" } ?? ""
-            add("Search · \(query)\(scope)",
-                ProjectCache.shared.searchTool(query: query, pathPrefix: path))
+            add("Search · \(label)\(scope)", searchOutputs[index] ?? "No results for '\(label)'.")
         }
 
         for pattern in stringArray(args["find"]) {
@@ -153,7 +202,7 @@ private enum ProjectInspection {
             add("Tree · depth \(depth)", ProjectCache.shared.treeTool(maxDepth: depth))
         }
 
-        guard operations > 0 else {
+        guard !sections.isEmpty else {
             return "No inspection requested. Supply changes, tree_depth, lists, find, search, or read."
         }
         if omittedOperations > 0 {
@@ -190,7 +239,35 @@ private enum ProjectInspection {
         (value as? [Any])?.compactMap { $0 as? String } ?? []
     }
 
-    private static func objectArray(_ value: Any?) -> [[String: Any]] {
-        (value as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+    /// Models do not always agree on whether a one-item batch should be a bare
+    /// string, object, array, or even a JSON array encoded as a string. Normalize
+    /// all those shapes before executing anything; malformed strings remain
+    /// ordinary scalar values and get the usual path/query validation.
+    private static func batchElements(_ value: Any?) -> [Any] {
+        guard let value else { return [] }
+        if let array = value as? [Any] { return array }
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if (trimmed.hasPrefix("[") || trimmed.hasPrefix("{")),
+               let data = trimmed.data(using: .utf8),
+               let decoded = try? JSONSerialization.jsonObject(with: data) {
+                return batchElements(decoded)
+            }
+        }
+        return [value]
+    }
+
+    private static func readRequests(_ value: Any?) -> [[String: Any]] {
+        batchElements(value).compactMap { element in
+            if let path = element as? String { return ["path": path] }
+            return element as? [String: Any]
+        }
+    }
+
+    private static func searchRequests(_ value: Any?) -> [[String: Any]] {
+        batchElements(value).compactMap { element in
+            if let query = element as? String { return ["query": query] }
+            return element as? [String: Any]
+        }
     }
 }

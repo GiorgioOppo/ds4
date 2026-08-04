@@ -137,7 +137,7 @@ extension ChatStore {
                 messages[index].text = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
                 if !unparsed.isEmpty, messages[index].toolCalls.isEmpty {
                     messages.append(UIMessage(role: .tool,
-                        text: "✗ malformed tool call (not executed): \(String(unparsed.prefix(300)))"))
+                        text: "Chiamata tool incompleta o non valida — non eseguita.\n\nMarkup ricevuto:\n\(unparsed)"))
                 }
             }
         } catch is CancellationError {

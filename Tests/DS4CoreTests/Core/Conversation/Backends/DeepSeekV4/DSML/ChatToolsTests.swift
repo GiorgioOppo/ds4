@@ -117,6 +117,66 @@ final class ChatToolsTests: XCTestCase {
         XCTAssertEqual(calls[1].argumentsJSON, #"{"host":"a.com"}"#)
     }
 
+    /// The all-or-nothing execution parser preserves every invoke in one outer
+    /// tool_calls block, in order, so one model turn can dispatch a true batch.
+    func testParseStrictMultipleInvokesInOneBlock() throws {
+        let text = markup.callsOpen + "\n" +
+            markup.invokeOpen("project_inspect") + "\n" +
+            #"<｜DSML｜parameter name="search" string="false">["strcpy(","sprintf("]</｜DSML｜parameter>"# + "\n" +
+            #"<｜DSML｜parameter name="read" string="false">["docs/SECURITY.md","src/sudo.c"]</｜DSML｜parameter>"# + "\n" +
+            markup.invokeClose + "\n" +
+            markup.invokeOpen("now") + "\n" + markup.invokeClose + "\n" +
+            markup.callsClose
+
+        let parsed = try ToolCallParser.parseStrict(text, markup: markup)
+        XCTAssertEqual(parsed.calls.map(\.name), ["project_inspect", "now"])
+        XCTAssertEqual(parsed.calls[0].argumentsJSON,
+                       #"{"search":["strcpy(","sprintf("],"read":["docs/SECURITY.md","src/sudo.c"]}"#)
+        XCTAssertEqual(parsed.calls[1].argumentsJSON, "{}")
+    }
+
+    /// DeepSeek V4 can emit `array=false` where the protocol example says
+    /// `string=false`; the JSON body is still complete and unambiguous.
+    func testParseStrictAcceptsArrayAttributeAlias() throws {
+        let search = #"[{"path":"src","pattern":"strcpy|sprintf|open.*O_CREAT"}]"#
+        let text = markup.callsOpen +
+            markup.invokeOpen("project_inspect") +
+            "<\(markup.dsml)parameter name=\"read\" string=\"true\">docs/SECURITY.md\(markup.paramClose)" +
+            "<\(markup.dsml)parameter name=\"search\" array=\"false\">\(search)\(markup.paramClose)" +
+            "<\(markup.dsml)parameter name=\"tree_depth\" string=\"false\">3\(markup.paramClose)" +
+            markup.invokeClose + markup.callsClose
+
+        let parsed = try ToolCallParser.parseStrict(text, markup: markup)
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls[0].name, "project_inspect")
+        let data = try XCTUnwrap(parsed.calls[0].argumentsJSON.data(using: .utf8))
+        let arguments = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(arguments["read"] as? String, "docs/SECURITY.md")
+        XCTAssertEqual((arguments["tree_depth"] as? NSNumber)?.intValue, 3)
+        let searches = try XCTUnwrap(arguments["search"] as? [[String: String]])
+        XCTAssertEqual(searches, [[
+            "path": "src",
+            "pattern": "strcpy|sprintf|open.*O_CREAT",
+        ]])
+    }
+
+    func testReadOnlyEnvelopeRepairDoesNotRepairMutations() throws {
+        let inspect = markup.callsOpen + markup.invokeOpen("project_inspect") +
+            markup.invokeClose
+        let repaired = try ToolCallParser.parseRepairingReadOnlyEnvelope(
+            inspect, markup: markup, allowedToolNames: ["project_inspect"]
+        )
+        XCTAssertEqual(repaired.calls.map(\.name), ["project_inspect"])
+
+        let write = markup.callsOpen + markup.invokeOpen("file_write") +
+            markup.invokeClose
+        XCTAssertThrowsError(try ToolCallParser.parseRepairingReadOnlyEnvelope(
+            write, markup: markup, allowedToolNames: ["project_inspect"]
+        ))
+    }
+
     func testParseStrictCompleteCall() throws {
         let text = "Let me check.\n" + markup.callsOpen + "\n" +
             markup.invokeOpen("get_weather") + "\n" +

@@ -22,7 +22,10 @@ struct ContextSizeControl: View {
                 Spacer()
                 TextField("Context tokens", value: clampedValue,
                           format: .number.grouping(.never))
-                    .frame(width: 104)
+                    // Keep the complete upper-bound value (1,000,000) visible
+                    // while editing, with enough room for the caret and selection.
+                    .frame(minWidth: 160, idealWidth: 180, maxWidth: 220)
+                    .font(.body.monospacedDigit())
                     .multilineTextAlignment(.trailing)
                     .textFieldStyle(.roundedBorder)
                 Text("tokens")

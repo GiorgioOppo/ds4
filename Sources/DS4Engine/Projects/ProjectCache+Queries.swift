@@ -122,30 +122,123 @@ extension ProjectCache {
     /// `pathPrefix` restricts the search to one subfolder (or a single file) —
     /// fewer hits burned on the wrong part of the tree, faster on big projects.
     public func searchTool(query: String, pathPrefix: String? = nil) -> String {
-        let q = query.lowercased()
-        guard q.count >= 2 else { return "Query too short." }
+        searchTools(queries: [query], pathPrefix: pathPrefix).first
+            ?? "No results for '\(query)'."
+    }
+
+    /// Batch counterpart used by project_search/project_inspect. Files and lines
+    /// are decoded/lowercased once, then tested against every pending query. This
+    /// matters on a cold large repository: N queries no longer reread every file
+    /// N times from disk merely because the model batched its investigation.
+    func searchTools(queries: [String], pathPrefix: String? = nil) -> [String] {
+        guard !queries.isEmpty else { return [] }
+        let lowered = queries.map { $0.lowercased() }
+        let validIndices = lowered.indices.filter { lowered[$0].count >= 2 }
+        guard !validIndices.isEmpty else {
+            return queries.map { _ in "Query too short." }
+        }
+
         lock.lock(); var snapshot = files; lock.unlock()
         if var p = pathPrefix?.trimmingCharacters(in: .whitespaces), !p.isEmpty, p != "." {
-            guard !p.contains("..") else { return "Invalid path." }
+            guard !p.contains("..") else {
+                return lowered.indices.map { lowered[$0].count >= 2 ? "Invalid path." : "Query too short." }
+            }
             if p.hasPrefix("./") { p = String(p.dropFirst(2)) }
             let dirPrefix = p.hasSuffix("/") ? p : p + "/"
             snapshot = snapshot.filter { $0 == p || $0.hasPrefix(dirPrefix) }
-            if snapshot.isEmpty { return "No indexed files under '\(p)'." }
+            if snapshot.isEmpty {
+                return lowered.indices.map {
+                    lowered[$0].count >= 2 ? "No indexed files under '\(p)'." : "Query too short."
+                }
+            }
         }
-        var hits: [String] = []
+
+        var hits = Array(repeating: [String](), count: queries.count)
+        var pending = Set(validIndices)
         for f in snapshot {
             guard let text = searchContents(f) else { continue }
-            for (i, line) in text.components(separatedBy: "\n").enumerated()
-            where line.lowercased().contains(q) {
-                hits.append("\(f):\(i + 1): \(String(line.trimmingCharacters(in: .whitespaces).prefix(160)))")
+            for (lineIndex, line) in text.components(separatedBy: "\n").enumerated() {
+                let lowercaseLine = line.lowercased()
+                var completed: [Int] = []
+                for queryIndex in pending where lowercaseLine.contains(lowered[queryIndex]) {
+                    hits[queryIndex].append(
+                        "\(f):\(lineIndex + 1): \(String(line.trimmingCharacters(in: .whitespaces).prefix(160)))"
+                    )
+                    if hits[queryIndex].count >= Self.maxSearchHits {
+                        completed.append(queryIndex)
+                    }
+                }
+                for queryIndex in completed { pending.remove(queryIndex) }
+                if pending.isEmpty { break }
+            }
+            if pending.isEmpty { break }
+        }
+
+        return queries.indices.map { index in
+            guard lowered[index].count >= 2 else { return "Query too short." }
+            guard !hits[index].isEmpty else { return "No results for '\(queries[index])'." }
+            var output = hits[index].joined(separator: "\n")
+            if hits[index].count >= Self.maxSearchHits {
+                output += "\n... (limit of \(Self.maxSearchHits) results reached)"
+            }
+            return output
+        }
+    }
+
+    /// Safe pattern search accepted from compact project_inspect calls. This is
+    /// deliberately not a general regular-expression engine: `|` selects
+    /// alternatives and `.*` means an ordered gap. The bounded grammar covers
+    /// common security sweeps without exposing pathological-regex CPU behavior.
+    func searchPatternTool(pattern: String, pathPrefix: String? = nil) -> String {
+        let raw = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.count >= 2 else { return "Pattern too short." }
+        guard raw.count <= 1_024 else { return "Pattern too long (max 1024 characters)." }
+        let alternatives = raw.split(separator: "|", omittingEmptySubsequences: true)
+            .map { String($0).lowercased() }
+        guard !alternatives.isEmpty, alternatives.count <= 64 else {
+            return "Invalid pattern (max 64 alternatives)."
+        }
+
+        lock.lock(); var snapshot = files; lock.unlock()
+        if var path = pathPrefix?.trimmingCharacters(in: .whitespaces),
+           !path.isEmpty, path != "." {
+            guard !path.contains("..") else { return "Invalid path." }
+            if path.hasPrefix("./") { path = String(path.dropFirst(2)) }
+            let directoryPrefix = path.hasSuffix("/") ? path : path + "/"
+            snapshot = snapshot.filter { $0 == path || $0.hasPrefix(directoryPrefix) }
+            if snapshot.isEmpty { return "No indexed files under '\(path)'." }
+        }
+
+        func matches(_ line: String, _ alternative: String) -> Bool {
+            let pieces = alternative.components(separatedBy: ".*").filter { !$0.isEmpty }
+            guard !pieces.isEmpty else { return false }
+            var remainder = line[...]
+            for piece in pieces {
+                guard let range = remainder.range(of: piece) else { return false }
+                remainder = remainder[range.upperBound...]
+            }
+            return true
+        }
+
+        var hits: [String] = []
+        for file in snapshot {
+            guard let text = searchContents(file) else { continue }
+            for (lineIndex, line) in text.components(separatedBy: "\n").enumerated() {
+                let lowercaseLine = line.lowercased()
+                guard alternatives.contains(where: { matches(lowercaseLine, $0) }) else { continue }
+                hits.append(
+                    "\(file):\(lineIndex + 1): \(String(line.trimmingCharacters(in: .whitespaces).prefix(160)))"
+                )
                 if hits.count >= Self.maxSearchHits { break }
             }
             if hits.count >= Self.maxSearchHits { break }
         }
-        if hits.isEmpty { return "No results for '\(query)'." }
-        var out = hits.joined(separator: "\n")
-        if hits.count >= Self.maxSearchHits { out += "\n... (limit of \(Self.maxSearchHits) results reached)" }
-        return out
+        guard !hits.isEmpty else { return "No results for pattern '\(pattern)'." }
+        var output = hits.joined(separator: "\n")
+        if hits.count >= Self.maxSearchHits {
+            output += "\n... (limit of \(Self.maxSearchHits) results reached)"
+        }
+        return output
     }
 
     /// Load (and cache) a file's contents; nil if not in the index.

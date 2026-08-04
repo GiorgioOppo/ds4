@@ -77,6 +77,24 @@ final class ProjectCacheTests: XCTestCase {
         XCTAssertTrue(ProjectCache.shared.searchTool(query: "zzz_not_there").contains("No results"))
     }
 
+    /// project_search can amortize one inference round across several content
+    /// queries while retaining the original single-query call shape.
+    func testProjectSearchToolBatchesQueriesAndKeepsLegacyQuery() throws {
+        let tool = try XCTUnwrap(ToolRegistry.builtin(named: "project_search"))
+
+        let batch = tool.run(#"{"queries":["answer","func main","not present"],"path":"Sources"}"#)
+        XCTAssertTrue(batch.contains("## Search 1/3 · answer"), batch)
+        XCTAssertTrue(batch.contains("## Search 2/3 · func main"), batch)
+        XCTAssertTrue(batch.contains("Sources/Main.swift:1"), batch)
+        XCTAssertTrue(batch.contains("Sources/Main.swift:2"), batch)
+        XCTAssertTrue(batch.contains("No results for 'not present'"), batch)
+
+        let legacy = tool.run(#"{"query":"answer","path":"Sources"}"#)
+        XCTAssertTrue(legacy.contains("Sources/Main.swift:1"), legacy)
+        XCTAssertFalse(legacy.contains("## Search"), legacy)
+        XCTAssertTrue(tool.run("{}").contains("Missing 'queries'"))
+    }
+
     /// project_read 'lines': larger chunks on demand, hard-capped at maxReadLines.
     func testReadCustomChunk() {
         let big = ProjectCache.shared.readTool(path: "Sources/Long.txt", fromLine: 1, maxLines: 250)
@@ -162,10 +180,43 @@ final class ProjectCacheTests: XCTestCase {
         XCTAssertTrue(output.contains("## Tree · depth 2"), output)
     }
 
+    /// Compact model-friendly shorthand: strings are sufficient for whole-file
+    /// reads and unscoped searches, as either one value or a batch.
+    func testProjectInspectAcceptsStringListsAndSingletons() throws {
+        let tool = try XCTUnwrap(ToolRegistry.builtin(named: "project_inspect"))
+
+        let batch = tool.run(#"{"search":["answer","func main"],"read":["Sources/Main.swift","Sources/Long.txt"]}"#)
+        XCTAssertTrue(batch.contains("## Read · Sources/Main.swift:1+160"), batch)
+        XCTAssertTrue(batch.contains("## Read · Sources/Long.txt:1+160"), batch)
+        XCTAssertTrue(batch.contains("## Search · answer"), batch)
+        XCTAssertTrue(batch.contains("## Search · func main"), batch)
+        XCTAssertTrue(batch.contains("Sources/Main.swift:2"), batch)
+
+        let single = tool.run(#"{"search":"answer","read":"Sources/Main.swift"}"#)
+        XCTAssertTrue(single.contains("## Read · Sources/Main.swift:1+160"), single)
+        XCTAssertTrue(single.contains("## Search · answer"), single)
+
+        // Recover an array emitted with DSML's string flag by a heavily
+        // quantized model instead of treating the JSON as one invalid path.
+        let encoded = tool.run(#"{"read":"[\"Sources/Main.swift\",\"Sources/Long.txt\"]"}"#)
+        XCTAssertTrue(encoded.contains("## Read · Sources/Main.swift:1+160"), encoded)
+        XCTAssertTrue(encoded.contains("## Read · Sources/Long.txt:1+160"), encoded)
+
+        _ = ProjectCache.shared.writeFileTool(
+            path: "Sources/Security.c",
+            content: "strcpy(dst, src);\nfd = open(name, flags | O_CREAT);\n"
+        )
+        let pattern = tool.run(
+            #"{"search":[{"path":"Sources","pattern":"strcpy|sprintf|open.*O_CREAT"}]}"#
+        )
+        XCTAssertTrue(pattern.contains("Sources/Security.c:1"), pattern)
+        XCTAssertTrue(pattern.contains("Sources/Security.c:2"), pattern)
+    }
+
     func testProjectInspectRejectsEmptyAndCapsOperations() throws {
         let tool = try XCTUnwrap(ToolRegistry.builtin(named: "project_inspect"))
         XCTAssertTrue(tool.run("{}").contains("No inspection requested"))
-        let searches = (1...14).map { _ in #"{"query":"answer"}"# }.joined(separator: ",")
+        let searches = (1...26).map { _ in #"{"query":"answer"}"# }.joined(separator: ",")
         let output = tool.run(#"{"search":["# + searches + "]}")
         XCTAssertTrue(output.contains("operation(s) omitted"), output)
     }

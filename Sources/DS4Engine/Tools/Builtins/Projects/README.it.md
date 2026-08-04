@@ -9,11 +9,14 @@ inserire l'intero repository nel prompt.
 
 - `project_inspect`: superficie batch preferita e in sola lettura. Una richiesta
   limitata può combinare scope Git, albero/liste, ricerche per percorso/contenuto
-  e più intervalli sorgente (12 operazioni, tetto rigido di 48.000 caratteri).
+  e più intervalli sorgente (24 operazioni, tetto rigido di 48.000 caratteri).
+  `search` accetta stringhe od oggetti `{query,path}`; `read` accetta percorsi od
+  oggetti intervallo, sia come elemento singolo sia come array.
 - `project_tree`, `project_list`, `project_find`: orientamento e percorsi.
 - `project_read`, `project_search`: letture limitate e ricerca opzionalmente
-  ristretta a una sottocartella. Restano per compatibilità; gli agenti di
-  progetto predefiniti usano `project_inspect` per evitare un round per file.
+  ristretta a una sottocartella. `project_search` accetta fino a otto query in
+  una chiamata. Restano per compatibilità; gli agenti di progetto predefiniti
+  usano `project_inspect` per evitare un round per file.
 - `project_write`, `project_edit`: scrittura e sostituzione esatta.
 - `project_reload`: ricostruzione dell'indice dopo cambiamenti esterni.
 
