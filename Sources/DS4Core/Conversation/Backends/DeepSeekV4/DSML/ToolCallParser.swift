@@ -236,9 +236,17 @@ public enum ToolCallParser {
         // normalize only in this two-attribute, false-valued shape.
         let arrayAliasShape = names == Set(["name", "array"])
             && attributes["array"] == "false"
-        guard (standardShape || arrayAliasShape),
+        // Another compact form emitted by the model puts a JSON number directly
+        // in a `number` attribute and leaves the parameter body empty:
+        //   <parameter name="from_line" number="120"></parameter>
+        // Accept only that exact, unambiguous shape; it is canonicalized to the
+        // same non-string JSON value used by `string="false">120`.
+        let numberValueShape = names == Set(["name", "number"])
+        guard (standardShape || arrayAliasShape || numberValueShape),
               let name = attributes["name"] else {
-            throw StrictError.malformed("parameter requires exactly name and string attributes")
+            throw StrictError.malformed(
+                "parameter requires name plus string, array=false, or a numeric number attribute"
+            )
         }
         let stringFlag = standardShape ? (attributes["string"] ?? "") : "false"
         guard isValidIdentifier(name) else {
@@ -256,7 +264,20 @@ public enum ToolCallParser {
         guard !rawValue.contains(m.dsml) else {
             throw StrictError.malformed("nested DSML markup in parameter \(name)")
         }
-        let value = String(rawValue).trimmingCharacters(in: .whitespacesAndNewlines)
+        let bodyValue = String(rawValue).trimmingCharacters(in: .whitespacesAndNewlines)
+        let value: String
+        if numberValueShape {
+            guard bodyValue.isEmpty,
+                  let number = attributes["number"],
+                  isJSONNumber(number) else {
+                throw StrictError.malformed(
+                    "number-valued parameter \(name) must have an empty body and a valid JSON number"
+                )
+            }
+            value = number
+        } else {
+            value = bodyValue
+        }
         let isString = stringFlag == "true"
         if !isString {
             guard let data = value.data(using: .utf8),
@@ -387,6 +408,15 @@ public enum ToolCallParser {
         !value.isEmpty && value.allSatisfy {
             $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "."
         }
+    }
+
+    /// Strict JSON number grammar. This deliberately excludes booleans, quoted
+    /// strings, NaN/Infinity, leading zeroes, and any trailing content.
+    private static func isJSONNumber(_ value: String) -> Bool {
+        value.range(
+            of: #"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$"#,
+            options: .regularExpression
+        ) != nil
     }
 
     /// Build a JSON arguments object from parsed DSML parameters.

@@ -162,6 +162,39 @@ final class ChatToolsTests: XCTestCase {
         ]])
     }
 
+    /// DeepSeek V4 also emits numeric values in a `number` attribute with an
+    /// empty body. Multiple file reads in the same complete block remain atomic
+    /// and preserve their numeric ranges as JSON numbers.
+    func testParseStrictAcceptsNumberValueAttributeForMultipleFileReads() throws {
+        let ranges = [
+            ("plugins/sudoers/match_command.c", 120, 200),
+            ("plugins/sudoers/goodpath.c", 40, 60),
+            ("plugins/sudoers/visudo.c", 800, 820),
+            ("plugins/sudoers/env.c", 1, 50),
+        ]
+        var text = markup.callsOpen + "\n"
+        for range in ranges {
+            text += markup.invokeOpen("file_read") + "\n"
+            text += "<\(markup.dsml)parameter name=\"path\" string=\"true\">\(range.0)\(markup.paramClose)\n"
+            text += "<\(markup.dsml)parameter name=\"from_line\" number=\"\(range.1)\">\(markup.paramClose)\n"
+            text += "<\(markup.dsml)parameter name=\"to_line\" number=\"\(range.2)\">\(markup.paramClose)\n"
+            text += markup.invokeClose + "\n"
+        }
+        text += markup.callsClose
+
+        let parsed = try ToolCallParser.parseStrict(text, markup: markup)
+        XCTAssertEqual(parsed.calls.map(\.name), Array(repeating: "file_read", count: 4))
+        for (call, expected) in zip(parsed.calls, ranges) {
+            let data = try XCTUnwrap(call.argumentsJSON.data(using: .utf8))
+            let arguments = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any]
+            )
+            XCTAssertEqual(arguments["path"] as? String, expected.0)
+            XCTAssertEqual((arguments["from_line"] as? NSNumber)?.intValue, expected.1)
+            XCTAssertEqual((arguments["to_line"] as? NSNumber)?.intValue, expected.2)
+        }
+    }
+
     func testReadOnlyEnvelopeRepairDoesNotRepairMutations() throws {
         let inspect = markup.callsOpen + markup.invokeOpen("project_inspect") +
             markup.invokeClose
@@ -225,6 +258,9 @@ final class ChatToolsTests: XCTestCase {
         assertStrictRejects(head + "<\(d)parameter key=\"city\" string=\"true\">Paris\(markup.paramClose)" + tail)
         assertStrictRejects(head + "<\(d)parameter name=\"city\" string=\"yes\">Paris\(markup.paramClose)" + tail)
         assertStrictRejects(head + "<\(d)parameter name=\"days\" string=\"false\">three\(markup.paramClose)" + tail)
+        assertStrictRejects(head + "<\(d)parameter name=\"days\" number=\"01\">\(markup.paramClose)" + tail)
+        assertStrictRejects(head + "<\(d)parameter name=\"days\" number=\"3\">four\(markup.paramClose)" + tail)
+        assertStrictRejects(head + "<\(d)parameter name=\"days\" number=\"true\">\(markup.paramClose)" + tail)
     }
 
     func testParseStrictRejectsMalformedOrPartialBlocksAtomically() {
