@@ -2,13 +2,16 @@
 
 # DwarfStar/Features/Benchmark
 
-Benchmark nativi del motore condiviso. Il pannello offre due misure distinte:
+Benchmark nativi del motore condiviso. Il pannello offre tre misure distinte:
 
 - **Speed** misura throughput di prefill e generazione a contesti crescenti ed
   è disponibile sia in locale sia attraverso il coordinator distribuito;
 - **Correctness** misura quante volte il token successivo di un testo fornito
   dall'utente compare fra i primi uno, due o tre candidati del modello. Usa
-  teacher forcing ed è al momento disponibile soltanto sul motore locale.
+  teacher forcing ed è al momento disponibile soltanto sul motore locale;
+- **Checkpoint** identifica l'intero GGUF tramite SHA-256 e riesegue i vettori
+  smoke ufficiali DeepSeek del checkpoint esatto. Gli hash sconosciuti vengono
+  rifiutati invece di scegliere una fixture dal nome del file.
 
 ## Componenti
 
@@ -66,6 +69,24 @@ corti non devono avere lo stesso peso di quelli completi nella metrica globale.
 La modalità distribuita viene rifiutata esplicitamente per Correctness: il
 protocollo corrente restituisce soltanto i logits dell'ultimo token di un chunk
 e non esiste un fallback silenzioso al motore locale.
+
+## Fixture di checkpoint
+
+I manifest incorporati provengono da `antirez/ds4@b7e9f00` e contengono al
+momento i tre casi brevi dell'API ufficiale per `pre-0731` e `0731`. Il modello
+caricato viene associato a un manifest soltanto tramite un SHA-256 ammesso.
+DwarfStar usa prima la ricevuta verificata del download, poi un hash completo
+in cache legato a dimensione e data di modifica; se mancano entrambi, la prima
+esecuzione legge una volta il GGUF con I/O non cached e salva il risultato. Una
+variazione di dimensione o data invalida la cache.
+
+Gli hash di catalogo IQ2XXS, IQ2XXS/Q4_K misto e Q4_K selezionano `pre-0731`.
+Il manifest `0731` non accetta intenzionalmente alcun hash finché non viene
+fissato il digest del GGUF corrispondente: rinominare un file non può quindi
+attivarlo per errore. Ogni caso renderizza una chat senza system prompt e senza
+thinking e confronta i byte grezzi di ogni token greedy, come il runner
+upstream. La golden locale a contesto lungo non fa ancora parte di questo tier
+smoke limitato della GUI.
 
 ## Interpretazione
 

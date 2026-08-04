@@ -137,8 +137,7 @@ struct ModelLoadView: View {
             }
 
             Section("Context and System Prompt") {
-                Stepper("Context: \(store.contextSize) tokens",
-                        value: $store.contextSize, in: 1024...1_000_000, step: 1024)
+                ContextSizeControl(value: $store.contextSize)
                 Text("KV caches grow with the context actually used and take page cache away from expert streaming. Laguna starts its full-attention KV at 512 rows and grows lazily, so its configured maximum is no longer reserved at load. On low RAM, very long active conversations can still slow generation; raise the window only when needed.")
                     .font(.caption).foregroundStyle(.secondary)
                 TextField("Additional system prompt (added to the agent role)",

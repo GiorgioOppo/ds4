@@ -78,9 +78,14 @@ extension StreamingDecoder {
     /// body, then feed each layer to `importKVLayer` and release it — peak RAM
     /// is one layer's slabs, not the whole checkpoint.
     public func beginImportKV(nKeys: Int, headDim: Int, layerCount: Int) throws {
-        guard headDim == d.headDim, layerCount == nLayers, nKeys <= maxKeys else {
+        guard headDim == d.headDim, layerCount == nLayers,
+              nKeys >= 0, nKeys <= maxKeys else {
             throw KVSnapshotError.shapeMismatch
         }
+        // A disk checkpoint can jump far beyond the initial physical KV
+        // frontier. Grow all contiguous compressor caches before layer payloads
+        // are copied into them; the logical max remains the validation ceiling.
+        try prepareLiveContext(nKeys: nKeys)
     }
 
     /// Restore ONE layer (raw window + compressors). Layers outside the
@@ -143,6 +148,7 @@ extension StreamingDecoder {
               snap.stateScore.count == stateLen else {
             throw KVSnapshotError.shapeMismatch
         }
+        try c.ensureCacheCapacity(rt, requiredRows: snap.count)
         writeFloatsArray(snap.stateKv, into: c.stateKv, at: 0)
         writeFloatsArray(snap.stateScore, into: c.stateScore, at: 0)
         writeFloatsArray(snap.cacheRows, into: c.cache, at: 0)

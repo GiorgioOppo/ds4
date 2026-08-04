@@ -156,7 +156,7 @@ struct ChatView: View {
             Label(activeProjectName ?? "Project", systemImage: "folder")
         }
         .fixedSize()
-        .help("Active project for the agent's project_* tools. Importing does not touch chat memory.")
+        .help("Passed to project-capable agents on the next message. Switching preserves the visible chat and re-primes the engine with the selected project.")
         .onAppear { refreshProject() }
     }
 

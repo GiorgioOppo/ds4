@@ -47,4 +47,19 @@ final class ContextCapacityPolicyTests: XCTestCase {
             current: 1, required: 90, maximum: 100
         ), 90)
     }
+
+    func testCompressorCacheCapacityGrowsGeometricallyAndHonoursCap() {
+        XCTAssertEqual(CompressorState.grownCacheCapacity(
+            current: 136, required: 136, maximum: 250_008
+        ), 136)
+        XCTAssertEqual(CompressorState.grownCacheCapacity(
+            current: 136, required: 137, maximum: 250_008
+        ), 272)
+        XCTAssertEqual(CompressorState.grownCacheCapacity(
+            current: 272, required: 2_056, maximum: 250_008
+        ), 2_056)
+        XCTAssertEqual(CompressorState.grownCacheCapacity(
+            current: 200_000, required: 250_008, maximum: 250_008
+        ), 250_008)
+    }
 }

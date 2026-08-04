@@ -73,7 +73,7 @@ public enum ToolRegistry {
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  webSearch, webFetch, githubClone,
                                                  projectTree, projectList, projectFind,
-                                                 projectRead, projectSearch, projectReload,
+                                                 projectRead, projectSearch, projectInspect, projectReload,
                                                  projectWrite, projectEdit,
                                                  fileRead, fileLines, fileWrite, fileAdd, fileModify,
                                                  fileDelete, git,
@@ -83,7 +83,7 @@ public enum ToolRegistry {
     /// resolver drops these when no project is loaded.
     public static let projectScoped: Set<String> = [
         "project_tree", "project_list", "project_find",
-        "project_read", "project_search", "project_reload", "project_edit", "project_write",
+        "project_read", "project_search", "project_inspect", "project_reload", "project_edit", "project_write",
         "file_read", "file_lines", "file_write", "file_add", "file_modify", "file_delete", "git",
     ]
 

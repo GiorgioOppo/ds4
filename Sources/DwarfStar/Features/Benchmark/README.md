@@ -2,7 +2,7 @@
 
 # DwarfStar/Features/Benchmark
 
-Native benchmarks for the shared engine. The panel offers two distinct
+Native benchmarks for the shared engine. The panel offers three distinct
 measurements:
 
 - **Speed** measures prefill and generation throughput at increasing context
@@ -10,7 +10,10 @@ measurements:
   coordinator;
 - **Correctness** measures how often the next token of a user-provided text
   appears among the model's top one, two or three candidates. It uses teacher
-  forcing and is currently available only on the local engine.
+  forcing and is currently available only on the local engine;
+- **Checkpoint** identifies the complete GGUF by SHA-256 and replays the compact
+  official DeepSeek smoke vectors for that exact checkpoint. Unknown hashes are
+  rejected instead of selecting a fixture from the filename.
 
 ## Components
 
@@ -71,6 +74,22 @@ carry the same weight as complete ones in the global metric.
 Distributed mode is explicitly rejected for Correctness: the current protocol
 returns only the logits of the last token of a chunk, and there is no silent
 fallback to the local engine.
+
+## Checkpoint fixtures
+
+The built-in manifests come from `antirez/ds4@b7e9f00` and currently contain
+the three short official API cases for `pre-0731` and `0731`. The loaded model
+is matched to a manifest only through an allowed SHA-256. DwarfStar first uses
+a verified download receipt, then a stamp-bound cached full-file hash; if both
+are absent, the first run streams the GGUF once with uncached I/O and stores the
+result. A changed size or modification date invalidates that cache.
+
+The existing IQ2XXS, mixed IQ2XXS/Q4_K and Q4_K catalog hashes select
+`pre-0731`. The `0731` manifest intentionally has no accepted hash until the
+corresponding GGUF digest is pinned; it therefore cannot be run accidentally by
+renaming a file. Each case renders a systemless, non-thinking chat prompt and
+compares the raw bytes of every greedy token, exactly like the upstream runner.
+The long-context local golden is not part of this bounded GUI smoke tier yet.
 
 ## Interpretation
 

@@ -165,6 +165,8 @@ final class ChatStore {
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_PREAD_SPLIT", String(preadSplit), 1)                   // NVMe queue depth, auto-tune
+        _ = setenv("DS4_PREFETCH", "0", 1)                                  // A/B: compete con gather esperti e riduce tok/s
+        _ = setenv("DS4_PREFETCH_EXPERTS", "0", 1)                          // niente I/O esperti speculativo
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
@@ -814,6 +816,9 @@ final class ChatStore {
     /// visible history (the disk-KV cache restores the prefix), after which turns
     /// are incremental again.
     var enginePrimed = true
+    /// Active-project root encoded in the system prompt currently held by the
+    /// engine. A mismatch forces one history re-prime on the next send.
+    var engineProjectSignature: String?
 
     var service: InferenceService?
     /// GLM 5.2 chat service — mutually exclusive with `service`. The chat

@@ -7,12 +7,45 @@ extension StreamingDecoder {
     /// rewritten at every layer (layer i's phase B completes before layer i+1's
     /// phase A touches them) — instead of 3·n fresh Metal buffers per LAYER
     /// (43 × 512 × 3 ≈ 66k allocations per chunk).
-    struct PrefillStage {
-        let cur: [GPUTensor]     // n × nEmbd        (attn-normed FFN input)
-        let attn: [GPUTensor]    // n × nHC·nEmbd    (post-attention residual)
-        let split: [GPUTensor]   // n × 24           (HC split)
-        let ids: [GPUTensor]     // n × k Int32      (remapped ids, padded to k)
-        let rw: [GPUTensor]      // n × k Float      (route weights, 0-padded)
+    /// Reference semantics are intentional here. This object owns a large graph
+    /// of Objective-C-backed Metal buffers and is passed through many nested
+    /// prefill helpers/closures. Keeping it as a value type made optimized Swift
+    /// synthesize copies and field-by-field destroys of the whole graph; Release
+    /// builds could then destroy a copied `[GPUTensor]` with a stale MTLBuffer
+    /// reference. A stage has identity and is never copied, so model it as such.
+    final class PrefillStage {
+        /// Logical rows carved out of one Metal slab. Deliberately does not
+        /// retain an array of `GPUTensor` objects: optimized Swift used to crash
+        /// in `swift_arrayDestroy` while releasing those row-view arrays at the
+        /// end of a Release prefill. A row object is now a short-lived facade;
+        /// the single slab is the only persistent owner.
+        struct SlabRows {
+            let slab: GPUTensor
+            let count: Int
+            let rowBytes: Int
+            let rowCount: Int
+
+            init(_ rt: MetalRuntime, count: Int, rowBytes: Int,
+                 rowCount: Int) throws {
+                self.slab = try GPUTensor.zerosBytes(rt, byteLength: count * rowBytes)
+                self.count = count
+                self.rowBytes = rowBytes
+                self.rowCount = rowCount
+            }
+
+            @inline(__always)
+            subscript(index: Int) -> GPUTensor {
+                precondition(index >= 0 && index < count)
+                return slab.subview(byteOffset: index * rowBytes,
+                                    byteLength: rowBytes, count: rowCount)
+            }
+        }
+
+        let cur: SlabRows        // n × nEmbd        (attn-normed FFN input)
+        let attn: SlabRows       // n × nHC·nEmbd    (post-attention residual)
+        let split: SlabRows      // n × 24           (HC split)
+        let ids: SlabRows        // n × k Int32      (remapped ids, padded to k)
+        let rw: SlabRows         // n × k Float      (route weights, 0-padded)
         /// Whole-slab views of attn/split (the per-token entries above are row
         /// views into these): the batched phase-B tail reads residuals and HC
         /// splits as matrices (hcExpand4 with nTokens = run length).
@@ -65,7 +98,7 @@ extension StreamingDecoder {
             let pad: GPUTensor   // final partial 64-block K/V/mask padding
             let blk: GPUTensor   // mask block map (skip fully-masked tiles)
             let splitA: GPUTensor    // nq × 24 f32 slab (attention HC split)
-            let split: [GPUTensor]   // row views into splitA (per-token use)
+            let split: SlabRows      // logical row views into splitA
             /// Dense-GEMM staging (DS4_PREFILL_DENSE_MM): token-major activation
             /// matrices so every dense projection of the route reads its weights
             /// ONCE per run instead of once per token.
@@ -123,11 +156,10 @@ extension StreamingDecoder {
                 kvF16 = try .zerosBytes(rt, byteLength: sb.kvF16)
                 pad = try .zerosBytes(rt, byteLength: sb.pad)
                 blk = try .zerosBytes(rt, byteLength: sb.blk)
-                let splitSlab = try GPUTensor.zeros(rt, floatCount: nq * 24)
-                splitA = splitSlab
-                split = (0..<nq).map {
-                    splitSlab.subview(byteOffset: $0 * 24 * 4, byteLength: 24 * 4, count: 24)
-                }
+                let splitRows = try SlabRows(rt, count: nq, rowBytes: 24 * 4,
+                                             rowCount: 24)
+                splitA = splitRows.slab
+                split = splitRows
                 let hcDim = d.nHC * d.nEmbd
                 hcMat = try .zeros(rt, floatCount: nq * hcDim)
                 flatMat = try .zeros(rt, floatCount: nq * hcDim)
@@ -161,17 +193,6 @@ extension StreamingDecoder {
         }
         let flash: FlashBatch?
 
-        /// Allocate one zeroed Metal slab and expose `n` fixed-size logical
-        /// rows as GPUTensor views. Before this helper PrefillStage allocated
-        /// five MTLBuffers per prompt token (2,560 buffers at chunk=512), which
-        /// made buffer creation and Objective-C lifetime management measurable
-        /// prefill work. Views keep the same hazard-tracked shared buffer while
-        /// preserving every call site's existing GPUTensor API.
-        private static func rowViews(_ rt: MetalRuntime, n: Int,
-                                     rowBytes: Int, rowCount: Int) throws -> [GPUTensor] {
-            try slabViews(rt, n: n, rowBytes: rowBytes, rowCount: rowCount).views
-        }
-
         static func slabViews(_ rt: MetalRuntime, n: Int, rowBytes: Int,
                               rowCount: Int) throws -> (slab: GPUTensor, views: [GPUTensor]) {
             let slab = try GPUTensor.zerosBytes(rt, byteLength: n * rowBytes)
@@ -187,18 +208,18 @@ extension StreamingDecoder {
             flash = try flashBatch.flatMap { fb in
                 fb.nq >= 2 ? try FlashBatch(rt, nq: fb.nq, maxKv: fb.maxKv, d: d) : nil
             }
-            let curPair = try Self.slabViews(rt, n: n, rowBytes: d.nEmbd * 4,
-                                             rowCount: d.nEmbd)
-            curSlab = curPair.slab; cur = curPair.views
-            let attnPair = try Self.slabViews(rt, n: n, rowBytes: d.nHC * d.nEmbd * 4,
-                                              rowCount: d.nHC * d.nEmbd)
-            attnSlab = attnPair.slab; attn = attnPair.views
-            let splitPair = try Self.slabViews(rt, n: n, rowBytes: 24 * 4, rowCount: 24)
-            splitSlab = splitPair.slab; split = splitPair.views
-            let idsPair = try Self.slabViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
-            idsSlab = idsPair.slab; ids = idsPair.views
-            let rwPair = try Self.slabViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
-            rwSlab = rwPair.slab; rw = rwPair.views
+            let curRows = try SlabRows(rt, count: n, rowBytes: d.nEmbd * 4,
+                                       rowCount: d.nEmbd)
+            curSlab = curRows.slab; cur = curRows
+            let attnRows = try SlabRows(rt, count: n, rowBytes: d.nHC * d.nEmbd * 4,
+                                        rowCount: d.nHC * d.nEmbd)
+            attnSlab = attnRows.slab; attn = attnRows
+            let splitRows = try SlabRows(rt, count: n, rowBytes: 24 * 4, rowCount: 24)
+            splitSlab = splitRows.slab; split = splitRows
+            let idsRows = try SlabRows(rt, count: n, rowBytes: d.k * 4, rowCount: d.k)
+            idsSlab = idsRows.slab; ids = idsRows
+            let rwRows = try SlabRows(rt, count: n, rowBytes: d.k * 4, rowCount: d.k)
+            rwSlab = rwRows.slab; rw = rwRows
             if mmPath {
                 let onesBuf = try GPUTensor.zeros(rt, floatCount: n)
                 let op = (onesBuf.buffer.contents() + onesBuf.byteOffset)

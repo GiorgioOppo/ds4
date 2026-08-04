@@ -157,7 +157,7 @@ struct CoordinatorChatView: View {
             Label(activeProjectName ?? "Project", systemImage: "folder")
         }
         .fixedSize()
-        .help("Active project for the agent's project_* tools, executed on the coordinator.")
+        .help("Passed to project-capable agents and used by project_* tools on the coordinator.")
         .onAppear { refreshProject() }
     }
 

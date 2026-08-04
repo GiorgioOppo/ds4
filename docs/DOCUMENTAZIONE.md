@@ -352,13 +352,14 @@ result is deliberately small: a directory tree with file counts plus the
 documentation files to read first (README, root `.md` files, `docs/`).
 
 From there the model works context-frugally, the same way as with a folder
-imported from the Project tab: structure via `project_tree`/`project_list`,
-file names via `project_find`, code search via `project_search` (optionally
-scoped to a subfolder), and targeted reads via `project_read` in line-capped
-chunks. Nothing enters the conversation KV until a tool actually returns
-content, so a large repository can be analyzed without prefilling it into the
-context. `github_clone` is not grantable to sub-agents because it swaps the
-shared active project.
+imported from the Project tab. The default project agents use
+`project_inspect` to batch a read-only Git scope, structure, file-name/content
+searches, and several line-capped source ranges into one bounded result. The
+fine-grained `project_tree`/`project_find`/`project_search`/`project_read`
+primitives remain for compatibility. Nothing enters the conversation KV until
+a tool actually returns content, so a large repository can be analyzed without
+prefilling it wholesale or paying one inference round per file. `github_clone`
+is not grantable to sub-agents because it swaps the shared active project.
 
 Cloned repositories are also first-class citizens in the GUI: they appear
 automatically in the **Project tab** (and in the chat/distributed Project

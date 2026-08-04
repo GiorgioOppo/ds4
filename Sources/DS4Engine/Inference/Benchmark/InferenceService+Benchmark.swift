@@ -1041,6 +1041,492 @@ public struct BenchPoint: Sendable {
         )
     }
 
+    // MARK: - Checkpoint-bound official quality fixtures
+
+    /// Compact native-Swift representation of the official DeepSeek API smoke
+    /// vectors. The JSON is deliberately checkpoint-scoped: accepting a model
+    /// digest that belongs to another revision would turn a fixture mismatch
+    /// into a false backend regression.
+    public struct OfficialFixtureManifest: Codable, Equatable, Sendable {
+        public struct Case: Codable, Equatable, Sendable, Identifiable {
+            public let id: String
+            public let kind: String
+            public let referenceContext: Int
+            public let prompt: String
+            public let expectedTokenHex: [String]
+
+            enum CodingKeys: String, CodingKey {
+                case id, kind, prompt
+                case referenceContext = "reference_context"
+                case expectedTokenHex = "expected_token_hex"
+            }
+
+            public var expectedTokenBytes: [[UInt8]] {
+                expectedTokenHex.compactMap(Self.decodeHex)
+            }
+
+            private static func decodeHex(_ text: String) -> [UInt8]? {
+                guard !text.isEmpty, text.count.isMultiple(of: 2),
+                      text.unicodeScalars.allSatisfy({
+                          (48...57).contains($0.value)
+                              || (65...70).contains($0.value)
+                              || (97...102).contains($0.value)
+                      }) else { return nil }
+                var bytes: [UInt8] = []
+                bytes.reserveCapacity(text.count / 2)
+                var index = text.startIndex
+                while index < text.endIndex {
+                    let end = text.index(index, offsetBy: 2)
+                    guard let byte = UInt8(text[index..<end], radix: 16) else {
+                        return nil
+                    }
+                    bytes.append(byte)
+                    index = end
+                }
+                return bytes
+            }
+        }
+
+        public let schema: String
+        public let source: String
+        public let sourceCommit: String
+        public let model: String
+        public let checkpoint: String
+        public let allowedModelSHA256: [String]
+        public let cases: [Case]
+
+        enum CodingKeys: String, CodingKey {
+            case schema, source, model, checkpoint, cases
+            case sourceCommit = "source_commit"
+            case allowedModelSHA256 = "allowed_model_sha256"
+        }
+    }
+
+    public enum OfficialFixtureDigestSource: String, Sendable {
+        case downloadReceipt = "verified download receipt"
+        case fingerprintCache = "cached full-file SHA-256"
+        case fullFileHash = "fresh full-file SHA-256"
+        case supplied = "supplied SHA-256"
+    }
+
+    public struct OfficialFixtureIdentity: Equatable, Sendable {
+        public let fileName: String
+        public let sha256: String
+        public let digestSource: OfficialFixtureDigestSource
+        public let manifest: OfficialFixtureManifest
+
+        public init(fileName: String, sha256: String,
+                    digestSource: OfficialFixtureDigestSource,
+                    manifest: OfficialFixtureManifest) {
+            self.fileName = fileName
+            self.sha256 = sha256
+            self.digestSource = digestSource
+            self.manifest = manifest
+        }
+    }
+
+    public struct OfficialFixtureStepResult: Equatable, Sendable, Identifiable {
+        public let index: Int
+        public let expectedHex: String
+        public let actualTokenID: Int
+        public let actualHex: String
+        public let matches: Bool
+        public var id: Int { index }
+    }
+
+    public struct OfficialFixtureCaseResult: Equatable, Sendable, Identifiable {
+        public let id: String
+        public let promptTokens: Int
+        public let steps: [OfficialFixtureStepResult]
+        public var passed: Bool { steps.allSatisfy(\.matches) }
+        public var passedSteps: Int { steps.lazy.filter(\.matches).count }
+    }
+
+    public struct OfficialFixtureResult: Equatable, Sendable {
+        public let checkpoint: String
+        public let modelSHA256: String
+        public let digestSource: OfficialFixtureDigestSource
+        public let cases: [OfficialFixtureCaseResult]
+        public let duration: Double
+        public var passed: Bool { cases.allSatisfy(\.passed) }
+        public var totalSteps: Int { cases.reduce(0) { $0 + $1.steps.count } }
+        public var passedSteps: Int {
+            cases.reduce(0) { $0 + $1.passedSteps }
+        }
+    }
+
+    public enum OfficialFixtureError: Error, Equatable, Sendable,
+                                      CustomStringConvertible {
+        case invalidManifest(String)
+        case invalidSHA256(String)
+        case unsupportedModelDigest(String)
+        case modelFileMissing(String)
+        case modelFileNotRegular(String)
+        case contextTooSmall(required: Int, actual: Int)
+
+        public var description: String {
+            switch self {
+            case .invalidManifest(let reason):
+                return "invalid official fixture manifest: \(reason)"
+            case .invalidSHA256(let digest):
+                return "invalid model SHA-256: \(digest)"
+            case .unsupportedModelDigest(let digest):
+                return "no checkpoint fixture accepts model SHA-256 \(digest). "
+                    + "The test was stopped to avoid a cross-checkpoint result."
+            case .modelFileMissing(let path):
+                return "model file not found: \(path)"
+            case .modelFileNotRegular(let path):
+                return "model path is not a regular file: \(path)"
+            case .contextTooSmall(let required, let actual):
+                return "fixture prompt needs \(required) context tokens; "
+                    + "the loaded engine provides \(actual)"
+            }
+        }
+    }
+
+    /// Built-in fixture catalog captured from antirez/ds4 commit b7e9f00.
+    /// Only the compact official smoke vectors live here; the 140 KB local
+    /// long-context golden remains a separate future tier so ordinary GUI
+    /// checks stay bounded and the application does not ship test corpora.
+    public enum OfficialFixtureCatalog {
+        public static let sourceCommit =
+            "b7e9f0091139999b6c070a57590c447c5741da5c"
+
+        private static let pre0731JSON = #"""
+        {
+          "schema": "ds4-swift-official-logprob-v1",
+          "source": "deepseek-official-api",
+          "source_commit": "b7e9f0091139999b6c070a57590c447c5741da5c",
+          "model": "deepseek-v4-flash",
+          "checkpoint": "pre-0731",
+          "allowed_model_sha256": [
+            "efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668",
+            "edabc92af63ad8b139f00087fbfc10a4072f37b7597f4fd9ad1dfa6f83002396",
+            "a2a3b31eca06344b93d32b2095511c4d36f92739a68a599b22047b4b2335d859"
+          ],
+          "cases": [
+            {
+              "id": "short_italian_fact",
+              "kind": "short",
+              "reference_context": 16384,
+              "prompt": "Rispondi in italiano con una frase: chi era Ada Lovelace?",
+              "expected_token_hex": ["416461", "204c6f76", "656c", "616365"]
+            },
+            {
+              "id": "short_code_completion",
+              "kind": "short",
+              "reference_context": 4096,
+              "prompt": "Complete the C statement with the next exact token only:\nreturn snprintf(buf, sizeof(buf), \"%d\", value",
+              "expected_token_hex": ["606060", "63", "0a", "72657475726e"]
+            },
+            {
+              "id": "short_reasoning_plain",
+              "kind": "short",
+              "reference_context": 4096,
+              "prompt": "Answer with only the number: 2048 divided by 128 is",
+              "expected_token_hex": ["3136"]
+            }
+          ]
+        }
+        """#
+
+        private static let checkpoint0731JSON = #"""
+        {
+          "schema": "ds4-swift-official-logprob-v1",
+          "source": "deepseek-official-api",
+          "source_commit": "b7e9f0091139999b6c070a57590c447c5741da5c",
+          "model": "deepseek-v4-flash",
+          "checkpoint": "0731",
+          "allowed_model_sha256": [],
+          "cases": [
+            {
+              "id": "short_italian_fact",
+              "kind": "short",
+              "reference_context": 16384,
+              "prompt": "Rispondi in italiano con una frase: chi era Ada Lovelace?",
+              "expected_token_hex": ["416461", "204c6f76", "656c", "616365"]
+            },
+            {
+              "id": "short_code_completion",
+              "kind": "short",
+              "reference_context": 4096,
+              "prompt": "Complete the C statement with the next exact token only:\nreturn snprintf(buf, sizeof(buf), \"%d\", value",
+              "expected_token_hex": ["72657475726e"]
+            },
+            {
+              "id": "short_reasoning_plain",
+              "kind": "short",
+              "reference_context": 4096,
+              "prompt": "Answer with only the number: 2048 divided by 128 is",
+              "expected_token_hex": ["3136"]
+            }
+          ]
+        }
+        """#
+
+        public static func manifest(checkpoint: String) throws
+            -> OfficialFixtureManifest {
+            let json: String
+            switch checkpoint.lowercased() {
+            case "pre-0731": json = pre0731JSON
+            case "0731": json = checkpoint0731JSON
+            default:
+                throw OfficialFixtureError.invalidManifest(
+                    "unknown checkpoint \(checkpoint)")
+            }
+            let manifest: OfficialFixtureManifest
+            do {
+                manifest = try JSONDecoder().decode(
+                    OfficialFixtureManifest.self,
+                    from: Data(json.utf8))
+            } catch {
+                throw OfficialFixtureError.invalidManifest(error.localizedDescription)
+            }
+            try validate(manifest)
+            return manifest
+        }
+
+        public static func allManifests() throws
+            -> [OfficialFixtureManifest] {
+            try [manifest(checkpoint: "pre-0731"),
+                 manifest(checkpoint: "0731")]
+        }
+
+        public static func resolve(
+            fileName: String,
+            sha256: String,
+            digestSource: OfficialFixtureDigestSource = .supplied
+        ) throws -> OfficialFixtureIdentity {
+            let digest = sha256.lowercased()
+            guard isSHA256(digest) else {
+                throw OfficialFixtureError.invalidSHA256(sha256)
+            }
+            guard let manifest = try allManifests().first(where: {
+                $0.allowedModelSHA256.contains(digest)
+            }) else {
+                throw OfficialFixtureError.unsupportedModelDigest(digest)
+            }
+            return OfficialFixtureIdentity(
+                fileName: fileName,
+                sha256: digest,
+                digestSource: digestSource,
+                manifest: manifest)
+        }
+
+        /// Resolve a real model without trusting its filename. A verified GUI
+        /// download receipt is cheapest; otherwise a stamp-bound cached digest
+        /// is used, and the final fallback streams the complete file once with
+        /// F_NOCACHE. Task cancellation is checked between hash blocks.
+        public static func resolveModel(
+            at url: URL,
+            onProgress: (Int64, Int64) -> Void = { _, _ in }
+        ) throws -> OfficialFixtureIdentity {
+            let file = url.standardizedFileURL
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: file.path, isDirectory: &isDirectory) else {
+                throw OfficialFixtureError.modelFileMissing(file.path)
+            }
+            guard !isDirectory.boolValue,
+                  let stamp = try? fileStamp(file) else {
+                throw OfficialFixtureError.modelFileNotRegular(file.path)
+            }
+
+            let digest: String
+            let source: OfficialFixtureDigestSource
+            if let receipt = receiptDigest(fileName: file.lastPathComponent,
+                                           size: stamp.size) {
+                digest = receipt
+                source = .downloadReceipt
+                storeCachedDigest(receipt, for: file, stamp: stamp)
+            } else if let cached = cachedDigest(for: file, stamp: stamp) {
+                digest = cached
+                source = .fingerprintCache
+            } else {
+                digest = try ModelDownloader.sha256Hex(of: file) { hashed in
+                    onProgress(hashed, stamp.size)
+                }
+                source = .fullFileHash
+                storeCachedDigest(digest, for: file, stamp: stamp)
+            }
+            return try resolve(fileName: file.lastPathComponent,
+                               sha256: digest, digestSource: source)
+        }
+
+        private struct FileStamp {
+            let size: Int64
+            let modificationBits: UInt64
+        }
+
+        private static let fingerprintDefaultsKey =
+            "ds4.modelCheckpointFingerprints.v1"
+        private static let receiptDefaultsKey =
+            "ds4.modelArtifactReceipts.v1"
+
+        private static func fileStamp(_ url: URL) throws -> FileStamp {
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: url.path)
+            guard let type = attributes[.type] as? FileAttributeType,
+                  type == .typeRegular,
+                  let number = attributes[.size] as? NSNumber,
+                  let modified = attributes[.modificationDate] as? Date else {
+                throw OfficialFixtureError.modelFileNotRegular(url.path)
+            }
+            return FileStamp(
+                size: number.int64Value,
+                modificationBits: modified.timeIntervalSince1970.bitPattern)
+        }
+
+        private static func receiptDigest(fileName: String,
+                                          size: Int64) -> String? {
+            guard let target = ModelCatalogRegistry.allArtifacts.first(where: {
+                $0.file == fileName
+            }),
+            let receipts = UserDefaults.standard.dictionary(
+                forKey: receiptDefaultsKey) as? [String: String],
+            let value = receipts[target.id],
+            let separator = value.lastIndex(of: "|"),
+            let receiptSize = Int64(value[value.index(after: separator)...]),
+            receiptSize == size else { return nil }
+            let digest = String(value[..<separator]).lowercased()
+            return isSHA256(digest) ? digest : nil
+        }
+
+        private static func cachedDigest(for url: URL,
+                                         stamp: FileStamp) -> String? {
+            guard let values = UserDefaults.standard.dictionary(
+                forKey: fingerprintDefaultsKey) as? [String: String],
+                  let value = values[url.path] else { return nil }
+            let fields = value.split(separator: "|", omittingEmptySubsequences: false)
+            guard fields.count == 3,
+                  let size = Int64(fields[1]), size == stamp.size,
+                  let modified = UInt64(fields[2]),
+                  modified == stamp.modificationBits else { return nil }
+            let digest = String(fields[0]).lowercased()
+            return isSHA256(digest) ? digest : nil
+        }
+
+        private static func storeCachedDigest(_ digest: String, for url: URL,
+                                              stamp: FileStamp) {
+            var values = UserDefaults.standard.dictionary(
+                forKey: fingerprintDefaultsKey) as? [String: String] ?? [:]
+            values[url.path] = "\(digest)|\(stamp.size)|\(stamp.modificationBits)"
+            UserDefaults.standard.set(values, forKey: fingerprintDefaultsKey)
+        }
+
+        private static func isSHA256(_ digest: String) -> Bool {
+            digest.count == 64 && digest.unicodeScalars.allSatisfy {
+                (48...57).contains($0.value) || (97...102).contains($0.value)
+            }
+        }
+
+        private static func validate(_ manifest: OfficialFixtureManifest) throws {
+            guard manifest.schema == "ds4-swift-official-logprob-v1" else {
+                throw OfficialFixtureError.invalidManifest(
+                    "unsupported schema \(manifest.schema)")
+            }
+            guard manifest.sourceCommit == sourceCommit else {
+                throw OfficialFixtureError.invalidManifest(
+                    "unexpected source commit \(manifest.sourceCommit)")
+            }
+            guard manifest.model == "deepseek-v4-flash",
+                  !manifest.checkpoint.isEmpty,
+                  !manifest.cases.isEmpty else {
+                throw OfficialFixtureError.invalidManifest(
+                    "missing model, checkpoint or cases")
+            }
+            for digest in manifest.allowedModelSHA256 {
+                guard isSHA256(digest) else {
+                    throw OfficialFixtureError.invalidManifest(
+                        "invalid allowed SHA-256 \(digest)")
+                }
+            }
+            var ids = Set<String>()
+            for fixture in manifest.cases {
+                guard !fixture.id.isEmpty, ids.insert(fixture.id).inserted,
+                      !fixture.prompt.isEmpty,
+                      fixture.referenceContext > 0,
+                      !fixture.expectedTokenHex.isEmpty,
+                      fixture.expectedTokenBytes.count
+                        == fixture.expectedTokenHex.count else {
+                    throw OfficialFixtureError.invalidManifest(
+                        "invalid or duplicate case \(fixture.id)")
+                }
+            }
+        }
+    }
+
+    /// Execute the official systemless, non-thinking chat smoke vectors on the
+    /// already-loaded engine. Each next step feeds the model's greedy token,
+    /// matching the upstream runner; token pieces are compared as raw bytes so
+    /// Unicode and byte-level BPE cannot be normalized accidentally.
+    public func officialFixtureBenchmark(
+        identity: OfficialFixtureIdentity
+    ) throws -> OfficialFixtureResult {
+        let usage = decoder.usage
+        let usageSnapshot = usage?.serialize()
+        defer {
+            usage?.replace(with: usageSnapshot)
+            kvDirty = true
+        }
+
+        var caseResults: [OfficialFixtureCaseResult] = []
+        caseResults.reserveCapacity(identity.manifest.cases.count)
+        let started = Date()
+        decoder.resetProfile()
+
+        for fixture in identity.manifest.cases {
+            try Task.checkCancellation()
+            let rendered = ChatRenderer.render(
+                turns: [.user(fixture.prompt)], tools: [], think: .none,
+                markup: markup, compactTools: false)
+            let ids = tok.tokenizeRenderedChat(rendered).map(Int.init)
+            guard !ids.isEmpty, ids.count + fixture.expectedTokenHex.count
+                    <= contextSize else {
+                throw OfficialFixtureError.contextTooSmall(
+                    required: ids.count + fixture.expectedTokenHex.count,
+                    actual: contextSize)
+            }
+
+            var logits = try decoder.prefill(tokens: ids, startPos: 0)
+            var position = ids.count
+            var steps: [OfficialFixtureStepResult] = []
+            steps.reserveCapacity(fixture.expectedTokenHex.count)
+
+            for (index, expectedBytes) in fixture.expectedTokenBytes.enumerated() {
+                try Task.checkCancellation()
+                let token = Sampler.argmax(logits)
+                let actualBytes = tok.tokenText(Int32(token))
+                steps.append(OfficialFixtureStepResult(
+                    index: index,
+                    expectedHex: fixture.expectedTokenHex[index].lowercased(),
+                    actualTokenID: token,
+                    actualHex: Self.fixtureHex(actualBytes),
+                    matches: actualBytes == expectedBytes))
+                if index + 1 < fixture.expectedTokenHex.count {
+                    logits = try decoder.forward(
+                        token: token, pos: position, nKeys: position + 1)
+                    position += 1
+                }
+            }
+            caseResults.append(OfficialFixtureCaseResult(
+                id: fixture.id,
+                promptTokens: ids.count,
+                steps: steps))
+        }
+
+        return OfficialFixtureResult(
+            checkpoint: identity.manifest.checkpoint,
+            modelSHA256: identity.sha256,
+            digestSource: identity.digestSource,
+            cases: caseResults,
+            duration: Date().timeIntervalSince(started))
+    }
+
+    private nonisolated static func fixtureHex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Riscalda il motore subito dopo il load. La slot-cache degli esperti crea
     /// i pool SOLO alla prima richiesta (allocazione Metal + fill dei top-usage:
     /// ~slot × ~7 MB × layer instradati ≈ GB letti da SSD) e i percorsi

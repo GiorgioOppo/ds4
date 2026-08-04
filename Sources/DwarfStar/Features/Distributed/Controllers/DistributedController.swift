@@ -273,7 +273,8 @@ final class DistributedController {
         let index = messages.count
         messages.append(UIMessage(role: .assistant, text: ""))
 
-        let agent = selectedAgent
+        let agent = selectedAgent.withActiveProjectContext(
+            ProjectCache.shared.agentContext())
         // Immutable snapshot for the detached closure (capturing a mutable local
         // trips Swift 6 region analysis: "sending parameter risks data races").
         let sendTurns: [ChatTurn] = (agent.systemPrompt.isEmpty ? [] : [.system(agent.systemPrompt)]) + turns

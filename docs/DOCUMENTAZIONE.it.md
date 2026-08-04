@@ -382,15 +382,15 @@ tool è deliberatamente piccolo: un albero di directory con i conteggi dei file
 più i file di documentazione da leggere per primi (README, file `.md` di
 radice, `docs/`).
 
-Da lì il modello lavora in modo parsimonioso con il contesto, allo stesso modo
-di una cartella importata dalla tab Project: struttura via
-`project_tree`/`project_list`, nomi dei file via `project_find`, ricerca nel
-codice via `project_search` (facoltativamente limitata a una sottocartella) e
-letture mirate via `project_read` in blocchi con tetto di righe. Nulla entra
-nella KV della conversazione finché un tool non restituisce effettivamente
-contenuto, quindi un repository grande può essere analizzato senza prefillarlo
-nel contesto. `github_clone` non è concedibile ai sub-agent perché sostituisce
-il progetto attivo condiviso.
+Da lì il modello lavora in modo parsimonioso con il contesto, come con una
+cartella importata dalla tab Project. Gli agenti di progetto predefiniti usano
+`project_inspect` per accorpare in un solo risultato limitato lo scope Git in
+sola lettura, la struttura, le ricerche per nome/contenuto e più intervalli di
+codice. Le primitive fini `project_tree`/`project_find`/`project_search`/
+`project_read` restano per compatibilità. Nulla entra nella KV finché un tool
+non restituisce contenuto: un repository grande si analizza senza prefillarlo
+interamente e senza pagare un round di inferenza per file. `github_clone` non è
+concedibile ai sub-agent perché sostituisce il progetto attivo condiviso.
 
 I repository clonati sono anche cittadini di prima classe nella GUI: appaiono
 automaticamente nella **tab Project** (e nei menu Project della chat e della

@@ -2,6 +2,67 @@ import Foundation
 import Metal
 import DS4Core
 
+private enum PrefillPoolFailure {
+    case cancelled
+    case error(String)
+}
+
+/// Void-specialized pool boundary. Keeping this separate from the generic
+/// result carrier avoids optimized code assigning `()` through `T?`; that path
+/// produced an invalid Objective-C retain inside nested expert-group pools.
+@inline(never)
+private func withPrefillVoidAutoreleasePool(_ body: () throws -> Void) throws {
+    var failure: PrefillPoolFailure?
+    autoreleasepool {
+        do {
+            try body()
+        } catch is CancellationError {
+            failure = .cancelled
+        } catch {
+            failure = .error(String(reflecting: error))
+        }
+    }
+    switch failure {
+    case .cancelled:
+        throw CancellationError()
+    case .error(let message):
+        throw MetalError.unsupported("prefill autoreleasepool: \(message)")
+    case nil:
+        return
+    }
+}
+
+/// Foundation's throwing `autoreleasepool` can let an Objective-C-backed
+/// `Error` outlive the pool that owns its NSError box in optimized builds.
+/// Capture its text while the pool is still alive and only throw Swift value
+/// types after the drain. The explicit result slot also retains successful
+/// Objective-C-backed return values (notably GraphContext) before draining.
+@inline(never)
+private func withPrefillAutoreleasePool<T>(_ body: () throws -> T) throws -> T {
+    var output: T?
+    var failure: PrefillPoolFailure?
+    autoreleasepool {
+        do {
+            output = try body()
+        } catch is CancellationError {
+            failure = .cancelled
+        } catch {
+            failure = .error(String(reflecting: error))
+        }
+    }
+    switch failure {
+    case .cancelled:
+        throw CancellationError()
+    case .error(let message):
+        throw MetalError.unsupported("prefill autoreleasepool: \(message)")
+    case nil:
+        guard let output else {
+            throw MetalError.unsupported("prefill autoreleasepool returned no value")
+        }
+        return output
+    }
+}
+
 extension StreamingDecoder {
     /// once** (per chunk) instead of once per token, so the dominant weight I/O is
     /// amortized over all the chunk's tokens. Numerically **identical** to calling
@@ -32,7 +93,7 @@ extension StreamingDecoder {
                 // Drain the ObjC autorelease pool per chunk: Metal command buffers /
                 // encoders are autoreleased, and a long prefill inside one pool scope
                 // accumulates them all — transient footprint grows with the prompt.
-                let hiddens = try autoreleasepool {
+                let hiddens = try withPrefillAutoreleasePool {
                     try prefillRange(tokens, start: start, end: end, posBase: startPos)
                 }
                 lastHC = hiddens.last
@@ -95,7 +156,7 @@ extension StreamingDecoder {
             while start < tokens.count {
                 try Task.checkCancellation()
                 let end = min(start + step, tokens.count)
-                let hiddens = try autoreleasepool {
+                let hiddens = try withPrefillAutoreleasePool {
                     try prefillRange(tokens, start: start, end: end, posBase: startPos)
                 }
                 let overlapStart = max(start, scored.lowerBound)
@@ -180,7 +241,11 @@ extension StreamingDecoder {
         // cover the whole expert set, not just the union cap.
         let stageUnion = (prefillFullLayer && n >= prefillFullLayerMin)
             ? max(maxUnionExperts, d.nExperts) : maxUnionExperts
-        let stage: PrefillStage? = (expertGather != nil && n > 1)
+        // Default ON after the Release WMO fix in batchedExpertLayer and the
+        // slab-row ownership redesign. `=0` keeps the historical per-token
+        // phase-B path available for parity/performance diagnostics.
+        let expertBatchEnabled = ProcessInfo.processInfo.environment["DS4_PREFILL_EXPERT_BATCH"] != "0"
+        let stage: PrefillStage? = (expertBatchEnabled && expertGather != nil && n > 1)
             ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: stageUnion,
                                flashBatch: flashBatch) : nil
         // SPIA del percorso batchato: i gate del run flash hanno condizioni di
@@ -207,7 +272,7 @@ extension StreamingDecoder {
             // Per-layer pool drain: the layer weights and per-token command
             // buffers are autoreleased ObjC objects — without this they pile up
             // for the whole chunk instead of freeing at each EVICT.
-            try autoreleasepool {
+            try withPrefillVoidAutoreleasePool {
                 try Task.checkCancellation()
                 prefillLayerProgress?(i, nLayers, n)     // progresso vivo per la GUI
                 let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
@@ -264,13 +329,14 @@ extension StreamingDecoder {
         // percorso per-token; i layer non idonei (indexer attivo nella
         // finestra, quant fuori classe, activeExperts ridotti) ricadono sul
         // giro per-token storico.
-        let stage: PrefillStage? = (specVerifyBatch && n > 1 && remoteExperts == nil
+        let expertBatchEnabled = ProcessInfo.processInfo.environment["DS4_PREFILL_EXPERT_BATCH"] != "0"
+        let stage: PrefillStage? = (expertBatchEnabled && specVerifyBatch && n > 1 && remoteExperts == nil
                                     && expertGather != nil && slotCache != nil
                                     && !profileRoute && d.activeExperts >= d.k)
             ? try PrefillStage(rt, n: n, d: d, mmPath: false, maxUnion: d.k) : nil
         do {
             for i in 0..<nLayers {
-                try autoreleasepool {
+                try withPrefillVoidAutoreleasePool {
                     try Task.checkCancellation()
                     let w = try layerProvider(i)
                     if i + 1 < nLayers { prefetch?(i + 1) }
@@ -431,6 +497,12 @@ extension StreamingDecoder {
     /// Numerically identical to the per-token path (a token's FFN does not feed
     /// other tokens within the layer); only the expert I/O is deduplicated:
     /// ≤ min(6·tokens, 256) expert reads per layer instead of 6·tokens.
+    // Swift 6.3 WMO/LICM miscompiles the Objective-C-backed tensor temporaries
+    // in this very large mixed CPU/Metal routine (Release-only objc_retain at
+    // 0x100000020; Debug and the per-token fallback are stable). The actual GPU
+    // kernels remain fully optimized; this only keeps Swift's command-encoding
+    // orchestration at the reliable optimization level.
+    @_optimize(none)
     private func batchedExpertLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                                     cur: [GPUTensor], other: [GPUTensor], otherSlab: GPUTensor,
                                     n: Int, posBase: Int,
@@ -528,7 +600,7 @@ extension StreamingDecoder {
                 }
                 if iEnd - j >= 2 {
                     let t = Date()
-                    let ctx = try autoreleasepool { () -> GraphContext in
+                    let ctx = try withPrefillAutoreleasePool { () -> GraphContext in
                         try Task.checkCancellation()
                         return try encodeIndexedFlashRun(fb, i, w: w, layerRope: layerRope,
                                                          cur: cur, stage: stage,
@@ -547,7 +619,7 @@ extension StreamingDecoder {
                 // Per-token path (diagnostica DS4_PROFILE_ROUTE): reads and
                 // writes the shared scratch CPU-side — join the pipeline first.
                 drainPendingRun()
-                try autoreleasepool {
+                try withPrefillVoidAutoreleasePool {
                     try Task.checkCancellation()
                     let pos = posBase + j
                     let t = Date()
@@ -581,7 +653,7 @@ extension StreamingDecoder {
                 // intero il loro scratch; l'in-order queue serializza).
                 drainPendingRun()
                 let gEnd = min(n, j + max(1, routeBatch))
-                try autoreleasepool {
+                try withPrefillVoidAutoreleasePool {
                     try Task.checkCancellation()
                     let t = Date()
                     clearMaskIfDirty()
@@ -634,7 +706,7 @@ extension StreamingDecoder {
             if let fb = stage.flash, nqRun >= 2, nqRun <= fb.nq,
                nRawSpan <= rawRows, nRawSpan + compBound <= fb.maxKv,
                prefillDenseEligible(w) || !prefillDenseMM {
-                let ctx = try autoreleasepool { () -> GraphContext in
+                let ctx = try withPrefillAutoreleasePool { () -> GraphContext in
                     try Task.checkCancellation()
                     return try encodeFlashRun(fb, i, w: w, layerRope: layerRope, cur: cur, stage: stage,
                                               j: j, jEnd: jEnd, posBase: posBase, tokens: tokens,
@@ -662,7 +734,7 @@ extension StreamingDecoder {
                 continue
             } else {
                 drainPendingRun()
-                try autoreleasepool {
+                try withPrefillVoidAutoreleasePool {
                     try Task.checkCancellation()
                     clearMaskIfDirty()
                     let c = GraphContext(rt); try c.begin()
@@ -741,7 +813,7 @@ extension StreamingDecoder {
         var pending: PrefillGather.Pending? = nil
         defer { pending?.join() }   // never leave a background gather running on error/cancel
         for (gi, group) in groups.enumerated() {
-            try autoreleasepool {
+            try withPrefillVoidAutoreleasePool {
                 var t = Date()
                 let g: GPUTensor, u: GPUTensor, dn: GPUTensor
                 if let p = pending {
@@ -830,22 +902,28 @@ extension StreamingDecoder {
                         var remapped = idsT[j].map { posOf[$0]! }
                         var weights = rwT[j]
                         while remapped.count < d.k { remapped.append(0); weights.append(0) }
+                        let idsRow = stage.ids[j]
+                        let rwRow = stage.rw[j]
                         remapped.withUnsafeBytes {
                             _ = memcpy(
-                                stage.ids[j].buffer.contents()
-                                    + stage.ids[j].byteOffset,
+                                idsRow.buffer.contents() + idsRow.byteOffset,
                                 $0.baseAddress!, $0.count)
                         }
-                        writeFloats(weights, into: stage.rw[j])
+                        writeFloats(weights, into: rwRow)
                     }
                     try Task.checkCancellation()
                     t = Date()
                     let c2 = GraphContext(rt); try c2.begin()
                     for j in group.tokens {
+                        let idsRow = stage.ids[j]
+                        let curRow = stage.cur[j]
+                        let attnRow = stage.attn[j]
+                        let splitRow = stage.split[j]
+                        let rwRow = stage.rw[j]
                         try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                             ids: stage.ids[j], outHc: other[j], activeK: d.k,
-                                             cur: stage.cur[j], afterAttn: stage.attn[j],
-                                             split: stage.split[j], rw: stage.rw[j])
+                                             ids: idsRow, outHc: other[j], activeK: d.k,
+                                             cur: curRow, afterAttn: attnRow,
+                                             split: splitRow, rw: rwRow)
                     }
                     c2.commit()
                     profile.expertsS += Date().timeIntervalSince(t)
@@ -986,7 +1064,7 @@ extension StreamingDecoder {
         // the slab AFTER the commit (same data the readback produced).
         if residentIds {
             var t2 = Date()
-            try autoreleasepool {
+            try withPrefillVoidAutoreleasePool {
                 try fullLayerMMRun(w: w, other: other, otherSlab: otherSlab,
                                    stage: stage, idsT: idsT, rwT: rwT,
                                    gate: g, up: u, down: dn, tokens: 0..<n, nExperts: nE,
@@ -1018,7 +1096,7 @@ extension StreamingDecoder {
             var j1 = j0 + 1
             while j1 < n && (mmOK && idsT[j1].count == d.k) == mmRun { j1 += 1 }
             t = Date()
-            try autoreleasepool {
+            try withPrefillVoidAutoreleasePool {
                 if mmRun && j1 - j0 >= 8 {
                     // `act` MUST follow the slabDirect source: with the
                     // snapshot blits gone, mm.curMat is stale (the resident
@@ -1529,6 +1607,8 @@ extension StreamingDecoder {
         let e0 = ((posFirst + ratio) / ratio) * ratio - 1
         let nEmit = e0 > posLast ? 0 : (posLast - e0) / ratio + 1
         if nEmit > 0 {
+            precondition(comp.count + nEmit <= comp.cacheCapacity,
+                         "compressor cache: prefill oltre la capacita' fisica")
             try c.compPoolBatchEnc(kv: fb.compCombKv, sc: fb.compCombSc, out: fb.compPooled,
                                    headDim: h, width: width, ratio: ratio, win: win,
                                    nEmit: nEmit, firstRow: e0 - p0)

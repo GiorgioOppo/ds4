@@ -32,6 +32,26 @@ final class ProjectCacheTests: XCTestCase {
         XCTAssertEqual(info?.fileCount, 2)            // .git/config excluded
     }
 
+    func testActiveProjectContextIsInjectedIntoProjectAgents() throws {
+        let context = try XCTUnwrap(ProjectCache.shared.agentContext())
+        XCTAssertEqual(context.name, root.lastPathComponent)
+        XCTAssertEqual(context.rootPath, root.standardizedFileURL.path)
+        XCTAssertEqual(context.fileCount, 2)
+        XCTAssertTrue(context.systemInstruction.contains("ACTIVE PROJECT SELECTED IN THE GUI"))
+        XCTAssertTrue(context.systemInstruction.contains("Do not ask which project"))
+
+        let coding = try XCTUnwrap(AgentProfile.defaults.first { $0.id == "coding" })
+        let scoped = coding.withActiveProjectContext(context)
+        XCTAssertTrue(scoped.systemPrompt.contains(context.rootPath))
+        XCTAssertTrue(scoped.systemPrompt.contains("project_inspect"))
+
+        let general = try XCTUnwrap(AgentProfile.defaults.first { $0.id == "generale" })
+        XCTAssertEqual(general.withActiveProjectContext(context), general)
+
+        ProjectCache.shared.clear()
+        XCTAssertNil(ProjectCache.shared.agentContext())
+    }
+
     func testList() {
         let rootList = ProjectCache.shared.listTool(path: "")
         XCTAssertTrue(rootList.contains("Sources/"))
@@ -113,8 +133,41 @@ final class ProjectCacheTests: XCTestCase {
     func testToolsAreRegistered() {
         let names = Set(ToolRegistry.builtins.map(\.spec.name))
         XCTAssertTrue(names.isSuperset(of: ["project_tree", "project_list", "project_find",
-                                            "project_read", "project_search", "project_reload",
+                                            "project_read", "project_search", "project_inspect", "project_reload",
                                             "file_delete"]))
+    }
+
+    /// One model round can carry independent orientation, search, and source
+    /// evidence. The sectioned response remains easy to cite during a review.
+    func testProjectInspectBatchesIndependentOperations() throws {
+        let arguments = #"""
+        {
+          "tree_depth": 2,
+          "find": ["*.swift"],
+          "search": [{"query": "answer", "path": "Sources"}],
+          "read": [
+            {"path": "Sources/Main.swift", "from_line": 1, "lines": 2},
+            {"path": "Sources/Long.txt", "from_line": 121, "lines": 2}
+          ]
+        }
+        """#
+        let tool = try XCTUnwrap(ToolRegistry.builtin(named: "project_inspect"))
+        let output = tool.run(arguments)
+        XCTAssertTrue(output.contains("## Read · Sources/Main.swift:1+2"), output)
+        XCTAssertTrue(output.contains("1\tlet answer = 42"), output)
+        XCTAssertTrue(output.contains("121\tline 121"), output)
+        XCTAssertTrue(output.contains("## Search · answer in Sources"), output)
+        XCTAssertTrue(output.contains("Sources/Main.swift:1"), output)
+        XCTAssertTrue(output.contains("## Find · *.swift"), output)
+        XCTAssertTrue(output.contains("## Tree · depth 2"), output)
+    }
+
+    func testProjectInspectRejectsEmptyAndCapsOperations() throws {
+        let tool = try XCTUnwrap(ToolRegistry.builtin(named: "project_inspect"))
+        XCTAssertTrue(tool.run("{}").contains("No inspection requested"))
+        let searches = (1...14).map { _ in #"{"query":"answer"}"# }.joined(separator: ",")
+        let output = tool.run(#"{"search":["# + searches + "]}")
+        XCTAssertTrue(output.contains("operation(s) omitted"), output)
     }
 
     /// project_reload picks up files created OUTSIDE the tools (scripts, git):

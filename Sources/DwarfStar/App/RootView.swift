@@ -10,6 +10,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case server = "Server"
     case distributed = "Worker"
     case benchmark = "Benchmark"
+    case sweBench = "Swift-bench"
     case conversion = "Conversione"
     case diagnostics = "Diagnostics"
 
@@ -25,6 +26,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .server: return "server.rack"
         case .distributed: return "cpu"
         case .benchmark: return "gauge.with.dots.needle.67percent"
+        case .sweBench: return "wrench.and.screwdriver"
         case .conversion: return "arrow.triangle.2.circlepath"
         case .diagnostics: return "stethoscope"
         }
@@ -40,6 +42,7 @@ struct RootView: View {
     @State private var distributed: DistributedController
     @State private var server: ServerController
     @State private var bench: BenchController
+    @State private var sweBench: SWEBenchController
     @State private var diagnostics: DiagnosticsController
     @State private var conversion = SafetensorsConversionController()
     @State private var selection: AppSection? = .chat
@@ -52,6 +55,7 @@ struct RootView: View {
         _distributed = State(initialValue: distributed)
         _server = State(initialValue: ServerController(settings: settings, store: store))
         _bench = State(initialValue: BenchController(settings: settings, dist: distributed, store: store))
+        _sweBench = State(initialValue: SWEBenchController(store: store))
         _diagnostics = State(initialValue: DiagnosticsController(settings: settings))
     }
 
@@ -104,6 +108,8 @@ struct RootView: View {
                         WorkerView(controller: distributed)
                     case .benchmark:
                         BenchView(controller: bench)
+                    case .sweBench:
+                        SWEBenchView(controller: sweBench)
                     case .conversion:
                         SafetensorsConversionView(controller: conversion)
                     case .diagnostics:

@@ -47,6 +47,7 @@ let package = Package(
         .executable(name: "DwarfStar", targets: ["DwarfStar"]),
         // Pure-Swift engine demo CLI — NO external links (no C engine).
         .executable(name: "DS4Demo", targets: ["DS4Demo"]),
+        .executable(name: "ds4-swe-local", targets: ["DS4SWEBenchLocal"]),
     ],
     targets: [
         // Portable formats, architecture inspection and backend-owned model
@@ -89,7 +90,12 @@ let package = Package(
             // Assets.xcassets is the .app icon catalog: consumed by the xcodegen
             // .xcodeproj build, but SwiftPM has no asset-catalog compiler — exclude
             // it here so `swift build`/`swift test` don't warn about unhandled files.
-            exclude: markdownFiles(in: "Sources/DwarfStar", also: ["Assets.xcassets"])
+            exclude: markdownFiles(in: "Sources/DwarfStar", also: [
+                "Assets.xcassets",
+                // Keep newly added feature docs warning-free even when SwiftPM
+                // reuses a cached evaluation of this dynamic manifest.
+                "Features/SWEBench/README.md",
+            ])
         ),
 
         // Pure-Swift engine demo CLI: drives DS4Core + DS4Metal directly (Metal
@@ -100,5 +106,6 @@ let package = Package(
             dependencies: ["DS4Core", "DS4Metal"],
             exclude: markdownFiles(in: "Sources/DS4Demo")
         ),
+        .executableTarget(name: "DS4SWEBenchLocal"),
     ]
 )

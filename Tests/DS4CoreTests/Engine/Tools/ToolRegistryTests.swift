@@ -103,7 +103,8 @@ final class ToolRegistryTests: XCTestCase {
         let names = Set(ToolRegistry.builtins.map(\.spec.name))
         XCTAssertTrue(names.isSuperset(of: ["add", "subtract", "multiply",
                                             "web_search", "web_fetch", "github_clone",
-                                            "project_tree", "project_find", "file_delete"]))
+                                            "project_tree", "project_find", "project_inspect",
+                                            "file_delete"]))
     }
 
     func testSpecsForEnabledSubset() {
@@ -120,7 +121,7 @@ final class ToolRegistryTests: XCTestCase {
         XCTAssertFalse(g.contains("subagent_search"))
         XCTAssertFalse(g.contains("agents_list"))
         XCTAssertFalse(g.contains("github_clone"))
-        XCTAssertTrue(g.isSuperset(of: ["project_tree", "project_find", "file_delete",
+        XCTAssertTrue(g.isSuperset(of: ["project_tree", "project_find", "project_inspect", "file_delete",
                                         "web_search", "web_fetch", "git"]))
     }
 

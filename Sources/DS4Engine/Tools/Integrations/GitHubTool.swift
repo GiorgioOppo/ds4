@@ -7,8 +7,8 @@ import Foundation
 ///
 /// The point is CONTEXT FRUGALITY on a local model: the clone costs the chat
 /// only the returned orientation summary (tree + documentation files), and the
-/// model then explores with project_find / project_search and reads only the
-/// relevant ranges with project_read — instead of paying prefill for the whole
+/// model then batches finds, searches, and relevant ranges with project_inspect
+/// — instead of paying repeated prefill for each small call or for the whole
 /// repository.
 ///
 /// Safety: this tool runs on model-emitted arguments, so the request is pinned
@@ -151,7 +151,7 @@ public enum GitHubTool {
             if docs.count > maxDocFiles { list += "\n... (+\(docs.count - maxDocFiles) more documentation files)" }
             out += "\n\nDocumentation to orient from (project_read, first chunk first):\n" + list
         }
-        out += "\n\nNext: locate code with project_find (file names) and project_search (contents, scoped with 'path'); read only the relevant line ranges with project_read. Do not read the repository wholesale — every token of tool output is prefill cost."
+        out += "\n\nNext: batch independent file-name finds, scoped content searches, and relevant line ranges in one project_inspect request. Follow up only for a newly discovered dependency; do not read the repository wholesale — every token of tool output is prefill cost."
         return out
     }
 

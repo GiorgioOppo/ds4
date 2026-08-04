@@ -1,0 +1,25 @@
+bench 2026-08-02 13:55 — Apple M1 Pro, RAM 16 GB
+gguf: /Users/oppog/Library/Containers/com.dwarfstar.app/Data/Library/Application Support/DwarfStar/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+
+== base-noq4 (DS4_DENSE_Q4=0)
+  FALLITA (exit 139) — ultime righe:
+  DS4 lazy-idx: indexer.attn_q_b/proj fuori dal piano per-token — 346 MB/token in meno dal disco; caricamento residente una sola volta alla soglia live
+  DS4 dense-stream: proiezioni compressori NSA residenti — 580 MB wired, altrettanti MB/token in meno dal disco
+  DS4 lazy-idx: il contesto non può raggiungere la soglia; scorer mai caricati
+  DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…
+  DS4Demo: 1 forward in 1.7s — logits[129280] finite=YES argmax=5 (logit 16.815)
+  DS4Demo: prompt dal file /tmp/ds4-cpu-prefetch-ab-prompt.txt: 6 caratteri
+  DS4Demo: prompt 'Hello
+  ' (6 car.) -> 6 tokens; generating 8 (greedy, streaming)…
+
+== cpu-prefetch-noq4 (DS4_DENSE_Q4=0 DS4_PREFETCH=1 DS4_PREFETCH_EXPERTS=0)
+  FALLITA (exit 139) — ultime righe:
+  DS4 lazy-idx: indexer.attn_q_b/proj fuori dal piano per-token — 346 MB/token in meno dal disco; caricamento residente una sola volta alla soglia live
+  DS4 dense-stream: proiezioni compressori NSA residenti — 580 MB wired, altrettanti MB/token in meno dal disco
+  DS4 lazy-idx: il contesto non può raggiungere la soglia; scorer mai caricati
+  DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…
+  DS4Demo: 1 forward in 1.6s — logits[129280] finite=YES argmax=5 (logit 16.815)
+  DS4Demo: prompt dal file /tmp/ds4-cpu-prefetch-ab-prompt.txt: 6 caratteri
+  DS4Demo: prompt 'Hello
+  ' (6 car.) -> 6 tokens; generating 8 (greedy, streaming)…
+

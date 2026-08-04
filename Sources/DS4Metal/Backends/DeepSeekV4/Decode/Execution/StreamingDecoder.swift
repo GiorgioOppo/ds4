@@ -343,17 +343,39 @@ public final class StreamingDecoder {
         precondition(nKeys >= 0 && nKeys <= maxKeys,
                      "live context: nKeys \(nKeys) fuori da 0...\(maxKeys)")
         let required = Self.scratchRowsNeeded(nKeys: nKeys, nSWA: d.nSWA)
+        let compressorGrowthNeeded = compStates.contains { state in
+            guard let state else { return false }
+            return nKeys / state.ratio + 8 > state.cacheCapacity
+        } || indexStates.contains { state in
+            guard let state else { return false }
+            return nKeys / state.ratio + 8 > state.cacheCapacity
+        }
+        if required > scratch.attentionRows || compressorGrowthNeeded {
+            // Cache replacement and scratch replacement both invalidate buffers
+            // retained by an asynchronous routed FFN. Join exactly once before
+            // touching either family of resources.
+            drainFFN()
+        }
         if required > scratch.attentionRows {
             let next = Self.grownScratchCapacity(current: scratch.attentionRows,
                                                  required: required,
                                                  maximum: scratchMaximumRows)
             precondition(next >= required, "attention scratch: capacity cap insufficiente")
-            drainFFN()
             let replacement = try DecodeScratch(rt, d, maxKeys: next)
             scratch = replacement
             // A dirty count belongs to the discarded mask; the replacement
             // starts zeroed and must not use offsets from the old capacity.
             maskDirtyCount = 0
+        }
+        if compressorGrowthNeeded {
+            for state in compStates.compactMap({ $0 }) {
+                try state.ensureCacheCapacity(
+                    rt, requiredRows: min(state.maxComp, nKeys / state.ratio + 8))
+            }
+            for state in indexStates.compactMap({ $0 }) {
+                try state.ensureCacheCapacity(
+                    rt, requiredRows: min(state.maxComp, nKeys / state.ratio + 8))
+            }
         }
         if let activateIndexerScoring,
            Self.indexerScoringNeeded(liveKeys: nKeys, topK: d.indexerTopK,
@@ -457,20 +479,45 @@ public final class StreamingDecoder {
         let kvRange = kvLayers ?? 0..<nLayers
         self.kvRange = kvRange
         self.maxKeys = maxKeys
-        // NSA compressor state per compressed layer (ratio!=0). The states retain
-        // their full lazy context capacity; only the transient attention scratch
-        // below starts small and grows with the live high-water mark.
+        // Physical KV starts from a small live frontier even when the logical
+        // session ceiling is 1M. DS4_KV_INITIAL is expressed in TOKENS; every
+        // compressor converts it to its own emitted-row cadence.
+        let configuredKVInitial = ProcessInfo.processInfo.environment["DS4_KV_INITIAL"]
+            .flatMap(Int.init) ?? 512
+        let initialKVKeys = min(max(1, maxKeys), max(1, configuredKVInitial))
+        // NSA compressor state per compressed layer (ratio!=0). Both attention
+        // and indexer caches grow geometrically from `initialKVKeys`; allocating
+        // their logical maximum as one MTLBuffer made configured capacity itself
+        // expensive even when the live KV was empty.
         compStates = try (0..<nLayers).map { il -> CompressorState? in
             guard kvRange.contains(il) else { return nil }
             let ratio = geometry?.compressRatio(layer: il) ?? DSV4Shape.compressRatio(layer: il)
             guard ratio != 0 else { return nil }
-            return try CompressorState(rt, ratio: ratio, headDim: dims.headDim, maxComp: maxKeys / ratio + 8)
+            let maximum = maxKeys / ratio + 8
+            let initial = min(maximum, initialKVKeys / ratio + 8)
+            return try CompressorState(rt, ratio: ratio, headDim: dims.headDim,
+                                       maxComp: maximum, initialComp: initial)
         }
         // NSA indexer compressor (DSA): ratio-4 layers only (head_dim 128).
         indexStates = try (0..<nLayers).map { il -> CompressorState? in
             let ratio = geometry?.compressRatio(layer: il) ?? DSV4Shape.compressRatio(layer: il)
             guard kvRange.contains(il), ratio == 4 else { return nil }
-            return try CompressorState(rt, ratio: 4, headDim: dims.nIndexerHeadDim, maxComp: maxKeys / 4 + 8)
+            let maximum = maxKeys / 4 + 8
+            let initial = min(maximum, initialKVKeys / 4 + 8)
+            return try CompressorState(rt, ratio: 4, headDim: dims.nIndexerHeadDim,
+                                       maxComp: maximum, initialComp: initial)
+        }
+        let compressorStates = compStates.compactMap { $0 } + indexStates.compactMap { $0 }
+        let initialCompressorBytes = compressorStates.reduce(0) { $0 + $1.cache.byteLength }
+        let logicalCompressorBytes = compressorStates.reduce(0) {
+            $0 + $1.maxComp * $1.headDim * MemoryLayout<Float>.stride
+        }
+        if logicalCompressorBytes > initialCompressorBytes {
+            let initialMiB = Double(initialCompressorBytes) / 1_048_576
+            let logicalGiB = Double(logicalCompressorBytes) / 1_073_741_824
+            DS4Log.info("kv-grow",
+                String(format: "cache compresse %.1f MiB fisici iniziali / %.2f GiB logici (DS4_KV_INITIAL=%d)",
+                       initialMiB, logicalGiB, initialKVKeys))
         }
         scratchMaximumRows = Self.scratchRowsNeeded(nKeys: maxKeys, nSWA: dims.nSWA)
         let initialKeys = maxKeys > 0 ? 1 : 0

@@ -627,6 +627,79 @@ final class AccuracyBenchmarkTests: XCTestCase {
                        larger.pieces.count)
     }
 
+    func testOfficialFixtureManifestsAreCheckpointScopedAndValid() throws {
+        let historical = try InferenceService.OfficialFixtureCatalog.manifest(
+            checkpoint: "pre-0731")
+        let current = try InferenceService.OfficialFixtureCatalog.manifest(
+            checkpoint: "0731")
+
+        XCTAssertEqual(historical.schema, "ds4-swift-official-logprob-v1")
+        XCTAssertEqual(historical.sourceCommit,
+                       InferenceService.OfficialFixtureCatalog.sourceCommit)
+        XCTAssertEqual(historical.checkpoint, "pre-0731")
+        XCTAssertEqual(current.checkpoint, "0731")
+        XCTAssertEqual(historical.cases.count, 3)
+        XCTAssertEqual(current.cases.count, 3)
+        XCTAssertFalse(historical.allowedModelSHA256.isEmpty)
+        XCTAssertTrue(current.allowedModelSHA256.isEmpty,
+                      "0731 must remain fail-closed until its GGUF SHA is pinned")
+    }
+
+    func testOfficialFixtureCapturesTheCheckpointCodeCompletionChange() throws {
+        let historical = try InferenceService.OfficialFixtureCatalog.manifest(
+            checkpoint: "pre-0731")
+        let current = try InferenceService.OfficialFixtureCatalog.manifest(
+            checkpoint: "0731")
+        let historicalCode = try XCTUnwrap(
+            historical.cases.first { $0.id == "short_code_completion" })
+        let currentCode = try XCTUnwrap(
+            current.cases.first { $0.id == "short_code_completion" })
+
+        XCTAssertEqual(historicalCode.expectedTokenHex,
+                       ["606060", "63", "0a", "72657475726e"])
+        XCTAssertEqual(currentCode.expectedTokenHex, ["72657475726e"])
+        XCTAssertEqual(historicalCode.expectedTokenBytes.first,
+                       Array("```".utf8))
+        XCTAssertEqual(currentCode.expectedTokenBytes.first,
+                       Array("return".utf8))
+    }
+
+    func testOfficialFixtureResolutionUsesDigestNotFilename() throws {
+        let digest =
+            "efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668"
+        let identity = try InferenceService.OfficialFixtureCatalog.resolve(
+            fileName: "misleading-0731-name.gguf",
+            sha256: digest)
+
+        XCTAssertEqual(identity.sha256, digest)
+        XCTAssertEqual(identity.manifest.checkpoint, "pre-0731")
+        XCTAssertEqual(identity.digestSource, .supplied)
+    }
+
+    func testOfficialFixtureResolutionRejectsCrossCheckpointGuessing() {
+        let unknown = String(repeating: "a", count: 64)
+        XCTAssertThrowsError(
+            try InferenceService.OfficialFixtureCatalog.resolve(
+                fileName: "DeepSeek-V4-Flash-0731.gguf",
+                sha256: unknown)
+        ) { error in
+            XCTAssertEqual(
+                error as? InferenceService.OfficialFixtureError,
+                .unsupportedModelDigest(unknown))
+        }
+    }
+
+    func testOfficialFixtureResolutionRejectsMalformedDigest() {
+        XCTAssertThrowsError(
+            try InferenceService.OfficialFixtureCatalog.resolve(
+                fileName: "model.gguf", sha256: "not-a-sha")
+        ) { error in
+            XCTAssertEqual(
+                error as? InferenceService.OfficialFixtureError,
+                .invalidSHA256("not-a-sha"))
+        }
+    }
+
     private func assertEquivalentPlans(
         _ lhs: InferenceService.AccuracySamplingPlan,
         _ rhs: InferenceService.AccuracySamplingPlan,

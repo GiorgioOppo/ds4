@@ -53,6 +53,53 @@ extension ChatStore {
                 }
                 UserDefaults.standard.set(true, forKey: delegationMigrationKey)
             }
+            // Replace the five fine-grained project exploration tools on the
+            // built-in project roles with one high-density, read-only batch
+            // primitive. Preserve every custom/non-project grant and custom
+            // prompt text; only remove the obsolete stock instruction that
+            // explicitly forced one tool call at a time.
+            let inspectionMigrationKey = "DS4AgentProjectInspect2026_08_03"
+            if !UserDefaults.standard.bool(forKey: inspectionMigrationKey) {
+                let projectRoleIDs: Set<String> = [
+                    "coding", "code", "revisore", "debug",
+                    "orchestratore", "latex", "documentatore",
+                ]
+                let granularTools: Set<String> = [
+                    "project_tree", "project_list", "project_find",
+                    "project_read", "project_search",
+                ]
+                let oldRoundRule = "Use as many sequential tool/result rounds as needed to complete and verify the work."
+                let newRoundRule = "When a tool accepts batch operations, combine independent work in one request; use another tool/result round only when prior evidence reveals a new dependency."
+                let batchInstruction = "For project evidence, use project_inspect to combine independent tree, Git scope, searches, callers, tests, and source ranges in one request; never call once per file. Follow up only for a newly discovered dependency."
+
+                for i in arr.indices where projectRoleIDs.contains(arr[i].id) {
+                    arr[i].toolNames.removeAll { granularTools.contains($0) }
+                    if !arr[i].toolNames.contains("project_inspect") {
+                        let insertion = arr[i].toolNames.firstIndex(of: "github_clone")
+                            .map { arr[i].toolNames.index(after: $0) } ?? arr[i].toolNames.startIndex
+                        arr[i].toolNames.insert("project_inspect", at: insertion)
+                    }
+                    arr[i].systemPrompt = arr[i].systemPrompt
+                        .replacingOccurrences(
+                            of: "Work one tool call at a time through these stages:",
+                            with: "Batch independent project discovery and reads into one project_inspect request; never make one call per file."
+                        )
+                        .replacingOccurrences(of: oldRoundRule, with: newRoundRule)
+                    if !arr[i].systemPrompt.contains("For project evidence, use project_inspect") {
+                        arr[i].systemPrompt += "\n" + batchInstruction
+                    }
+                }
+                if let i = arr.firstIndex(where: { $0.id == "orchestratore" }),
+                   var delegated = arr[i].delegatedToolNames,
+                   !delegated.contains("project_inspect") {
+                    delegated.append("project_inspect")
+                    arr[i].delegatedToolNames = delegated
+                }
+                if let migrated = try? JSONEncoder().encode(arr) {
+                    UserDefaults.standard.set(migrated, forKey: "DS4Agents")
+                }
+                UserDefaults.standard.set(true, forKey: inspectionMigrationKey)
+            }
             return arr
         }
         return AgentProfile.defaults
@@ -107,15 +154,22 @@ extension ChatStore {
         return imported.count
     }
 
-    /// The agent with the user's extra system prompt appended (if any).
-    func resolvedAgent() -> AgentProfile {
+    /// Resolve role, user note and the active GUI project from one atomic
+    /// ProjectCache snapshot. The signature lets the send path invalidate only
+    /// the engine KV when the selected root changes, preserving visible chat.
+    func resolvedAgentContext() -> (agent: AgentProfile, projectSignature: String?) {
         var agent = selectedAgent
         let extra = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !extra.isEmpty {
             agent.systemPrompt = agent.systemPrompt.isEmpty ? extra : agent.systemPrompt + "\n\n" + extra
         }
-        return agent
+        let project = ProjectCache.shared.agentContext()
+        let signature = agent.usesActiveProjectContext ? project?.signature : nil
+        return (agent.withActiveProjectContext(project), signature)
     }
+
+    /// Compatibility helper for call sites that only need the profile.
+    func resolvedAgent() -> AgentProfile { resolvedAgentContext().agent }
 
     /// Apply the agent to the running service: fresh chat with its role + tools,
     /// per-agent usage profile swapped in, slot-cache re-warmed.
@@ -125,7 +179,8 @@ extension ChatStore {
         // il tuningInfo resta una capacità DeepSeek (nil su GLM).
         guard let backend = chatBackend else { return nil }
         let concreteService = service
-        let agent = resolvedAgent()
+        let resolved = resolvedAgentContext()
+        let agent = resolved.agent
         toolsEnabled = !agent.toolNames.isEmpty
         enabledToolNames = Set(agent.toolNames)
         let tools = toolsEnabled ? ToolRegistry.autoSpecs(enabled: enabledToolNames) : []
@@ -149,6 +204,7 @@ extension ChatStore {
             let warmupSucceeded = await backend.warmup()
             let info = await concreteService?.tuningInfo()
             if self.engineSetupEpoch == epoch {
+                self.engineProjectSignature = resolved.projectSignature
                 self.tuningInfo = info
                 self.engineSetupCompletedEpoch = epoch
                 self.engineSetupWarmupSucceeded = warmupSucceeded

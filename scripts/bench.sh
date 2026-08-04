@@ -11,7 +11,7 @@
 #                    ~/Downloads/ds4-main/README.md
 #
 # Senza casi espliciti esegue TUTTA la matrice (~9 run, ~6-7 min l'una).
-# Casi disponibili: base hot-eviction reuse-eviction mm union256 chunk1024 route64 nsg2 nsg8 slots24 sharedq4
+# Casi disponibili: base cpu-prefetch base-noq4 cpu-prefetch-noq4 hot-eviction reuse-eviction mm union256 chunk1024 route64 nsg2 nsg8 slots24 sharedq4
 set -u
 GGUF="${1:?uso: bench.sh <gguf> <file-prompt> [report] [casi...]}"
 PROMPT="${2:?serve il file prompt (usato come @file)}"
@@ -20,6 +20,7 @@ shift 2
 [ $# -gt 0 ] && shift   # scarta il nome report se presente
 CASES="${*:-base hot-eviction reuse-eviction mm union256 chunk1024 route64 nsg2 nsg8 slots24 sharedq4}"
 BIN=.build/release/DS4Demo
+GEN_TOKENS="${DS4_BENCH_GEN_TOKENS:-8}"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
@@ -35,8 +36,9 @@ run_case() {
     # I knob di base sono la configurazione veloce misurata; gli argomenti
     # extra del caso vengono DOPO e quindi la sovrascrivono.
     env DS4_DIAG=1 DS4_EXPERT_CACHE_SLOTS=16 DS4_EXPERT_PREAD=1 DS4_PREAD_SPLIT=3 \
+        DS4_PREFETCH=0 DS4_PREFETCH_EXPERTS=0 \
         DS4_DENSE_STREAM=1 DS4_DENSE_Q4=1 DS4_MLOCK=1 "$@" \
-        "$BIN" "$GGUF" 8 "@$PROMPT" > "$TMP" 2>&1
+        "$BIN" "$GGUF" "$GEN_TOKENS" "@$PROMPT" > "$TMP" 2>&1
     rc=$?
     if [ $rc -ne 0 ]; then
         echo "  FALLITA (exit $rc) — ultime righe:" | tee -a "$OUT"
@@ -56,6 +58,9 @@ run_case() {
 for c in $CASES; do
     case "$c" in
         base)      run_case base ;;
+        cpu-prefetch) run_case cpu-prefetch DS4_PREFETCH=1 DS4_PREFETCH_EXPERTS=0 ;;
+        base-noq4) run_case base-noq4 DS4_DENSE_Q4=0 ;;
+        cpu-prefetch-noq4) run_case cpu-prefetch-noq4 DS4_DENSE_Q4=0 DS4_PREFETCH=1 DS4_PREFETCH_EXPERTS=0 ;;
         hot-eviction) run_case hot-eviction DS4_EXPERT_CACHE_HOT_EVICTION=1 ;;
         reuse-eviction) run_case reuse-eviction DS4_EXPERT_CACHE_REUSE_EVICTION=1 ;;
         mm)        run_case mm DS4_PREFILL_MM=1 ;;
@@ -66,7 +71,7 @@ for c in $CASES; do
         nsg8)      run_case nsg8 DS4_Q8_NSG=8 ;;
         slots24)   run_case slots24 DS4_EXPERT_CACHE_SLOTS=24 ;;
         sharedq4)  run_case sharedq4 DS4_SHARED_Q4=1 ;;
-        *)         echo "caso sconosciuto: $c (disponibili: base hot-eviction reuse-eviction mm union256 chunk1024 route64 nsg2 nsg8 slots24 sharedq4)" ;;
+        *)         echo "caso sconosciuto: $c (disponibili: base cpu-prefetch base-noq4 cpu-prefetch-noq4 hot-eviction reuse-eviction mm union256 chunk1024 route64 nsg2 nsg8 slots24 sharedq4)" ;;
     esac
 done
 

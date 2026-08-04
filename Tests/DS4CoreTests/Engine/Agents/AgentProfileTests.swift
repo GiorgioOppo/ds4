@@ -10,7 +10,8 @@ final class AgentProfileTests: XCTestCase {
             let prompt = agent.systemPrompt
             XCTAssertTrue(prompt.contains("user's language"), agent.id)
             XCTAssertTrue(prompt.contains("untrusted data"), agent.id)
-            XCTAssertTrue(prompt.contains("sequential tool/result rounds"), agent.id)
+            XCTAssertTrue(prompt.contains("accepts batch operations"), agent.id)
+            XCTAssertTrue(prompt.contains("prior evidence reveals a new dependency"), agent.id)
             XCTAssertTrue(prompt.contains("side effects only when required"), agent.id)
         }
     }
@@ -30,6 +31,7 @@ final class AgentProfileTests: XCTestCase {
                                      "file_write", "file_add", "file_modify", "file_delete", "git",
                                      "subagent_run"]
         XCTAssertTrue(Set(reviewer.toolNames).isDisjoint(with: mutating))
+        XCTAssertEqual(reviewer.toolNames.first, "project_inspect")
         XCTAssertTrue(reviewer.systemPrompt.contains("READ-ONLY"))
     }
 
@@ -47,6 +49,27 @@ final class AgentProfileTests: XCTestCase {
         XCTAssertFalse(delegated.contains("file_delete"))
         XCTAssertFalse(delegated.contains("subagent_run"))
         XCTAssertFalse(delegated.contains("github_clone"))
+        XCTAssertTrue(delegated.contains("project_inspect"))
+    }
+
+    /// The default project roles expose one high-density inspection surface,
+    /// not five primitives that encourage one model round per file.
+    func testProjectRolesPreferBatchInspection() throws {
+        let ids: Set<String> = [
+            "coding", "code", "revisore", "debug",
+            "orchestratore", "latex", "documentatore",
+        ]
+        let granular: Set<String> = [
+            "project_tree", "project_list", "project_find",
+            "project_read", "project_search",
+        ]
+        for agent in AgentProfile.defaults where ids.contains(agent.id) {
+            XCTAssertTrue(agent.toolNames.contains("project_inspect"), agent.id)
+            XCTAssertTrue(Set(agent.toolNames).isDisjoint(with: granular), agent.id)
+        }
+        let code = try XCTUnwrap(AgentProfile.defaults.first { $0.id == "code" })
+        XCTAssertFalse(code.systemPrompt.contains("one tool call at a time"))
+        XCTAssertTrue(code.systemPrompt.contains("never make one call per file"))
     }
 
     func testLegacyProfileJSONDecodesWithDenyAllDelegation() throws {

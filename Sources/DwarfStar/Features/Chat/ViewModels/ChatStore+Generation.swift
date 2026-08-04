@@ -61,10 +61,17 @@ extension ChatStore {
         attachmentNote = nil
         // If the engine doesn't hold this (reopened) chat yet, re-feed the prior
         // turns on this first send. Capture them BEFORE appending the new rows.
+        let resolved = resolvedAgentContext()
+        // A project switch changes the system-level referent and therefore the
+        // prompt prefix. Re-prime from the visible transcript on this send; do
+        // not clear the chat and do not rely on the model noticing the toolbar.
         let primed = enginePrimed
+            && engineProjectSignature == resolved.projectSignature
         let history = primed ? [] : Self.chatTurns(from: messages)
-        let sys = primed ? nil : (resolvedAgent().systemPrompt.isEmpty ? nil : resolvedAgent().systemPrompt)
+        let sys = primed ? nil : (resolved.agent.systemPrompt.isEmpty
+                                  ? nil : resolved.agent.systemPrompt)
         enginePrimed = true
+        engineProjectSignature = resolved.projectSignature
         messages.append(UIMessage(role: .user, text: typed, attachments: atts.map(\.name)))
         let index = appendAssistant()
         isGenerating = true

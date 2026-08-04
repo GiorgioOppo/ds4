@@ -68,6 +68,10 @@ extension ChatStore {
             _ = setenv("DS4_PREFILL_UNION", "192", 1)
             _ = setenv("DS4_PREFILL_CHUNK", "2048", 1)
             _ = setenv("DS4_PREFILL_ROUTE_BATCH", "128", 1)
+            // Release-verified on a 2,496-token prompt: 8.63 tok/s on M1 Pro.
+            // The orchestration function carries a local Swift 6.3 WMO barrier;
+            // `=0` remains the emergency/parity fallback.
+            _ = setenv("DS4_PREFILL_EXPERT_BATCH", "1", 1)
             _ = setenv("DS4_MTLIO", "1", 1)
             _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)
             _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)

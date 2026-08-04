@@ -470,10 +470,11 @@ extension StreamingDecoder {
             return usage.top(layer: il, n: lookN).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
         }
         // Read-ahead: overlap the NEXT layer's SSD I/O with the current layer's
-        // compute. DEFAULT OFF: on the I/O-bound streaming path speculative reads
-        // can STEAL SSD bandwidth from the real gather (worse when the usage prior is
-        // cold) — it must be measured per machine. Opt in with DS4_PREFETCH=1 (then
-        // it prefetches the always-needed non-routed weights). DS4_PREFETCH_EXPERTS>0
+        // compute. DEFAULT OFF: the complete 2026-08-02 M1 Pro A/B with the
+        // expert cache active measured 2.33 -> 2.21 wall tok/s and reduced
+        // effective gather bandwidth from 4.22 to 3.74 GB/s. The dense read-ahead
+        // contends with demand expert reads on an SSD-bound decode. Opt in with
+        // DS4_PREFETCH=1 only for a machine-specific A/B. DS4_PREFETCH_EXPERTS>0
         // additionally prefetches that many usage-prior experts (speculative; off by
         // default). Hint-only on the read-only mapping — cannot affect numerics.
         let prefetchOn = ProcessInfo.processInfo.environment["DS4_PREFETCH"] == "1"

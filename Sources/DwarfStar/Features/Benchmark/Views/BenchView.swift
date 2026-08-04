@@ -2,8 +2,8 @@ import SwiftUI
 import Charts
 import DS4Engine
 
-/// Native benchmark panel. Speed measures prefill/decode throughput; Correctness
-/// measures exact teacher-forced next-token prediction on a pasted corpus.
+/// Native benchmark panel. Checkpoint fixtures are SHA-bound and never selected
+/// from a filename alone, so a model revision cannot produce a false regression.
 struct BenchView: View {
     @Bindable var controller: BenchController
 
@@ -20,9 +20,7 @@ struct BenchView: View {
 
                 Section {
                     Label(benchmarkExplanation,
-                          systemImage: controller.kind == .speed
-                              ? "gauge.with.dots.needle.67percent"
-                              : "checkmark.circle")
+                          systemImage: benchmarkExplanationIcon)
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Section("Engine") {
@@ -32,8 +30,8 @@ struct BenchView: View {
                     .pickerStyle(.segmented)
                     if controller.mode == .distributed {
                         LabeledContent("Route", value: controller.distRoute)
-                        if controller.kind == .accuracy {
-                            Label("Correctness is currently available only on the Local engine. Select Local to run it; no silent fallback will be used.",
+                        if controller.kind != .speed {
+                            Label("Correctness and Checkpoint tests are available only on the Local engine. Select Local; no silent fallback will be used.",
                                   systemImage: "exclamationmark.triangle")
                                 .font(.callout).foregroundStyle(.orange)
                         } else if !controller.distConnected {
@@ -49,7 +47,8 @@ struct BenchView: View {
                     LabeledContent("Context", value: "\(controller.contextSize) tokens")
                 }
 
-                if controller.kind == .speed {
+                switch controller.kind {
+                case .speed:
                     Section("Context Frontiers") {
                         Stepper("Start: \(controller.ctxStart)", value: $controller.ctxStart, in: 64...200_000, step: 256)
                         Stepper("Max: \(controller.ctxMax)", value: $controller.ctxMax, in: 256...200_000, step: 256)
@@ -58,7 +57,7 @@ struct BenchView: View {
                                 value: $controller.genTokens, in: 1...512, step: 8)
                     }
                     .disabled(controller.isRunning)
-                } else {
+                case .accuracy:
                     Section("Evaluation Text") {
                         TextEditor(text: $controller.accuracyText)
                             .font(.body)
@@ -113,6 +112,19 @@ struct BenchView: View {
                             .foregroundStyle(.secondary)
                     }
                     .disabled(controller.isRunning)
+                case .official:
+                    Section("Official checkpoint fixture") {
+                        LabeledContent("Source", value: "antirez/ds4@b7e9f00")
+                        LabeledContent("Cases", value: "3 short smoke vectors")
+                        Label("The exact GGUF SHA-256 selects the fixture. A filename or an unknown model digest is rejected.",
+                              systemImage: "lock.shield")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Label("If the model has no verified download receipt or cached fingerprint, the first run hashes the complete GGUF once using uncached I/O.",
+                              systemImage: "externaldrive")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Section {
@@ -123,9 +135,7 @@ struct BenchView: View {
                         }
                     } else {
                         Button { controller.run() } label: {
-                            Label(controller.kind == .speed
-                                  ? "Start Speed Benchmark"
-                                  : "Start Correctness Benchmark",
+                            Label(startButtonTitle,
                                   systemImage: "play.fill")
                         }
                         .disabled(startDisabled)
@@ -133,14 +143,14 @@ struct BenchView: View {
                 }
             }
             .formStyle(.grouped)
-            .frame(maxHeight: controller.kind == .speed ? 320 : 650)
+            .frame(maxHeight: formMaximumHeight)
 
             Divider()
 
-            if controller.kind == .speed {
-                speedResults
-            } else {
-                accuracyResults
+            switch controller.kind {
+            case .speed: speedResults
+            case .accuracy: accuracyResults
+            case .official: officialResults
             }
 
             if !controller.log.isEmpty {
@@ -165,6 +175,32 @@ struct BenchView: View {
                 : "Distributed benchmark: measures prefill and generation throughput (tokens/s) on the cluster, reusing the coordinator already connected in Chat -> Distributed."
         case .accuracy:
             return "Teacher-forced benchmark over reproducible random text pieces: each piece uses an independently sampled preceding context, then checks whether the source token appears among the model's first 1, 2 or 3 candidate tokens. These are token candidates, not MoE experts."
+        case .official:
+            return "Checkpoint-bound replay of official DeepSeek API smoke vectors. The model is identified by SHA-256, then generated token bytes are compared exactly with the fixture for that revision."
+        }
+    }
+
+    private var benchmarkExplanationIcon: String {
+        switch controller.kind {
+        case .speed: return "gauge.with.dots.needle.67percent"
+        case .accuracy: return "checkmark.circle"
+        case .official: return "checkmark.shield"
+        }
+    }
+
+    private var startButtonTitle: String {
+        switch controller.kind {
+        case .speed: return "Start Speed Benchmark"
+        case .accuracy: return "Start Correctness Benchmark"
+        case .official: return "Verify Official Checkpoint"
+        }
+    }
+
+    private var formMaximumHeight: CGFloat {
+        switch controller.kind {
+        case .speed: return 320
+        case .accuracy: return 650
+        case .official: return 440
         }
     }
 
@@ -174,6 +210,9 @@ struct BenchView: View {
             return controller.mode == .distributed && !controller.distConnected
         case .accuracy:
             return controller.accuracyUnavailableForSelectedMode || controller.accuracyTextIsEmpty
+        case .official:
+            return controller.accuracyUnavailableForSelectedMode
+                || controller.modelPath.isEmpty
         }
     }
 
@@ -273,6 +312,84 @@ struct BenchView: View {
                 }
                 .padding()
             }
+        }
+    }
+
+    @ViewBuilder
+    private var officialResults: some View {
+        if let result = controller.officialResult {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if controller.isRunning { runningBadge }
+                    HStack(spacing: 12) {
+                        metricCard(
+                            title: "Checkpoint",
+                            value: result.checkpoint,
+                            systemImage: "shippingbox.fill",
+                            tint: .blue)
+                        metricCard(
+                            title: "Exact token bytes",
+                            value: "\(result.passedSteps)/\(result.totalSteps)",
+                            systemImage: result.passed
+                                ? "checkmark.seal.fill"
+                                : "xmark.seal.fill",
+                            tint: result.passed ? .green : .red)
+                        metricCard(
+                            title: "Duration",
+                            value: result.duration.formatted(
+                                .number.precision(.fractionLength(2))) + " s",
+                            systemImage: "clock.fill",
+                            tint: .secondary)
+                    }
+                    GroupBox("Verified model identity") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            LabeledContent("SHA-256") {
+                                Text(result.modelSHA256)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                            LabeledContent("Evidence",
+                                           value: result.digestSource.rawValue)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    GroupBox("Official smoke cases") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(result.cases) { fixture in
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Label(
+                                        "\(fixture.id) · \(fixture.passedSteps)/\(fixture.steps.count)",
+                                        systemImage: fixture.passed
+                                            ? "checkmark.circle.fill"
+                                            : "xmark.circle.fill")
+                                        .foregroundStyle(fixture.passed
+                                                         ? Color.green
+                                                         : Color.red)
+                                    Text("Prompt: \(fixture.promptTokens) tokens")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    ForEach(fixture.steps.filter { !$0.matches }) { step in
+                                        Text("Step \(step.index): expected \(step.expectedHex), got \(step.actualHex) (token \(step.actualTokenID))")
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.red)
+                                            .textSelection(.enabled)
+                                    }
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding()
+            }
+        } else {
+            ContentUnavailableView(
+                "No Checkpoint Result",
+                systemImage: "checkmark.shield",
+                description: Text(controller.isRunning
+                    ? "Identifying the GGUF and replaying official vectors - \(controller.runningLabel ?? "")"
+                    : "Verify the loaded DeepSeek GGUF against the official fixture for its exact checkpoint."))
+                .frame(maxHeight: .infinity)
         }
     }
 

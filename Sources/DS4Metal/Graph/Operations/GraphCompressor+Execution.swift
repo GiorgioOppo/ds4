@@ -107,6 +107,8 @@ extension GraphContext {
         case .indexerQat: try indexerHadamardFp4Enc(comp.rowScratch, rows: 1, rowStrideBytes: h * 4)
         }
         // copy rowScratch -> cache[count]
+        precondition(comp.count < comp.cacheCapacity,
+                     "compressor cache: prepareLiveContext non ha riservato la riga emessa")
         let dstRow = comp.cache.rowView(row: comp.count, cols: h)
         try gatherRowsEnc(src: comp.rowScratch, srcByteOffset: comp.rowScratch.byteOffset, srcRowStride: h,
                           dst: dstRow, dstByteOffset: dstRow.byteOffset, rows: 1, cols: h)

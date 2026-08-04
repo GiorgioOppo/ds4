@@ -10,12 +10,12 @@ struct BenchRow: Identifiable, Sendable {
     let kvcacheBytes: Int64
 }
 
-/// The two measurements exposed by the Benchmark panel. Speed keeps the
-/// existing synthetic throughput sweep; Correctness evaluates exact next-token
-/// prediction on user-provided text with teacher forcing.
+/// Measurements exposed by the Benchmark panel. Checkpoint replays the compact
+/// official DeepSeek smoke fixtures only after exact model identification.
 enum BenchKind: String, CaseIterable, Identifiable {
     case speed = "Speed"
     case accuracy = "Correctness"
+    case official = "Checkpoint"
     var id: String { rawValue }
 }
 
@@ -83,6 +83,7 @@ final class BenchController {
     var accuracyLiveTop3CorrectTokens = 0
     var accuracyLivePieceIndex = 0
     var accuracyResult: InferenceService.AccuracyResult?
+    var officialResult: InferenceService.OfficialFixtureResult?
     var log = ""
     var isRunning = false
     /// Which engine the in-flight run is actually using (nil when idle). Drives the
@@ -99,7 +100,12 @@ final class BenchController {
 
     /// Human label for the engine currently running (nil when idle).
     var runningLabel: String? {
-        let suffix = runningKind == .accuracy ? " · Correctness" : ""
+        let suffix: String
+        switch runningKind {
+        case .accuracy: suffix = " · Correctness"
+        case .official: suffix = " · Checkpoint"
+        case .speed, nil: suffix = ""
+        }
         switch runningMode {
         case .local:       return "Local (in-process engine)\(suffix)"
         case .distributed: return "Distributed · \(distRoute)\(suffix)"
@@ -110,7 +116,7 @@ final class BenchController {
     /// Correctness currently has no efficient distributed implementation: the
     /// distributed protocol returns logits for the last token of a chunk only.
     var accuracyUnavailableForSelectedMode: Bool {
-        kind == .accuracy && mode == .distributed
+        kind != .speed && mode == .distributed
     }
 
     var accuracyTextIsEmpty: Bool {
@@ -123,13 +129,14 @@ final class BenchController {
     private var rowTask: Task<Void, Never>?
     private var accuracyObservationTask: Task<Void, Never>?
     private var accuracyResultTask: Task<Void, Never>?
+    private var officialResultTask: Task<Void, Never>?
     private var accuracyLiveObservationStride = 1
     private var engineLease: EngineActivityGate.Lease?
 
     func run() {
         guard !isRunning else { return }
         guard !accuracyUnavailableForSelectedMode else {
-            log = "The Correctness benchmark is currently available only with the Local engine.\n"
+            log = "Correctness and Checkpoint benchmarks are available only with the Local engine.\n"
             return
         }
         guard kind != .accuracy || !accuracyTextIsEmpty else {
@@ -164,6 +171,9 @@ final class BenchController {
             accuracyLivePieceIndex = 0
             accuracyResult = nil
             runAccuracyLocal()
+        case .official:
+            officialResult = nil
+            runOfficialLocal()
         }
     }
 
@@ -454,6 +464,71 @@ final class BenchController {
                        observationCont: observationCont, resultCont: resultCont)
     }
 
+    /// Replay the checkpoint-scoped DeepSeek smoke vectors. Identification is
+    /// deliberately outside the engine actor: a missing verified download
+    /// receipt may require one uncached full-file hash, which must not block the
+    /// actor executor or masquerade as prefill time.
+    private func runOfficialLocal() {
+        guard mode == .local else {
+            log = "The Checkpoint benchmark is available only with the Local engine.\n"
+            clearRunningState()
+            return
+        }
+        guard let service = store.benchmarkService else {
+            log = store.isReady
+                ? "Checkpoint fixtures currently support DeepSeek V4 Flash only.\n"
+                : "No DeepSeek model loaded. Load one in Settings first.\n"
+            clearRunningState()
+            return
+        }
+        guard !modelPath.isEmpty else {
+            log = "No model path selected in Settings.\n"
+            clearRunningState()
+            return
+        }
+
+        let file = URL(fileURLWithPath: modelPath)
+        let (logCont, resultCont) = makeOfficialChannels()
+        let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
+        let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
+            do {
+                onLog("Identifying the exact model checkpoint (SHA-256, filename is not trusted)...\n")
+                var lastProgressBucket = -1
+                let identity = try InferenceService.OfficialFixtureCatalog.resolveModel(
+                    at: file
+                ) { hashed, total in
+                    guard total > 0 else { return }
+                    let percent = min(100, Int((hashed * 100) / total))
+                    let bucket = percent / 5
+                    if bucket > lastProgressBucket {
+                        lastProgressBucket = bucket
+                        onLog("  hashing model: \(percent)%\n")
+                    }
+                }
+                onLog("  checkpoint \(identity.manifest.checkpoint) · SHA-256 \(identity.sha256.prefix(12))… · \(identity.digestSource.rawValue)\n")
+                onLog("  source antirez/ds4@\(InferenceService.OfficialFixtureCatalog.sourceCommit.prefix(7)) · \(identity.manifest.cases.count) official smoke cases\n")
+
+                let result = try await service.officialFixtureBenchmark(
+                    identity: identity)
+                resultCont.yield(result)
+                for fixture in result.cases {
+                    onLog("  \(fixture.passed ? "PASS" : "FAIL") \(fixture.id): \(fixture.passedSteps)/\(fixture.steps.count) exact token bytes · prompt \(fixture.promptTokens) tokens\n")
+                    for step in fixture.steps where !step.matches {
+                        onLog("    step \(step.index): expected \(step.expectedHex), got \(step.actualHex) (token \(step.actualTokenID))\n")
+                    }
+                }
+                onLog("  \(result.passed ? "PASS" : "FAIL") checkpoint \(result.checkpoint): \(result.passedSteps)/\(result.totalSteps) steps in \(String(format: "%.2f", result.duration)) s\n")
+                return nil
+            } catch is CancellationError {
+                return nil
+            } catch {
+                return "\(error)"
+            }
+        }
+        finishOfficial(benchWork: benchWork, logCont: logCont,
+                       resultCont: resultCont)
+    }
+
     /// Wire the log/row AsyncStreams into `self` and return their continuations.
     private func makeChannels() -> (AsyncStream<String>.Continuation, AsyncStream<BenchRow>.Continuation) {
         let (logStream, logCont) = AsyncStream<String>.makeStream()
@@ -502,6 +577,24 @@ final class BenchController {
         return (logCont, observationCont, resultCont)
     }
 
+    private func makeOfficialChannels() -> (
+        AsyncStream<String>.Continuation,
+        AsyncStream<InferenceService.OfficialFixtureResult>.Continuation
+    ) {
+        let (logStream, logCont) = AsyncStream<String>.makeStream()
+        let (resultStream, resultCont) =
+            AsyncStream<InferenceService.OfficialFixtureResult>.makeStream()
+        logTask?.cancel()
+        officialResultTask?.cancel()
+        logTask = Task { [weak self] in
+            for await entry in logStream { self?.log += entry }
+        }
+        officialResultTask = Task { [weak self] in
+            for await result in resultStream { self?.officialResult = result }
+        }
+        return (logCont, resultCont)
+    }
+
     /// Drain the work task, report any error, run `onComplete`, and clear the flag.
     private func finish(benchWork: Task<String?, Never>,
                         logCont: AsyncStream<String>.Continuation,
@@ -533,6 +626,23 @@ final class BenchController {
             logCont.finish(); observationCont.finish(); resultCont.finish()
             _ = await logTask?.value
             _ = await observationTask?.value
+            _ = await resultTask?.value
+            self.clearRunningState()
+        }
+    }
+
+    private func finishOfficial(
+        benchWork: Task<String?, Never>,
+        logCont: AsyncStream<String>.Continuation,
+        resultCont: AsyncStream<InferenceService.OfficialFixtureResult>.Continuation
+    ) {
+        self.benchWork = benchWork
+        let logTask = self.logTask
+        let resultTask = self.officialResultTask
+        work = Task {
+            if let err = await benchWork.value { logCont.yield("error: \(err)\n") }
+            logCont.finish(); resultCont.finish()
+            _ = await logTask?.value
             _ = await resultTask?.value
             self.clearRunningState()
         }
