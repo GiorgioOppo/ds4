@@ -1147,6 +1147,7 @@ typedef struct {
 } quant_policy;
 
 static bool is_attention_projection(const char *name) {
+    if (strstr(name, ".indexer.")) return false;
     return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
            strstr(name, ".attn_q_b.weight") || strstr(name, ".attn_output_a.weight") ||
            strstr(name, ".attn_output_b.weight");
@@ -1875,6 +1876,112 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     fclose(fp);
 }
 
+static void copy_bytes(FILE *dst, FILE *src, uint64_t n, const char *path) {
+    uint8_t buf[1u << 20];
+    while (n) {
+        size_t chunk = n < sizeof(buf) ? (size_t)n : sizeof(buf);
+        if (fread(buf, 1, chunk, src) != chunk) die_errno("read source GGUF", path);
+        if (fwrite(buf, 1, chunk, dst) != chunk) die("write output tensor failed");
+        n -= chunk;
+    }
+}
+
+static void dequantize_q8_0_rows(const uint8_t *src, float *dst,
+                                 int64_t nrows, int64_t ncols) {
+    const int64_t blocks = ncols / 32;
+    for (int64_t r = 0; r < nrows; r++) {
+        const uint8_t *row = src + (size_t)r * (size_t)blocks * 34u;
+        float *out = dst + (size_t)r * (size_t)ncols;
+        for (int64_t b = 0; b < blocks; b++) {
+            uint16_t hd;
+            memcpy(&hd, row + (size_t)b * 34u, sizeof(hd));
+            const float d = ds4q_f16_to_f32(hd);
+            const int8_t *qs = (const int8_t *)(row + (size_t)b * 34u + 2u);
+            for (int j = 0; j < 32; j++) out[b * 32 + j] = d * (float)qs[j];
+        }
+    }
+}
+
+static void write_requant_gguf(const gguf_file *src_g, const output_context *out_ctx,
+                               const char *out_path, const imatrix_store *imatrix) {
+    FILE *src_fp = fopen(src_g->path, "rb");
+    if (!src_fp) die_errno("open source GGUF", src_g->path);
+    FILE *fp = fopen(out_path, "wb");
+    if (!fp) die_errno("open output", out_path);
+    if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
+    write_u32(fp, src_g->version);
+    write_u64(fp, src_g->n_tensors);
+    write_u64(fp, src_g->n_kv + out_ctx->n_kv_extra);
+    if (fwrite(src_g->kv_raw, 1, src_g->kv_raw_len, fp) != src_g->kv_raw_len) {
+        die("write GGUF KV failed");
+    }
+    write_imatrix_kvs(fp, imatrix);
+    for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
+        const tensor_meta *t = &out_ctx->tensors[i];
+        write_gguf_string(fp, t->name);
+        write_u32(fp, (uint32_t)t->n_dims);
+        for (int j = 0; j < t->n_dims; j++) write_u64(fp, (uint64_t)t->ne[j]);
+        write_u32(fp, (uint32_t)t->type);
+        write_u64(fp, t->new_offset);
+    }
+    off_t pos = ftello(fp);
+    if (pos < 0 || (size_t)pos > out_ctx->data_offset) die("bad output metadata size");
+    write_padding(fp, out_ctx->data_offset - (size_t)pos);
+
+    for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
+        const tensor_meta *src = &src_g->tensors[i];
+        const tensor_meta *dst = &out_ctx->tensors[i];
+        fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s: %s -> %s\n",
+                i + 1, out_ctx->n_tensors, src->name,
+                ds4q_type_name(src->type), ds4q_type_name(dst->type));
+        if (fseeko(src_fp, (off_t)(src_g->data_offset + src->old_offset), SEEK_SET) != 0) {
+            die_errno("seek source GGUF", src_g->path);
+        }
+        if (src->type == dst->type) {
+            copy_bytes(fp, src_fp, src->size, src_g->path);
+        } else {
+            if (src->type != DS4Q_TYPE_Q8_0 || dst->type != DS4Q_TYPE_Q4_K ||
+                src->ne[0] % 256 != 0) {
+                fprintf(stderr, "error: direct requantization unsupported for %s (%s -> %s)\n",
+                        src->name, ds4q_type_name(src->type), ds4q_type_name(dst->type));
+                exit(1);
+            }
+            int64_t nrows = 1;
+            for (int d = 1; d < src->n_dims; d++) nrows *= src->ne[d];
+            const int64_t ncols = src->ne[0];
+            const size_t q8_row = ds4q_row_size(DS4Q_TYPE_Q8_0, ncols);
+            const size_t q4_row = ds4q_row_size(DS4Q_TYPE_Q4_K, ncols);
+            const int64_t batch_cap = 16;
+            uint8_t *q8 = xmalloc((size_t)batch_cap * q8_row);
+            float *f32 = xmalloc((size_t)batch_cap * (size_t)ncols * sizeof(float));
+            uint8_t *q4 = xmalloc((size_t)batch_cap * q4_row);
+            const char *names[1] = { src->name };
+            const float *imat = imatrix_find(imatrix, names, 1, ncols, -1, 0);
+            ds4q_quantize_init(DS4Q_TYPE_Q4_K);
+            for (int64_t row0 = 0; row0 < nrows; row0 += batch_cap) {
+                const int64_t nr = nrows - row0 < batch_cap ? nrows - row0 : batch_cap;
+                if (fread(q8, q8_row, (size_t)nr, src_fp) != (size_t)nr) {
+                    die_errno("read Q8_0 source tensor", src_g->path);
+                }
+                dequantize_q8_0_rows(q8, f32, nr, ncols);
+                const size_t wrote = ds4q_quantize_chunk(
+                    DS4Q_TYPE_Q4_K, f32, q4, 0, nr, ncols, imat);
+                if (wrote != (size_t)nr * q4_row ||
+                    fwrite(q4, 1, wrote, fp) != wrote) {
+                    die("Q4_K requantization write failed");
+                }
+            }
+            free(q4);
+            free(f32);
+            free(q8);
+        }
+        const size_t padded = ds4q_pad(dst->size, out_ctx->alignment);
+        write_padding(fp, padded - dst->size);
+    }
+    if (fclose(fp) != 0) die_errno("close output", out_path);
+    fclose(src_fp);
+}
+
 static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
     size_t tensor_bytes = 0;
     size_t changed = 0;
@@ -1924,6 +2031,7 @@ static void dspark_support_defaults(dspark_support_options *o) {
 
 typedef struct {
     char *hf_dir;
+    char *source_gguf;
     char *template_gguf;
     char *out_gguf;
     char *compare_gguf;
@@ -2629,10 +2737,11 @@ static void free_dspark_support_plan(dspark_support_plan *plan) {
 }
 
 static void usage(const char *argv0) {
-    printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("usage: %s (--hf DIR | --source-gguf MODEL.gguf) --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
+    printf("  --source-gguf FILE     requantize directly from a GGUF (currently Q8_0 -> Q4_K)\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
@@ -2731,6 +2840,8 @@ static params parse_args(int argc, char **argv) {
             exit(0);
         } else if (strcmp(arg, "--hf") == 0) {
             p.hf_dir = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--source-gguf") == 0) {
+            p.source_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
@@ -2796,7 +2907,12 @@ static params parse_args(int argc, char **argv) {
             exit(1);
         }
     }
-    if (!p.hf_dir) die("--hf is required");
+    if (!!p.hf_dir == !!p.source_gguf) {
+        die("exactly one of --hf or --source-gguf is required");
+    }
+    if (p.source_gguf && (p.dspark_manifest || p.dspark_support)) {
+        die("--source-gguf is not supported for DSpark modes");
+    }
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
     if (p.dspark_manifest) return p;
     if (p.dspark_support) {
@@ -2970,6 +3086,17 @@ int main(int argc, char **argv) {
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
     print_plan(&tmpl, &out_ctx);
     if (p.dry_run) return 0;
+
+    if (p.source_gguf) {
+        write_requant_gguf(&tmpl, &out_ctx, p.out_gguf, &imatrix);
+        fprintf(stderr, "wrote %s\n", p.out_gguf);
+        imatrix_free(&imatrix);
+        free_gguf_file(&tmpl);
+        free(out_ctx.tensors);
+        for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
+        free(p.policy.overrides);
+        return 0;
+    }
 
     st_db db;
     db_open(&db, p.hf_dir);
