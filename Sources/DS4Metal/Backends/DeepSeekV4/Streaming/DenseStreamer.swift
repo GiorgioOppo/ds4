@@ -97,6 +97,10 @@ public final class DenseStreamer: @unchecked Sendable {
         // 129 independent (layer, tensor) requants saturate every core, ~6-8×
         // faster load than converting layer by layer.
         var q4Jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
+        // AProjQ4 checkpoints already carry the same projections as canonical
+        // Q4_K bytes.  With the Q4 residency knobs enabled, copy those bytes
+        // directly once: no requantization and no .q4dense sidecar.
+        var nativeQ4Jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
         // DS4_SHARED_Q4 (opt-in, needs q4Dense): also requantize the shared-expert
         // FFN projections — their Q8 slabs leave the per-token stream entirely,
         // freeing disk bandwidth for the expert gather. Lossy like the attn trio.
@@ -139,10 +143,15 @@ public final class DenseStreamer: @unchecked Sendable {
                 let sharedQ4Field = sharedQ4 && (f == .sharedGate || f == .sharedUp || f == .sharedDown)
                 let qkvQ4Field = qkvQ4 && (f == .qA || f == .kvW)
                 if q4Dense, attnQ4Field || sharedQ4Field || qkvQ4Field,
-                   let info = GGUF.typeInfo(t.type), info.name == "q8_0",
                    Int(t.elements) % 256 == 0 {
-                    q4Jobs.append((il: il, f: f, t: t))
-                    continue
+                    if t.type == 8 { // q8_0: create/load the requant cache
+                        q4Jobs.append((il: il, f: f, t: t))
+                        continue
+                    }
+                    if t.type == 12 { // q4_K: already in the executable layout
+                        nativeQ4Jobs.append((il: il, f: f, t: t))
+                        continue
+                    }
                 }
                 plan.append(Entry(field: f, fileOffset: Int(t.absOffset),
                                   bytes: Int(t.bytes), stageOffset: off))
@@ -194,6 +203,67 @@ public final class DenseStreamer: @unchecked Sendable {
                     "proiezioni compressori NSA residenti — " +
                     "\(residentBytes / (1 << 20)) MB wired, altrettanti MB/token in meno dal disco")
             }
+        }
+        if !nativeQ4Jobs.isEmpty {
+            LoadProgress.shared.begin("Caricamento proiezioni Q4 native…",
+                                      from: 0.32, to: 0.90,
+                                      units: nativeQ4Jobs.count)
+            var loaded = [GPUTensor?](repeating: nil, count: nativeQ4Jobs.count)
+            let jobs = nativeQ4Jobs
+            let deviceRef = rt.device
+            let failureLock = NSLock()
+            nonisolated(unsafe) var firstError: Error?
+            try loaded.withUnsafeMutableBufferPointer { output in
+                nonisolated(unsafe) let outputBase = output.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: jobs.count) { index in
+                    let job = jobs[index]
+                    do {
+                        let bytes = Int(job.t.bytes)
+                        guard let buffer = deviceRef.makeBuffer(
+                            length: max(1, bytes), options: .storageModeShared)
+                        else { throw MetalError.bufferAlloc }
+                        guard GGUFWeights.preadFull(
+                            fd, into: buffer.contents(), bytes: bytes,
+                            offset: Int(job.t.absOffset))
+                        else {
+                            throw GGUFWeights.LoadError.message(
+                                "DenseStreamer: pread Q4 nativo fallito su \(job.t.name)")
+                        }
+                        outputBase[index] = GPUTensor(
+                            buffer: buffer, byteLength: bytes,
+                            count: Int(job.t.elements))
+                        LoadProgress.shared.advance()
+                    } catch {
+                        failureLock.lock()
+                        if firstError == nil { firstError = error }
+                        failureLock.unlock()
+                    }
+                }
+                if let firstError { throw firstError }
+            }
+            var residentBytes = 0
+            for (index, job) in jobs.enumerated() {
+                guard let tensor = loaded[index] else {
+                    throw GGUFWeights.LoadError.message(
+                        "DenseStreamer: proiezione Q4 nativa mancante: \(job.t.name)")
+                }
+                if lockResident { tensor.lockResident() }
+                switch job.f {
+                case .qB: skeleton[job.il]!.qB = tensor
+                case .attnOut: skeleton[job.il]!.attnOut = tensor
+                case .attnOutA: skeleton[job.il]!.attnOutA = tensor
+                case .qA: skeleton[job.il]!.qA = tensor
+                case .kvW: skeleton[job.il]!.kvW = tensor
+                case .sharedGate: skeleton[job.il]!.sharedGate = tensor
+                case .sharedUp: skeleton[job.il]!.sharedUp = tensor
+                case .sharedDown: skeleton[job.il]!.sharedDown = tensor
+                default: break
+                }
+                residentBytes += tensor.byteLength
+            }
+            DS4Log.info("q4-native",
+                "\(nativeQ4Jobs.count) proiezioni Q4_K lette direttamente dal GGUF — "
+                + "\(residentBytes / (1 << 20)) MB residenti, nessuna cache .q4dense")
         }
         if !q4Jobs.isEmpty {
             // Requant CACHE: the converted Q4 tensors are persisted next to the

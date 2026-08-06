@@ -64,6 +64,22 @@ public enum GGUFWeights {
         let dims = geometry.dims
         for il in 0..<geometry.nLayers {
             let p = "blk.\(il)."
+            // The published Flash checkpoints now exist both with the signal
+            // path in Q8_0 and with all attention projections already stored as
+            // Q4_K (AProjQ4).  Kernel selection must therefore be driven by the
+            // tensor itself, never by the optional Q8->Q4 requantization knobs.
+            // Keep the accepted set closed: treating an unknown quant as Q8_0
+            // would produce plausible-looking buffers with invalid logits.
+            for name in ["attn_q_a.weight", "attn_q_b.weight",
+                         "attn_kv.weight", "attn_output_a.weight",
+                         "attn_output_b.weight"] {
+                guard let tensor = model.findTensor(p + name) else {
+                    throw LoadError.missing(p + name)
+                }
+                guard tensor.type == 8 || tensor.type == 12 else {
+                    throw LoadError.message("\(p)\(name): expected q8_0 or q4_K, got \(tensor.typeName)")
+                }
+            }
             guard let g = model.findTensor(p + "ffn_gate_exps.weight") else { continue }   // dense layer
             guard let u = model.findTensor(p + "ffn_up_exps.weight"),
                   let dn = model.findTensor(p + "ffn_down_exps.weight") else {
@@ -137,6 +153,7 @@ public enum GGUFWeights {
         try loadIndexer(&w, model, il, big: optT, small: optT)
         try loadRouterExtras(&w, rt, model, il, mapped: false)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
+        setDenseQuantization(&w, model, il) // native AProjQ8/AProjQ4 kernel binding
         return w
     }
 
@@ -151,6 +168,50 @@ public enum GGUFWeights {
         if let g = model.findTensor(p + "ffn_gate_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.gateQuant = g }
         if let u = model.findTensor(p + "ffn_up_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.upQuant = u }
         if let dn = model.findTensor(p + "ffn_down_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.downQuant = dn }
+    }
+
+    /// Per-projection signal-path quantization read directly from the GGUF.
+    /// These flags are deliberately independent from DS4_DENSE_Q4 and
+    /// DS4_QKV_Q4: those knobs decide residency/requantization, while these
+    /// values decide which Metal kernel can legally consume the bytes.
+    struct DenseQuantization: Equatable {
+        let qAIsQ4: Bool
+        let qBIsQ4: Bool
+        let kvIsQ4: Bool
+        let outputAIsQ4: Bool
+        let outputBIsQ4: Bool
+        let sharedGateIsQ4: Bool
+        let sharedUpIsQ4: Bool
+        let sharedDownIsQ4: Bool
+    }
+
+    static func denseQuantization(_ model: GGUFModel, layer il: Int) -> DenseQuantization {
+        let p = "blk.\(il)."
+        func q4(_ name: String) -> Bool {
+            model.findTensor(p + name)?.type == 12
+        }
+        return DenseQuantization(
+            qAIsQ4: q4("attn_q_a.weight"),
+            qBIsQ4: q4("attn_q_b.weight"),
+            kvIsQ4: q4("attn_kv.weight"),
+            outputAIsQ4: q4("attn_output_a.weight"),
+            outputBIsQ4: q4("attn_output_b.weight"),
+            sharedGateIsQ4: q4("ffn_gate_shexp.weight"),
+            sharedUpIsQ4: q4("ffn_up_shexp.weight"),
+            sharedDownIsQ4: q4("ffn_down_shexp.weight"))
+    }
+
+    static func setDenseQuantization(_ w: inout LayerWeights,
+                                     _ model: GGUFModel, _ il: Int) {
+        let q = denseQuantization(model, layer: il)
+        w.qAQ4 = q.qAIsQ4
+        w.qBQ4 = q.qBIsQ4
+        w.kvQ4 = q.kvIsQ4
+        w.attnOutAQ4 = q.outputAIsQ4
+        w.attnOutQ4 = q.outputBIsQ4
+        w.sharedGateQ4 = q.sharedGateIsQ4
+        w.sharedUpQ4 = q.sharedUpIsQ4
+        w.sharedDownQ4 = q.sharedDownIsQ4
     }
 
     /// Number of routed layers whose expert quant differs from the model-global
@@ -270,6 +331,7 @@ public enum GGUFWeights {
         try loadIndexer(&w, model, il, big: optM, small: optT)
         try loadRouterExtras(&w, rt, model, il, mapped: true)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
+        setDenseQuantization(&w, model, il) // native AProjQ8/AProjQ4 kernel binding
         return w
     }
 
@@ -304,6 +366,7 @@ public enum GGUFWeights {
         // token and the 3-layer table is ~9 MB total — not worth streaming.
         try loadRouterExtras(&w, rt, model, il, mapped: false)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
+        setDenseQuantization(&w, model, il) // flags survive streamed staging views
         return w
     }
 

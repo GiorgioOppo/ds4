@@ -124,12 +124,12 @@ private struct DeepSeekMemorySection: View {
             }
             Toggle("Dense-weight streaming (reads layer i+1 while computing layer i) - recommended <=16 GB", isOn: $store.denseStreamEnabled)
             Toggle("Pin hot buffers in RAM (mlock ~3.3 GB, keeps the memory compressor away)", isOn: $store.mlockEnabled)
-            Toggle("Q4 attention projections (LOSSY, ~+30% speed)", isOn: $store.denseQ4Enabled)
+            Toggle("Q4 attention projections (native or requantized)", isOn: $store.denseQ4Enabled)
             if store.denseQ4Enabled {
-                Label("Requantizes the three giant attention projections Q8→Q4_K at load (~+30% tok/s measured). Slightly lossy: greedy outputs can occasionally differ while staying coherent. Requires dense-weight streaming.",
+                Label("AProjQ4 models use their native Q4_K tensors directly, without creating a .q4dense cache. AProjQ8 models are requantized once (slightly lossy, ~+30% tok/s measured). Requires dense-weight streaming for residency.",
                       systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
-                Toggle("Q4 also q_a/kv projections (LOSSY, ~+10% measured)", isOn: $store.qkvQ4Enabled)
+                Toggle("Keep q_a/kv Q4 resident (native or requantized)", isOn: $store.qkvQ4Enabled)
                 Toggle("Q4 shared-expert FFN (LOSSY, +7% decode but SLOWS PREFILL)",
                        isOn: $store.sharedQ4Enabled)
                 if store.sharedQ4Enabled {

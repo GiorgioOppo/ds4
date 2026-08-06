@@ -43,4 +43,60 @@ final class GGUFWeightMapTests: XCTestCase {
         XCTAssertNotNil(model.findTensor("blk.\(DSV4Shape.nLayer - 1).attn_norm.weight"))
         XCTAssertNil(model.findTensor("blk.\(DSV4Shape.nLayer).attn_norm.weight"))
     }
+
+    func testNativeAProjQ4SelectsQ4KernelsFromTensorTypes() throws {
+        var writer = try GGUFWriter()
+        let q4Names = [
+            "attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight",
+            "attn_output_a.weight", "attn_output_b.weight",
+        ]
+        let q8Names = [
+            "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
+        ]
+        for name in q4Names {
+            writer.add(.init(name: "blk.0.\(name)", dims: [256], type: 12,
+                             data: Data(count: 144)))
+        }
+        for name in q8Names {
+            writer.add(.init(name: "blk.0.\(name)", dims: [256], type: 8,
+                             data: Data(count: 272)))
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aproj-q4-\(UUID().uuidString).gguf")
+        try writer.write(to: url.path)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let model = try GGUFModel(path: url.path, metalMapping: false)
+        let quant = GGUFWeights.denseQuantization(model, layer: 0)
+        XCTAssertTrue(quant.qAIsQ4)
+        XCTAssertTrue(quant.qBIsQ4)
+        XCTAssertTrue(quant.kvIsQ4)
+        XCTAssertTrue(quant.outputAIsQ4)
+        XCTAssertTrue(quant.outputBIsQ4)
+        XCTAssertFalse(quant.sharedGateIsQ4)
+        XCTAssertFalse(quant.sharedUpIsQ4)
+        XCTAssertFalse(quant.sharedDownIsQ4)
+    }
+
+    func testAProjQ8KeepsQ8KernelBinding() throws {
+        var writer = try GGUFWriter()
+        for name in ["attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight",
+                     "attn_output_a.weight", "attn_output_b.weight"] {
+            writer.add(.init(name: "blk.0.\(name)", dims: [256], type: 8,
+                             data: Data(count: 272)))
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aproj-q8-\(UUID().uuidString).gguf")
+        try writer.write(to: url.path)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let model = try GGUFModel(path: url.path, metalMapping: false)
+        let quant = GGUFWeights.denseQuantization(model, layer: 0)
+        XCTAssertFalse(quant.qAIsQ4)
+        XCTAssertFalse(quant.qBIsQ4)
+        XCTAssertFalse(quant.kvIsQ4)
+        XCTAssertFalse(quant.outputAIsQ4)
+        XCTAssertFalse(quant.outputBIsQ4)
+    }
 }
