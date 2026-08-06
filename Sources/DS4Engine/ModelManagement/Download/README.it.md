@@ -74,7 +74,7 @@ di avanzamento; evitare buffer proporzionali alla dimensione del modello.
 Un target scaricabile non implica compatibilità con il decoder. Il catalogo
 principale dichiara il supporto runtime per entry: i tre Flash e PRO Q2
 singolo-file sono selezionabili, mentre il package PRO Q4 e i tre GLM 5.2
-restano `downloadOnly`. MTP resta interno; gli accessori DSpark originale e
+restano `downloadOnly`. MTP resta interno; gli accessori DSpark 0730 e
 0731 compaiono nel downloader ma non possono essere selezionati come modelli
 principali.
 

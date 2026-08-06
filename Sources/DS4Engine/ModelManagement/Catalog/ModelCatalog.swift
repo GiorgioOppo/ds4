@@ -516,12 +516,13 @@ public enum DeepSeekV4AccessoryCatalog {
         role: .optionalComponent
     )
 
-    /// Original DeepSeek V4 Flash checkpoint support model.
+    /// DeepSeek V4 Flash 0730 checkpoint support model. The upstream artifact
+    /// predates the suffixed 0731 publication and keeps the unsuffixed name.
     public static let dspark = ModelTarget(
         id: ModelCatalogID.dsparkSupport.rawValue,
         file: "DeepSeek-V4-Flash-DSpark-support.gguf",
         approxGB: 6,
-        note: "DSpark support model for the original Flash checkpoint",
+        note: "DSpark support model for the Flash 0730 checkpoint",
         sha256: "8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e",
         expectedSizeBytes: 5_989_114_272,
         role: .optionalComponent
@@ -542,19 +543,19 @@ public enum DeepSeekV4AccessoryCatalog {
     public static let downloadEntries: [ModelCatalogEntry] = [
         .init(
             id: .dsparkSupport,
-            displayName: "DeepSeek V4 Flash · supporto DSpark",
+            displayName: "DeepSeek V4 Flash 0730 · supporto DSpark",
             profile: .deepSeekV4(.flash),
-            summary: "Modello ausiliario DSpark per il checkpoint Flash originale. Propone fino a cinque token; non è un modello autonomo.",
+            summary: "Modello ausiliario DSpark per il checkpoint Flash 0730. Propone fino a cinque token; non è un modello autonomo.",
             artifacts: [dspark],
             runtimeAvailability: .downloadOnly(
-                reason: "Accessorio DSpark eseguibile dal runtime Swift/Metal; richiede il modello Flash originale abbinato."
+                reason: "Accessorio DSpark eseguibile dal runtime Swift/Metal; richiede il modello Flash 0730 abbinato."
             )
         ),
         .init(
             id: .dsparkSupport0731,
             displayName: "DeepSeek V4 Flash 0731 · supporto DSpark",
             profile: .deepSeekV4(.flash),
-            summary: "Supporto DSpark specifico per il checkpoint Flash 0731; non va usato con il checkpoint originale.",
+            summary: "Supporto DSpark specifico per il checkpoint Flash 0731; non va usato con il checkpoint 0730.",
             artifacts: [dspark0731],
             runtimeAvailability: .downloadOnly(
                 reason: "Accessorio DSpark eseguibile dal runtime Swift/Metal; richiede il checkpoint Flash 0731 abbinato."

@@ -314,6 +314,7 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         let dsparkGreedy = sampling.temperature <= 0
             && sampling.repetitionPenalty == 1
             && decoder.dsparkStage0Runtime != nil
+        let dsparkStatsStart = dsparkScheduler.snapshot
         if decoder.dsparkStage0Runtime != nil, !dsparkGreedy {
             continuation.yield(.progress(
                 "DSpark pronto ma inattivo: richiede temperatura 0 e repetition penalty 1"))
@@ -340,36 +341,57 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                 let room = max(0, contextSize - pos)
                 let allowance = min(ordinaryRemaining, room)
                 if allowance > 0 {
-                    do {
-                        if let draft = try decoder.dsparkPropose(
-                            currentToken: currentToken, position: pos - 1),
-                           !draft.tokens.isEmpty {
-                            var candidates = Array(draft.tokens.prefix(allowance))
-                            if let eosIndex = candidates.firstIndex(
-                                where: { Int32($0) == tok.eosId }) {
-                                candidates = Array(candidates.prefix(upTo: eosIndex))
-                            }
-                            // Stop the batch as soon as a tool opener is known;
-                            // subsequent tool markup must use the incremental
-                            // parser and the bounded tool-token grace budget.
-                            if let toolIndex = candidates.firstIndex(
-                                where: { Int32($0) == dsmlId }) {
-                                candidates = Array(candidates.prefix(through: toolIndex))
-                            }
-                            if !candidates.isEmpty {
-                                let result = try decoder.dsparkVerifyAndCommit(
-                                    proposal: candidates,
-                                    currentLogits: lastLogits,
-                                    startPos: pos)
-                                verified = result.acceptedTokens
-                                if !verified.isEmpty {
-                                    lastLogits = result.nextLogits
+                    let schedule = dsparkScheduler.decision(
+                        remainingTokens: allowance)
+                    if schedule.shouldAttempt {
+                        var proposedThisRound = 0
+                        var acceptedThisRound = 0
+                        var firstConfidence: Float?
+                        var completedAttempt = false
+                        do {
+                            if let draft = try decoder.dsparkPropose(
+                                currentToken: currentToken, position: pos - 1) {
+                                completedAttempt = true
+                                firstConfidence = draft.firstConfidence
+                                if !draft.tokens.isEmpty {
+                                    var candidates = Array(draft.tokens.prefix(allowance))
+                                    if let eosIndex = candidates.firstIndex(
+                                        where: { Int32($0) == tok.eosId }) {
+                                        candidates = Array(candidates.prefix(upTo: eosIndex))
+                                    }
+                                    // Stop the batch as soon as a tool opener is known;
+                                    // subsequent tool markup must use the incremental
+                                    // parser and the bounded tool-token grace budget.
+                                    if let toolIndex = candidates.firstIndex(
+                                        where: { Int32($0) == dsmlId }) {
+                                        candidates = Array(candidates.prefix(through: toolIndex))
+                                    }
+                                    proposedThisRound = candidates.count
+                                    if !candidates.isEmpty {
+                                        let result = try decoder.dsparkVerifyAndCommit(
+                                            proposal: candidates,
+                                            currentLogits: lastLogits,
+                                            startPos: pos)
+                                        verified = result.acceptedTokens
+                                        acceptedThisRound = result.acceptedCount
+                                        if !verified.isEmpty {
+                                            lastLogits = result.nextLogits
+                                        }
+                                    }
                                 }
+                            } else {
+                                completedAttempt = true
                             }
+                        } catch {
+                            decoder.disableDSpark()
+                            Self.log("DSpark disattivato dopo errore di proposta/verifica: \(error)")
                         }
-                    } catch {
-                        decoder.disableDSpark()
-                        Self.log("DSpark disattivato dopo errore di proposta/verifica: \(error)")
+                        if completedAttempt {
+                            dsparkScheduler.note(
+                                proposedDrafts: proposedThisRound,
+                                acceptedDrafts: acceptedThisRound,
+                                firstConfidence: firstConfidence)
+                        }
                     }
                 }
             }
@@ -451,6 +473,18 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             continuation.yield(.progress(String(
                 format: "resa: %.0f ms/token = motore %.0f + sampler %.0f + resto %.0f%@",
                 wall * per, engine * per, sampleS * per, other * per, regime)))
+        }
+        if dsparkGreedy {
+            let stats = dsparkScheduler.snapshot.delta(since: dsparkStatsStart)
+            if stats.attempts + stats.tailSkips + stats.backoffSkips > 0 {
+                let summary = String(
+                    format: "DSpark: %d tentativi, %d/%d accettati, %d vuoti, %d skip-coda, %d backoff",
+                    stats.attempts, stats.accepted, stats.proposals,
+                    stats.emptyProposals, stats.tailSkips,
+                    stats.backoffSkips)
+                DS4Log.info("dspark", summary)
+                continuation.yield(.progress(summary))
+            }
         }
 
         // Extract any tool calls from the generated output.

@@ -15,6 +15,7 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         needsClose = false
         kvDirty = false   // next generation starts at pos 0 and resets the compressor
         lastDiskStoreCount = 0
+        dsparkScheduler = DSparkAdaptiveScheduler()
     }
 
     /// Enable/disable the disk KV cache. `dir` nil turns it off. Takes effect on

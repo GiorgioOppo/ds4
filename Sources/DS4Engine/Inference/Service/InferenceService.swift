@@ -84,8 +84,12 @@ public actor InferenceService: DS4Logging {
     var agentId = "generale"
     var warmedUp = false
     var lastPrefillProfile = "Profilo prefill: nessun prefill registrato."
+    /// Session-scoped like upstream `ds4_session`: low-yield evidence and
+    /// backoff survive assistant turns instead of charging every reply a fresh
+    /// multi-second DSpark probe. Reset only with the conversation/model.
+    var dsparkScheduler = DSparkAdaptiveScheduler()
 
-    public static let engineRevision = "2026-08-06 DSpark transformer forward + KV seed"
+    public static let engineRevision = "2026-08-06 DSpark adaptive scheduler + confidence-first"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil,
@@ -104,7 +108,9 @@ public actor InferenceService: DS4Logging {
                      "DS4_VECTOR_COPY", "DS4_FLASH_KV_STAGE", "DS4_ROPE_PAIR", "DS4_ROPE_AFFINE",
                      "DS4_MTLIO", "DS4_RESIDENT_COMP", "DS4_FUSED_HC",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR",
-                     "DS4_DSPARK_GGUF"]
+                     "DS4_DSPARK_GGUF", "DS4_DSPARK_SCHEDULER",
+                     "DS4_DSPARK_SCHEDULER_WINDOW",
+                     "DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS"]
         let env = ProcessInfo.processInfo.environment
         let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
         Self.log("knob \(knobLine)")

@@ -22,7 +22,7 @@ silenzioso.
 il nuovo artefatto DSpark multistadio. Valida tutti gli 81 ruoli tensoriali,
 metadati, classi di quantizzazione e forme contro la geometria Flash attiva. La
 demo lo apre con `DS4_DSPARK_GGUF=<percorso>` oppure `=1`; la ricerca automatica
-non mescola mai checkpoint originale e 0731. `DSparkStage0Runtime` cattura poi
+non mescola mai checkpoint 0730 e 0731. `DSparkStage0Runtime` cattura poi
 la media degli stream HC in ogni target layer dichiarato dal supporto ed esegue
 su Metal lo stage residente `main_proj` + `main_norm` dopo decode e prefill. I
 tre transformer vengono già legati ai tipi ufficiali: matrici grandi ed esperti

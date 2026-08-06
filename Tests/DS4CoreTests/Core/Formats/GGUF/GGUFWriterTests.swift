@@ -175,7 +175,7 @@ final class GGUFWriterTests: XCTestCase {
         })
     }
 
-    func testDSparkSupportLocateNeverMixesOriginalAnd0731() throws {
+    func testDSparkSupportLocateNeverMixes0730And0731() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("dspark-locate-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -239,6 +239,12 @@ final class GGUFWriterTests: XCTestCase {
         XCTAssertEqual(proposal.tokens, [7, 9])
         XCTAssertEqual(proposal.confidences, [0.91, 0.73])
         XCTAssertEqual(proposal.threshold, 0.7)
+        XCTAssertEqual(proposal.firstConfidence, 0.91)
+
+        let rejected = DSparkProposal(
+            tokens: [], confidences: [], threshold: 0.7,
+            firstConfidence: 0.42)
+        XCTAssertEqual(rejected.firstConfidence, 0.42)
     }
 
     func testDSparkKVWindowCropAppendAndRingEviction() {

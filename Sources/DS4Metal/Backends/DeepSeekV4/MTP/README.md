@@ -22,7 +22,7 @@ produces silent garbage.
 the newer multi-stage DSpark artifact. It validates all 81 tensor roles,
 metadata, quant classes and shapes against the active Flash geometry. The demo
 opens it with `DS4_DSPARK_GGUF=<path>` or `=1`; automatic lookup never mixes
-the original and 0731 checkpoints. `DSparkStage0Runtime` then captures the
+the 0730 and 0731 checkpoints. `DSparkStage0Runtime` then captures the
 mean-reduced HC state at every support-declared target layer and runs the
 resident `main_proj` + `main_norm` stage on Metal after decode and prefill.
 All three transformers are already bound with their official types: large

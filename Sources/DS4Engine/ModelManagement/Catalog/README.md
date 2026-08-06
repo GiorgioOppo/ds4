@@ -32,7 +32,7 @@ names or infer support from the filename.
 `ModelCatalogEntry.isSelectable` requires a `runnable` runtime, a single
 artifact and the `mainModel` role. This rule prevents a split package or an
 accessory from becoming a local model. `DeepSeekV4AccessoryCatalog.mtp`
-remains separate. The original and 0731 DSpark support files are optional
+remains separate. The 0730 and 0731 DSpark support files are optional
 components shown only through `ModelCatalogRegistry.downloadEntries`; they
 never enter `entries` or `selectableEntries`.
 

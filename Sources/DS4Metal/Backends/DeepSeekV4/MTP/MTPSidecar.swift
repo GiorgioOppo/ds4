@@ -206,7 +206,7 @@ public struct DSparkSupportModel: DS4Logging {
     }
 
     /// Locate the checkpoint-matched canonical support model next to the main
-    /// GGUF.  Never silently mix the original and 0731 checkpoints: they have
+    /// GGUF. Never silently mix the 0730 and 0731 checkpoints: they have
     /// identical geometry, so a shape-only check cannot catch that mismatch.
     public static func locate(near mainModelPath: String) -> String? {
         let dir = (mainModelPath as NSString).deletingLastPathComponent
@@ -277,7 +277,7 @@ public struct DSparkSupportModel: DS4Logging {
     }
 
     /// Check the only compatibility signal currently published outside the
-    /// tensor geometry: the original/0731 checkpoint suffix in canonical file
+    /// tensor geometry: the 0730/0731 naming in canonical file
     /// names. Explicitly named custom files remain the caller's responsibility.
     public func checkpointCompatibilityIssue(mainModelPath: String) -> String? {
         let supportName = (model.path as NSString).lastPathComponent.lowercased()
@@ -287,8 +287,8 @@ public struct DSparkSupportModel: DS4Logging {
         let main0731 = mainName.contains("0731")
         guard support0731 != main0731 else { return nil }
         return "checkpoint non compatibile: modello principale "
-            + (main0731 ? "0731" : "originale") + ", supporto DSpark "
-            + (support0731 ? "0731" : "originale")
+            + (main0731 ? "0731" : "0730") + ", supporto DSpark "
+            + (support0731 ? "0731" : "0730")
     }
 
     public func report(mainModelPath: String? = nil) -> String {
@@ -1538,26 +1538,24 @@ private final class DSparkTransformerExecutor {
                     bytes: draftCount * hcRowBytes)])
             }
         }
+        guard let finalStage = allWeights.last else {
+            throw MetalError.unsupported("stadio finale DSpark non disponibile")
+        }
+        // Upstream fuses the final HC collapse into the stage chain. Keeping it
+        // in this command buffer removes one full CPU/GPU boundary before the
+        // confidence-zero admission check.
+        try encodeFinalHidden(graph, finalStage: finalStage)
         graph.commit()
         if let error = graph.lastError { throw error }
     }
 
-    /// Collapse the last support stage, evaluate the shared target output head,
-    /// then decode a confidence-gated Markov chain exactly in draft order.
-    /// The full-vocabulary argmax remains on Metal; CPU reads back only one
-    /// confidence float and one token id per accepted candidate.
-    @_optimize(none)
-    func makeProposal(firstPreviousToken: Int,
-                      finalStage: DSparkMappedStageWeights,
-                      baseOutputHead: GPUTensor,
-                      confidenceThreshold: Float) throws -> DSparkProposal {
+    private func encodeFinalHidden(_ graph: GraphContext,
+                                   finalStage: DSparkMappedStageWeights) throws {
         guard let head = finalStage.finalHead,
-              firstPreviousToken >= 0, firstPreviousToken < d.vocab else {
+              finalStage.type(of: "hc_head_fn.weight") != nil else {
             throw MetalError.unsupported("teste finali DSpark non disponibili")
         }
         let hcDim = d.nHC * d.nEmbd
-        let graph = GraphContext(rt)
-        try graph.begin()
         try graph.rmsNorm(stageOutputHC, weight: nil, out: finalFlat,
                           rows: draftCount, n: hcDim,
                           eps: ModelDefaults.rmsEps)
@@ -1588,35 +1586,99 @@ private final class DSparkTransformerExecutor {
         try graph.rmsNorm(finalEmbd, weight: head.norm, out: finalNorm,
                           rows: draftCount, n: d.nEmbd,
                           eps: ModelDefaults.rmsEps)
-        // The DeepSeek V4 shared output head is Q8_0 by model contract.
-        try graph.encodeMMDenseQ8(
-            weight: baseOutputHead, act: finalNorm, actBase: 0,
-            out: baseLogits, inDim: d.nEmbd, outDim: d.vocab,
-            nTok: draftCount)
+    }
+
+    /// Evaluate confidence row zero before reading the 530 MB target output
+    /// head. Low-yield prompts therefore stop after the support transformer,
+    /// matching upstream's confidence-first runtime path.
+    private func evaluateConfidence(_ head: DSparkFinalHeadWeights,
+                                    finalStage: DSparkMappedStageWeights,
+                                    row: Int) throws -> Float {
+        packConfidenceFeatures(hiddenRow: row)
+        let graph = GraphContext(rt)
+        try graph.begin()
+        try dense(
+            graph, weight: head.confidenceProjection,
+            type: finalStage.type(of: "confidence_head.proj.weight")!,
+            act: confidenceFeatures, out: confidenceLogit,
+            inDim: d.nEmbd + markovRank, outDim: 1, rows: 1)
         graph.commit()
         if let error = graph.lastError { throw error }
+        let logit = (confidenceLogit.buffer.contents()
+            + confidenceLogit.byteOffset)
+            .bindMemory(to: Float.self, capacity: 1).pointee
+        return DSparkProposal.sigmoid(logit)
+    }
+
+    /// Decode a confidence-gated Markov chain exactly in draft order. The
+    /// full-vocabulary argmax remains on Metal; CPU reads back only one
+    /// confidence float and one token id per accepted candidate.
+    @_optimize(none)
+    func makeProposal(firstPreviousToken: Int,
+                      finalStage: DSparkMappedStageWeights,
+                      baseOutputHead: GPUTensor,
+                      confidenceThreshold: Float) throws -> DSparkProposal {
+        guard let head = finalStage.finalHead,
+              firstPreviousToken >= 0, firstPreviousToken < d.vocab else {
+            throw MetalError.unsupported("teste finali DSpark non disponibili")
+        }
 
         let threshold = min(1, max(0, confidenceThreshold))
         var previous = firstPreviousToken
         var tokens: [Int] = []
         var confidences: [Float] = []
+        var firstConfidence: Float?
         tokens.reserveCapacity(draftCount)
         confidences.reserveCapacity(draftCount)
 
-        for row in 0..<draftCount {
+        // Confidence depends on the current-token Markov row plus the final
+        // hidden row, but not on target logits. Reject before the expensive
+        // vocabulary head and Markov W2 whenever possible.
+        if threshold > 0 {
             try loadDenseRow(
                 head.markovW1,
                 type: finalStage.type(of: "markov_head.markov_w1.weight")!,
                 row: previous, width: markovRank, into: markovState)
-            packConfidenceFeatures(hiddenRow: row)
+            let confidence = try evaluateConfidence(
+                head, finalStage: finalStage, row: 0)
+            firstConfidence = confidence
+            guard confidence >= threshold else {
+                return DSparkProposal(
+                    tokens: [], confidences: [], threshold: threshold,
+                    firstConfidence: confidence)
+            }
+        }
+
+        // The DeepSeek V4 shared output head is Q8_0 by model contract. It is
+        // deliberately encoded only after confidence row zero passes.
+        let logitsGraph = GraphContext(rt)
+        try logitsGraph.begin()
+        try logitsGraph.encodeMMDenseQ8(
+            weight: baseOutputHead, act: finalNorm, actBase: 0,
+            out: baseLogits, inDim: d.nEmbd, outDim: d.vocab,
+            nTok: draftCount)
+        logitsGraph.commit()
+        if let error = logitsGraph.lastError { throw error }
+
+        for row in 0..<draftCount {
+            let reusedConfidence = row == 0 ? firstConfidence : nil
+            if reusedConfidence == nil {
+                try loadDenseRow(
+                    head.markovW1,
+                    type: finalStage.type(of: "markov_head.markov_w1.weight")!,
+                    row: previous, width: markovRank, into: markovState)
+                packConfidenceFeatures(hiddenRow: row)
+            }
 
             let candidateGraph = GraphContext(rt)
             try candidateGraph.begin()
-            try dense(
-                candidateGraph, weight: head.confidenceProjection,
-                type: finalStage.type(of: "confidence_head.proj.weight")!,
-                act: confidenceFeatures, out: confidenceLogit,
-                inDim: d.nEmbd + markovRank, outDim: 1, rows: 1)
+            if reusedConfidence == nil {
+                try dense(
+                    candidateGraph, weight: head.confidenceProjection,
+                    type: finalStage.type(of: "confidence_head.proj.weight")!,
+                    act: confidenceFeatures, out: confidenceLogit,
+                    inDim: d.nEmbd + markovRank, outDim: 1, rows: 1)
+            }
             try dense(
                 candidateGraph, weight: head.markovW2,
                 type: finalStage.type(of: "markov_head.markov_w2.weight")!,
@@ -1636,10 +1698,16 @@ private final class DSparkTransformerExecutor {
             candidateGraph.commit()
             if let error = candidateGraph.lastError { throw error }
 
-            let logit = (confidenceLogit.buffer.contents()
-                + confidenceLogit.byteOffset)
-                .bindMemory(to: Float.self, capacity: 1).pointee
-            let confidence = DSparkProposal.sigmoid(logit)
+            let confidence: Float
+            if let reusedConfidence {
+                confidence = reusedConfidence
+            } else {
+                let logit = (confidenceLogit.buffer.contents()
+                    + confidenceLogit.byteOffset)
+                    .bindMemory(to: Float.self, capacity: 1).pointee
+                confidence = DSparkProposal.sigmoid(logit)
+                if firstConfidence == nil { firstConfidence = confidence }
+            }
             guard confidence >= threshold else { break }
             let token = Int((argmaxResult.buffer.contents()
                 + argmaxResult.byteOffset)
@@ -1652,7 +1720,8 @@ private final class DSparkTransformerExecutor {
             previous = token
         }
         return DSparkProposal(tokens: tokens, confidences: confidences,
-                              threshold: threshold)
+                              threshold: threshold,
+                              firstConfidence: firstConfidence)
     }
 
     /// Load one logical row from F32/F16/Q8_0 without materializing the whole
@@ -1758,12 +1827,18 @@ public struct DSparkProposal: Sendable, Equatable {
     public let tokens: [Int]
     public let confidences: [Float]
     public let threshold: Float
+    /// Confidence evaluated for row zero even when it is below `threshold`
+    /// and therefore no token is proposed. The adaptive scheduler uses this
+    /// signal to avoid repeatedly paying for predictably empty blocks.
+    public let firstConfidence: Float?
 
-    public init(tokens: [Int], confidences: [Float], threshold: Float) {
+    public init(tokens: [Int], confidences: [Float], threshold: Float,
+                firstConfidence: Float? = nil) {
         precondition(tokens.count == confidences.count)
         self.tokens = tokens
         self.confidences = confidences
         self.threshold = threshold
+        self.firstConfidence = firstConfidence ?? confidences.first
     }
 
     static func sigmoid(_ value: Float) -> Float {
