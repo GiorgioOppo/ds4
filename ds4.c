@@ -48561,6 +48561,7 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t draft_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     uint64_t accepted_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     uint64_t scheduler_skips;
+    uint64_t scheduler_auto_break_even_pauses;
     uint64_t tail_skips;
     uint64_t verifier_unavailable;
     uint64_t verifier_errors;
@@ -48714,6 +48715,11 @@ static uint32_t ds4_dspark_scheduler_break_even_window(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_BREAK_EVEN_WINDOW", 0);
 }
 
+static bool ds4_dspark_scheduler_auto_break_even_enabled(void) {
+    const char *env = getenv("DS4_DSPARK_SCHEDULER_AUTO_BREAK_EVEN");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
 }
@@ -48737,7 +48743,8 @@ static float ds4_dspark_scheduler_cold_low_confidence_threshold(void) {
 /* Timing-sensitive scheduling changes which arithmetic path advances a token.
  * Keep it opt-in so greedy DSpark output is reproducible across runs. */
 static bool ds4_dspark_scheduler_timing_enabled(void) {
-    return ds4_dspark_scheduler_max_ms_per_accept_milli() != 0 ||
+    return ds4_dspark_scheduler_auto_break_even_enabled() ||
+           ds4_dspark_scheduler_max_ms_per_accept_milli() != 0 ||
            ds4_dspark_scheduler_max_extra_saved_ratio_milli() != 0;
 }
 
@@ -48837,8 +48844,16 @@ static void ds4_session_dspark_scheduler_note(
     }
 
     const uint32_t window = ds4_dspark_scheduler_window();
-    const uint32_t break_even_window =
+    const bool auto_break_even =
+        ds4_dspark_scheduler_auto_break_even_enabled();
+    uint32_t break_even_window =
         ds4_dspark_scheduler_break_even_window();
+    /* Auto mode reuses the scheduler window as its warm-up and the existing
+     * finite slow-skip pause below, so every suppression is followed by a
+     * fresh measured retry without adding another scheduler state machine. */
+    if (auto_break_even && break_even_window == 0) {
+        break_even_window = window;
+    }
 
     const uint32_t max_extra_saved_ratio_milli =
         ds4_dspark_scheduler_max_extra_saved_ratio_milli();
@@ -48849,19 +48864,28 @@ static void ds4_session_dspark_scheduler_note(
         s->dspark_sched_extra_ms * 1000.0 >
             s->dspark_sched_saved_ms *
             (double)max_extra_saved_ratio_milli;
+    const bool auto_unprofitable =
+        auto_break_even &&
+        s->dspark_sched_extra_ms > 0.0 &&
+        s->dspark_sched_extra_ms >= s->dspark_sched_saved_ms;
 
     if (break_even_window != 0 &&
         s->dspark_sched_cycles >= break_even_window &&
-        measured_unprofitable) {
+        (measured_unprofitable || auto_unprofitable)) {
         s->dspark_sched_skip = ds4_dspark_scheduler_slow_skip_cycles();
+        if (auto_unprofitable) {
+            s->dspark_stats.scheduler_auto_break_even_pauses++;
+        }
         if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
-                    "ds4: DSpark scheduler break-even pause cycles=%u "
-                    "accepted=%u saved=%.3fms extra=%.3fms skip=%u\n",
+                    "ds4: DSpark scheduler break-even pause auto=%d cycles=%u "
+                    "accepted=%u saved=%.3fms extra=%.3fms net=%.3fms skip=%u\n",
+                    auto_unprofitable ? 1 : 0,
                     s->dspark_sched_cycles,
                     s->dspark_sched_accepted,
                     s->dspark_sched_saved_ms,
                     s->dspark_sched_extra_ms,
+                    s->dspark_sched_saved_ms - s->dspark_sched_extra_ms,
                     s->dspark_sched_skip);
         }
         ds4_session_dspark_scheduler_reset(s);
@@ -57727,7 +57751,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "ds4: DSpark stats cycles=%llu first_tokens=%llu proposed=%llu "
             "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f "
             "full=%llu partial=%llu miss_first=%llu no_draft=%llu "
-            "no_room=%llu invalid=%llu scheduler_skips=%llu "
+            "no_room=%llu invalid=%llu scheduler_skips=%llu scheduler_auto_pauses=%llu "
             "tail_skips=%llu verifier_unavailable=%llu errors=%llu time_ms propose=%.3f "
             "prop_stage0=%.3f prop_setup=%.3f prop_cache=%.3f "
             "prop_chain=%.3f prop_hidden=%.3f prop_conf0=%.3f "
@@ -57750,6 +57774,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             (unsigned long long)st->no_room,
             (unsigned long long)st->invalid_draft,
             (unsigned long long)st->scheduler_skips,
+            (unsigned long long)st->scheduler_auto_break_even_pauses,
             (unsigned long long)st->tail_skips,
             (unsigned long long)st->verifier_unavailable,
             (unsigned long long)st->verifier_errors,
