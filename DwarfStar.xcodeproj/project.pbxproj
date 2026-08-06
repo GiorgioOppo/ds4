@@ -245,12 +245,14 @@
 		730197DF7E9FC7AB85938007 /* WebFetch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72CDEB8BA56E51030CFB5AC5 /* WebFetch.swift */; };
 		73EFC817206754837D4CB019 /* GraphAttnTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E5EA6AB42FE7673BA97D32F /* GraphAttnTests.swift */; };
 		741D8D0C09BB7BD8798077E6 /* GLM52ChatRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B190251B4AB272B762B97556 /* GLM52ChatRenderer.swift */; };
+		7437DBD6940FE2594BBABB4C /* DSparkScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09BF1AC4EED8792B7CB412E7 /* DSparkScheduler.swift */; };
 		75022560390D08CFC5223A8F /* GLM52ChatStreamSplitterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1441B3FF579B1884D6669F45 /* GLM52ChatStreamSplitterTests.swift */; };
 		75313EF181C3412051D996CE /* GLM52Backend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC26D813DB9CF90A7DB5A33 /* GLM52Backend.swift */; };
 		764C93A1E5CFBDE2C5BA896E /* MetalMoE.swift in Sources */ = {isa = PBXBuildFile; fileRef = 452BEE38DA81C4476EC2F526 /* MetalMoE.swift */; };
 		76FB63CF4CB35D87F750BF6D /* GraphAttentionOutput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68A4D9B881558AB3CBB80656 /* GraphAttentionOutput.swift */; };
 		775BB257E3E9FFF3264D2043 /* ChartExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EF18203937EBF4E6D7AB79E /* ChartExport.swift */; };
 		779E20614C58F52738E19EE0 /* MetalIndexerScore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FDF45E12C5958C152843BD3 /* MetalIndexerScore.swift */; };
+		77A420E57DBD7608BBE56E40 /* DSparkSchedulerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E69517F58757FCED59C9061A /* DSparkSchedulerTests.swift */; };
 		77DF22554621A7AA5070FA1D /* ChatStore+MachineAutoTune.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FD681EF1237424D4EF370C1 /* ChatStore+MachineAutoTune.swift */; };
 		788A11A76CBFCDFAE02702BF /* HalfTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C63E0FD806A7EF3833BD53FF /* HalfTests.swift */; };
 		78BACF4E9383EC364E9D0D56 /* ToolMarkup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41AB687AF9AABE14CFC3199E /* ToolMarkup.swift */; };
@@ -645,6 +647,7 @@
 		06FD24F96EB2A9DED9409DB6 /* GLM52PrefillBatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52PrefillBatch.swift; sourceTree = "<group>"; };
 		07BFC548FFE5CA86034C66C8 /* GLM52DecodeGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52DecodeGraph.swift; sourceTree = "<group>"; };
 		088A1BC71A4E1077818EC559 /* GraphAttentionPrefill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphAttentionPrefill.swift; sourceTree = "<group>"; };
+		09BF1AC4EED8792B7CB412E7 /* DSparkScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DSparkScheduler.swift; sourceTree = "<group>"; };
 		09C0044DBC374AA6504218E7 /* MetalDenseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDenseTests.swift; sourceTree = "<group>"; };
 		0AD3A88DDB91C0C95DB6543B /* GGUFRequantizerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GGUFRequantizerTests.swift; sourceTree = "<group>"; };
 		0B28C8F0D93DFADD48B03F43 /* LagunaConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LagunaConfiguration.swift; sourceTree = "<group>"; };
@@ -691,7 +694,7 @@
 		1C2EFD097851550ADB1BC4DE /* GraphPrefillAttnTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphPrefillAttnTests.swift; sourceTree = "<group>"; };
 		1C79C544943EE62D61EC0857 /* ToolRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolRegistryTests.swift; sourceTree = "<group>"; };
 		1CA11E04A13553A2DEA3B05F /* MetalCompressorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalCompressorTests.swift; sourceTree = "<group>"; };
-		1D21A76A252CBFB07AB0537C /* DS4Demo */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = text; path = DS4Demo; sourceTree = BUILT_PRODUCTS_DIR; };
+		1D21A76A252CBFB07AB0537C /* DS4Demo */ = {isa = PBXFileReference; includeInIndex = 0; path = DS4Demo; sourceTree = BUILT_PRODUCTS_DIR; };
 		1D4382F1D18E40A78BCC8894 /* ConversationModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationModels.swift; sourceTree = "<group>"; };
 		1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Core.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1EAFF91002D3FD8DC2C5B41B /* GLM52IndexerTopKTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerTopKTests.swift; sourceTree = "<group>"; };
@@ -1018,7 +1021,7 @@
 		B0D9D47C68C0EEADBF9F5819 /* GraphMoETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphMoETests.swift; sourceTree = "<group>"; };
 		B0E8D4CE8497E9B17FBD6E3F /* MCPProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPProtocol.swift; sourceTree = "<group>"; };
 		B0EA8C6E1912F5A56A949435 /* set_rows.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = set_rows.metal; sourceTree = "<group>"; };
-		B0EF4BED2C2FA923BA3D5392 /* DS4SWEBenchLocal */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = DS4SWEBenchLocal; sourceTree = BUILT_PRODUCTS_DIR; };
+		B0EF4BED2C2FA923BA3D5392 /* DS4SWEBenchLocal */ = {isa = PBXFileReference; includeInIndex = 0; path = DS4SWEBenchLocal; sourceTree = BUILT_PRODUCTS_DIR; };
 		B190251B4AB272B762B97556 /* GLM52ChatRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ChatRenderer.swift; sourceTree = "<group>"; };
 		B1E03E7A6ED351EA3FC68889 /* glm52_kv.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = glm52_kv.metal; sourceTree = "<group>"; };
 		B20F10AC939FBD64F6CC3F7F /* LagunaWeightMapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LagunaWeightMapTests.swift; sourceTree = "<group>"; };
@@ -1137,6 +1140,7 @@
 		E55954FBC866836F2848C24F /* GGUFModel+Export.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GGUFModel+Export.swift"; sourceTree = "<group>"; };
 		E5C68D82CE395CB25BEBA58C /* DenseStreamer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DenseStreamer.swift; sourceTree = "<group>"; };
 		E5FB551B3B8F22FF2EE9E1E7 /* ChatStore+Tuning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+Tuning.swift"; sourceTree = "<group>"; };
+		E69517F58757FCED59C9061A /* DSparkSchedulerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DSparkSchedulerTests.swift; sourceTree = "<group>"; };
 		E6E108C268C3775BF0EFC867 /* MachineAutoTuneTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineAutoTuneTests.swift; sourceTree = "<group>"; };
 		E6F5317E7EE861DDF2A8EEE7 /* moe.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = moe.metal; sourceTree = "<group>"; };
 		E9456F4FD5EE971F841FD827 /* DiskKVStore+Streaming.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DiskKVStore+Streaming.swift"; sourceTree = "<group>"; };
@@ -3104,6 +3108,7 @@
 		BD169D00D9DCCECE70C54D3B /* MTP */ = {
 			isa = PBXGroup;
 			children = (
+				09BF1AC4EED8792B7CB412E7 /* DSparkScheduler.swift */,
 				A8AB80F335746580F38A4BC8 /* MTPSidecar.swift */,
 			);
 			path = MTP;
@@ -3518,6 +3523,7 @@
 		E2BAC54B38D3C5C258F69431 /* Formats */ = {
 			isa = PBXGroup;
 			children = (
+				E69517F58757FCED59C9061A /* DSparkSchedulerTests.swift */,
 				4A42EA276426B5AE23369065 /* GGUF */,
 				569F57CD1CEF1B417C824734 /* KVCheckpoint */,
 				F3AD964D5D3D20C32501D174 /* Quantization */,
@@ -4213,6 +4219,7 @@
 				C90E874F8BBADD80796E9FC4 /* DSV4Dims.swift in Sources */,
 				B03B461281F93DF1286A3A1B /* DSV4RuntimeGeometry.swift in Sources */,
 				231514E92888996E46D7243E /* DSV4Shape.swift in Sources */,
+				7437DBD6940FE2594BBABB4C /* DSparkScheduler.swift in Sources */,
 				4C685AF9E144FCAB50BA5F7D /* DecodeLayer.swift in Sources */,
 				FB584EF0AB58A365D9A955C9 /* DecodeProfile.swift in Sources */,
 				E1851DAFB0D63E694E32A6F0 /* DecodeScratch.swift in Sources */,
@@ -4478,6 +4485,7 @@
 				68AA10F1E36B757BA87EBA62 /* ContextCapacityPolicyTests.swift in Sources */,
 				B27B20DA44F34DF4DFEB4991 /* DS4RuntimeEnvironmentTests.swift in Sources */,
 				B96488E8DA7E6B4DC4336E1D /* DSV4RuntimeGeometryTests.swift in Sources */,
+				77A420E57DBD7608BBE56E40 /* DSparkSchedulerTests.swift in Sources */,
 				6BD98C401B14A54D691713F0 /* DecodeProfileTests.swift in Sources */,
 				7F61703FFFD4120357BF7D05 /* DeepSeekV4ConfigurationTests.swift in Sources */,
 				541B920538CC2737997D14D9 /* DeepSeekV4TokenizerTests.swift in Sources */,
@@ -4704,7 +4712,6 @@
 		09659161EB1DA486C5264F8C /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -4719,7 +4726,6 @@
 		1A5BBA3ABD21A280827DB63E /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -4734,7 +4740,6 @@
 		2AEB8175D986D10CB681222B /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -4749,7 +4754,6 @@
 		3184AE13E81A2FD16B25B40F /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -4764,7 +4768,6 @@
 		335FC99C78AD6B533BE8DD02 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -4778,12 +4781,11 @@
 		4EDFF857E892F890525F79E1 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -4809,12 +4811,11 @@
 		63ACCE1320AF5B87AA30650B /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 30;
+				CURRENT_PROJECT_VERSION = 31;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -4917,7 +4918,6 @@
 		B23D42C3B7E7F92A2E5FE96D /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -4932,7 +4932,6 @@
 		B49E97198B7BF691B8321DEE /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -5029,7 +5028,6 @@
 		D2669261729DDDBBA9F560ED /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
