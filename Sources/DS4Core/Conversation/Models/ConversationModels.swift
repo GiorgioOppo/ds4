@@ -62,3 +62,56 @@ public enum ChatTurn: Sendable, Equatable {
     case assistant(text: String, toolCalls: [ToolCall])
     case toolResult(callId: String, name: String, content: String)
 }
+
+/// Structural validation for client-supplied tool histories.  The server APIs
+/// accept uncapped message arrays, so validation must stay O(number of turns +
+/// calls): build the set of preceding call ids while scanning forward instead
+/// of searching the whole prefix for every tool result.
+public enum ToolHistoryValidator {
+    public enum ValidationError: Error, Equatable, CustomStringConvertible {
+        case duplicateCallID(String)
+        case unknownResultID(String)
+        case duplicateResultID(String)
+
+        public var description: String {
+            switch self {
+            case .duplicateCallID(let id):
+                return "duplicate tool call id \(id)"
+            case .unknownResultID(let id):
+                return "tool result \(id) has no preceding assistant call"
+            case .duplicateResultID(let id):
+                return "tool call \(id) has more than one result"
+            }
+        }
+    }
+
+    /// Empty ids are retained for legacy `role=function` compatibility: those
+    /// messages are name-addressed and cannot participate in id validation.
+    public static func validate(_ turns: [ChatTurn]) throws {
+        var declared = Set<String>()
+        var resolved = Set<String>()
+        declared.reserveCapacity(turns.count)
+        resolved.reserveCapacity(turns.count)
+
+        for turn in turns {
+            switch turn {
+            case .assistant(_, let calls):
+                for call in calls where !call.id.isEmpty {
+                    guard declared.insert(call.id).inserted else {
+                        throw ValidationError.duplicateCallID(call.id)
+                    }
+                }
+            case .toolResult(let callID, _, _):
+                guard !callID.isEmpty else { continue }
+                guard declared.contains(callID) else {
+                    throw ValidationError.unknownResultID(callID)
+                }
+                guard resolved.insert(callID).inserted else {
+                    throw ValidationError.duplicateResultID(callID)
+                }
+            case .system, .user:
+                continue
+            }
+        }
+    }
+}

@@ -136,7 +136,12 @@ public enum GGUFRequantizer {
     private static func plan(_ t: GGUFModel.Tensor, to want: UInt32, options: Options) -> Plan {
         guard QuantEncode.canQuantize(want) else { return .skip("target \(GGUF.typeName(want)) not encodable") }
         guard let info = GGUF.typeInfo(want) else { return .skip("unknown target type \(want)") }
-        let columns = Int(t.dims[0])
+        guard let firstDimension = t.dims.first,
+              firstDimension <= UInt64(Int.max),
+              t.elements <= UInt64(Int.max) else {
+            return .skip("shape \(t.dims) is too large")
+        }
+        let columns = Int(firstDimension)
         let elements = Int(t.elements)
         guard columns > 0, columns % Int(info.blockElems) == 0, elements % columns == 0 else {
             return .skip("shape \(t.dims) not block-aligned for \(info.name)")
@@ -152,7 +157,12 @@ public enum GGUFRequantizer {
             return .skip("imatrix length \(im.count) != inner dim \(columns)")
         }
         let rows = elements / columns
-        let byteCount = QuantEncode.rowSize(type: want, columns: columns) * rows
+        let rowBytes = QuantEncode.rowSize(type: want, columns: columns)
+        let (byteCount, overflow) = rowBytes.multipliedReportingOverflow(
+            by: rows)
+        guard rowBytes > 0, !overflow else {
+            return .skip("output allocation for shape \(t.dims) is too large")
+        }
         return .requant(byteCount: byteCount, imatrix: im, columns: columns, rows: rows)
     }
 
@@ -160,9 +170,12 @@ public enum GGUFRequantizer {
     private static func requantBytes(_ t: GGUFModel.Tensor, to want: UInt32, source: GGUFModel,
                                      imatrix im: [Float]?, columns: Int, rows: Int,
                                      byteCount: Int) throws -> Data {
-        guard let f32 = dequantizeToF32(type: t.type,
+        let (elementCount, overflow) = rows.multipliedReportingOverflow(
+            by: columns)
+        guard !overflow,
+              let f32 = dequantizeToF32(type: t.type,
                                         src: source.mapBase.advanced(by: Int(t.absOffset)),
-                                        count: rows * columns) else {
+                                        count: elementCount) else {
             throw GGUFError.message("requant: dequantization of \(t.name) failed")
         }
         var dst = Data(count: byteCount)

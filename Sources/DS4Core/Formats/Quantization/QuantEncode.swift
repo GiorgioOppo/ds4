@@ -27,7 +27,10 @@ public enum QuantEncode {
     /// the type's block size).
     public static func rowSize(type: UInt32, columns: Int) -> Int {
         guard let info = GGUF.typeInfo(type) else { return 0 }
-        return columns / Int(info.blockElems) * Int(info.blockBytes)
+        let blocks = columns / Int(info.blockElems)
+        let (bytes, overflow) = blocks.multipliedReportingOverflow(
+            by: Int(info.blockBytes))
+        return overflow ? 0 : bytes
     }
 
     /// Port of `ds4q_quantize_chunk`: quantize `rows` full rows starting at

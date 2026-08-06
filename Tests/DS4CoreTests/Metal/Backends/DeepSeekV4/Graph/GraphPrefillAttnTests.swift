@@ -226,4 +226,14 @@ final class GraphPrefillAttnTests: XCTestCase {
             }
         }
     }
+
+    func testDSparkNoncausalMaskExposesWholeBlock() {
+        let queries = 5, keys = 17
+        var mask = [UInt16](repeating: 0xFC00, count: queries * keys)
+        mask.withUnsafeMutableBufferPointer {
+            GraphContext.fillDSparkNoncausalMask(
+                $0.baseAddress!, queryRows: queries, keyRows: keys)
+        }
+        XCTAssertTrue(mask.allSatisfy { $0 == 0 })
+    }
 }

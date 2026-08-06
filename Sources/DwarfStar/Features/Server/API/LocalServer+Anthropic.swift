@@ -14,6 +14,13 @@ extension LocalServer {
         guard !parsed.turns.isEmpty else {
             try await send(conn, Self.anthropicError(400, "no messages", cors: config.cors)); return
         }
+        do {
+            try ToolHistoryValidator.validate(parsed.turns)
+        } catch {
+            try await send(conn, Self.anthropicError(
+                400, "invalid tool history: \(error)", cors: config.cors))
+            return
+        }
         let model = resolveModel(parsed.model)
         let id = "msg_" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         onLog("POST /v1/messages (\(parsed.turns.count) msg, stream=\(parsed.stream))\n")

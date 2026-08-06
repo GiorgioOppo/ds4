@@ -15,6 +15,8 @@ public enum ModelCatalogID: String, CaseIterable, Identifiable, Sendable, Hashab
     case lagunaQ4 = "laguna-q4"
     case lagunaQ2Q3 = "laguna-q2-q3"
     case kimiK3IQ2XXSQ2K = "kimi-k3-iq2-xxs-q2-k"
+    case dsparkSupport = "dspark-support"
+    case dsparkSupport0731 = "dspark-support-0731"
 
     public var id: String { rawValue }
 }
@@ -481,12 +483,26 @@ public enum ModelCatalogRegistry {
     public static let selectableEntries: [ModelCatalogEntry] = entries.filter(\.isSelectable)
     public static let allArtifacts: [ModelTarget] = entries.flatMap(\.artifacts)
 
+    /// Entries rendered by the downloader. Optional support models belong
+    /// here, but never enter `entries`/`selectableEntries`, so downloading a
+    /// DSpark sidecar cannot accidentally replace the active main model.
+    public static let downloadEntries: [ModelCatalogEntry] =
+        entries + DeepSeekV4AccessoryCatalog.downloadEntries
+
     public static func entry(_ id: ModelCatalogID) -> ModelCatalogEntry? {
         entries.first { $0.id == id }
     }
 
     public static func entry(_ id: String) -> ModelCatalogEntry? {
         ModelCatalogID(rawValue: id).flatMap(entry)
+    }
+
+    public static func downloadEntry(_ id: ModelCatalogID) -> ModelCatalogEntry? {
+        downloadEntries.first { $0.id == id }
+    }
+
+    public static func downloadEntry(_ id: String) -> ModelCatalogEntry? {
+        ModelCatalogID(rawValue: id).flatMap(downloadEntry)
     }
 }
 
@@ -499,6 +515,52 @@ public enum DeepSeekV4AccessoryCatalog {
         note: "optional speculative-decoding component",
         role: .optionalComponent
     )
+
+    /// Original DeepSeek V4 Flash checkpoint support model.
+    public static let dspark = ModelTarget(
+        id: ModelCatalogID.dsparkSupport.rawValue,
+        file: "DeepSeek-V4-Flash-DSpark-support.gguf",
+        approxGB: 6,
+        note: "DSpark support model for the original Flash checkpoint",
+        sha256: "8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e",
+        expectedSizeBytes: 5_989_114_272,
+        role: .optionalComponent
+    )
+
+    /// Checkpoint-specific support model for the 0731 refresh. The exact size
+    /// is learned from the pinned Hugging Face manifest before download; the
+    /// SHA is already pinned by the official publication.
+    public static let dspark0731 = ModelTarget(
+        id: ModelCatalogID.dsparkSupport0731.rawValue,
+        file: "DeepSeek-V4-Flash-DSpark-support-0731.gguf",
+        approxGB: 6,
+        note: "DSpark support model for the Flash 0731 checkpoint",
+        sha256: "7e319924541db3f7a163ed7e11d7532a70d48228ab59d36cb81e1d4511885360",
+        role: .optionalComponent
+    )
+
+    public static let downloadEntries: [ModelCatalogEntry] = [
+        .init(
+            id: .dsparkSupport,
+            displayName: "DeepSeek V4 Flash · supporto DSpark",
+            profile: .deepSeekV4(.flash),
+            summary: "Modello ausiliario DSpark per il checkpoint Flash originale. Propone fino a cinque token; non è un modello autonomo.",
+            artifacts: [dspark],
+            runtimeAvailability: .downloadOnly(
+                reason: "Accessorio DSpark eseguibile dal runtime Swift/Metal; richiede il modello Flash originale abbinato."
+            )
+        ),
+        .init(
+            id: .dsparkSupport0731,
+            displayName: "DeepSeek V4 Flash 0731 · supporto DSpark",
+            profile: .deepSeekV4(.flash),
+            summary: "Supporto DSpark specifico per il checkpoint Flash 0731; non va usato con il checkpoint originale.",
+            artifacts: [dspark0731],
+            runtimeAvailability: .downloadOnly(
+                reason: "Accessorio DSpark eseguibile dal runtime Swift/Metal; richiede il checkpoint Flash 0731 abbinato."
+            )
+        ),
+    ]
 }
 
 /// Optional Laguna companions, excluded from the main-model catalog and from

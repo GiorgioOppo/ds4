@@ -73,6 +73,13 @@ extension LocalServer {
         guard !parsed.turns.isEmpty else {
             try await send(conn, Self.httpError(400, "no messages", cors: config.cors)); return
         }
+        do {
+            try ToolHistoryValidator.validate(parsed.turns)
+        } catch {
+            try await send(conn, Self.httpError(
+                400, "invalid tool history: \(error)", cors: config.cors))
+            return
+        }
         let model = resolveModel(parsed.model)
         let id = "chatcmpl-" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         let created = Int(Date().timeIntervalSince1970)

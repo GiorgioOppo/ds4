@@ -15,9 +15,9 @@ struct DownloadView: View {
 
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(ModelCatalogRegistry.entries) { entry in
+                    ForEach(ModelCatalogRegistry.downloadEntries) { entry in
                         catalogRow(entry)
-                        if entry.id != ModelCatalogRegistry.entries.last?.id {
+                        if entry.id != ModelCatalogRegistry.downloadEntries.last?.id {
                             Divider()
                         }
                     }
@@ -105,7 +105,10 @@ struct DownloadView: View {
             }
 
             HStack(spacing: 12) {
-                if entry.isSplitFragmentPackage {
+                if entry.artifacts.allSatisfy({ $0.role == .optionalComponent }) {
+                    Label("Accessorio · non sostituisce il modello selezionato",
+                          systemImage: "puzzlepiece.extension")
+                } else if entry.isSplitFragmentPackage {
                     Label("GGUF diviso · \(entry.artifacts.count) parti consecutive",
                           systemImage: "rectangle.split.3x1")
                 } else if entry.artifacts.count > 1 {

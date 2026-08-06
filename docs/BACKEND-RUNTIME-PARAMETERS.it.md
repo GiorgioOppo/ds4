@@ -182,6 +182,8 @@ interna. Promette la stessa intenzione operativa: per esempio
 | `DS4_SPEC_DRAFT_EXPERTS` | `2` | Esperti del draft. |
 | `DS4_SPEC_VERIFY_BATCH` | on | Verifica speculativa batchata. |
 | `DS4_MTP_GGUF` | non impostato | Modello MTP separato. |
+| `DS4_DSPARK_GGUF` | non impostato; percorso o `1` | Supporto DSpark greedy completo: abbinamento checkpoint, capture target-hidden, KV privata, tre transformer Metal, teste Markov/confidence, verifica batch e replay esatto. Richiede temperatura 0 e repetition penalty 1. |
+| `DS4_DSPARK_EXACT_REPLAY` | off | Se `1`, ripristina e rigioca il prefisso anche quando tutta la proposta è accettata: utile per parità bit-per-bit, ma disabilita il vantaggio prestazionale del commit veloce. |
 | `DS4_N_INDEXER_TOP_K` | modello | Override geometria indexer. |
 | `DS4_N_SWA` | modello | Override sliding window. |
 | `DS4_SHAPE_FLASH` | auto | Override shape diagnostico. |

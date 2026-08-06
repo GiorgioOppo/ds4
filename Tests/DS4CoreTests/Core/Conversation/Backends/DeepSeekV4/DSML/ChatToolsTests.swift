@@ -33,6 +33,47 @@ final class ChatToolsTests: XCTestCase {
         XCTAssertTrue(s.hasSuffix("<｜Assistant｜><think>"))
     }
 
+    func testToolPromptDoesNotAskToReopenAnAlreadyOpenThinkBlock() {
+        let s = ChatRenderer.render(turns: [.user("hi")], tools: [weather],
+                                    think: .high, markup: markup)
+        XCTAssertTrue(s.contains(
+            "When thinking mode is enabled, finish reasoning with </think>"))
+        XCTAssertFalse(s.contains("MUST output your complete reasoning inside <think>"))
+    }
+
+    func testToolHistoryValidationIsLinearAndAcceptsLargeValidHistory() throws {
+        var turns: [ChatTurn] = []
+        turns.reserveCapacity(8_192)
+        for index in 0..<4_096 {
+            let id = "call_\(index)"
+            turns.append(.assistant(text: "", toolCalls: [
+                ToolCall(id: id, name: "tool", argumentsJSON: "{}")
+            ]))
+            turns.append(.toolResult(callId: id, name: "tool", content: "ok"))
+        }
+        XCTAssertNoThrow(try ToolHistoryValidator.validate(turns))
+    }
+
+    func testToolHistoryRejectsUnknownDuplicateCallsAndResults() throws {
+        XCTAssertThrowsError(try ToolHistoryValidator.validate([
+            .toolResult(callId: "missing", name: "tool", content: "x")
+        ])) { error in
+            XCTAssertEqual(error as? ToolHistoryValidator.ValidationError,
+                           .unknownResultID("missing"))
+        }
+
+        let call = ToolCall(id: "same", name: "tool", argumentsJSON: "{}")
+        XCTAssertThrowsError(try ToolHistoryValidator.validate([
+            .assistant(text: "", toolCalls: [call]),
+            .assistant(text: "", toolCalls: [call])
+        ]))
+        XCTAssertThrowsError(try ToolHistoryValidator.validate([
+            .assistant(text: "", toolCalls: [call]),
+            .toolResult(callId: "same", name: "tool", content: "a"),
+            .toolResult(callId: "same", name: "tool", content: "b")
+        ]))
+    }
+
     /// Past assistant turns get `<｜Assistant｜></think>…<eos>` (template form).
     func testMultiTurnAssistantThinkMarker() {
         let turns: [ChatTurn] = [.user("a"), .assistant(text: "answer", toolCalls: []), .user("b")]

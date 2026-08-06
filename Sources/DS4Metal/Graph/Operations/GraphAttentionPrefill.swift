@@ -10,6 +10,16 @@ import Metal
 // (simdgroup MMA blocks vs the vec kernel's per-chunk loop).
 
 extension GraphContext {
+    /// DSpark's draft rows attend the complete support prefix and every row in
+    /// the current proposal block, including later rows. Its mask is therefore
+    /// deliberately all-zero (non-causal), unlike ordinary target prefill.
+    public static func fillDSparkNoncausalMask(
+        _ mask: UnsafeMutablePointer<UInt16>, queryRows: Int, keyRows: Int
+    ) {
+        precondition(queryRows > 0 && keyRows > 0)
+        memset(mask, 0, queryRows * keyRows * MemoryLayout<UInt16>.stride)
+    }
+
     /// Fill the batched-prefill attention mask CPU-side (the buffer is read
     /// only by the command buffer this run commits). Row r belongs to absolute
     /// position `posFirst + r`; the key axis is `rawSpan` raw rows starting at

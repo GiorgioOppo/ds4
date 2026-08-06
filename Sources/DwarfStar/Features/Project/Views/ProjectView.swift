@@ -56,8 +56,8 @@ enum ProjectLibrary {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.title = "Import a Project Folder"
-        panel.prompt = "Import"
+        panel.title = "Add a Local Project"
+        panel.prompt = "Add Project"
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
         _ = url.startAccessingSecurityScopedResource()
         guard let bm = try? url.bookmarkData(options: .withSecurityScope,
@@ -213,7 +213,7 @@ struct ProjectView: View {
                         activate(p)
                     }
                 } label: {
-                    Label("Import Folder...", systemImage: "folder.badge.plus")
+                    Label("Add New Project…", systemImage: "folder.badge.plus")
                 }
                 Text("Text files only (<=1 MB each, max 3000); folders like .git and node_modules are excluded. Folders remain accessible across launches through sandbox bookmarks. Repositories cloned in chat with github_clone appear here automatically with a \u{2913} icon (stored in Application Support; removing one deletes the cloned copy).")
                     .font(.caption).foregroundStyle(.tertiary)

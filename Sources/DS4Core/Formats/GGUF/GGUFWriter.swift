@@ -61,6 +61,7 @@ public enum GGUFWriterError: Error, CustomStringConvertible {
     case invalidAlignment(UInt64)
     case emptyDims(String)
     case tooManyDims(String, Int)
+    case tensorShapeOverflow(String)
     case unknownTensorType(String, UInt32)
     case tensorDataSizeMismatch(name: String, expected: UInt64, got: UInt64)
     case arrayElementTypeMismatch(expected: GGUFValueType, got: GGUFValueType)
@@ -72,6 +73,7 @@ public enum GGUFWriterError: Error, CustomStringConvertible {
         case .invalidAlignment(let a): return "invalid GGUF alignment \(a)"
         case .emptyDims(let n): return "tensor \(n) has no dimensions"
         case .tooManyDims(let n, let d): return "tensor \(n) has \(d) dimensions (max \(GGUF.maxDims))"
+        case .tensorShapeOverflow(let n): return "tensor \(n) shape is too large"
         case .unknownTensorType(let n, let t): return "tensor \(n) has unknown GGUF type \(t)"
         case .tensorDataSizeMismatch(let n, let e, let g):
             return "tensor \(n) data is \(g) bytes, expected \(e) for its type/shape"
@@ -117,7 +119,18 @@ public struct GGUFWriter {
             self.byteCount = byteCount; self.provider = provider
         }
 
-        var elements: UInt64 { dims.reduce(1, *) }
+        func elementCount() throws -> UInt64 {
+            var count: UInt64 = 1
+            for dimension in dims {
+                let (next, overflow) = count.multipliedReportingOverflow(
+                    by: dimension)
+                guard !overflow else {
+                    throw GGUFWriterError.tensorShapeOverflow(name)
+                }
+                count = next
+            }
+            return count
+        }
     }
 
     public private(set) var metadata: [(key: String, value: GGUFMetadataValue)]
@@ -222,7 +235,8 @@ public struct GGUFWriter {
             guard t.dims.count <= GGUF.maxDims else {
                 throw GGUFWriterError.tooManyDims(t.name, t.dims.count)
             }
-            guard let expected = GGUF.tensorNBytes(type: t.type, elements: t.elements) else {
+            guard let expected = GGUF.tensorNBytes(
+                type: t.type, elements: try t.elementCount()) else {
                 throw GGUFWriterError.unknownTensorType(t.name, t.type)
             }
             guard UInt64(t.byteCount) == expected else {
@@ -244,7 +258,8 @@ public struct GGUFWriter {
         relOffsets.reserveCapacity(tensors.count)
         var off: UInt64 = 0
         for t in tensors {
-            guard let expected = GGUF.tensorNBytes(type: t.type, elements: t.elements) else {
+            guard let expected = GGUF.tensorNBytes(
+                type: t.type, elements: try t.elementCount()) else {
                 throw GGUFWriterError.unknownTensorType(t.name, t.type)
             }
             guard UInt64(t.byteCount) == expected else {
@@ -253,7 +268,11 @@ public struct GGUFWriter {
             }
             off = GGUF.alignUp(off, alignment)
             relOffsets.append(off)
-            off += expected
+            let (next, overflow) = off.addingReportingOverflow(expected)
+            guard !overflow else {
+                throw GGUFWriterError.tensorShapeOverflow(t.name)
+            }
+            off = next
         }
         return (relOffsets, off)
     }

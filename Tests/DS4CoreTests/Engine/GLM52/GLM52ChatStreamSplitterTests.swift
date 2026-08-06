@@ -11,6 +11,34 @@ final class GLM52ChatStreamSplitterTests: XCTestCase {
             "4 tok · 2.00 tok/s — \(prefill)")
     }
 
+    func testLivePrefixRewindReevaluatesFinalPromptToken() {
+        XCTAssertEqual(
+            GLM52ChatService.livePrefixRewindTarget(
+                oldPosition: 17, promptLength: 8,
+                commonPrefix: 8, liveTokenCount: 17),
+            7)
+        XCTAssertEqual(
+            GLM52ChatService.livePrefixRewindTarget(
+                oldPosition: 49_826, promptLength: 48_379,
+                commonPrefix: 48_379, liveTokenCount: 49_826),
+            48_378)
+    }
+
+    func testLivePrefixRewindRejectsUnsafeStates() {
+        XCTAssertNil(GLM52ChatService.livePrefixRewindTarget(
+            oldPosition: 17, promptLength: 8,
+            commonPrefix: 7, liveTokenCount: 17))
+        XCTAssertNil(GLM52ChatService.livePrefixRewindTarget(
+            oldPosition: 8, promptLength: 8,
+            commonPrefix: 8, liveTokenCount: 8))
+        XCTAssertNil(GLM52ChatService.livePrefixRewindTarget(
+            oldPosition: 17, promptLength: 1,
+            commonPrefix: 1, liveTokenCount: 17))
+        XCTAssertNil(GLM52ChatService.livePrefixRewindTarget(
+            oldPosition: 17, promptLength: 8,
+            commonPrefix: 8, liveTokenCount: 16))
+    }
+
     func testOrdinaryTextIsEmittedWithoutFixedTailDelay() {
         var splitter = GLM52ChatService.StreamSplitter(startsInThink: false)
 

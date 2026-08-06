@@ -125,7 +125,7 @@ struct ChatView: View {
         return "Tool (\(store.enabledToolNames.count))"
     }
 
-    /// Import/switch the active project right from the chat: the agent's
+    /// Add/switch the active project right from the chat: the agent's
     /// project_* tools read the active one; the chat memory is untouched.
     private var projectMenu: some View {
         Menu {
@@ -150,7 +150,7 @@ struct ChatView: View {
                     refreshProject()
                 }
             } label: {
-                Label("Import Folder...", systemImage: "folder.badge.plus")
+                Label("Add New Project…", systemImage: "folder.badge.plus")
             }
         } label: {
             Label(activeProjectName ?? "Project", systemImage: "folder")

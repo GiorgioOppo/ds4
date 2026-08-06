@@ -100,6 +100,9 @@ private struct DeepSeekMemorySection: View {
             Toggle("Mixed-quant expert cache (recommended)", isOn: $store.multiQuantCacheEnabled)
             Text("Caches every routed IQ2/Q4 layer with its real record size under the same total byte budget as the legacy cache. The M1 Pro A/B improved decode by 28.9% and cut expert reads by 31.1%, with all 64 tokens and 2,068,480 logits bit-identical. Turn OFF to restore the legacy off-class bypass. Applies on the next model load.")
                 .font(.caption).foregroundStyle(.secondary)
+            Toggle("DSpark support (runtime sperimentale)", isOn: $store.dsparkEnabled)
+            Text("Usa automaticamente il supporto originale/0731 abbinato al modello. I tre transformer Metal, Markov e confidence propongono fino a 5 token, verificati in batch dal modello principale; viene committato solo il prefisso esatto. Attivo con temperatura 0 e repetition penalty 1. Si applica al prossimo caricamento.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Uniform expert-cache allocation (A/B option)", isOn: $store.expertCacheUniform)
             Text(store.expertCacheUniform
                  ? "Every routed layer receives the same slot allocation."

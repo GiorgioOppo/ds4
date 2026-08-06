@@ -151,7 +151,7 @@ struct CoordinatorChatView: View {
                     refreshProject()
                 }
             } label: {
-                Label("Import Folder...", systemImage: "folder.badge.plus")
+                Label("Add New Project…", systemImage: "folder.badge.plus")
             }
         } label: {
             Label(activeProjectName ?? "Project", systemImage: "folder")

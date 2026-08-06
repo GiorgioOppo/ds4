@@ -203,6 +203,11 @@ final class ChatStore {
         UserDefaults.standard.removeObject(forKey: "DS4ResidentDense")
         _ = setenv("DS4_RESIDENT_DENSE", Self.residentDenseAuto ? "1" : "0", 1)
         _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
+        if dsparkEnabled {
+            _ = setenv("DS4_DSPARK_GGUF", "1", 1)
+        } else {
+            _ = unsetenv("DS4_DSPARK_GGUF")
+        }
         // Riparazione una-tantum: la prima versione del benchmark rapido
         // poteva scegliere union=64 su una misura da 128 token troppo corta
         // (rumore) — a scala reale 64 è il valore catastrofico. Riporta al
@@ -406,6 +411,21 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(multiQuantCacheEnabled, forKey: "DS4MultiQuantCache")
             _ = setenv("DS4_MULTI_QUANT_CACHE", multiQuantCacheEnabled ? "1" : "0", 1)
+        }
+    }
+    /// DSpark support accessory. Strict matching, target-hidden capture, lazy
+    /// private KV, all three Metal transformers, Markov/confidence proposal and
+    /// exact target verification are executable for greedy generation.
+    /// The selected value is part of the load signature through the environment.
+    var dsparkEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4DSparkEnabled") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(dsparkEnabled, forKey: "DS4DSparkEnabled")
+            if dsparkEnabled {
+                _ = setenv("DS4_DSPARK_GGUF", "1", 1)
+            } else {
+                _ = unsetenv("DS4_DSPARK_GGUF")
+            }
         }
     }
     /// `false` distribuisce il budget cache in base al profilo di routing;

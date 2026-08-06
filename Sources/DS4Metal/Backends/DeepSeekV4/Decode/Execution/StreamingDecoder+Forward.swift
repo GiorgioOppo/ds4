@@ -5,6 +5,7 @@ import DS4Core
 extension StreamingDecoder {
     public func forward(token: Int, pos: Int, nKeys: Int) throws -> [Float] {
         try prepareLiveContext(nKeys: nKeys)
+        dsparkStage0Runtime?.beginCapture(position: pos)
         // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
         if pos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }
         // Layer 0's expert I/O can start NOW: the token id is known before any
@@ -23,6 +24,10 @@ extension StreamingDecoder {
                     if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
                     try runLayer(i, w: w, layerRope: ropeParams(layer: i),
                                  cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
+                    if let dspark = dsparkStage0Runtime {
+                        do { try dspark.capture(layer: i, hiddenHC: other) }
+                        catch { disableDSparkAfterFailure(error) }
+                    }
                     swap(&cur, &other)
                     // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
                 }
@@ -35,6 +40,13 @@ extension StreamingDecoder {
         // would cover the GPU ordering, but exportKV/readHC and error paths
         // must find NOTHING in flight — one explicit drain keeps the invariant.
         drainFFN()
+        if let dspark = dsparkStage0Runtime {
+            do {
+                _ = try dspark.finishCapture()
+                try dspark.maintainCapturedTarget(position: pos)
+            }
+            catch { disableDSparkAfterFailure(error) }
+        }
         profile.forwards += 1
         return try outputHead(cur)
     }

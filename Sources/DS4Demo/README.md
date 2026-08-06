@@ -80,6 +80,11 @@ throughput.
 | `DS4_PROMPT_MAX_CHARS` | positive integer | `12000` | Maximum number of characters read from a prompt file before truncation. The final tokenized prompt plus requested output must still fit `DS4_DEMO_CONTEXT`. |
 | `DS4_TYPES_ONLY` | present, usually `=1` | off | GGUF audit mode. Prints critical tensor dtypes, tokenizer special ids, and prompt tokenization, then exits before constructing the decoder. Use it first when a model produces nonsense or when validating a new quantization. |
 | `DS4_DIAG` | `=1` | off | Full streaming diagnostic run. Before generation it prints active knobs, measures disk bandwidth with `F_NOCACHE`, and checks whether MTP weights exist in the GGUF. After generation it prints per-layer routing, expert concentration, cache-slot allocation, and effective gather bandwidth versus measured SSD ceiling. |
+| `DS4_DSPARK_GGUF` | path or `=1` | unset | Opens the checkpoint-matched DSpark support GGUF and enables the complete greedy speculative path: three no-copy transformers, private KV, Markov/confidence proposal and exact target verification. Requires temperature 0 and repetition penalty 1. |
+| `DS4_DSPARK_EXACT_REPLAY` | `=1` | off | Replays even fully accepted proposals through ordinary one-token decode for bit-level A/B diagnostics. This intentionally removes the fast full-accept commit. |
+
+`DS4Demo inspect-dspark <support.gguf>` prints metadata, shapes and quantization
+without starting Metal; add `--bind` to validate the three no-copy bindings.
 | `DS4_ACTIVE_EXPERTS` | `1...6` | `6` | Reduces how many routed MoE experts are actually used per token. This lowers I/O and gather time but changes quality because both supported DeepSeek profiles use top-6. Useful as a degraded low-RAM mode or to estimate expert-I/O cost. |
 | `DS4_USAGE_FILE` | path or `off` | `<gguf-path>.usage.json` | JSON file for the usage imatrix, i.e. the historical expert choices made by the router. Keeping it enabled lets the next run pre-warm the cache with historically hot experts. Use a dedicated path for repeatable benchmarks; use `off` for cold runs. |
 | `DS4_WARMUP` | integer `>=0` | `0`; with `DS4_DIAG`, `min(4, maxNew-1)` | Excludes the first N generated tokens from the decode profile. Early tokens often pay one-time costs such as cold cache, buffer wiring, and memory settling. |

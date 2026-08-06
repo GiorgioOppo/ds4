@@ -92,7 +92,9 @@ public enum GGUF {
         guard let info = typeTable[type], info.blockElems != 0 else { return nil }
         let be = UInt64(info.blockElems)
         let bb = UInt64(info.blockBytes)
-        let blocks = (elements + be - 1) / be
+        let (rounded, roundedOverflow) = elements.addingReportingOverflow(be - 1)
+        guard !roundedOverflow else { return nil }
+        let blocks = rounded / be
         guard blocks <= UInt64.max / bb else { return nil }
         return blocks * bb
     }
@@ -102,4 +104,3 @@ public enum GGUF {
         return rem == 0 ? value : value + alignment - rem
     }
 }
-

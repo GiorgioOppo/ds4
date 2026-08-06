@@ -25,6 +25,8 @@ final class ModelDownloaderTests: XCTestCase {
             XCTAssertEqual(ModelDownloader.target(target.id), target)
         }
         XCTAssertEqual(ModelDownloader.target("mtp")?.role, .optionalComponent)
+        XCTAssertEqual(ModelDownloader.target("dspark-support")?.role, .optionalComponent)
+        XCTAssertEqual(ModelDownloader.target("dspark-support-0731")?.role, .optionalComponent)
         XCTAssertEqual(ModelDownloader.target("laguna-dflash")?.role, .optionalComponent)
     }
 
@@ -34,6 +36,7 @@ final class ModelDownloaderTests: XCTestCase {
         XCTAssertEqual(LagunaModelCatalog.entries.count, 2)
         XCTAssertEqual(KimiK3ModelCatalog.entries.count, 1)
         XCTAssertEqual(ModelCatalogRegistry.entries.count, 11)
+        XCTAssertEqual(ModelCatalogRegistry.downloadEntries.count, 13)
         XCTAssertEqual(
             Set(ModelCatalogRegistry.selectableEntries.map(\.id)),
             Set([.flashQ2Imatrix, .flashQ2Q4Imatrix, .flashQ4Imatrix, .proQ2Imatrix,
@@ -59,6 +62,22 @@ final class ModelDownloaderTests: XCTestCase {
                 .flatMap(\.artifacts)
                 .contains { $0.id == DeepSeekV4AccessoryCatalog.mtp.id },
             "MTP is an accessory, not a main-model catalog entry"
+        )
+        XCTAssertTrue(
+            Set(DeepSeekV4AccessoryCatalog.downloadEntries.map(\.id))
+                == Set([.dsparkSupport, .dsparkSupport0731])
+        )
+        XCTAssertTrue(DeepSeekV4AccessoryCatalog.downloadEntries.allSatisfy {
+            !$0.isSelectable && $0.artifacts.allSatisfy { $0.role == .optionalComponent }
+        })
+        XCTAssertEqual(DeepSeekV4AccessoryCatalog.dspark.expectedSizeBytes, 5_989_114_272)
+        XCTAssertEqual(
+            DeepSeekV4AccessoryCatalog.dspark.sha256,
+            "8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e"
+        )
+        XCTAssertEqual(
+            DeepSeekV4AccessoryCatalog.dspark0731.sha256,
+            "7e319924541db3f7a163ed7e11d7532a70d48228ab59d36cb81e1d4511885360"
         )
 
         let artifacts = ModelCatalogRegistry.allArtifacts

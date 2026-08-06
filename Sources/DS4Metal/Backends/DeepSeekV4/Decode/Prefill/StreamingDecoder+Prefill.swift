@@ -219,6 +219,9 @@ extension StreamingDecoder {
         // earlier tokens then reuse the same high-water allocation.
         try prepareLiveContext(nKeys: posBase + end)
         let n = end - start
+        dsparkStage0Runtime?.beginCapture(position: posBase + end - 1)
+        dsparkStage0Runtime?.beginBatchCapture(
+            startPosition: posBase + start, nTokens: n)
         let hcDim = d.nHC * d.nEmbd
         // Slab-backed HC ping-pong: same per-token views as the historical
         // separate buffers, but the batched phase-B tail can write a whole
@@ -292,7 +295,22 @@ extension StreamingDecoder {
                 }
                 swap(&cur, &other)                       // w drops here -> EVICT
                 swap(&curPair, &otherPair)
+                if let dspark = dsparkStage0Runtime {
+                    do {
+                        try dspark.capture(layer: i, hiddenHC: cur[n - 1])
+                        try dspark.captureBatch(
+                            layer: i, hiddenHC: curPair.slab, nTokens: n)
+                    }
+                    catch { disableDSparkAfterFailure(error) }
+                }
             }
+        }
+        if let dspark = dsparkStage0Runtime {
+            do {
+                _ = try dspark.finishCapture()
+                _ = dspark.finishBatchCapture()
+            }
+            catch { disableDSparkAfterFailure(error) }
         }
         // The alternate ping-pong side can be released immediately. `cur`
         // leaves this helper so the caller can select the last hidden (normal
@@ -319,6 +337,9 @@ extension StreamingDecoder {
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         try embedTokensBatch(tokens, into: cur)
+        dsparkStage0Runtime?.beginCapture(position: startPos + n - 1)
+        dsparkStage0Runtime?.beginBatchCapture(
+            startPosition: startPos, nTokens: n)
         // Fase V1 (DS4_SPEC_VERIFY_BATCH, default on): dove possibile la route/
         // attention dell'INTERA finestra va in UN command buffer per layer
         // (encodeRouteInto + snapshot blit, la fase A del prefill batchato — una
@@ -359,13 +380,31 @@ extension StreamingDecoder {
                         }
                     }
                     swap(&cur, &other)
+                    if let dspark = dsparkStage0Runtime {
+                        do {
+                            try dspark.capture(layer: i, hiddenHC: cur[n - 1])
+                            try dspark.captureBatchRows(layer: i, hiddenHC: cur)
+                        } catch {
+                            disableDSparkAfterFailure(error)
+                        }
+                    }
                 }
             }
         } catch {
             drainFFN()   // stesso invariante di prefill: mai un cb in volo oltre l'errore
+            dsparkStage0Runtime?.abortCapture()
+            dsparkStage0Runtime?.abortBatchCapture()
             throw error
         }
         drainFFN()
+        if let dspark = dsparkStage0Runtime {
+            do {
+                _ = try dspark.finishCapture()
+                _ = dspark.finishBatchCapture()
+            } catch {
+                disableDSparkAfterFailure(error)
+            }
+        }
         profile.forwards += n
         return try cur.map { try outputHead($0) }
     }

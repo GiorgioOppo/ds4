@@ -63,12 +63,13 @@ final class GLM52IQ2XXSTests: XCTestCase {
             XCTAssertEqual(abs(value), 1.0, "cell magnitude at \(i)")
         }
         // Raising the first group's cell scale nibble to 15 rescales ONLY
-        // that group: db = (0.5 + 15) * 0.25 = 3.875.
+        // that group: db = (0.5 + 15) * 0.25 = 3.875; grid[0] has
+        // magnitude 8, therefore every decoded value has magnitude 31.
         var words = [UInt16](repeating: 0, count: 32)
         words[3] = 0xF000
         let scaled = dequant(block(d: 1, words: words), count: 256)
         for i in 0..<32 {
-            XCTAssertEqual(abs(scaled[i]), 3.875, "scaled group at \(i)")
+            XCTAssertEqual(abs(scaled[i]), 31, "scaled group at \(i)")
         }
         for i in 32..<256 {
             XCTAssertEqual(abs(scaled[i]), 1.0, "untouched group at \(i)")

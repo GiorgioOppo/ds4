@@ -115,6 +115,52 @@ extension GraphContext {
                                  topK: Int, out: GPUTensor,
                                  scratch: GPUTensor) throws {
         precondition(nComp > 0 && nTokens > 0 && topK > 0 && topK <= nComp)
+        // Upstream exact streaming selector: one 256-thread group per token,
+        // bounded 8 KiB threadgroup state, no global scratch or merge chain.
+        // This path is ordinary Metal and benefits pre-MPP GPUs such as M1.
+        if topK == 512 && nComp > 1024 && nTokens >= 32 {
+            var args = [UInt8](repeating: 0, count: 72)
+            args.withUnsafeMutableBytes { p in
+                p.storeBytes(of: Int32(nComp), toByteOffset: 0,
+                             as: Int32.self)
+                p.storeBytes(of: Int32(nTokens), toByteOffset: 4,
+                             as: Int32.self)
+                p.storeBytes(of: Int32(1), toByteOffset: 8,
+                             as: Int32.self)
+                p.storeBytes(of: Int32(1), toByteOffset: 12,
+                             as: Int32.self)
+                p.storeBytes(of: UInt64(4), toByteOffset: 16,
+                             as: UInt64.self)
+                p.storeBytes(of: UInt64(nComp * 4), toByteOffset: 24,
+                             as: UInt64.self)
+                p.storeBytes(of: UInt64(nComp * nTokens * 4),
+                             toByteOffset: 32, as: UInt64.self)
+                p.storeBytes(of: UInt64(nComp * nTokens * 4),
+                             toByteOffset: 40, as: UInt64.self)
+                p.storeBytes(of: Int32(topK), toByteOffset: 48,
+                             as: Int32.self)
+                p.storeBytes(of: Int32(nTokens), toByteOffset: 52,
+                             as: Int32.self)
+                p.storeBytes(of: Int32(1), toByteOffset: 56,
+                             as: Int32.self)
+                p.storeBytes(of: Int32(1), toByteOffset: 60,
+                             as: Int32.self)
+                p.storeBytes(of: Int32(topK), toByteOffset: 64,
+                             as: Int32.self)
+            }
+            let pso = try rt.pipeline("kernel_topk_stream512")
+            let e = encoder
+            e.setComputePipelineState(pso)
+            args.withUnsafeBytes {
+                e.setBytes($0.baseAddress!, length: $0.count, index: 0)
+            }
+            e.setBuffer(scores.buffer, offset: scores.byteOffset, index: 1)
+            e.setBuffer(out.buffer, offset: out.byteOffset, index: 2)
+            e.dispatchThreadgroups(
+                MTLSize(width: nTokens, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            return
+        }
         let sortPso = try rt.pipeline("kernel_argsort_f32_i32_desc")
         var maxThreads = sortPso.maxTotalThreadsPerThreadgroup
         if maxThreads == 0 { maxThreads = 256 }

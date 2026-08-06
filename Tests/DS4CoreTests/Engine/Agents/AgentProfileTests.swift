@@ -52,6 +52,25 @@ final class AgentProfileTests: XCTestCase {
         XCTAssertTrue(delegated.contains("project_inspect"))
     }
 
+    /// The orchestrator must be able to choose a role without guessing what the
+    /// similarly named Coding/Code profiles do. The live agents_list remains
+    /// authoritative, while the prompt carries a compact built-in capability map.
+    func testOrchestratorPromptDocumentsBuiltInRosterAndTools() throws {
+        let prompt = try XCTUnwrap(
+            AgentProfile.defaults.first { $0.id == "orchestratore" }
+        ).systemPrompt
+        for id in ["generale", "coding", "code", "revisore", "debug", "orchestratore",
+                   "ricerca", "matematica", "scrittura", "latex", "documentatore"] {
+            XCTAssertTrue(prompt.contains("\(id)="), "missing orchestrator roster entry: \(id)")
+        }
+        XCTAssertTrue(prompt.contains("coding=Code Analyst, read-only guidance"))
+        XCTAssertTrue(prompt.contains("code=Developer, implementation"))
+        XCTAssertTrue(prompt.contains("R=project_inspect+file_read+file_lines"))
+        XCTAssertTrue(prompt.contains("W=file_write+file_add+file_modify"))
+        XCTAssertTrue(prompt.contains("agents_list first"))
+        XCTAssertTrue(prompt.contains("live roster is authoritative"))
+    }
+
     /// The default project roles expose one high-density inspection surface,
     /// not five primitives that encourage one model round per file.
     func testProjectRolesPreferBatchInspection() throws {

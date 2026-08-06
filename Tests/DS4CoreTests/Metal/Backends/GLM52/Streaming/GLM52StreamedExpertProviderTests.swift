@@ -25,14 +25,14 @@ final class GLM52StreamedExpertProviderTests: XCTestCase {
         -> GLM52RoutedExpertWeights {
         let gate = descriptor(name: "blk.5.ffn_gate_exps.weight",
                               type: gateUpType,
-                              dims: [256, 128, expertCount], offset: 1_024)
+                              dims: [256, 512, expertCount], offset: 1_024)
         let up = descriptor(name: "blk.5.ffn_up_exps.weight",
                             type: gateUpType,
-                            dims: [256, 128, expertCount],
+                            dims: [256, 512, expertCount],
                             offset: gate.absOffset + gate.bytes + 512)
         let down = descriptor(name: "blk.5.ffn_down_exps.weight",
                               type: downType,
-                              dims: [256, 128, expertCount],
+                              dims: [512, 256, expertCount],
                               offset: up.absOffset + up.bytes + 512)
         return GLM52RoutedExpertWeights(gate: gate, up: up, down: down)
     }

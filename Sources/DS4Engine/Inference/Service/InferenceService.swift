@@ -85,7 +85,7 @@ public actor InferenceService: DS4Logging {
     var warmedUp = false
     var lastPrefillProfile = "Profilo prefill: nessun prefill registrato."
 
-    public static let engineRevision = "2026-07-16 mixed-quant expert cache + exact cache diagnostics"
+    public static let engineRevision = "2026-08-06 DSpark transformer forward + KV seed"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil,
@@ -103,7 +103,8 @@ public actor InferenceService: DS4Logging {
                      "DS4_QKV_Q4", "DS4_COMP_Q8", "DS4_LAZY_IDX", "DS4_GPU_INDEXER_TOPK", "DS4_ADAPTIVE_SPLITK", "DS4_DENSE_Q4_KERNEL", "DS4_FUSED_ROUTER_PROBS", "DS4_FUSED_ROUTER_FINALIZE", "DS4_FUSED_COMP_PROJ",
                      "DS4_VECTOR_COPY", "DS4_FLASH_KV_STAGE", "DS4_ROPE_PAIR", "DS4_ROPE_AFFINE",
                      "DS4_MTLIO", "DS4_RESIDENT_COMP", "DS4_FUSED_HC",
-                     "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
+                     "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR",
+                     "DS4_DSPARK_GGUF"]
         let env = ProcessInfo.processInfo.environment
         let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
         Self.log("knob \(knobLine)")
@@ -179,6 +180,31 @@ public actor InferenceService: DS4Logging {
                                                                        nLayers: geometry.nLayers, maxKeys: contextSize,
                                                                        cacheSlots: expertCacheSlots,
                                                                        geometry: geometry)
+        if let requested = env["DS4_DSPARK_GGUF"], !requested.isEmpty {
+            let supportPath = requested == "1"
+                ? DSparkSupportModel.locate(near: modelPath)
+                : requested
+            if let supportPath,
+               FileManager.default.fileExists(atPath: supportPath) {
+                do {
+                    try decoder.enableDSparkStage0(
+                        supportPath: supportPath,
+                        mainModelPath: modelPath)
+                    let runtime = decoder.dsparkStage0Runtime
+                    let residentMiB = (runtime?.residentWeightBytes ?? 0) >> 20
+                    let mappedGiB = Double(runtime?.mappedTransformerBytes ?? 0)
+                        / Double(1 << 30)
+                    let kvMiB = (runtime?.privateKVBytes ?? 0) >> 20
+                    Self.log(String(format:
+                        "DSpark capture/stage0 + 3 transformer eseguibili: %.2f GiB mmap, %d MiB residenti, KV privato %d MiB",
+                        mappedGiB, residentMiB, kvMiB))
+                } catch {
+                    Self.log("DSpark non attivato; decode target invariato: \(error)")
+                }
+            } else {
+                Self.log("DSpark richiesto ma supporto completo abbinato non trovato; file .part ignorati")
+            }
+        }
         // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
         // so the slot-cache warms with the historically hottest experts. The
         // profile is PER-AGENT: different roles route to different experts.

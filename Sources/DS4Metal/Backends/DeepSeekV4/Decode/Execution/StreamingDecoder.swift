@@ -31,6 +31,11 @@ public final class StreamingDecoder {
     let out: OutputHeadWeights
     let rmsEps: Float, hcEps: Float
 
+    /// Optional DSpark target-hidden capture and executable stage-0 graph.
+    /// Nil on the ordinary path, so attaching DSpark cannot alter baseline
+    /// allocation, command ordering or logits.
+    public internal(set) var dsparkStage0Runtime: DSparkStage0Runtime?
+
     /// Per-phase decode timing (opt-in: read after a run, reset between runs).
     public var profile = DecodeProfile()
     public func resetProfile() { profile = DecodeProfile() }

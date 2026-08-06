@@ -173,7 +173,7 @@ final class DownloadRunner {
     func checkForUpdates() {
         guard task == nil else { return }
         refresh()
-        let installedEntries = ModelCatalogRegistry.entries.filter {
+        let installedEntries = ModelCatalogRegistry.downloadEntries.filter {
             installation(for: $0).state == .installed
         }
         guard !installedEntries.isEmpty else { return }
@@ -204,7 +204,7 @@ final class DownloadRunner {
 
     func refresh() {
         var next: [String: CatalogInstallation] = [:]
-        for entry in ModelCatalogRegistry.entries {
+        for entry in ModelCatalogRegistry.downloadEntries {
             let effective = remoteEntries[entry.id.rawValue] ?? effectiveInstalledEntry(entry)
             next[entry.id.rawValue] = inspect(effective)
         }
@@ -270,7 +270,7 @@ final class DownloadRunner {
                 var downloaded = false
                 for (index, target) in entry.artifacts.enumerated() {
                     try Task.checkCancellation()
-                    let catalogTarget = ModelCatalogRegistry.entry(entry.id)?.artifacts
+                    let catalogTarget = ModelCatalogRegistry.downloadEntry(entry.id)?.artifacts
                         .first(where: { $0.id == target.id })
                     let replaceArtifact = replacing && catalogTarget != target
                     if !replaceArtifact, self.existingFile(for: target) != nil {

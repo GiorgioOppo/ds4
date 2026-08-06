@@ -445,6 +445,23 @@ public actor GLM52ChatService {
             prefillSummary)
     }
 
+    /// A stateless request can resend a prompt that is a complete prefix of the
+    /// live GLM session (the live state also contains the previous answer). GLM
+    /// caches are rewindable: retain every row before the final prompt token and
+    /// reevaluate that token to recover the exact next-token logits.
+    static func livePrefixRewindTarget(
+        oldPosition: Int,
+        promptLength: Int,
+        commonPrefix: Int,
+        liveTokenCount: Int
+    ) -> Int? {
+        guard oldPosition == liveTokenCount,
+              promptLength > 1,
+              promptLength < oldPosition,
+              commonPrefix == promptLength else { return nil }
+        return promptLength - 1
+    }
+
     public func setAgent(systemPrompt: String?) {
         self.systemPrompt = systemPrompt
     }
@@ -748,12 +765,23 @@ public actor GLM52ChatService {
                         && common == primed.count
                         && common == service.engine.position
                         && common < tokens.count
+                    let rewindTo = Self.livePrefixRewindTarget(
+                        oldPosition: service.engine.position,
+                        promptLength: tokens.count,
+                        commonPrefix: common,
+                        liveTokenCount: primed.count)
                     let suffix: [Int32]
                     if incremental {
                         suffix = Array(tokens[common...])
                         continuation.yield(.progress(
                             "prefill incrementale \(suffix.count) token "
                             + "(+\(common) in cache)"))
+                    } else if let rewindTo {
+                        try service.engine.rollback(to: rewindTo)
+                        suffix = Array(tokens[rewindTo...])
+                        continuation.yield(.progress(
+                            "KV GLM riavvolto da \(primed.count) a \(rewindTo) token; "
+                            + "rivaluto l'ultimo token del prompt"))
                     } else {
                         service.engine.resetContext()
                         // Disk KV: lo store cerca tra TUTTI i checkpoint il

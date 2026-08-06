@@ -74,7 +74,9 @@ di avanzamento; evitare buffer proporzionali alla dimensione del modello.
 Un target scaricabile non implica compatibilità con il decoder. Il catalogo
 principale dichiara il supporto runtime per entry: i tre Flash e PRO Q2
 singolo-file sono selezionabili, mentre il package PRO Q4 e i tre GLM 5.2
-restano `downloadOnly`. MTP è un accessorio separato e non compare tra i modelli GUI.
+restano `downloadOnly`. MTP resta interno; gli accessori DSpark originale e
+0731 compaiono nel downloader ma non possono essere selezionati come modelli
+principali.
 
 Per Kimi K3 la GUI acquisisce in ordine cinque `splitFragment`. Ogni parte ha
 resume, dimensione e SHA-256 indipendenti; il package risulta installato solo

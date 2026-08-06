@@ -1,5 +1,77 @@
 import Foundation
 import DS4Core
+import DS4Metal
+
+/// Inspect an official DSpark support artifact without creating Metal or
+/// opening the multi-gigabyte target model. Keeping this as an offline
+/// subcommand makes tensor-type drift visible before any kernel is bound.
+func runDSparkInspectCLI(_ arguments: [String]) -> Int32 {
+    guard arguments.count == 1
+            || (arguments.count == 2
+                && ["--bind", "--runtime"].contains(arguments[1])) else {
+        FileHandle.standardError.write(Data(
+            "usage: DS4Demo inspect-dspark <support.gguf> [--bind|--runtime]\n".utf8))
+        return 2
+    }
+    do {
+        let support = try DSparkSupportModel(
+            path: arguments[0],
+            targetDims: DSV4Shape.dims,
+            targetLayerCount: DSV4Shape.nLayer,
+            metalMapping: false)
+        print(support.report())
+        for stage in support.stages {
+            print("  mtp.\(stage.index):")
+            for tensor in stage.tensors.values.sorted(by: { $0.name < $1.name }) {
+                let shape = tensor.dims.map(String.init).joined(separator: "×")
+                print("    \(tensor.name)  \(tensor.typeName)  [\(shape)]  \(tensor.bytes) B")
+            }
+        }
+        if arguments.count == 2, arguments[1] == "--bind" {
+            let mappedSupport = try DSparkSupportModel(
+                path: arguments[0],
+                targetDims: DSV4Shape.dims,
+                targetLayerCount: DSV4Shape.nLayer,
+                metalMapping: true)
+            let runtime = try MetalRuntime()
+            var mapped = 0
+            var resident = 0
+            for index in mappedSupport.stages.indices {
+                let weights = try mappedSupport.loadMappedStageWeights(
+                    runtime, stage: index)
+                mapped += weights.mappedBytes
+                resident += weights.residentBytes
+                let final = weights.finalHead != nil ? "yes" : "no"
+                print("  bind mtp.\(index): mmap=\(weights.mappedBytes) B "
+                    + "resident=\(weights.residentBytes) B "
+                    + "final=\(final)")
+            }
+            print("  bind totale: mmap=\(mapped) B resident=\(resident) B")
+        }
+        if arguments.count == 2, arguments[1] == "--runtime" {
+            let runtime = try MetalRuntime()
+            let supportName = (arguments[0] as NSString).lastPathComponent
+            let directory = (arguments[0] as NSString).deletingLastPathComponent
+            let checkpointName = supportName.lowercased().contains("0731")
+                ? "DeepSeek-V4-Flash-main-0731.gguf"
+                : "DeepSeek-V4-Flash-main.gguf"
+            let dspark = try DSparkStage0Runtime(
+                rt: runtime, supportPath: arguments[0],
+                mainModelPath: directory + "/" + checkpointName,
+                targetDims: DSV4Shape.dims,
+                targetLayerCount: DSV4Shape.nLayer)
+            print("  runtime: transformer=pronto "
+                + "cache=\(dspark.cacheCapacity) righe "
+                + "private-kv=\(dspark.privateKVBytes) B "
+                + "mmap=\(dspark.mappedTransformerBytes) B "
+                + "resident=\(dspark.residentWeightBytes) B")
+        }
+        return support.isRunnable ? 0 : 1
+    } catch {
+        FileHandle.standardError.write(Data("inspect-dspark: \(error)\n".utf8))
+        return 1
+    }
+}
 
 /// Pesi MTP (Multi-Token Prediction) nel GGUF: se presenti, la decodifica
 /// speculativa (draft con la testa MTP + verifica batch) è possibile. Le
@@ -45,7 +117,7 @@ func knobReport() -> String {
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
                  "DS4_QKV_Q4", "DS4_COMP_Q8", "DS4_LAZY_IDX", "DS4_GPU_INDEXER_TOPK", "DS4_ADAPTIVE_SPLITK", "DS4_DENSE_Q4_KERNEL", "DS4_FUSED_HC", "DS4_FUSED_ROUTER_PROBS", "DS4_FUSED_ROUTER_FINALIZE", "DS4_FUSED_COMP_PROJ",
                  "DS4_VECTOR_COPY", "DS4_FLASH_KV_STAGE", "DS4_ROPE_PAIR", "DS4_ROPE_AFFINE",
-                 "DS4_MTLIO", "DS4_MTLIO_MIN_GBS", "DS4_MLOCK", "DS4_RESIDENT_COMP", "DS4_PROFILE_ROUTE", "DS4_SPEC_K", "DS4_SPEC_DRAFT", "DS4_SPEC_DRAFT_EXPERTS", "DS4_SPEC_VERIFY_BATCH", "DS4_MTP_GGUF",
+                 "DS4_MTLIO", "DS4_MTLIO_MIN_GBS", "DS4_MLOCK", "DS4_RESIDENT_COMP", "DS4_PROFILE_ROUTE", "DS4_SPEC_K", "DS4_SPEC_DRAFT", "DS4_SPEC_DRAFT_EXPERTS", "DS4_SPEC_VERIFY_BATCH", "DS4_MTP_GGUF", "DS4_DSPARK_GGUF",
                  "DS4_DEMO_TEMPERATURE", "DS4_DEMO_TOP_K", "DS4_DEMO_TOP_P", "DS4_DEMO_MIN_P",
                  "DS4_DEMO_REPEAT_PENALTY", "DS4_DEMO_REPEAT_LAST_N",
                  "DS4_WARMUP", "DS4_USAGE_FILE", "DS4_AB_TRACE", "DS4_AB_TRACE_FRAMES",

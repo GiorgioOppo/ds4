@@ -22,7 +22,10 @@ public enum ModelDownloader {
     /// DFlash draft remain addressable as optional accessories.
     public static var targets: [ModelTarget] {
         ModelCatalogRegistry.allArtifacts
-            + [DeepSeekV4AccessoryCatalog.mtp, LagunaAccessoryCatalog.dflash]
+            + [DeepSeekV4AccessoryCatalog.mtp,
+               DeepSeekV4AccessoryCatalog.dspark,
+               DeepSeekV4AccessoryCatalog.dspark0731,
+               LagunaAccessoryCatalog.dflash]
     }
 
     public static func target(_ id: String) -> ModelTarget? {

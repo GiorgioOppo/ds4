@@ -21,10 +21,41 @@ the baseline.
 
 | Field | Value |
 |---|---|
-| Upstream HEAD reviewed | `80ebbc3` |
-| Date | 2026-06-17 |
+| Upstream HEAD reviewed | `b030961` |
+| Date | 2026-08-05 |
 | Repository | `https://github.com/antirez/ds4.git` |
-| Result | **No urgent changes required** for the standard model path. |
+| Result | **Shared correctness fixes and the M1-capable streaming top-512 prefill selector ported.** |
+
+## Update 2026-08-05 (reviewed upstream `main` through `b030961`)
+
+Reviewed the latest 20 commits on `main` and ported the shared behavior rather
+than the C ownership/runtime details:
+
+- `222b2cb`: exact `kernel_topk_stream512` plus the Swift dispatch for wide
+  DeepSeek indexed-prefill rows (`topK=512`, `nComp>1024`, `nTokens>=32`). The
+  Metal 4/MPP dual-head variant remains deferred because it cannot run on the
+  current M1 Pro validation machine.
+- `7694112`: GLM live-prefix rewind. A repeated stateless prompt that prefixes
+  the live prompt+answer state now rolls back to its penultimate token and
+  reevaluates the last prompt token instead of rebuilding the prompt.
+- `af80694` + `7fb2830`: speculative accepts are always restored and replayed
+  through ordinary one-token decode, keeping recurrent compressor state greedy
+  identical after both full and partial accepts.
+- `fe2d3b0`: the full tool prompt no longer asks the model to reopen the think
+  block, and tool-enabled DeepSeek streams hold tentative post-think text until
+  a tool/final boundary or a second close marker classifies it.
+- `a169cff`: client tool histories are validated in one forward pass, with
+  duplicate/unknown call ids rejected before OpenAI, Responses or Anthropic
+  inference.
+- `a968c08`: GGUF writer/type-size/requantization shape products now use checked
+  arithmetic. The external safetensors C converter still needs the upstream C
+  patch until that converter itself is rewritten in Swift.
+
+Already aligned: disk-KV restores retain successful checkpoints (`24fa85e`),
+complete DSML calls are recognized regardless of an unclosed reasoning block
+(`51a1c14`), and project edits never enabled fuzzy `[upto]` matching (`b030961`).
+The routed MoE MPP prefill kernel from `532ec8b` is retained as a future
+Metal-4 port; it has no executable path on pre-M5 Apple GPUs.
 
 ## Update 2026-07-28 (reviewed branch `laguna-s2.1`, head `448d569`)
 
@@ -84,7 +115,7 @@ on a Mac.
 | `66cbce5` Unify distributed inference CLI and documentation | CLI/docs | **N/A** (distributed CLI/docs; the port has its own). |
 | `36ee8c1` Add CUDA tensor parallelism and session batching | CUDA/TP | **N/A** (out of scope). |
 | `63d9874` Add two-machine Metal tensor parallelism | TP | **N/A** (tensor-parallel + RDMA out of scope). |
-| `fc9efd1` Add DSpark speculative decoding | speculative | **N/A** (MTP/speculative family out of scope; the port has its own self-speculative). |
+| `fc9efd1` Add DSpark speculative decoding | speculative | **PORTED, DEVICE VALIDATION IN PROGRESS.** Swift has downloads, strict 81-tensor validation, target-hidden capture, private-ring seeding/maintenance, the three-stage Metal forward (non-causal attention + MoE), final HC/output/Markov/confidence heads and exact target verification/replay in the GUI and demo greedy loops. A same-checkpoint performance/acceptance A/B still remains. |
 
 Net new actionable items: `519c4d8` (expert-cache/sampling correctness) and
 `427e281` (Metal kernel resync) — both need on-device evaluation. Advance the

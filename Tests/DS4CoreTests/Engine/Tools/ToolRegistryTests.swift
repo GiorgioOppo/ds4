@@ -5,6 +5,22 @@ import DS4Core
 /// Pure-Swift checks of the built-in demo tools and the registry dispatch.
 final class ToolRegistryTests: XCTestCase {
 
+    func testSecondReasoningGuardReroutesOnlyAfterSecondClose() {
+        var guardState = InferenceService.SecondReasoningGuard(enabled: true)
+        XCTAssertFalse(guardState.closeReasoning(wasReasoning: true))
+        XCTAssertTrue(guardState.isHolding)
+        XCTAssertTrue(guardState.closeReasoning(wasReasoning: false))
+        XCTAssertFalse(guardState.isHolding)
+    }
+
+    func testSecondReasoningGuardReleasesTentativeAnswerAtBoundary() {
+        var guardState = InferenceService.SecondReasoningGuard(enabled: true)
+        _ = guardState.closeReasoning(wasReasoning: true)
+        guardState.resolveAsAnswer()
+        XCTAssertFalse(guardState.isHolding)
+        XCTAssertFalse(guardState.closeReasoning(wasReasoning: false))
+    }
+
     private var allBuiltinsPolicy: ToolExecutionPolicy {
         ToolExecutionPolicy(allowedToolNames: Set(ToolRegistry.builtins.map(\.spec.name)))
     }

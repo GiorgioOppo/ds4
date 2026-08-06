@@ -22,6 +22,9 @@ import Metal
 if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "requantize" {
     exit(runRequantizeCLI(Array(CommandLine.arguments.dropFirst(2))))
 }
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "inspect-dspark" {
+    exit(runDSparkInspectCLI(Array(CommandLine.arguments.dropFirst(2))))
+}
 
 do {
     let rt = try MetalRuntime()   // kernels embedded in the binary — no folder needed
@@ -833,6 +836,41 @@ do {
     dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down; dims.routerF16 = mq.routerF16
     log("DS4Demo: profilo=\(config.shape.name) layer=\(geometry.nLayers) esperti=\(dims.nExperts)")
     log("DS4Demo: MoE quant gate=\(mq.gate) up=\(mq.up) down=\(mq.down) routerF16=\(mq.routerF16)")
+    // DS4_DSPARK_GGUF opens and strictly validates the multi-stage DSpark
+    // support model. `=1` locates the checkpoint-matched canonical accessory
+    // next to the main GGUF; an explicit path also supports custom conversions.
+    // A valid support path is attached to the decoder below: target-hidden
+    // capture + the resident stage-0 main projection then run on every target
+    // forward. Transformer draft stages remain behind the next runtime gate.
+    var dsparkRuntimePath: String?
+    if let dsparkEnv = ProcessInfo.processInfo.environment["DS4_DSPARK_GGUF"],
+       !dsparkEnv.isEmpty {
+        let supportPath = dsparkEnv == "1"
+            ? DSparkSupportModel.locate(near: ggufPath)
+            : dsparkEnv
+        if let path = supportPath, FileManager.default.fileExists(atPath: path) {
+            do {
+                let support = try DSparkSupportModel(
+                    path: path,
+                    targetDims: dims,
+                    targetLayerCount: geometry.nLayers
+                )
+                log(support.report(mainModelPath: ggufPath))
+                if !support.isRunnable(withMainModelPath: ggufPath) {
+                    DSparkSupportModel.log("supporto rifiutato: correggi gli errori prima di abilitare il forward")
+                } else {
+                    dsparkRuntimePath = path
+                }
+            } catch {
+                DSparkSupportModel.log("apertura supporto FALLITA (\(path)): \(error)")
+            }
+        } else {
+            DSparkSupportModel.log(
+                "supporto compatibile non trovato (DS4_DSPARK_GGUF=\(dsparkEnv)); "
+                    + "scarica l'accessorio DSpark dalla GUI o passa il percorso esplicito"
+            )
+        }
+    }
     // DS4_MTP_GGUF (Fase M1, docs/SELF-SPECULATIVE.md § Fase M): apre il
     // sidecar MTP e stampa inventario + validazione dell'interfaccia draft.
     // Solo diagnostica — nessun effetto sul decode. `=1` cerca *MTP*.gguf
@@ -873,6 +911,22 @@ do {
                                                               geometry: geometry)
         log("DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…")
     }
+    if let dsparkRuntimePath {
+        do {
+            try dec.enableDSparkStage0(supportPath: dsparkRuntimePath,
+                                       mainModelPath: ggufPath)
+            let runtime = dec.dsparkStage0Runtime
+            let residentMiB = (runtime?.residentWeightBytes ?? 0) >> 20
+            let mappedGiB = Double(runtime?.mappedTransformerBytes ?? 0)
+                / Double(1 << 30)
+            let kvMiB = (runtime?.privateKVBytes ?? 0) >> 20
+            DSparkStage0Runtime.log(String(format:
+                "capture/stage0 + 3 transformer legati: %.2f GiB mmap, %d MiB residenti, KV privato %d MiB",
+                mappedGiB, residentMiB, kvMiB))
+        } catch {
+            DSparkStage0Runtime.log("stage 0 non attivato: \(error)")
+        }
+    }
     // Persistenza della usage imatrix TRA i run della demo (l'app la persiste
     // per agente). Senza, i pool della slot-cache nascono al primo token con
     // storia vuota: l'allocazione usage-driven resterebbe un'anteprima nella
@@ -893,6 +947,13 @@ do {
     for (i, v) in logits.enumerated() where v > best { best = v; argmax = i }
     log(String(format: "DS4Demo: 1 forward in %.1fs — logits[%d] finite=%@ argmax=%d (logit %.3f)",
                dt, logits.count, finite ? "YES" : "NO", argmax, best))
+    if let position = dec.dsparkStage0Position,
+       let hidden = dec.dsparkStage0Hidden() {
+        let rms = sqrt(hidden.reduce(0) { $0 + $1 * $1 } / Float(max(1, hidden.count)))
+        DSparkStage0Runtime.log(String(
+            format: "stage 0 pronto a pos=%d — hidden=%d RMS=%.5f",
+            position, hidden.count, rms))
+    }
     if maxNew > 0 {
         // Real chat generation: tokenize the prompt (3rd arg) with the model's
         // tokenizer + chat template, greedy-decode, detokenize, print the answer.
@@ -1022,6 +1083,9 @@ do {
         // full-config): DS4_SPEC_K=1 o assente = percorso storico.
         let requestedSpecK = ProcessInfo.processInfo.environment["DS4_SPEC_K"].flatMap(Int.init) ?? 0
         let specK = (sampleTemperature <= 0 && sampleRepeat <= 1) ? requestedSpecK : 0
+        let dsparkSpec = dec.dsparkStage0Runtime != nil
+            && sampleTemperature <= 0 && sampleRepeat <= 1
+            && requestedSpecK < 2 && abTrace == nil
         if requestedSpecK >= 2 && specK == 0 {
             log("DS4Demo: self-speculative disattivata — richiede sampling greedy senza repetition penalty")
         }
@@ -1034,7 +1098,82 @@ do {
         // verifica batch full-config e stessa accettazione greedy del loop a
         // esperti ridotti: parità bit-per-bit col decode normale per costruzione.
         let specDraft = ProcessInfo.processInfo.environment["DS4_SPEC_DRAFT"] ?? "experts"
-        if specK >= 2, specDraft == "ngram" {
+        if dsparkSpec {
+            var rounds = 0, proposed = 0, accepted = 0, misses = 0
+            log("DS4Demo: decode DSpark — transformer support + Markov/confidence + verifica target")
+            dsparkLoop: while genTokens < maxNew, pos < maxKeys {
+                let remaining = min(maxNew - genTokens, maxKeys - pos)
+                var committed: [Int] = []
+                let roundStart = Date()
+                do {
+                    if let current = recent.last,
+                       let proposal = try dec.dsparkPropose(
+                            currentToken: current, position: pos - 1),
+                       !proposal.tokens.isEmpty {
+                        var candidates = Array(proposal.tokens.prefix(remaining))
+                        if let eosIndex = candidates.firstIndex(
+                            where: { Int32($0) == tok.eosId }) {
+                            candidates = Array(candidates.prefix(upTo: eosIndex))
+                        }
+                        proposed += candidates.count
+                        if !candidates.isEmpty {
+                            let result = try dec.dsparkVerifyAndCommit(
+                                proposal: candidates,
+                                currentLogits: last, startPos: pos)
+                            committed = result.acceptedTokens
+                            if !committed.isEmpty { last = result.nextLogits }
+                        }
+                    }
+                } catch {
+                    dec.disableDSpark()
+                    log("DS4Demo: DSpark disattivato dopo errore runtime: \(error)")
+                }
+
+                if committed.isEmpty {
+                    misses += 1
+                    let next = Sampler.sample(
+                        last, temperature: 0, topK: 0,
+                        topP: 1, minP: 0, rng: &rng)
+                    if Int32(next) == tok.eosId { break dsparkLoop }
+                    stdout.write(Data(tok.tokenText(Int32(next))))
+                    generatedTraceTokens.append(next)
+                    recent.append(next)
+                    last = try dec.forward(
+                        token: next, pos: pos, nKeys: pos + 1)
+                    pos += 1
+                    genTokens += 1
+                    committed = [next]
+                } else {
+                    rounds += 1
+                    accepted += committed.count
+                    for next in committed {
+                        stdout.write(Data(tok.tokenText(Int32(next))))
+                        generatedTraceTokens.append(next)
+                        recent.append(next)
+                        pos += 1
+                        genTokens += 1
+                        if genTokens == warmup {
+                            dec.resetProfile()
+                            steadyStart = Date()
+                        }
+                    }
+                }
+                if genTokens == warmup {
+                    dec.resetProfile()
+                    steadyStart = Date()
+                }
+                let elapsed = Date().timeIntervalSince(roundStart)
+                log(String(format:
+                    "  [DSpark +%d tok  %.1fs  %.2f tok/s  accept %.0f%%]",
+                    committed.count, elapsed,
+                    elapsed > 0 ? Double(committed.count) / elapsed : 0,
+                    proposed > 0 ? 100 * Double(accepted) / Double(proposed) : 0))
+            }
+            log(String(format:
+                "DS4Demo: DSpark — %d round verificati, %d fallback, %d/%d draft accettati (%.0f%%)",
+                rounds, misses, accepted, proposed,
+                proposed > 0 ? 100 * Double(accepted) / Double(proposed) : 0))
+        } else if specK >= 2, specDraft == "ngram" {
             var history = ids
             var rounds = 0, drafted = 0, acceptedCands = 0, misses = 0
             log("DS4Demo: decode speculativo prompt-lookup — finestra \(specK), n-gramma 4→2")
@@ -1063,7 +1202,7 @@ do {
                 //    full-config con logit per posizione.
                 let snap = dec.specSnapshot(nKeys: pos)
                 var window = [tP]; window.append(contentsOf: cands)
-                var logitsAll = try dec.specVerifyStep(tokens: window, startPos: pos)
+                let logitsAll = try dec.specVerifyStep(tokens: window, startPos: pos)
                 // 3) accettazione greedy: window[i+1] deve essere l'argmax
                 //    full-config di logitsAll[i].
                 var j = 0
@@ -1072,13 +1211,14 @@ do {
                     if a == window[j + 1] { j += 1 } else { break }
                 }
                 rounds += 1; drafted += window.count - 1; acceptedCands += j
-                // 4) rifiuto a metà finestra: rollback e ricostruzione pulita
-                //    dei soli j+1 token committati (come nel loop a esperti).
-                if j + 1 < window.count {
-                    dec.specRestore(snap)
-                    logitsAll = try dec.specVerifyStep(tokens: Array(window.prefix(j + 1)), startPos: pos)
-                }
-                // 5) emetti gli accettati; l'ultimo logit verificato dà il tP
+                // 4) Il verify batch usa kernel di compressione numericamente
+                //    diversi dal decode ordinario: rollback e replay one-token
+                //    di OGNI prefisso accettato, anche quando l'intera finestra
+                //    passa, per conservare l'identità greedy.
+                dec.specRestore(snap)
+                let replayLogits = try dec.specReplay(
+                    window.prefix(j + 1), startPos: pos)
+                // 5) emetti gli accettati; l'ultimo logit del replay dà il tP
                 //    del round successivo (bonus token).
                 if j >= 1 {
                     for c in window[1...j] {
@@ -1092,7 +1232,7 @@ do {
                     }
                 }
                 pos += j + 1
-                last = logitsAll[j]
+                last = replayLogits
                 let dt = Date().timeIntervalSince(t0)
                 log(String(format: "  [round %d  +%d tok  %.1fs  %.2f tok/s  accept %.2f  miss %d]",
                            rounds, j + 1, dt, dt > 0 ? Double(j + 1) / dt : 0,
@@ -1142,7 +1282,7 @@ do {
                 // 2) rollback + VERIFICA batch full-config (riscrive KV e
                 //    stato per pos..pos+|w|-1 con i valori veri).
                 dec.specRestore(snap)
-                var logitsAll = try dec.specVerifyStep(tokens: window, startPos: pos)
+                let logitsAll = try dec.specVerifyStep(tokens: window, startPos: pos)
                 // 3) accettazione greedy: window[i+1] deve essere l'argmax
                 //    full-config di logitsAll[i].
                 var j = 0
@@ -1151,13 +1291,13 @@ do {
                     if a == window[j + 1] { j += 1 } else { break }
                 }
                 rounds += 1; drafted += window.count - 1; acceptedCands += j
-                // 4) rifiuto a metà finestra: lo stato oltre pos+j è stato
-                //    calcolato con input sbagliati — rollback e ricostruzione
-                //    pulita dei soli j+1 token committati.
-                if j + 1 < window.count {
-                    dec.specRestore(snap)
-                    logitsAll = try dec.specVerifyStep(tokens: Array(window.prefix(j + 1)), startPos: pos)
-                }
+                // 4) Il verify batch aggiorna il compressore con kernel diversi
+                //    dal decode one-token. Ripristina sempre il frontier e
+                //    rigioca il prefisso accettato sul percorso ordinario:
+                //    accettazioni complete e parziali restano greedy-identiche.
+                dec.specRestore(snap)
+                let replayLogits = try dec.specReplay(
+                    window.prefix(j + 1), startPos: pos)
                 // 5) emetti i candidati accettati; l'ultimo logit verificato
                 //    fornisce il tP del round successivo (bonus token).
                 if j >= 1 {
@@ -1171,7 +1311,7 @@ do {
                     }
                 }
                 pos += j + 1
-                last = logitsAll[j]
+                last = replayLogits
                 let dt = Date().timeIntervalSince(t0)
                 log(String(format: "  [round %d  +%d tok  %.1fs  %.2f tok/s  accept %.2f]",
                            rounds, j + 1, dt, dt > 0 ? Double(j + 1) / dt : 0,

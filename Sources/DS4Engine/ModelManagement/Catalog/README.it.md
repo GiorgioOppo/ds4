@@ -32,7 +32,9 @@ duplicare nomi file o dedurre il supporto dal filename.
 `ModelCatalogEntry.isSelectable` richiede runtime `runnable`, un solo artefatto
 e ruolo `mainModel`. Questa regola impedisce a un package split o a un
 accessorio di diventare un modello locale. `DeepSeekV4AccessoryCatalog.mtp`
-resta separato e non viene iterato da `ModelCatalogRegistry.entries`.
+resta separato. I supporti DSpark originale e 0731 sono componenti opzionali
+mostrati soltanto tramite `ModelCatalogRegistry.downloadEntries`: non entrano
+mai in `entries` o `selectableEntries`.
 
 `KimiK3ModelCatalog` fissa revisione, dimensione e SHA-256 di ogni parte,
 oltre a dimensione e digest del flusso ricostruito. Il downloader conserva le

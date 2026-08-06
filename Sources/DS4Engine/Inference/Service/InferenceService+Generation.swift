@@ -3,6 +3,28 @@ import DS4Core
 import DS4Metal
 
 extension InferenceService {
+    /// Tool-capable reasoning models occasionally emit a second unmarked
+    /// reasoning pass after the first `</think>`. While armed, ordinary text is
+    /// tentative until a tool/final boundary proves it is an answer or a second
+    /// close marker proves it was reasoning.
+    struct SecondReasoningGuard {
+        let enabled: Bool
+        private(set) var isHolding = false
+
+        /// Returns true when the currently held text must be rerouted to the
+        /// reasoning stream. The first real close only arms the guard.
+        mutating func closeReasoning(wasReasoning: Bool) -> Bool {
+            if isHolding {
+                isHolding = false
+                return true
+            }
+            if enabled && wasReasoning { isHolding = true }
+            return false
+        }
+
+        mutating func resolveAsAnswer() { isHolding = false }
+    }
+
 func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         run(suffixIds: tok.tokenizeRenderedChat(suffix).map { Int($0) },
@@ -203,6 +225,8 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
 
         var rng = sampling.seed
         var inReasoning = think == .high       // suffix ends with <think> when enabled
+        var secondReasoning = SecondReasoningGuard(
+            enabled: think == .high && !tools.isEmpty)
         var inTool = false
         var pending: [UInt8] = []
         var visible = ""
@@ -244,11 +268,56 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             pending.append(lt)        // re-buffer the '<' for the next round
         }
 
+        /// Route one already-selected token through the same reasoning/tool/text
+        /// state machine. DSpark may deliver several verified tokens at once;
+        /// keeping presentation here prevents the speculative path from
+        /// bypassing DSML framing or thinking visibility.
+        func emitSelectedToken(_ next: Int) {
+            if !inTool, Int32(next) == dsmlId {
+                if pending.last == lt { pending.removeLast(); toolBytes.append(lt) }
+                secondReasoning.resolveAsAnswer()
+                flush(inReasoning)
+                inTool = true
+                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+                streamTool()
+            } else if inTool {
+                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+                streamTool()
+                let tail = String(decoding: toolBytes.suffix(256), as: UTF8.self)
+                toolBlockClosed = tail.contains(markup.callsClose)
+            } else if Int32(next) == tok.thinkStartId {
+                if secondReasoning.isHolding {
+                    flush(true)
+                    secondReasoning.resolveAsAnswer()
+                } else {
+                    flush(inReasoning)
+                }
+                inReasoning = true
+            } else if Int32(next) == tok.thinkEndId {
+                let rerouteHeldText = secondReasoning.closeReasoning(
+                    wasReasoning: inReasoning)
+                flush(rerouteHeldText ? true : inReasoning)
+                inReasoning = false
+            } else {
+                pending.append(contentsOf: tok.tokenText(Int32(next)))
+                if !secondReasoning.isHolding {
+                    flushHoldingOpener(inReasoning)
+                }
+            }
+        }
+
         var produced = 0
         let genStart = Date()
         var sampleS = 0.0                          // CPU sampler (full-vocab sort at temp>0)
         var lastProgress = Date(timeIntervalSince1970: 0)
         var regimeStart: Date?                     // timestamp after token 4 (demo's REGIME cut)
+        let dsparkGreedy = sampling.temperature <= 0
+            && sampling.repetitionPenalty == 1
+            && decoder.dsparkStage0Runtime != nil
+        if decoder.dsparkStage0Runtime != nil, !dsparkGreedy {
+            continuation.yield(.progress(
+                "DSpark pronto ma inattivo: richiede temperatura 0 e repetition penalty 1"))
+        }
         while pos < contextSize && (
             produced < maxTokens
             || ((inTool || pending.last == lt) && !toolBlockClosed
@@ -264,49 +333,75 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                 kvDirty = false
                 throw CancellationError()
             }
-            // Penalize the recently produced tokens to break repeat-loop collapse.
-            let lo = max(0, committedIds.count - sampling.repeatLastN)
-            let tSample = Date()
-            let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
-                                      topP: sampling.topP, minP: sampling.minP,
-                                      repetitionPenalty: sampling.repetitionPenalty,
-                                      recent: committedIds[lo...], rng: &rng)
-            sampleS += Date().timeIntervalSince(tSample)
-            if Int32(next) == tok.eosId { break }   // eos closes the turn; not forwarded (next suffix re-adds it)
-            if !inTool, Int32(next) == dsmlId {
-                // A held opener '<' belongs to the tool block, not the visible text:
-                // move it into toolBytes (so the parser sees "<｜DSML｜…") without ever
-                // streaming it as a stray bubble.
-                if pending.last == lt { pending.removeLast(); toolBytes.append(lt) }
-                flush(inReasoning)                               // flush any remaining real text
-                inTool = true
-                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
-                streamTool()                                     // begin streaming the raw markup
-            } else if inTool {
-                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
-                streamTool()
-                // Inspect only a small tail: the closing tag can straddle token
-                // pieces, but cannot start farther back once this token arrived.
-                let tail = String(decoding: toolBytes.suffix(256), as: UTF8.self)
-                toolBlockClosed = tail.contains(markup.callsClose)
-            } else if Int32(next) == tok.thinkStartId {
-                // The model opened a reasoning block on its own (even with think
-                // off): route it to the reasoning stream, don't show the tag.
-                flush(inReasoning)
-                inReasoning = true
-            } else if Int32(next) == tok.thinkEndId {
-                // Close reasoning (also when we weren't in it: suppress a stray
-                // literal "</think>" instead of showing it as text).
-                flush(inReasoning)
-                inReasoning = false
-            } else {
-                pending.append(contentsOf: tok.tokenText(Int32(next)))
-                flushHoldingOpener(inReasoning)
+            var verified: [Int] = []
+            if dsparkGreedy, !inTool, pending.last != lt,
+               let currentToken = committedIds.last, pos > 0 {
+                let ordinaryRemaining = max(0, maxTokens - produced)
+                let room = max(0, contextSize - pos)
+                let allowance = min(ordinaryRemaining, room)
+                if allowance > 0 {
+                    do {
+                        if let draft = try decoder.dsparkPropose(
+                            currentToken: currentToken, position: pos - 1),
+                           !draft.tokens.isEmpty {
+                            var candidates = Array(draft.tokens.prefix(allowance))
+                            if let eosIndex = candidates.firstIndex(
+                                where: { Int32($0) == tok.eosId }) {
+                                candidates = Array(candidates.prefix(upTo: eosIndex))
+                            }
+                            // Stop the batch as soon as a tool opener is known;
+                            // subsequent tool markup must use the incremental
+                            // parser and the bounded tool-token grace budget.
+                            if let toolIndex = candidates.firstIndex(
+                                where: { Int32($0) == dsmlId }) {
+                                candidates = Array(candidates.prefix(through: toolIndex))
+                            }
+                            if !candidates.isEmpty {
+                                let result = try decoder.dsparkVerifyAndCommit(
+                                    proposal: candidates,
+                                    currentLogits: lastLogits,
+                                    startPos: pos)
+                                verified = result.acceptedTokens
+                                if !verified.isEmpty {
+                                    lastLogits = result.nextLogits
+                                }
+                            }
+                        }
+                    } catch {
+                        decoder.disableDSpark()
+                        Self.log("DSpark disattivato dopo errore di proposta/verifica: \(error)")
+                    }
+                }
             }
-            produced += 1
-            lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
-            committedIds.append(next)           // the generated token is now in the KV
-            pos += 1
+
+            if verified.isEmpty {
+                // Penalize the recently produced tokens to break repeat-loop collapse.
+                let lo = max(0, committedIds.count - sampling.repeatLastN)
+                let tSample = Date()
+                let next = Sampler.sample(
+                    lastLogits, temperature: sampling.temperature,
+                    topK: sampling.topK, topP: sampling.topP,
+                    minP: sampling.minP,
+                    repetitionPenalty: sampling.repetitionPenalty,
+                    recent: committedIds[lo...], rng: &rng)
+                sampleS += Date().timeIntervalSince(tSample)
+                if Int32(next) == tok.eosId { break }
+                emitSelectedToken(next)
+                produced += 1
+                lastLogits = try decoder.forward(
+                    token: next, pos: pos, nKeys: pos + 1)
+                committedIds.append(next)
+                pos += 1
+            } else {
+                // Verification already replayed this exact prefix through the
+                // ordinary target forward path. Commit only transcript/UI state.
+                for next in verified {
+                    emitSelectedToken(next)
+                    produced += 1
+                    committedIds.append(next)
+                    pos += 1
+                }
+            }
             if toolBlockClosed { break }
             // THROTTLED progress (max ~4/s): every yield is a MainActor hop + a
             // SwiftUI invalidation in the GUI — per-token it costs main-thread
@@ -322,6 +417,9 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                                                      elapsed > 0 ? Double(produced) / elapsed : 0, ms)))
             }
         }
+        // Response end proves any still-tentative post-think text is the final
+        // answer; only a second close marker would have rerouted it.
+        secondReasoning.resolveAsAnswer()
         flush(inReasoning)
         // Attribution of the turn's wall clock: engine (per-phase profile),
         // sampler (CPU, full-vocab sort when temp>0 — the demo's greedy path

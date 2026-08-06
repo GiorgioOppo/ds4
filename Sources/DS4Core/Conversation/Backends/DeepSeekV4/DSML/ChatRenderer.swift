@@ -24,7 +24,7 @@ public enum ChatRenderer {
 
         String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
-        If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+        When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.
 
         Otherwise, output directly after </think> with tool calls or final response.
 

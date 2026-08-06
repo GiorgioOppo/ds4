@@ -39,4 +39,51 @@ final class MetalArgsortTests: XCTestCase {
             XCTAssertEqual(Int(gpu[k]), refOrder[k], "top-\(k) index mismatch")
         }
     }
+
+    func testStreamingTop512MatchesExactCPUOrderForWidePrefill() throws {
+        let rt: MetalRuntime
+        do { rt = try MetalRuntime() }
+        catch { throw XCTSkip("Metal unavailable: \(error)") }
+
+        let nComp = 1_280
+        let nTokens = 32
+        let topK = 512
+        var scores = [Float](repeating: 0, count: nComp * nTokens)
+        for token in 0..<nTokens {
+            for column in 0..<nComp {
+                // Unique finite values with a token-dependent permutation,
+                // including negatives, pin both ordering and index recovery.
+                let rank = (column * 733 + token * 197) % nComp
+                scores[token * nComp + column] = Float(rank) - 700.25
+            }
+        }
+
+        let scoreTensor = try GPUTensor.floats(rt, scores)
+        let selected = try GPUTensor.zerosBytes(
+            rt, byteLength: nTokens * topK * 4)
+        // The streaming path must not touch global scratch.
+        let scratch = try GPUTensor.zerosBytes(rt, byteLength: 4)
+        let context = GraphContext(rt)
+        try context.begin()
+        try context.indexerTopKIndicesBatch(
+            scores: scoreTensor, nComp: nComp, nTokens: nTokens,
+            topK: topK, out: selected, scratch: scratch)
+        context.commit()
+
+        let pointer = selected.buffer.contents()
+            .advanced(by: selected.byteOffset)
+            .bindMemory(to: Int32.self, capacity: nTokens * topK)
+        let gpu = Array(UnsafeBufferPointer(
+            start: pointer, count: nTokens * topK))
+        for token in 0..<nTokens {
+            let base = token * nComp
+            let expected = (0..<nComp).sorted {
+                let lhs = scores[base + $0]
+                let rhs = scores[base + $1]
+                return lhs == rhs ? $0 < $1 : lhs > rhs
+            }.prefix(topK).map(Int32.init)
+            XCTAssertEqual(Array(gpu[token * topK..<(token + 1) * topK]),
+                           expected, "token \(token)")
+        }
+    }
 }
