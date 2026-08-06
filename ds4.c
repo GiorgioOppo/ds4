@@ -48630,6 +48630,7 @@ struct ds4_session {
     uint32_t dspark_sched_accepted;
     uint32_t dspark_sched_no_draft;
     uint32_t dspark_sched_skip;
+    uint32_t dspark_sched_auto_backoff;
     uint32_t dspark_sched_lifetime_accepted;
     double dspark_sched_life_extra_ms;
     double dspark_sched_life_saved_ms;
@@ -48641,6 +48642,7 @@ struct ds4_session {
     bool dspark_draft_valid;
     bool dspark_sched_skipped_cycle;
     bool dspark_sched_long_accept_seen;
+    bool dspark_sched_auto_warmed;
     bool dspark_last_confidence0_valid;
     ds4_dspark_spec_stats dspark_stats;
 #endif
@@ -48718,6 +48720,19 @@ static uint32_t ds4_dspark_scheduler_break_even_window(void) {
 static bool ds4_dspark_scheduler_auto_break_even_enabled(void) {
     const char *env = getenv("DS4_DSPARK_SCHEDULER_AUTO_BREAK_EVEN");
     return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static uint32_t ds4_dspark_scheduler_auto_break_even_skip(bool ssd_streaming) {
+    uint32_t v = ds4_dspark_env_u32(
+            "DS4_DSPARK_SCHEDULER_AUTO_BREAK_EVEN_SKIP",
+            ssd_streaming ? 32u : 16u);
+    return v ? v : (ssd_streaming ? 32u : 16u);
+}
+
+static uint32_t ds4_dspark_scheduler_auto_break_even_max_skip(void) {
+    uint32_t v = ds4_dspark_env_u32(
+            "DS4_DSPARK_SCHEDULER_AUTO_BREAK_EVEN_MAX_SKIP", 64);
+    return v ? v : 64;
 }
 
 static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
@@ -48852,7 +48867,9 @@ static void ds4_session_dspark_scheduler_note(
      * finite slow-skip pause below, so every suppression is followed by a
      * fresh measured retry without adding another scheduler state machine. */
     if (auto_break_even && break_even_window == 0) {
-        break_even_window = window;
+        break_even_window =
+            (s->dspark_sched_auto_warmed || s->graph.ssd_streaming) ?
+                1u : window;
     }
 
     const uint32_t max_extra_saved_ratio_milli =
@@ -48872,9 +48889,25 @@ static void ds4_session_dspark_scheduler_note(
     if (break_even_window != 0 &&
         s->dspark_sched_cycles >= break_even_window &&
         (measured_unprofitable || auto_unprofitable)) {
-        s->dspark_sched_skip = ds4_dspark_scheduler_slow_skip_cycles();
         if (auto_unprofitable) {
             s->dspark_stats.scheduler_auto_break_even_pauses++;
+            const uint32_t initial_skip =
+                ds4_dspark_scheduler_auto_break_even_skip(
+                        s->graph.ssd_streaming);
+            const uint32_t max_skip =
+                ds4_dspark_scheduler_auto_break_even_max_skip();
+            uint32_t skip = s->dspark_sched_auto_backoff;
+            if (skip == 0) {
+                skip = initial_skip;
+            } else if (skip < max_skip) {
+                skip = skip > max_skip / 2u ? max_skip : skip * 2u;
+            }
+            if (skip > max_skip) skip = max_skip;
+            s->dspark_sched_auto_backoff = skip;
+            s->dspark_sched_auto_warmed = true;
+            s->dspark_sched_skip = skip;
+        } else {
+            s->dspark_sched_skip = ds4_dspark_scheduler_slow_skip_cycles();
         }
         if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
@@ -48890,6 +48923,12 @@ static void ds4_session_dspark_scheduler_note(
         }
         ds4_session_dspark_scheduler_reset(s);
         return;
+    }
+
+    if (auto_break_even && s->dspark_sched_auto_warmed &&
+        s->dspark_sched_cycles >= break_even_window) {
+        s->dspark_sched_auto_backoff = 0;
+        s->dspark_sched_auto_warmed = false;
     }
 
     if (s->dspark_sched_cycles < window) return;
@@ -56892,17 +56931,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         ds4_dspark_summary dspark = {0};
         e->support_kind =
             support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
         if (e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
+            if (e->ssd_streaming) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming is not compatible with legacy --mtp support\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
             if (opt->tp.role != DS4_TP_NONE) {
                 fprintf(stderr,
                         "ds4: legacy MTP support is ignored under tensor parallelism; "
@@ -60271,6 +60311,18 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     s->dspark_last_confidence0 = 0.0f;
     s->dspark_last_confidence0_valid = false;
     if (scheduler_enabled) s->dspark_last_propose_ms = 0.0;
+    /* Layer-by-layer SSD mappings replace the support-model view installed at
+     * startup. Restore that one contiguous view after target decode, while the
+     * target output view is still present, before any DSpark weight access. */
+    if (enabled && s->graph.ssd_streaming &&
+        !ds4_gpu_set_model_map_range(s->engine->mtp_model.map,
+                                     s->engine->mtp_model.size,
+                                     s->engine->mtp_model.tensor_data_pos,
+                                     s->engine->mtp_model.size -
+                                         s->engine->mtp_model.tensor_data_pos,
+                                     s->engine->mtp_model.max_tensor_bytes)) {
+        return false;
+    }
     if (enabled && !fake_argmax_enabled &&
         ds4_session_dspark_scheduler_should_skip(s)) {
         (void)metal_graph_dspark_ring_maintain(&s->graph,
