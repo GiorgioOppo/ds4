@@ -1,5 +1,57 @@
 import Foundation
 
+/// Runtime proposal controls shared by the demo and GUI. Capping the emitted
+/// prefix does not alter the official five-row support transformer; it only
+/// bounds how many candidates reach the exact target verifier.
+public struct DSparkProposalPolicy: Sendable, Equatable {
+    public let confidenceThreshold: Float
+    public let maxDraftTokens: Int
+
+    public init(confidenceThreshold: Float = 0.7, maxDraftTokens: Int = 5) {
+        self.confidenceThreshold = min(1, max(0, confidenceThreshold))
+        self.maxDraftTokens = min(DSparkSupportModel.maxBlockSize,
+                                  max(1, maxDraftTokens))
+    }
+
+    public static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Self {
+        let confidence = environment["DS4_DSPARK_CONFIDENCE"]
+            .flatMap(Float.init) ?? 0.7
+        let drafts = environment["DS4_DSPARK_DRAFT_TOKENS"]
+            .flatMap(Int.init) ?? 5
+        return Self(confidenceThreshold: confidence, maxDraftTokens: drafts)
+    }
+}
+
+/// Per-generation admission state matching upstream's speculative contract:
+/// one authoritative target token is committed before the first support-model
+/// proposal. The first scheduler decision still sees the original generation
+/// budget (primer included), so a 10-token request is not incorrectly rejected
+/// by a 10-token tail threshold after the primer has consumed one slot.
+public struct DSparkGenerationGate: Sendable, Equatable {
+    public private(set) var isTargetPrimed = false
+    private var hasMadeSchedulingDecision = false
+
+    public init() {}
+
+    public mutating func noteTargetToken() {
+        isTargetPrimed = true
+    }
+
+    /// Returns nil until the mandatory target primer has been committed.
+    /// Thereafter the first call includes the consumed primer in the scheduler
+    /// budget; later calls use the actual remaining-token count.
+    public mutating func schedulingBudget(remainingTokens: Int) -> Int? {
+        guard isTargetPrimed else { return nil }
+        let remaining = max(0, remainingTokens)
+        let primerCredit = hasMadeSchedulingDecision ? 0 : 1
+        hasMadeSchedulingDecision = true
+        return remaining > Int.max - primerCredit
+            ? Int.max : remaining + primerCredit
+    }
+}
+
 /// Deterministic, output-preserving admission policy for expensive DSpark
 /// proposals. Skipped cycles still advance through the ordinary target
 /// decoder, whose forward path maintains the private DSpark KV frontier.
@@ -90,6 +142,7 @@ public struct DSparkSchedulerSnapshot: Sendable, Equatable {
     public let proposals: Int
     public let accepted: Int
     public let emptyProposals: Int
+    public let rejectedBlocks: Int
     public let tailSkips: Int
     public let backoffSkips: Int
     public let pendingBackoff: Int
@@ -104,6 +157,7 @@ public struct DSparkSchedulerSnapshot: Sendable, Equatable {
             proposals: max(0, proposals - previous.proposals),
             accepted: max(0, accepted - previous.accepted),
             emptyProposals: max(0, emptyProposals - previous.emptyProposals),
+            rejectedBlocks: max(0, rejectedBlocks - previous.rejectedBlocks),
             tailSkips: max(0, tailSkips - previous.tailSkips),
             backoffSkips: max(0, backoffSkips - previous.backoffSkips),
             pendingBackoff: pendingBackoff)
@@ -127,6 +181,7 @@ public struct DSparkAdaptiveScheduler: Sendable {
     private var totalProposals = 0
     private var totalAccepted = 0
     private var totalEmpty = 0
+    private var totalRejectedBlocks = 0
     private var totalTailSkips = 0
     private var totalBackoffSkips = 0
 
@@ -161,6 +216,7 @@ public struct DSparkAdaptiveScheduler: Sendable {
         totalProposals += proposed
         totalAccepted += accepted
         if proposed == 0 { totalEmpty += 1 }
+        if proposed > 0, accepted == 0 { totalRejectedBlocks += 1 }
 
         guard policy.enabled else { return }
         windowCycles += 1
@@ -202,6 +258,7 @@ public struct DSparkAdaptiveScheduler: Sendable {
             proposals: totalProposals,
             accepted: totalAccepted,
             emptyProposals: totalEmpty,
+            rejectedBlocks: totalRejectedBlocks,
             tailSkips: totalTailSkips,
             backoffSkips: totalBackoffSkips,
             pendingBackoff: skipRemaining)

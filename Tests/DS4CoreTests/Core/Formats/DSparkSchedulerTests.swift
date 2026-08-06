@@ -2,6 +2,31 @@ import XCTest
 @testable import DS4Metal
 
 final class DSparkSchedulerTests: XCTestCase {
+    func testGenerationGateRequiresTargetPrimerAndCreditsFirstBudget() {
+        var gate = DSparkGenerationGate()
+        XCTAssertNil(gate.schedulingBudget(remainingTokens: 10))
+        XCTAssertFalse(gate.isTargetPrimed)
+
+        gate.noteTargetToken()
+        XCTAssertTrue(gate.isTargetPrimed)
+        XCTAssertEqual(gate.schedulingBudget(remainingTokens: 9), 10)
+        XCTAssertEqual(gate.schedulingBudget(remainingTokens: 8), 8)
+    }
+
+    func testProposalPolicyParsesAndClampsEnvironment() {
+        let policy = DSparkProposalPolicy.fromEnvironment([
+            "DS4_DSPARK_CONFIDENCE": "0",
+            "DS4_DSPARK_DRAFT_TOKENS": "4",
+        ])
+        XCTAssertEqual(policy.confidenceThreshold, 0)
+        XCTAssertEqual(policy.maxDraftTokens, 4)
+
+        let clamped = DSparkProposalPolicy(
+            confidenceThreshold: 2, maxDraftTokens: 100)
+        XCTAssertEqual(clamped.confidenceThreshold, 1)
+        XCTAssertEqual(clamped.maxDraftTokens, DSparkSupportModel.maxBlockSize)
+    }
+
     func testTailSkipProtectsShortGenerations() {
         var scheduler = DSparkAdaptiveScheduler(policy: .init(tailMinimumTokens: 10))
         XCTAssertEqual(scheduler.decision(remainingTokens: 8), .skipTail)
@@ -57,6 +82,22 @@ final class DSparkSchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.snapshot.accepted, 16)
         XCTAssertEqual(scheduler.snapshot.proposals, 20)
         XCTAssertEqual(scheduler.snapshot.acceptanceRate, 0.8, accuracy: 0.000_001)
+    }
+
+    func testSchedulerDistinguishesEmptyAndRejectedBlocks() {
+        var scheduler = DSparkAdaptiveScheduler(policy: .init(
+            enabled: false, tailMinimumTokens: 0))
+        scheduler.note(proposedDrafts: 0, acceptedDrafts: 0,
+                       firstConfidence: 0.4)
+        scheduler.note(proposedDrafts: 4, acceptedDrafts: 0,
+                       firstConfidence: 0.9)
+        scheduler.note(proposedDrafts: 4, acceptedDrafts: 2,
+                       firstConfidence: 0.9)
+
+        XCTAssertEqual(scheduler.snapshot.emptyProposals, 1)
+        XCTAssertEqual(scheduler.snapshot.rejectedBlocks, 1)
+        XCTAssertEqual(scheduler.snapshot.proposals, 8)
+        XCTAssertEqual(scheduler.snapshot.accepted, 2)
     }
 
     func testEnvironmentPolicyMatchesUpstreamNames() {

@@ -89,7 +89,7 @@ public actor InferenceService: DS4Logging {
     /// multi-second DSpark probe. Reset only with the conversation/model.
     var dsparkScheduler = DSparkAdaptiveScheduler()
 
-    public static let engineRevision = "2026-08-06 DSpark adaptive scheduler + confidence-first"
+    public static let engineRevision = "2026-08-06 DSpark verified-batch KV commit"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil,
@@ -109,6 +109,7 @@ public actor InferenceService: DS4Logging {
                      "DS4_MTLIO", "DS4_RESIDENT_COMP", "DS4_FUSED_HC",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR",
                      "DS4_DSPARK_GGUF", "DS4_DSPARK_SCHEDULER",
+                     "DS4_DSPARK_CONFIDENCE", "DS4_DSPARK_DRAFT_TOKENS",
                      "DS4_DSPARK_SCHEDULER_WINDOW",
                      "DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS"]
         let env = ProcessInfo.processInfo.environment

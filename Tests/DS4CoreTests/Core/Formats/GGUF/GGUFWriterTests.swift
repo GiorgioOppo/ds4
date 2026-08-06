@@ -284,6 +284,47 @@ final class GGUFWriterTests: XCTestCase {
         XCTAssertEqual(plan.visibleRows, 13)
     }
 
+    func testDSparkSeedPlanSupportsPromptBoundaryAndTargetPrimer() throws {
+        let atPromptBoundary = try XCTUnwrap(DSparkSeedPlan.make(
+            capturedRange: 0..<18, position: 17))
+        XCTAssertEqual(atPromptBoundary.historyRange, 0..<17)
+
+        let afterTargetPrimer = try XCTUnwrap(DSparkSeedPlan.make(
+            capturedRange: 0..<18, position: 18))
+        XCTAssertEqual(afterTargetPrimer.historyRange, 0..<18)
+
+        XCTAssertNil(DSparkSeedPlan.make(
+            capturedRange: 0..<18, position: 19))
+    }
+
+    func testDSparkVerifiedBatchPlanRequiresExactRingFrontier() throws {
+        var window = DSparkKVWindow(capacity: 16)
+        XCTAssertTrue(window.set(tokenStart: 8, length: 6))
+
+        let plan = try XCTUnwrap(DSparkVerifiedBatchPlan.make(
+            capturedRange: 14..<17,
+            startPosition: 14,
+            acceptedCount: 3,
+            window: window))
+        XCTAssertEqual(plan.tokenRange, 14..<17)
+
+        XCTAssertNil(DSparkVerifiedBatchPlan.make(
+            capturedRange: 15..<18,
+            startPosition: 15,
+            acceptedCount: 3,
+            window: window))
+        XCTAssertNil(DSparkVerifiedBatchPlan.make(
+            capturedRange: 14..<16,
+            startPosition: 14,
+            acceptedCount: 3,
+            window: window))
+        XCTAssertNil(DSparkVerifiedBatchPlan.make(
+            capturedRange: 14..<17,
+            startPosition: 14,
+            acceptedCount: 0,
+            window: window))
+    }
+
     func testDSparkStageBlockPlanRejectsCacheGapAndOverflow() {
         var gap = DSparkKVWindow(capacity: 16)
         XCTAssertTrue(gap.set(tokenStart: 5, length: 4))

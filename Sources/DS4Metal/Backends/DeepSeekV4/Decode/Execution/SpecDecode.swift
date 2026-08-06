@@ -155,6 +155,22 @@ extension StreamingDecoder {
             && acceptedCount > 0
             && ProcessInfo.processInfo.environment["DS4_DSPARK_EXACT_REPLAY"] != "1"
         if retainFull, let frontier = rows.last {
+            if let dsparkStage0Runtime {
+                do {
+                    guard try dsparkStage0Runtime.commitVerifiedTargets(
+                        startPosition: startPos,
+                        acceptedCount: acceptedCount) else {
+                        throw MetalError.unsupported(
+                            "commit KV DSpark del verifier fallito")
+                    }
+                } catch {
+                    // The full target verifier frontier is already valid and
+                    // remains the authoritative decode state. A support-cache
+                    // maintenance failure must disable only DSpark, never
+                    // discard or replay those accepted target tokens.
+                    disableDSparkAfterFailure(error)
+                }
+            }
             return DSparkVerificationResult(
                 proposedCount: proposal.count,
                 acceptedTokens: proposal,

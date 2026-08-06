@@ -809,6 +809,46 @@ public struct DSparkKVWindow: Sendable, Equatable {
     }
 }
 
+/// Select the target-history rows that seed DSpark's private cache before its
+/// first proposal. A proposal may run on the last row captured by prefill, or
+/// immediately after one authoritative target primer. In both cases the
+/// current row is supplied separately by the proposal block and must not be
+/// duplicated in the historical ring.
+struct DSparkSeedPlan: Sendable, Equatable {
+    let historyRange: Range<Int>
+
+    static func make(capturedRange: Range<Int>, position: Int) -> Self? {
+        guard position >= 0,
+              capturedRange.lowerBound >= 0,
+              capturedRange.lowerBound <= position else { return nil }
+        let includesCurrent = position < Int.max
+            && capturedRange.upperBound == position + 1
+        let endsBeforeCurrent = capturedRange.upperBound == position
+        guard includesCurrent || endsBeforeCurrent else { return nil }
+        return Self(historyRange: capturedRange.lowerBound..<position)
+    }
+}
+
+/// Validate the target-hidden batch that follows a fully accepted verifier
+/// window. The support proposal has already committed the preceding target row
+/// to its logical ring; the verifier batch must start exactly at that frontier
+/// before its target-confirmed rows can replace the speculative KV rows.
+struct DSparkVerifiedBatchPlan: Sendable, Equatable {
+    let tokenRange: Range<Int>
+
+    static func make(capturedRange: Range<Int>, startPosition: Int,
+                     acceptedCount: Int,
+                     window: DSparkKVWindow) -> Self? {
+        guard startPosition >= 0, acceptedCount > 0,
+              acceptedCount <= DSparkSupportModel.maxBlockSize,
+              startPosition <= Int.max - acceptedCount,
+              window.ends(at: startPosition) else { return nil }
+        let tokenRange = startPosition..<(startPosition + acceptedCount)
+        guard capturedRange == tokenRange else { return nil }
+        return Self(tokenRange: tokenRange)
+    }
+}
+
 /// Pure setup contract for one DSpark proposal block.  Keeping the arithmetic
 /// outside the Metal executor makes the cache/ring boundary independently
 /// testable (and prevents a malformed speculative block from reaching a GPU
@@ -1261,6 +1301,90 @@ private final class DSparkTransformerExecutor {
             if let error = graph.lastError { throw error }
             offset += rows
         }
+    }
+
+    /// Append target-confirmed rows captured by the exact verifier. Unlike
+    /// prompt seeding, an established DSpark ring already exists here, so each
+    /// row follows the same stage-0 projection + direct KV maintenance path as
+    /// an ordinary target decode skipped by the adaptive scheduler.
+    @_optimize(none)
+    func appendVerifiedTargets(
+        targetHistory: GPUTensor,
+        capturedRange: Range<Int>,
+        mainProjection: GPUTensor,
+        mainProjectionType: UInt32,
+        mainNorm: GPUTensor,
+        weights allWeights: [DSparkMappedStageWeights],
+        rawCaches: [GPUTensor]
+    ) throws {
+        guard !capturedRange.isEmpty,
+              capturedRange.count <= seedCapacity,
+              allWeights.count == rawCaches.count,
+              !allWeights.isEmpty else {
+            throw MetalError.unsupported(
+                "batch verificato DSpark non mantenibile")
+        }
+
+        let source = (targetHistory.buffer.contents() + targetHistory.byteOffset)
+            .bindMemory(to: Float.self,
+                        capacity: targetLayerCount * cacheCapacity * d.nEmbd)
+        let destination = (seedPacked.buffer.contents() + seedPacked.byteOffset)
+            .bindMemory(to: Float.self,
+                        capacity: seedCapacity * targetLayerCount * d.nEmbd)
+        let inputWidth = targetLayerCount * d.nEmbd
+        for (row, position) in capturedRange.enumerated() {
+            let physical = position % cacheCapacity
+            for slot in 0..<targetLayerCount {
+                let src = source + (slot * cacheCapacity + physical) * d.nEmbd
+                let dst = destination
+                    + (row * targetLayerCount + slot) * d.nEmbd
+                memcpy(dst, src, d.nEmbd * MemoryLayout<Float>.stride)
+            }
+        }
+
+        let rows = capturedRange.count
+        let packedView = seedPacked.subview(
+            byteOffset: 0, byteLength: rows * inputWidth * 4,
+            count: rows * inputWidth)
+        let mainView = seedMain.subview(
+            byteOffset: 0, byteLength: rows * d.nEmbd * 4,
+            count: rows * d.nEmbd)
+        let kvView = seedKV.subview(
+            byteOffset: 0, byteLength: rows * d.headDim * 4,
+            count: rows * d.headDim)
+
+        let graph = GraphContext(rt)
+        try graph.begin()
+        try dense(graph, weight: mainProjection,
+                  type: mainProjectionType, act: packedView,
+                  out: mainView, inDim: inputWidth,
+                  outDim: d.nEmbd, rows: rows)
+        try graph.rmsNorm(mainView, weight: mainNorm, out: mainView,
+                          rows: rows, n: d.nEmbd,
+                          eps: ModelDefaults.rmsEps)
+        for (stageIndex, mapped) in allWeights.enumerated() {
+            try dense(graph, weights: mapped, suffix: "attn_kv.weight",
+                      weight: mapped.block.kvW, act: mainView, out: kvView,
+                      inDim: d.nEmbd, outDim: d.headDim, rows: rows)
+            try graph.rmsNorm(
+                kvView, weight: mapped.block.kvNorm, out: kvView,
+                rows: rows, n: d.headDim, eps: ModelDefaults.rmsEps)
+            try graph.ropeTail(
+                x: kvView, nTok: rows, nHead: 1,
+                headDim: d.headDim, nRot: d.nRot,
+                nCtxOrig: rope.nCtxOrig, freqBase: rope.freqBase,
+                freqScale: rope.freqScale, extFactor: rope.extFactor,
+                attnFactor: rope.attnFactor, betaFast: rope.betaFast,
+                betaSlow: rope.betaSlow,
+                pos0: capturedRange.lowerBound, posStep: 1)
+            try graph.kvFP8StoreBatch(
+                kv: kvView, rawCache: rawCaches[stageIndex],
+                headDim: d.headDim, nRot: d.nRot,
+                pos0: capturedRange.lowerBound,
+                rawRows: cacheCapacity, nTok: rows)
+        }
+        graph.commit()
+        if let error = graph.lastError { throw error }
     }
 
     /// Append the just-committed target feature to every support-stage ring.
@@ -2215,8 +2339,8 @@ public final class DSparkStage0Runtime: DS4Logging {
         }
         if privateCacheNeedsSeed {
             guard let range = capturedBatchRange,
-                  position < Int.max,
-                  range.upperBound == position + 1 else {
+                  let seedPlan = DSparkSeedPlan.make(
+                    capturedRange: range, position: position) else {
                 cacheWindow.reset()
                 throw MetalError.unsupported(
                     "storico DSpark non allineato alla posizione \(position)")
@@ -2224,7 +2348,7 @@ public final class DSparkStage0Runtime: DS4Logging {
             do {
                 // The current target feature is row 0 of the proposal block;
                 // seed only rows strictly before it into the support history.
-                let seedRange = range.lowerBound..<position
+                let seedRange = seedPlan.historyRange
                 if !seedRange.isEmpty {
                     try transformerExecutor.seedCaches(
                         targetHistory: targetHiddenBatch,
@@ -2280,6 +2404,48 @@ public final class DSparkStage0Runtime: DS4Logging {
             weights: transformerStages, rawCaches: stageRawCaches)
         guard cacheWindow.appendRow(at: position) else {
             throw MetalError.unsupported("manutenzione ring DSpark fallita")
+        }
+    }
+
+    /// Commit the target-hidden rows produced by a fully accepted verifier
+    /// window into the private support ring. The verifier has already waited
+    /// for its batch captures, so this path adds only target-confirmed KV and
+    /// then clears the transient seeding marker that would otherwise suppress
+    /// scheduler-backoff maintenance.
+    func commitVerifiedTargets(startPosition: Int,
+                               acceptedCount: Int) throws -> Bool {
+        guard privateCacheNeedsSeed,
+              let capturedRange = capturedBatchRange,
+              let plan = DSparkVerifiedBatchPlan.make(
+                capturedRange: capturedRange,
+                startPosition: startPosition,
+                acceptedCount: acceptedCount,
+                window: cacheWindow),
+              let transformerExecutor else {
+            abortBatchCapture()
+            return false
+        }
+        do {
+            try transformerExecutor.appendVerifiedTargets(
+                targetHistory: targetHiddenBatch,
+                capturedRange: plan.tokenRange,
+                mainProjection: mainProj,
+                mainProjectionType: mainProjType,
+                mainNorm: mainNorm,
+                weights: transformerStages,
+                rawCaches: stageRawCaches)
+            for position in plan.tokenRange {
+                guard cacheWindow.appendRow(at: position) else {
+                    throw MetalError.unsupported(
+                        "commit batch verificato DSpark non allineato")
+                }
+            }
+            abortBatchCapture()
+            return true
+        } catch {
+            abortBatchCapture()
+            cacheWindow.reset()
+            throw error
         }
     }
 

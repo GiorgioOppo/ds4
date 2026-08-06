@@ -1101,44 +1101,78 @@ do {
         if dsparkSpec {
             var rounds = 0, proposed = 0, accepted = 0, misses = 0
             var scheduler = DSparkAdaptiveScheduler()
-            log("DS4Demo: decode DSpark — transformer support + Markov/confidence + verifica target")
+            var generationGate = DSparkGenerationGate()
+            let proposalPolicy = DSparkProposalPolicy.fromEnvironment()
+            func describeDSparkToken(_ token: Int) -> String {
+                let piece = String(
+                    decoding: tok.tokenText(Int32(token)), as: UTF8.self)
+                return "#\(token) \(String(reflecting: piece))"
+            }
+            log(String(format:
+                "DS4Demo: decode DSpark — transformer support + Markov/confidence + verifica target; draft max=%d confidence=%.3f",
+                proposalPolicy.maxDraftTokens,
+                proposalPolicy.confidenceThreshold))
             dsparkLoop: while genTokens < maxNew, pos < maxKeys {
                 let remaining = min(maxNew - genTokens, maxKeys - pos)
-                let schedule = scheduler.decision(remainingTokens: remaining)
+                let dsparkAvailable = dec.dsparkStage0Runtime != nil
+                let isTargetPrimer = dsparkAvailable
+                    && !generationGate.isTargetPrimed
+                let schedulingBudget = dsparkAvailable
+                    ? generationGate.schedulingBudget(
+                        remainingTokens: remaining)
+                    : nil
+                let schedule = schedulingBudget.map {
+                    scheduler.decision(remainingTokens: $0)
+                }
                 var committed: [Int] = []
                 var proposedThisRound = 0
                 var acceptedThisRound = 0
                 var firstConfidence: Float?
+                var draftTokensThisRound: [Int] = []
+                var draftConfidencesThisRound: [Float] = []
+                var targetTokenThisRound: Int?
+                var completedAttempt = false
                 let roundStart = Date()
                 do {
-                    if schedule.shouldAttempt,
+                    if schedule?.shouldAttempt == true,
                        let current = recent.last,
                        let proposal = try dec.dsparkPropose(
-                            currentToken: current, position: pos - 1) {
+                            currentToken: current, position: pos - 1,
+                            confidenceThreshold: proposalPolicy.confidenceThreshold) {
+                        completedAttempt = true
                         firstConfidence = proposal.firstConfidence
                         if !proposal.tokens.isEmpty {
-                            var candidates = Array(proposal.tokens.prefix(remaining))
+                            let candidateLimit = min(
+                                remaining, proposalPolicy.maxDraftTokens)
+                            var candidates = Array(
+                                proposal.tokens.prefix(candidateLimit))
                             if let eosIndex = candidates.firstIndex(
                                 where: { Int32($0) == tok.eosId }) {
                                 candidates = Array(candidates.prefix(upTo: eosIndex))
                             }
+                            draftTokensThisRound = candidates
+                            draftConfidencesThisRound = Array(
+                                proposal.confidences.prefix(candidates.count))
                             proposedThisRound = candidates.count
                             proposed += candidates.count
                             if !candidates.isEmpty {
                                 let result = try dec.dsparkVerifyAndCommit(
                                     proposal: candidates,
                                     currentLogits: last, startPos: pos)
+                                targetTokenThisRound = result.currentTarget
                                 committed = result.acceptedTokens
                                 acceptedThisRound = result.acceptedCount
                                 if !committed.isEmpty { last = result.nextLogits }
                             }
                         }
+                    } else if schedule?.shouldAttempt == true {
+                        completedAttempt = true
                     }
                 } catch {
                     dec.disableDSpark()
                     log("DS4Demo: DSpark disattivato dopo errore runtime: \(error)")
                 }
-                if schedule.shouldAttempt {
+                if completedAttempt {
                     scheduler.note(
                         proposedDrafts: proposedThisRound,
                         acceptedDrafts: acceptedThisRound,
@@ -1159,6 +1193,7 @@ do {
                     pos += 1
                     genTokens += 1
                     committed = [next]
+                    if isTargetPrimer { generationGate.noteTargetToken() }
                 } else {
                     rounds += 1
                     accepted += committed.count
@@ -1179,12 +1214,29 @@ do {
                     steadyStart = Date()
                 }
                 let elapsed = Date().timeIntervalSince(roundStart)
-                let scheduleLabel: String
-                switch schedule {
-                case .attempt: scheduleLabel = "tentativo"
-                case .skipTail: scheduleLabel = "skip-coda"
-                case .skipBackoff(let remaining):
-                    scheduleLabel = "backoff-\(remaining)"
+                let outcomeLabel: String
+                if !dsparkAvailable {
+                    outcomeLabel = "target-senza-dspark"
+                } else if isTargetPrimer {
+                    outcomeLabel = "primer-target"
+                } else { switch schedule {
+                case nil:
+                    outcomeLabel = "target-fallback"
+                case .attempt?:
+                    if !completedAttempt {
+                        outcomeLabel = "errore-proposta"
+                    } else if proposedThisRound == 0 {
+                        outcomeLabel = "proposta-vuota"
+                    } else if acceptedThisRound == 0 {
+                        outcomeLabel = "respinta 0/\(proposedThisRound)"
+                    } else {
+                        outcomeLabel = "accettata \(acceptedThisRound)/\(proposedThisRound)"
+                    }
+                case .skipTail?:
+                    outcomeLabel = "skip-coda"
+                case .skipBackoff(let remaining)?:
+                    outcomeLabel = "backoff-\(remaining)"
+                }
                 }
                 let confidenceLabel = firstConfidence.map {
                     String(format: "%.3f", $0)
@@ -1194,14 +1246,31 @@ do {
                     committed.count, elapsed,
                     elapsed > 0 ? Double(committed.count) / elapsed : 0,
                     proposed > 0 ? 100 * Double(accepted) / Double(proposed) : 0,
-                    scheduleLabel, confidenceLabel))
+                    outcomeLabel, confidenceLabel))
+                if !draftTokensThisRound.isEmpty {
+                    let draftDescription = draftTokensThisRound.enumerated().map {
+                        index, token in
+                        let confidence = draftConfidencesThisRound.indices.contains(index)
+                            ? String(format: "%.3f", draftConfidencesThisRound[index])
+                            : "n/a"
+                        let verdict = index < acceptedThisRound
+                            ? "accettato" : "rifiutato"
+                        return "\(describeDSparkToken(token)) conf=\(confidence) \(verdict)"
+                    }.joined(separator: " · ")
+                    let targetDescription = targetTokenThisRound.map {
+                        describeDSparkToken($0)
+                    } ?? "n/a"
+                    log("    DSpark ha proposto: \(draftDescription)")
+                    log("    Target atteso (primo token): \(targetDescription)")
+                }
             }
             let scheduleStats = scheduler.snapshot
             log(String(format:
-                "DS4Demo: DSpark — %d round verificati, %d fallback, %d/%d draft accettati (%.0f%%); scheduler %d tentativi, %d vuoti, %d skip-coda, %d backoff",
+                "DS4Demo: DSpark — primer target; %d round verificati, %d target/fallback, %d/%d draft accettati (%.0f%%); scheduler %d tentativi, %d proposte vuote, %d blocchi respinti, %d skip-coda, %d backoff",
                 rounds, misses, accepted, proposed,
                 proposed > 0 ? 100 * Double(accepted) / Double(proposed) : 0,
                 scheduleStats.attempts, scheduleStats.emptyProposals,
+                scheduleStats.rejectedBlocks,
                 scheduleStats.tailSkips, scheduleStats.backoffSkips))
         } else if specK >= 2, specDraft == "ngram" {
             var history = ids

@@ -315,6 +315,8 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             && sampling.repetitionPenalty == 1
             && decoder.dsparkStage0Runtime != nil
         let dsparkStatsStart = dsparkScheduler.snapshot
+        let dsparkProposalPolicy = DSparkProposalPolicy.fromEnvironment()
+        var dsparkGenerationGate = DSparkGenerationGate()
         if decoder.dsparkStage0Runtime != nil, !dsparkGreedy {
             continuation.yield(.progress(
                 "DSpark pronto ma inattivo: richiede temperatura 0 e repetition penalty 1"))
@@ -335,14 +337,17 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                 throw CancellationError()
             }
             var verified: [Int] = []
-            if dsparkGreedy, !inTool, pending.last != lt,
+            if dsparkGreedy, decoder.dsparkStage0Runtime != nil,
+               !inTool, pending.last != lt,
                let currentToken = committedIds.last, pos > 0 {
                 let ordinaryRemaining = max(0, maxTokens - produced)
                 let room = max(0, contextSize - pos)
                 let allowance = min(ordinaryRemaining, room)
-                if allowance > 0 {
+                if allowance > 0,
+                   let schedulingBudget = dsparkGenerationGate.schedulingBudget(
+                        remainingTokens: allowance) {
                     let schedule = dsparkScheduler.decision(
-                        remainingTokens: allowance)
+                        remainingTokens: schedulingBudget)
                     if schedule.shouldAttempt {
                         var proposedThisRound = 0
                         var acceptedThisRound = 0
@@ -350,11 +355,17 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                         var completedAttempt = false
                         do {
                             if let draft = try decoder.dsparkPropose(
-                                currentToken: currentToken, position: pos - 1) {
+                                currentToken: currentToken, position: pos - 1,
+                                confidenceThreshold:
+                                    dsparkProposalPolicy.confidenceThreshold) {
                                 completedAttempt = true
                                 firstConfidence = draft.firstConfidence
                                 if !draft.tokens.isEmpty {
-                                    var candidates = Array(draft.tokens.prefix(allowance))
+                                    let candidateLimit = min(
+                                        allowance,
+                                        dsparkProposalPolicy.maxDraftTokens)
+                                    var candidates = Array(
+                                        draft.tokens.prefix(candidateLimit))
                                     if let eosIndex = candidates.firstIndex(
                                         where: { Int32($0) == tok.eosId }) {
                                         candidates = Array(candidates.prefix(upTo: eosIndex))
@@ -385,12 +396,27 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                         } catch {
                             decoder.disableDSpark()
                             Self.log("DSpark disattivato dopo errore di proposta/verifica: \(error)")
+                            continuation.yield(.progress(
+                                "DSpark disattivato: \(error.localizedDescription)"))
                         }
                         if completedAttempt {
                             dsparkScheduler.note(
                                 proposedDrafts: proposedThisRound,
                                 acceptedDrafts: acceptedThisRound,
                                 firstConfidence: firstConfidence)
+                            let confidence = firstConfidence.map {
+                                String(format: "%.3f", $0)
+                            } ?? "n/a"
+                            let outcome: String
+                            if proposedThisRound == 0 {
+                                outcome = "nessuna proposta"
+                            } else if acceptedThisRound == 0 {
+                                outcome = "proposta respinta 0/\(proposedThisRound)"
+                            } else {
+                                outcome = "accettati \(acceptedThisRound)/\(proposedThisRound)"
+                            }
+                            continuation.yield(.progress(
+                                "DSpark: \(outcome) · confidenza \(confidence)"))
                         }
                     }
                 }
@@ -414,6 +440,7 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                     token: next, pos: pos, nKeys: pos + 1)
                 committedIds.append(next)
                 pos += 1
+                dsparkGenerationGate.noteTargetToken()
             } else {
                 // Verification already replayed this exact prefix through the
                 // ordinary target forward path. Commit only transcript/UI state.
@@ -478,9 +505,9 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             let stats = dsparkScheduler.snapshot.delta(since: dsparkStatsStart)
             if stats.attempts + stats.tailSkips + stats.backoffSkips > 0 {
                 let summary = String(
-                    format: "DSpark: %d tentativi, %d/%d accettati, %d vuoti, %d skip-coda, %d backoff",
+                    format: "DSpark: primer target · %d tentativi, %d/%d accettati, %d proposte vuote, %d blocchi respinti, %d skip-coda, %d backoff",
                     stats.attempts, stats.accepted, stats.proposals,
-                    stats.emptyProposals, stats.tailSkips,
+                    stats.emptyProposals, stats.rejectedBlocks, stats.tailSkips,
                     stats.backoffSkips)
                 DS4Log.info("dspark", summary)
                 continuation.yield(.progress(summary))
