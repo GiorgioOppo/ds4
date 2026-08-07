@@ -3381,6 +3381,34 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Dense Q-A/KV pair. Both projections consume the same activation rows and
+// retain the standalone Q4_K reduction order. Combining them removes one
+// Metal dispatch/encoder transition while keeping independently-sized output
+// matrices and byte-identical arithmetic.
+kernel void kernel_mul_mv_q4_K_dense_pair_f32(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int first_row =
+        (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+    if (first_row < args0.ne0) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            args0, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    }
+    if (first_row < args1.ne0) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            args1, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //
