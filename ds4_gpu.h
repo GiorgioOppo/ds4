@@ -668,6 +668,22 @@ int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x);
 
+/* Optional dense Q4_K pair used by prefill q_a + kv. Both projections share
+ * one MMQ activation quantization; a zero return requests separate fallback
+ * matmuls from the graph. */
+int ds4_gpu_matmul_q4_K_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight0_offset,
+        uint64_t              weight1_offset,
+        uint64_t              in_dim,
+        uint64_t              out0_dim,
+        uint64_t              out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
