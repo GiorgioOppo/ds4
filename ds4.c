@@ -25688,7 +25688,7 @@ static bool metal_graph_attention_output_dense_quant_batch(
                                                         heads,
                                                         n_tokens) != 0;
     }
-    if (out_a->type == DS4_TENSOR_Q4_K && n_tokens >= 32u) {
+    if (out_a->type == DS4_TENSOR_Q4_K && n_tokens >= 2u) {
         if (ds4_gpu_attention_output_q4_K_batch_tensor(out,
                                                        low,
                                                        metal_graph_batch_group_tmp(g),

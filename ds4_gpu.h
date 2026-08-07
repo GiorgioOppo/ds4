@@ -294,9 +294,9 @@ int ds4_gpu_tp_failed(void);
  *
  * ds4_gpu_matmul_q8_0_kslice_tensor computes a k-range partial matvec:
  * out[out_dim] = W[:, k_off : k_off + k_cnt] @ x[x_elem_off : +k_cnt] where
- * W rows span full_in_dim quantized Q8_0 elements.  k offsets/counts must be
- * multiples of 32 (Q8_0 block).  Partial results from both ranks sum to the
- * full projection.
+ * W rows span full_in_dim quantized elements. Q8_0 slices use multiples of 32;
+ * the generic dispatch also accepts Q4_K slices in multiples of 256. Partial
+ * results from both ranks sum to the full projection.
  *
  * ds4_gpu_attention_output_q8_tp_tensor is the group-sliced attention output
  * pair: low projection for groups [group0, group0+group_cnt) plus the
