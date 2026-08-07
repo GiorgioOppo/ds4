@@ -471,7 +471,10 @@ int ds4_mmq_dense_impl(
         int           M,
         int           N,
         int           K,
-        cudaStream_t  stream) {
+        cudaStream_t  stream,
+        const void  * W_pair = nullptr,
+        float       * out_pair = nullptr,
+        int           M_pair = 0) {
 
     if (!W || !X_f32 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -605,6 +608,26 @@ int ds4_mmq_dense_impl(
         return -3;
     }
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    if (W_pair && out_pair && M_pair > 0) {
+        if (out_memset_enabled()) {
+            cudaMemsetAsync(out_pair, 0,
+                            (size_t)M_pair * (size_t)N * sizeof(float), stream);
+        }
+        mmq_args pair_args = args;
+        pair_args.x = (const char *)W_pair;
+        pair_args.dst = out_pair;
+        pair_args.nrows_x = (int64_t)M_pair;
+        pair_args.nrows_dst = (int64_t)M_pair;
+        mul_mat_q_case<type>(*ctx, pair_args, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: pair mul_mat_q_case launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -4;
+        }
+        ds4_mmq_sanitize_f32(out_pair,
+                             (uint64_t)M_pair * (uint64_t)N, stream);
+    }
     return 0;
 }
 
@@ -826,6 +849,15 @@ extern "C" int ds4_mmq_q4_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_pair(
+        const void * W0, const void * W1, const float * X,
+        float * out0, float * out1,
+        int M0, int M1, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_pair", W0, X, out0, M0, N, K, stream,
+        W1, out1, M1);
 }
 
 extern "C" int ds4_mmq_mxfp4_dense(

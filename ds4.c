@@ -27718,32 +27718,48 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
-                                                      il,
-                                                      pos0,
-                                                      metal_graph_batch_qr(g),
-                                                      model,
-                                                      layer->attn_q_a,
-                                                      DS4_N_EMBD,
-                                                      q_rank,
-                                                      metal_graph_batch_attn_norm(g),
-                                                      n_tokens);
+    bool qkv_q4_pair_projected = false;
+    if (ok && qkv_rms_fused && n_tokens >= 2u &&
+        getenv("DS4_CUDA_NO_Q4_QKV_PAIR") == NULL &&
+        layer->attn_q_a->type == DS4_TENSOR_Q4_K &&
+        layer->attn_kv->type == DS4_TENSOR_Q4_K) {
+        qkv_q4_pair_projected = ds4_gpu_matmul_q4_K_pair_tensor(
+            metal_graph_batch_qr(g), metal_graph_batch_kv_raw(g),
+            model->map, model->size,
+            layer->attn_q_a->abs_offset, layer->attn_kv->abs_offset,
+            DS4_N_EMBD, q_rank, DS4_N_HEAD_DIM,
+            metal_graph_batch_attn_norm(g), n_tokens) != 0;
+    }
+    if (ok && !qkv_q4_pair_projected) {
+        ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
+                                                 il,
+                                                 pos0,
+                                                 metal_graph_batch_qr(g),
+                                                 model,
+                                                 layer->attn_q_a,
+                                                 DS4_N_EMBD,
+                                                 q_rank,
+                                                 metal_graph_batch_attn_norm(g),
+                                                 n_tokens);
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_batch_qr(g),
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
-                                                          il,
-                                                          pos0,
-                                                          metal_graph_batch_kv_raw(g),
-                                                          model,
-                                                          layer->attn_kv,
-                                                          DS4_N_EMBD,
-                                                          DS4_N_HEAD_DIM,
-                                                          metal_graph_batch_attn_norm(g),
-                                                          n_tokens);
+        if (ok && !qkv_q4_pair_projected) {
+            ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
+                                                     il,
+                                                     pos0,
+                                                     metal_graph_batch_kv_raw(g),
+                                                     model,
+                                                     layer->attn_kv,
+                                                     DS4_N_EMBD,
+                                                     DS4_N_HEAD_DIM,
+                                                     metal_graph_batch_attn_norm(g),
+                                                     n_tokens);
+        }
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", metal_graph_batch_kv_raw(g),
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);

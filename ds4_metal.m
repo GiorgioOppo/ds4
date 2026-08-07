@@ -18005,6 +18005,18 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
     return 1;
 }
 
+int ds4_gpu_matmul_q4_K_pair_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset,
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size;
+    (void)weight0_offset; (void)weight1_offset; (void)in_dim;
+    (void)out0_dim; (void)out1_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
 int ds4_gpu_matmul_q8_0_f16_out_tensor(
         ds4_gpu_tensor       *out_h,
         const void             *model_map,

@@ -15246,6 +15246,60 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
 
+extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset,
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out0 || !out1 || !x || !model_map || n_tok < 2u ||
+        in_dim == 0 || (in_dim % CUDA_QK_K) != 0u ||
+        in_dim > INT_MAX || out0_dim > INT_MAX || out1_dim > INT_MAX ||
+        n_tok > INT_MAX || !cuda_use_mmq()) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    if (blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) return 0;
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out0_dim > UINT64_MAX / row_bytes ||
+        out1_dim > UINT64_MAX / row_bytes ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out0_dim ||
+        n_tok > UINT64_MAX / out1_dim ||
+        n_tok * out0_dim > UINT64_MAX / sizeof(float) ||
+        n_tok * out1_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t w0_bytes = out0_dim * row_bytes;
+    const uint64_t w1_bytes = out1_dim * row_bytes;
+    if (weight0_offset > model_size || w0_bytes > model_size - weight0_offset ||
+        weight1_offset > model_size || w1_bytes > model_size - weight1_offset ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out0->bytes < n_tok * out0_dim * sizeof(float) ||
+        out1->bytes < n_tok * out1_dim * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out0);
+    if (ds4_tensor_device_idx(out1) != tier) return 0;
+    const char *w0 = cuda_resolve_weight_ptr(
+        model_map, weight0_offset, w0_bytes, tier, "q4_K pair0");
+    const char *w1 = cuda_resolve_weight_ptr(
+        model_map, weight1_offset, w1_bytes, tier, "q4_K pair1");
+    if (!w0 || !w1) return 0;
+    const int rc = ds4_mmq_q4_K_dense_pair(
+        w0, w1, (const float *)x->ptr,
+        (float *)out0->ptr, (float *)out1->ptr,
+        (int)out0_dim, (int)out1_dim, (int)n_tok, (int)in_dim,
+        cuda_decode_stream());
+    if (rc == 0) return 1;
+    fprintf(stderr,
+            "ds4: Q4_K pair MMQ returned %d (in=%llu out0=%llu out1=%llu n_tok=%llu); falling back\n",
+            rc, (unsigned long long)in_dim, (unsigned long long)out0_dim,
+            (unsigned long long)out1_dim, (unsigned long long)n_tok);
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
