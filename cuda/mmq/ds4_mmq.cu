@@ -4935,6 +4935,13 @@ extern "C" int ds4_mmq_q4_K_dense_pair_vec(
         W0, W1, X, out0, out1, M, K, stream);
 }
 
+extern "C" int ds4_mmq_q4_K_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
 // Explicit instantiations. One per quant type the public API exposes.
 // Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
 // device functions from mmq.cuh, so the .o objects below contain everything
