@@ -561,6 +561,10 @@ enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS = 256,
     DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS = 16,
     DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS = 16,
+    DS4_METAL_STREAM_EXPERT_PREAD_MAX_SPLIT = 8,
+    DS4_METAL_STREAM_EXPERT_PENDING_MAX_TASKS =
+        DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u *
+        DS4_METAL_STREAM_EXPERT_PREAD_MAX_SPLIT,
 };
 
 typedef struct {
@@ -10860,6 +10864,7 @@ typedef struct {
     uint32_t source_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint32_t n_loads;
     uint32_t n_tasks;
+    uint32_t n_tensor_tasks;
     uint64_t gate_expert_bytes;
     uint64_t down_expert_bytes;
     int32_t selected_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
@@ -10872,7 +10877,8 @@ typedef struct {
     NSUInteger gate_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     NSUInteger up_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     NSUInteger down_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u];
+    ds4_gpu_stream_expert_pread_task
+        tasks[DS4_METAL_STREAM_EXPERT_PENDING_MAX_TASKS];
     double start_ms;
     double prepare_ms;
 } ds4_gpu_stream_expert_pending_load;
@@ -11283,17 +11289,88 @@ static int ds4_gpu_stream_expert_pread_tasks_run(
  * slabs per layer (~4 experts x 3 slabs), while NVMe drives reach their
  * random-read ceiling around ~24 requests in flight: splitting raises the
  * queue depth at identical bytes. Boundaries are 16 KB aligned so F_NOCACHE
- * never reads the same page from two jobs. 1 (default) = historical path. */
+ * never reads the same page from two jobs. Automatic mode uses 1 for small
+ * caches and 4 from 64 entries upward; an explicit value always wins. */
 static uint32_t ds4_gpu_stream_expert_pread_split(void) {
-    static int cached = -1;
-    if (cached < 0) {
+    static int checked;
+    static uint32_t explicit_split;
+    if (!checked) {
         const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_SPLIT");
-        int v = env ? atoi(env) : 1;
-        if (v < 1) v = 1;
-        if (v > 8) v = 8;
-        cached = v;
+        if (env) {
+            int v = atoi(env);
+            if (v < 1) v = 1;
+            if (v > DS4_METAL_STREAM_EXPERT_PREAD_MAX_SPLIT) {
+                v = DS4_METAL_STREAM_EXPERT_PREAD_MAX_SPLIT;
+            }
+            explicit_split = (uint32_t)v;
+        }
+        checked = 1;
     }
-    return (uint32_t)cached;
+    if (explicit_split != 0) return explicit_split;
+
+    /* Four 16-KiB-aligned requests help once a larger expert cache can
+     * sustain enough concurrent misses. With the tiny automatic cache, the
+     * extra requests cost more than they overlap, so retain one read. Query
+     * the current budget so an engine reload can choose again. */
+    return ds4_gpu_stream_expert_cache_configured_count() >= 64u ? 4u : 1u;
+}
+
+/* Expand the persistent early-load task list in place. The pool keeps a
+ * pointer to this storage until pending_load_finish(), so a stack or temporary
+ * allocation would be unsafe here. If a future shape exceeds the fixed bound,
+ * preserve the original unsplit tasks instead of dropping any bytes. */
+static uint32_t ds4_gpu_stream_expert_pread_expand_tasks_bounded(
+        ds4_gpu_stream_expert_pread_task *tasks,
+        uint32_t n_tasks,
+        uint32_t capacity) {
+    const uint32_t split = ds4_gpu_stream_expert_pread_split();
+    const uint64_t min_split_len = 256u << 10;
+    const uint64_t align = 16u << 10;
+    enum {
+        max_tensor_tasks = DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u,
+    };
+    if (!tasks || n_tasks == 0 || split <= 1 ||
+        n_tasks > max_tensor_tasks || capacity < n_tasks) {
+        return n_tasks;
+    }
+
+    ds4_gpu_stream_expert_pread_task original[max_tensor_tasks];
+    memcpy(original, tasks, (size_t)n_tasks * sizeof(original[0]));
+
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        const uint64_t len = original[i].len;
+        if (len < min_split_len) {
+            if (out >= capacity) goto unsplit_fallback;
+            tasks[out++] = original[i];
+            continue;
+        }
+
+        uint64_t chunk = len / split + (len % split != 0);
+        if (chunk > UINT64_MAX - (align - 1u)) goto unsplit_fallback;
+        chunk = ((chunk + align - 1u) / align) * align;
+        uint64_t off = 0;
+        while (off < len) {
+            if (out >= capacity || original[i].offset > UINT64_MAX - off) {
+                goto unsplit_fallback;
+            }
+            const uint64_t part = len - off < chunk ? len - off : chunk;
+            tasks[out++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = original[i].offset + off,
+                .len = part,
+                .dst = original[i].dst + off,
+                .read_bytes = 0,
+                .ms = 0.0,
+                .ok = 0,
+            };
+            off += part;
+        }
+    }
+    return out;
+
+unsplit_fallback:
+    memcpy(tasks, original, (size_t)n_tasks * sizeof(original[0]));
+    return n_tasks;
 }
 
 static int ds4_gpu_stream_expert_pread_tasks(
@@ -14130,9 +14207,10 @@ static int ds4_gpu_stream_expert_pending_load_install(
     }
     if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
         fprintf(stderr,
-                "ds4: Metal streaming expert early-load finish layer=%u experts=%u tensors=%u bytes=%.2f GiB wall=%.3f ms\n",
+                "ds4: Metal streaming expert early-load finish layer=%u experts=%u tensors=%u requests=%u bytes=%.2f GiB wall=%.3f ms\n",
                 p->layer,
                 p->n_loads,
+                p->n_tensor_tasks,
                 p->n_tasks,
                 ds4_gpu_gib(read_bytes),
                 elapsed_ms);
@@ -14158,6 +14236,7 @@ static int ds4_gpu_stream_expert_pending_load_finish(
                                                               elapsed_ms);
     ds4_gpu_stream_expert_pending_load_release_buffers(p);
     p->n_tasks = 0;
+    p->n_tensor_tasks = 0;
     p->n_loads = 0;
     p->prepare_ms = 0.0;
     return ok;
@@ -14253,6 +14332,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     p->missing_mask = 0;
     p->n_loads = 0;
     p->n_tasks = 0;
+    p->n_tensor_tasks = 0;
     p->gate_expert_bytes = gate_expert_bytes;
     p->down_expert_bytes = down_expert_bytes;
     p->prepare_ms = 0.0;
@@ -14452,6 +14532,11 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         }
     }
 
+    p->n_tensor_tasks = p->n_tasks;
+    p->n_tasks = ds4_gpu_stream_expert_pread_expand_tasks_bounded(
+        p->tasks,
+        p->n_tasks,
+        DS4_METAL_STREAM_EXPERT_PENDING_MAX_TASKS);
     const uint32_t n_workers =
         ds4_gpu_stream_expert_pread_thread_count(p->n_tasks);
     p->start_ms = ds4_gpu_now_ms();
@@ -14464,9 +14549,10 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         p->active = 1;
         if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
             fprintf(stderr,
-                    "ds4: Metal streaming expert early-load begin layer=%u experts=%u tensors=%u threads=%u\n",
+                    "ds4: Metal streaming expert early-load begin layer=%u experts=%u tensors=%u requests=%u threads=%u\n",
                     layer,
                     p->n_loads,
+                    p->n_tensor_tasks,
                     p->n_tasks,
                     n_workers);
         }
@@ -14475,10 +14561,10 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
 
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
-    if (!ds4_gpu_stream_expert_pread_tasks(p->tasks,
-                                           p->n_tasks,
-                                           &read_bytes,
-                                           &read_ms)) {
+    if (!ds4_gpu_stream_expert_pread_tasks_run(p->tasks,
+                                               p->n_tasks,
+                                               &read_bytes,
+                                               &read_ms)) {
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
         return 0;
     }
@@ -14489,6 +14575,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     }
     ds4_gpu_stream_expert_pending_load_release_buffers(p);
     p->n_tasks = 0;
+    p->n_tensor_tasks = 0;
     p->n_loads = 0;
     p->prepare_ms = 0.0;
     return 1;
@@ -18011,10 +18098,70 @@ int ds4_gpu_matmul_q4_K_pair_tensor(
         uint64_t weight0_offset, uint64_t weight1_offset,
         uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
-    (void)out0; (void)out1; (void)model_map; (void)model_size;
-    (void)weight0_offset; (void)weight1_offset; (void)in_dim;
-    (void)out0_dim; (void)out1_dim; (void)x; (void)n_tok;
-    return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out0 || !out1 || !model_map || !x || n_tok == 0 || n_tok > 8u ||
+        in_dim == 0 || (in_dim % 256u) != 0 ||
+        in_dim > UINT32_MAX || out0_dim == 0 || out1_dim == 0 ||
+        out0_dim > UINT32_MAX || out1_dim > UINT32_MAX ||
+        getenv("DS4_METAL_DISABLE_Q4_DENSE_PAIR") != NULL) {
+        return 0;
+    }
+    @autoreleasepool {
+        const uint64_t row_bytes = (in_dim / 256u) * 144u;
+        const uint64_t w0_bytes = out0_dim * row_bytes;
+        const uint64_t w1_bytes = out1_dim * row_bytes;
+        if (weight0_offset > model_size || w0_bytes > model_size - weight0_offset ||
+            weight1_offset > model_size || w1_bytes > model_size - weight1_offset ||
+            ds4_gpu_tensor_bytes(x) < n_tok * in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out0) < n_tok * out0_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out1) < n_tok * out1_dim * sizeof(float)) {
+            return 0;
+        }
+        uint64_t inner0 = 0, inner1 = 0;
+        id<MTLBuffer> w0 = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight0_offset, w0_bytes, &inner0);
+        id<MTLBuffer> w1 = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight1_offset, w1_bytes, &inner1);
+        id<MTLBuffer> xb = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> o0 = ds4_gpu_tensor_buffer(out0);
+        id<MTLBuffer> o1 = ds4_gpu_tensor_buffer(out1);
+        if (!w0 || !w1 || !xb || !o0 || !o1) return 0;
+
+        const int16_t nsg = 2;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_ext_pipeline(
+            "kernel_mul_mv_q4_K_dense_pair_f32", nsg, 8);
+        if (!pipeline) return 0;
+        ds4_gpu_q8_0_matvec_args args0 = {
+            .ne00=(int32_t)in_dim, .ne01=(int32_t)out0_dim, .ne02=1,
+            .nb00=1, .nb01=row_bytes, .nb02=row_bytes*out0_dim, .nb03=row_bytes*out0_dim,
+            .ne10=(int32_t)in_dim, .ne11=(int32_t)n_tok, .ne12=1,
+            .nb10=sizeof(float), .nb11=in_dim*sizeof(float),
+            .nb12=in_dim*n_tok*sizeof(float), .nb13=in_dim*n_tok*sizeof(float),
+            .ne0=(int32_t)out0_dim, .ne1=(int32_t)n_tok, .nr0=2, .r2=1, .r3=1,
+        };
+        ds4_gpu_q8_0_matvec_args args1 = args0;
+        args1.ne01 = args1.ne0 = (int32_t)out1_dim;
+        args1.nb02 = args1.nb03 = row_bytes * out1_dim;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args0 length:sizeof(args0) atIndex:0];
+        [enc setBytes:&args1 length:sizeof(args1) atIndex:1];
+        [enc setBuffer:w0 offset:(NSUInteger)inner0 atIndex:2];
+        [enc setBuffer:w1 offset:(NSUInteger)inner1 atIndex:3];
+        [enc setBuffer:xb offset:ds4_gpu_tensor_offset(x) atIndex:4];
+        [enc setBuffer:o0 offset:ds4_gpu_tensor_offset(out0) atIndex:5];
+        [enc setBuffer:o1 offset:ds4_gpu_tensor_offset(out1) atIndex:6];
+        [enc setThreadgroupMemoryLength:32 atIndex:0];
+        const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+        [enc dispatchThreadgroups:MTLSizeMake((max_out + 3u) / 4u, n_tok, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "paired Q4_K matvec");
+    }
 }
 
 int ds4_gpu_matmul_q8_0_f16_out_tensor(

@@ -4686,41 +4686,51 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
 }
 #endif
 
-static uint64_t ds4_streaming_manual_cache_safe_bytes(
+static bool ds4_streaming_manual_cache_safe_bytes(
         ds4_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk,
-        bool        ssd_streaming) {
+        bool        ssd_streaming,
+        uint64_t    non_routed_bytes,
+        uint64_t   *safe_bytes_out) {
+    if (safe_bytes_out) *safe_bytes_out = 0;
 #ifdef DS4_NO_GPU
     (void)backend;
     (void)ctx_size;
     (void)prefill_chunk;
     (void)ssd_streaming;
-    return 0;
+    (void)non_routed_bytes;
+    return false;
 #else
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
     const uint64_t recommended = ds4_gpu_recommended_working_set_size();
-    if (recommended == 0) return 0;
+    if (recommended == 0 || !safe_bytes_out) return false;
 
     /*
-     * Explicit NGB budgets name only the routed expert cache. Keep that cache
-     * below the graph backend's working-set recommendation after accounting for
-     * the graph context/KV buffers. This is intentionally not an mlock-derived
-     * cap: crossing too close to the recommended working set makes short
-     * token-major prefill spend most of its time in VM/driver synchronization.
+     * Explicit NGB budgets name the total routed-expert budget (prefill
+     * headroom plus the decode cache).  On Metal, the mmap-backed non-routed
+     * weights share unified memory with that budget even though the startup
+     * report labels only the initially mapped token span as resident.  Failing
+     * to include them lets a seemingly safe expert cache evict the dense
+     * working set every token.  Keep the total below the backend's recommended
+     * working set after accounting for both graph memory and those weights.
+     *
+     * If less than the minimum usable cache remains, the normal planner emits
+     * its existing "budget too small" error instead of silently exceeding the
+     * memory-pressure limit.
      */
-    uint64_t target = recommended > UINT64_MAX / 7ull ?
-        UINT64_MAX : (recommended * 7ull) / 8ull;
+    const uint64_t target = recommended - recommended / 8ull;
     const ds4_context_memory ctx_mem =
         ds4_context_memory_estimate_with_prefill_mode(backend,
                                                       ctx_size,
                                                       prefill_chunk,
                                                       ssd_streaming);
-    uint64_t safe = 0;
-    if (target > ctx_mem.total_bytes) safe = target - ctx_mem.total_bytes;
-    safe = (safe / gib) * gib;
-    if (safe == 0) safe = gib;
-    return safe;
+    uint64_t fixed = ctx_mem.total_bytes;
+    if (backend == DS4_BACKEND_METAL) {
+        fixed = fixed > UINT64_MAX - non_routed_bytes ?
+            UINT64_MAX : fixed + non_routed_bytes;
+    }
+    *safe_bytes_out = target > fixed ? target - fixed : 0;
+    return true;
 #endif
 }
 
@@ -22363,10 +22373,28 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool qkv_proj_q8 =
         layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_kv->type == DS4_TENSOR_Q8_0;
+    const bool qkv_proj_q4 =
+        layer->attn_q_a->type == DS4_TENSOR_Q4_K &&
+        layer->attn_kv->type == DS4_TENSOR_Q4_K;
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused && qkv_proj_q8 &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(
+                metal_graph_qr(g),
+                metal_graph_kv_raw(g),
+                model->map,
+                model->size,
+                layer->attn_q_a->abs_offset,
+                layer->attn_kv->abs_offset,
+                DS4_N_EMBD,
+                q_rank,
+                DS4_N_HEAD_DIM,
+                metal_graph_attn_norm(g),
+                1) != 0;
+    }
+    if (!resume_after_qa_kv_raw && ok && qkv_rms_fused && qkv_proj_q4 &&
+        !qkv_pair_projected && !metal_graph_use_reference_qkv_pair_proj()) {
+        qkv_pair_projected = ds4_gpu_matmul_q4_K_pair_tensor(
                 metal_graph_qr(g),
                 metal_graph_kv_raw(g),
                 model->map,
@@ -56769,12 +56797,36 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
+        uint64_t non_routed_bytes = 0;
+        const bool non_routed_known =
+            weights_streaming_non_routed_bytes(&e->weights,
+                                               &non_routed_bytes);
+        if (e->backend == DS4_BACKEND_METAL && !non_routed_known) {
+            fprintf(stderr,
+                    "ds4: Metal SSD streaming could not measure non-routed "
+                    "weights for the manual cache safety cap\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        uint64_t safe_cache_bytes = 0;
+        const bool safe_cache_known =
             ds4_streaming_manual_cache_safe_bytes(e->backend,
                                                   opt->context_size,
                                                   e->prefill_chunk,
-                                                  e->ssd_streaming);
-        if (safe_cache_bytes != 0 &&
+                                                  e->ssd_streaming,
+                                                  non_routed_bytes,
+                                                  &safe_cache_bytes);
+        if (safe_cache_known && safe_cache_bytes == 0) {
+            fprintf(stderr,
+                    "ds4: %s SSD streaming has no safe room for the requested "
+                    "expert cache after graph and non-routed weights\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (safe_cache_known &&
             e->ssd_streaming_cache_bytes > safe_cache_bytes) {
             e->ssd_streaming_cache_bytes = safe_cache_bytes;
             fprintf(stderr,
