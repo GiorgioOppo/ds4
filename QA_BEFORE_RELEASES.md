@@ -267,6 +267,21 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
   `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
+- For the experimental resident-CUDA exact-2 verifier, run the active
+  acceptance fixture both with and without `DS4_CUDA_DSPARK_EXACT2=1` on the
+  same single-GPU host. Keep SSD streaming and TP disabled, require
+  byte-identical stdout, `errors=0`, `verifier_unavailable=0`, and record
+  `verify`, `replay`, acceptance, and generation t/s from both runs.
+- For CUDA HC and tiny routed-MoE kernel changes, keep
+  `DS4_CUDA_DSPARK_EXACT2` unset and repeat the resident acceptance fixture
+  with these explicit A/B pairs: HC control
+  `DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED=1` versus candidate with that variable
+  absent; routed-MoE control `DS4_CUDA_DSPARK_TINY_ALIGNED_VEC=0` versus
+  candidate `=1`. Require byte-identical stdout, `errors=0`, and
+  `verifier_unavailable=0`; record `prop_chain`, `verify_layer`, total
+  proposal/verify time, acceptance, and generation t/s. Also run
+  `--decode-consistency 64` and the logprob-vector regression before enabling
+  a numerically different kernel by default.
 - When DSpark, support-model mapping, or SSD streaming changes, repeat both
   the acceptance fixture and verifier invariant on every advertised graph
   backend. Apply the backend and SSD options to the target-only baseline as
