@@ -219,9 +219,10 @@ The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
 `ds4f-q4` models listed above. It is checkpoint-specific
 and must not be paired with an older Flash model. For now **DeepSeek V4 PRO**
 is not supported. On Metal, CUDA, and ROCm, the main model may be resident or
-use `--ssd-streaming`; the support model remains resident and adds its own
-weights and runtime state to the memory requirement. DSpark replaces the
-legacy one-stage MTP support model for that run rather than stacking with it.
+use `--ssd-streaming`; the support model is kept separately mapped or
+device-cached and adds its own weights and runtime state to the memory
+requirement. DSpark replaces the legacy one-stage MTP support model for that
+run rather than stacking with it.
 
 Run it with greedy decoding:
 
@@ -233,7 +234,9 @@ Run it with greedy decoding:
 
 On a single accelerator, the main model can instead stream its routed experts
 from SSD while the DSpark support model remains mapped or device-cached
-separately. Select the backend with `--metal`, `--cuda`, or `--rocm`:
+separately. On Metal the support mapping is file-backed and pageable; CUDA and
+ROCm prepare a separate device cache. Select the backend with `--metal`,
+`--cuda`, or `--rocm`:
 
 ```sh
 ./ds4 -m ds4flash.gguf \
@@ -245,14 +248,92 @@ separately. Select the backend with `--metal`, `--cuda`, or `--rocm`:
 Use `--cuda` in a CUDA build. On ROCm, use `--rocm` and a verification-safe
 cache, for example `--ssd-streaming-cache-experts 32`.
 
+For memory-constrained Metal systems, use a small graph workspace as well as a
+small expert cache. A practical 16 GiB starting point is:
+
+```sh
+./ds4 -m ds4flash.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --dspark --metal --ssd-streaming \
+  --ssd-streaming-cache-experts 16 \
+  --ctx 4096 --prefill-chunk 128 --temp 0
+```
+
+When DSpark+SSD runs on a Mac with at most 24 GiB and neither
+`--prefill-chunk` nor `DS4_METAL_PREFILL_CHUNK` is set, the runtime selects 128
+automatically. Set `DS4_DSPARK_LOW_MEMORY_PREFILL_CHUNK=0` to retain the normal
+workspace policy, or set it to another row count.
+
+The Metal SSD verifier automatically limits a speculative block to the number
+of complete top-k rows that fit in the effective target expert cache (two rows
+with 12 effective slots and top-6 routing). Override this diagnostic policy
+with `DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=N`. Exact file views for the two token
+embedding rows and repeatedly used Q8 support tensors are automatic; the
+compatibility kill switches are
+`DS4_METAL_DISABLE_TOKEN_EMBED_EXACT_VIEW=1` and
+`DS4_METAL_DISABLE_SUPPORT_Q8_DECODE_EXACT_VIEWS=1`.
+
+The low-memory Metal SSD scheduler measures proposal plus verify/replay cost
+against the target decode time. After two unprofitable attempts (cost above
+1.5 times the estimated saved decode work), it backs off for 4, 8, 16, 32,
+then 64 target cycles, probing once before advancing to the next backoff
+level.
+`DS4_DSPARK_SCHEDULER_TIMING=0` restores acceptance-only scheduling;
+the existing `DS4_DSPARK_SCHEDULER=0` disables all scheduler pauses. Quality
+and strict DSpark modes remain target-only.
+
 Tune the expert-cache count for the available accelerator memory. ROCm needs
 enough slots for a whole verification block (30 for the 0731 model; use at
 least 32), and currently supports the IQ2_XXS/Q2_K or all-Q2_K routed-expert
 layouts. CUDA uses a transient selected-expert cache for each target block.
-The DSpark support weights remain resident and are included in the startup
-memory budget. This combination is single-device only; CPU, distributed or
+The DSpark support weights are included in the startup memory budget even when
+the Metal file-backed mapping remains pageable. This combination is
+single-device only; CPU, distributed or
 multi-GPU placement, tensor parallelism, and legacy MTP support models remain
 incompatible with DSpark plus SSD streaming.
+
+Resident single-GPU CUDA skips verifier captures that rollback/replay cannot
+consume, batches frontier snapshot/restore copies behind one device fence,
+computes the output head only for the final replayed token, pads the five-row
+Q8 proposer head to the tensor-core shape, and fuses proposer Q RMSNorm with
+RoPE. CUDA and ROCm also avoid the Metal-only mid-token submission split: on
+those backends the same flush is a device-wide synchronization and only drains
+the launch pipeline. The two kernel-selection kill switches for before/after
+measurements are
+`DS4_CUDA_DSPARK_NO_PADDED_HEAD=1` and
+`DS4_CUDA_DSPARK_NO_Q_NORM_ROPE_FUSION=1`.
+
+CUDA fuses HC split, weighted sum, and RMSNorm across multiple batch rows,
+including the DSpark proposer and verifier; use
+`DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED=1` for an A/B fallback to the separate
+kernels. An experimental resident-CUDA path can run the existing aligned
+IQ2_XXS/Q2_K vector MoE kernels for two-to-five-token routed batches,
+preserving the established fused-SoA path as an automatic fallback:
+
+```sh
+DS4_CUDA_DSPARK_TINY_ALIGNED_VEC=1 DS4_DSPARK_STATS=1 \
+./ds4 --cuda -m ds4flash.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --dspark --temp 0 -p 'Write a Python quicksort function with comments.'
+```
+
+Keep the aligned tiny-batch path opt-in until the same-machine acceptance,
+decode-consistency, and throughput comparisons pass on CUDA hardware.
+
+An experimental exact two-token resident-CUDA verifier is available for a
+DGX Spark A/B test. It uses the ordinary decode kernels, commits a two-token
+full accept without rollback/replay, and replays only the first token on a
+partial accept. The switch also caps verification to the first two drafts:
+
+```sh
+DS4_CUDA_DSPARK_EXACT2=1 DS4_DSPARK_STATS=1 \
+./ds4 --cuda -m ds4flash.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --dspark --temp 0 -p 'Write a Python quicksort function with comments.'
+```
+
+Keep this path opt-in until the CUDA acceptance fixture is byte-identical and
+the same-machine statistics show lower `verify` plus `replay` time.
 
 The acceptance fixture can exercise the same SSD path on both the target-only
 baseline and the DSpark run. It also requires real proposals and accepted

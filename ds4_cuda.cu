@@ -23688,8 +23688,12 @@ static int routed_moe_launch(
         if (gate_aligned && up_aligned && down_aligned) {
             const cudaStream_t aligned_stream =
                 n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
-            int rc;
-            if (n_tokens == 1u) {
+            const int dspark_tiny_aligned_vec =
+                n_tokens >= 2u && n_tokens <= 5u &&
+                cuda_env_flag_enabled(
+                    "DS4_CUDA_DSPARK_TINY_ALIGNED_VEC", 0);
+            int rc = -1;
+            if (n_tokens == 1u || dspark_tiny_aligned_vec) {
                 rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
                     gate_aligned, up_aligned,
                     (const float *)x->ptr,
@@ -23710,7 +23714,20 @@ static int routed_moe_launch(
                         /*n_expert_used=*/1,
                         aligned_stream);
                 }
-            } else {
+                if (rc == 0 && dspark_tiny_aligned_vec) {
+                    static int logged_dspark_tiny_aligned_vec = 0;
+                    if (!logged_dspark_tiny_aligned_vec) {
+                        logged_dspark_tiny_aligned_vec = 1;
+                        fprintf(stderr,
+                                "ds4: CUDA DSpark tiny batches using "
+                                "aligned vector MoE\n");
+                    }
+                }
+            }
+            /* Keep the established fused-SoA path as the automatic fallback
+             * when the opt-in vector entries reject a tiny-batch shape. */
+            if (n_tokens > 1u &&
+                (!dspark_tiny_aligned_vec || rc != 0)) {
                 rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
                     gate_aligned, up_aligned, down_aligned,
                     (const float *)x->ptr,
@@ -25676,37 +25693,50 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
             (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
             return 0;
         }
-        uint64_t n_rows = out->bytes / out_row_bytes;
-        if (n_rows == 1) {
-            if (mix->bytes < n_rows * mix_bytes ||
-                split->bytes < n_rows * mix_bytes ||
-                residual_hc->bytes < n_rows * residual_row_bytes) {
-                return 0;
-            }
-            const int logical_tier = ds4_tensor_device_idx(out);
-            const float *scale = (const float *)cuda_resolve_weight_ptr(model_map, scale_offset,
-                    3ull * sizeof(float), logical_tier, "hc_scale");
-            const float *base = (const float *)cuda_resolve_weight_ptr(model_map, base_offset,
-                    mix_bytes, logical_tier, "hc_base");
-            const float *norm_w = (const float *)cuda_resolve_weight_ptr(model_map, norm_weight_offset,
-                    (uint64_t)n_embd * sizeof(float), logical_tier, "hc_norm_weight");
-            if (!scale || !base || !norm_w) return 0;
-            hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256, 0, cuda_decode_stream()>>>(
-                    (float *)out->ptr,
-                    (float *)norm_out->ptr,
-                    (float *)split->ptr,
-                    (const float *)mix->ptr,
-                    (const float *)residual_hc->ptr,
-                    scale,
-                    base,
-                    norm_w,
-                    n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
-            return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
+        const uint64_t n_rows = out->bytes / out_row_bytes;
+        if (n_rows > (uint64_t)INT_MAX ||
+            n_rows > UINT64_MAX / mix_bytes ||
+            n_rows > UINT64_MAX / residual_row_bytes) {
+            return 0;
         }
+        const uint64_t mix_total_bytes = n_rows * mix_bytes;
+        const uint64_t residual_total_bytes = n_rows * residual_row_bytes;
+        if (mix->bytes < mix_total_bytes ||
+            split->bytes < mix_total_bytes ||
+            residual_hc->bytes < residual_total_bytes) {
+            return 0;
+        }
+        const int logical_tier = ds4_tensor_device_idx(out);
+        const float *scale = (const float *)cuda_resolve_weight_ptr(model_map, scale_offset,
+                3ull * sizeof(float), logical_tier, "hc_scale");
+        const float *base = (const float *)cuda_resolve_weight_ptr(model_map, base_offset,
+                mix_bytes, logical_tier, "hc_base");
+        const float *norm_w = (const float *)cuda_resolve_weight_ptr(model_map, norm_weight_offset,
+                (uint64_t)n_embd * sizeof(float), logical_tier, "hc_norm_weight");
+        if (!scale || !base || !norm_w) return 0;
+        hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr,
+                (float *)norm_out->ptr,
+                (float *)split->ptr,
+                (const float *)mix->ptr,
+                (const float *)residual_hc->ptr,
+                scale,
+                base,
+                norm_w,
+                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+        return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
     }
     /* Multi-row fallback: norm EVERY row (rms_norm_weight_tensor is the
      * single-row entry and would leave rows 1..n-1 of norm_out untouched). */
     if (!out || n_embd == 0) return 0;
+    const uint64_t fallback_row_bytes = (uint64_t)n_embd * sizeof(float);
+    if (out->bytes < fallback_row_bytes ||
+        out->bytes % fallback_row_bytes != 0 ||
+        out->bytes / fallback_row_bytes > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    const uint32_t fallback_rows =
+        (uint32_t)(out->bytes / fallback_row_bytes);
     return ds4_gpu_hc_split_weighted_sum_tensor(out, split, mix, residual_hc,
                                                   model_map, model_size,
                                                   scale_offset, base_offset,
@@ -25715,8 +25745,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
            ds4_gpu_rms_norm_weight_rows_tensor(
                    norm_out, out, model_map, model_size,
                    norm_weight_offset, n_embd,
-                   (uint32_t)(out->bytes /
-                              ((uint64_t)n_embd * sizeof(float))),
+                   fallback_rows,
                    norm_eps);
 }
 extern "C" int ds4_gpu_output_hc_weights_tensor(
