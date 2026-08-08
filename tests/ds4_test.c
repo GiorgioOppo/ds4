@@ -6832,7 +6832,7 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
     puts("  DS4_TEST_BACKEND=cpu       Run model tests on CPU instead of Metal/CUDA.");
-    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through Metal SSD streaming.");
+    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through backend SSD streaming.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");

@@ -23,6 +23,46 @@ fi
 partial_cases=0
 direct_partial_cases=0
 direct_commits=0
+BACKEND=${DS4_DSPARK_FIXTURE_BACKEND:-auto}
+SSD_STREAMING=${DS4_DSPARK_FIXTURE_SSD_STREAMING:-0}
+SSD_CACHE_EXPERTS=${DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS:-}
+REQUIRE_ACTIVE=${DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE:-1}
+total_proposed=0
+total_accepted_draft=0
+
+case "$BACKEND" in
+auto|metal|cuda|rocm) ;;
+*)
+    echo "dspark-fixture: invalid DS4_DSPARK_FIXTURE_BACKEND=$BACKEND" >&2
+    exit 1
+    ;;
+esac
+case "$SSD_STREAMING" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_SSD_STREAMING must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$REQUIRE_ACTIVE" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$SSD_CACHE_EXPERTS" in
+""|*[!0-9]*)
+    if [ -n "$SSD_CACHE_EXPERTS" ]; then
+        echo "dspark-fixture: invalid SSD streaming expert count $SSD_CACHE_EXPERTS" >&2
+        exit 1
+    fi
+    ;;
+esac
+if [ "$SSD_STREAMING" = 0 ] && [ -n "$SSD_CACHE_EXPERTS" ]; then
+    echo "dspark-fixture: SSD cache experts requires DS4_DSPARK_FIXTURE_SSD_STREAMING=1" >&2
+    exit 1
+fi
 
 proposal_quality_guard_enabled() {
     case "$PROPOSAL_QUALITY_GUARD" in
@@ -109,6 +149,8 @@ print_metadata() {
         "$tail_min_tokens" "$PROPOSAL_QUALITY_GUARD" \
         "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED" \
         "$REQUIRE_DIRECT" "$REQUIRE_IDENTICAL"
+    printf '# backend=%s ssd_streaming=%s ssd_cache_experts=%s require_active=%s\n' \
+        "$BACKEND" "$SSD_STREAMING" "${SSD_CACHE_EXPERTS:-auto}" "$REQUIRE_ACTIVE"
     printf '# baseline_command=%s -m %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
         "$DS4_BIN" "$MODEL" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
     printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s%s -m %s --mtp-model %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
@@ -133,6 +175,44 @@ fi
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-dspark-fixture.XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
+run_variant() {
+    mode=$1
+    prompt=$2
+    stdout_file=$3
+    stderr_file=$4
+
+    set -- "$DS4_BIN"
+    case "$BACKEND" in
+    metal) set -- "$@" --metal ;;
+    cuda)  set -- "$@" --cuda ;;
+    rocm)  set -- "$@" --rocm ;;
+    esac
+    if [ "$SSD_STREAMING" = 1 ]; then
+        set -- "$@" --ssd-streaming
+        if [ -n "$SSD_CACHE_EXPERTS" ]; then
+            set -- "$@" --ssd-streaming-cache-experts "$SSD_CACHE_EXPERTS"
+        fi
+    fi
+    if [ "$mode" = dspark ]; then
+        set -- "$@" --dspark --mtp-model "$SUPPORT"
+        if [ "$EXACT_SAMPLING" != 0 ]; then
+            set -- "$@" --mtp-exact-sampling
+        fi
+        if [ -n "$CONFIDENCE" ]; then
+            set -- "$@" --dspark-confidence "$CONFIDENCE"
+        fi
+    fi
+    set -- "$@" -m "$MODEL" --tokens "$TOKENS" \
+        --temp "$TEMPERATURE" --top-p "$TOP_P" --min-p "$MIN_P" \
+        --seed "$SEED" --nothink -p "$prompt"
+
+    if [ "$mode" = dspark ]; then
+        DS4_DSPARK_STATS=1 "$@" >"$stdout_file" 2>"$stderr_file"
+    else
+        "$@" >"$stdout_file" 2>"$stderr_file"
+    fi
+}
+
 run_case() {
     id=$1
     prompt=$2
@@ -141,27 +221,8 @@ run_case() {
     dspark_out="$tmpdir/$id.dspark.out"
     dspark_err="$tmpdir/$id.dspark.err"
 
-    "$DS4_BIN" -m "$MODEL" \
-        --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
-        --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
-        >"$base_out" 2>"$base_err"
-
-    if [ -n "$CONFIDENCE" ]; then
-        DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark $exact_sampling_arg \
-            --dspark-confidence "$CONFIDENCE" \
-            -m "$MODEL" --mtp-model "$SUPPORT" \
-            --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
-            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
-            >"$dspark_out" 2>"$dspark_err"
-    else
-        DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark $exact_sampling_arg \
-            -m "$MODEL" --mtp-model "$SUPPORT" \
-            --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
-            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
-            >"$dspark_out" 2>"$dspark_err"
-    fi
+    run_variant baseline "$prompt" "$base_out" "$base_err"
+    run_variant dspark "$prompt" "$dspark_out" "$dspark_err"
 
     output_match=1
     if ! cmp -s "$base_out" "$dspark_out"; then
@@ -186,11 +247,15 @@ run_case() {
 
     partial=$(printf '%s\n' "$stats" | sed -n 's/.* partial=\([0-9][0-9]*\).*/\1/p')
     errors=$(printf '%s\n' "$stats" | sed -n 's/.*errors=\([0-9][0-9]*\).*/\1/p')
+    verifier_unavailable=$(printf '%s\n' "$stats" | sed -n 's/.*verifier_unavailable=\([0-9][0-9]*\).*/\1/p')
+    proposed=$(printf '%s\n' "$stats" | sed -n 's/.*proposed=\([0-9][0-9]*\).*/\1/p')
     accepted_draft=$(printf '%s\n' "$stats" | sed -n 's/.*accepted_draft=\([0-9][0-9]*\).*/\1/p')
     direct_full=$(printf '%s\n' "$stats" | sed -n 's/.*direct_full=\([0-9][0-9]*\).*/\1/p')
     direct_partial=$(printf '%s\n' "$stats" | sed -n 's/.*direct_partial=\([0-9][0-9]*\).*/\1/p')
     partial=${partial:-0}
     errors=${errors:-0}
+    verifier_unavailable=${verifier_unavailable:-0}
+    proposed=${proposed:-0}
     accepted_draft=${accepted_draft:-0}
     direct_full=${direct_full:-0}
     direct_partial=${direct_partial:-0}
@@ -198,6 +263,12 @@ run_case() {
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
         return 1
     fi
+    if [ "$verifier_unavailable" -ne 0 ]; then
+        echo "dspark-fixture: verifier unavailable for $id: $stats" >&2
+        return 1
+    fi
+    total_proposed=$((total_proposed + proposed))
+    total_accepted_draft=$((total_accepted_draft + accepted_draft))
     if [ "$PROPOSAL_QUALITY_GUARD_ACTIVE" -ne 0 ] && [ "$id" = c_add ] &&
         [ "$accepted_draft" -lt "$C_ADD_MIN_ACCEPTED" ]; then
         echo "dspark-fixture: c_add accepted_draft $accepted_draft below required $C_ADD_MIN_ACCEPTED: $stats" >&2
@@ -233,5 +304,10 @@ if [ "$REQUIRE_PARTIAL" != 0 ] && [ "$direct_partial_cases" -eq 0 ]; then
 fi
 if [ "$REQUIRE_DIRECT" != 0 ] && [ "$direct_commits" -eq 0 ]; then
     echo "dspark-fixture: expected at least one direct verifier-state commit" >&2
+    exit 1
+fi
+if [ "$REQUIRE_ACTIVE" != 0 ] &&
+   { [ "$total_proposed" -eq 0 ] || [ "$total_accepted_draft" -eq 0 ]; }; then
+    echo "dspark-fixture: DSpark runtime was not active (proposed=$total_proposed accepted_draft=$total_accepted_draft)" >&2
     exit 1
 fi

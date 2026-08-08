@@ -467,6 +467,58 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_head, head_dim);
 }
 
+extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t              n_tokens,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_head,
+        uint32_t              head_dim) {
+    uint64_t sink_bytes = 0;
+    uint64_t head_elems = 0;
+    uint64_t head_bytes = 0;
+    uint64_t raw_bytes = 0;
+    const bool sizes_ok =
+        cuda_u64_mul_checked(n_head, sizeof(float), &sink_bytes) &&
+        cuda_u64_mul3_checked(n_tokens, n_head, head_dim, &head_elems) &&
+        cuda_u64_mul_checked(head_elems, sizeof(float), &head_bytes) &&
+        cuda_u64_mul3_checked(raw_cap, head_dim, sizeof(float), &raw_bytes);
+    if (!heads || !q || !raw_kv || !model_map ||
+        !sizes_ok ||
+        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw ||
+        raw_start >= raw_cap || n_head == 0 || head_dim == 0 ||
+        sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        heads->bytes < head_bytes || q->bytes < head_bytes ||
+        raw_kv->bytes < raw_bytes) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, sink_bytes, "dspark_attn_sinks");
+    if (!sinks) return 0;
+    const size_t shmem = (size_t)n_raw * sizeof(float);
+    if (shmem > 32768u) return 0;
+    dim3 grid(n_tokens, n_head, 1);
+    attention_noncausal_raw_batch_heads_kernel<<<grid, 256, shmem>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_tokens,
+            n_raw,
+            raw_cap,
+            raw_start,
+            n_head,
+            head_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "attention noncausal raw batch heads launch");
+}
+
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

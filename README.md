@@ -350,10 +350,10 @@ GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
 `ds4f-q4` models listed above. It is checkpoint-specific
 and must not be paired with an older Flash model. For now **DeepSeek V4 PRO**
-is not supported. On Metal, the main model may be resident or use
-`--ssd-streaming`; the support model still adds its own weights and runtime
-state to the memory requirement. DSpark replaces the legacy one-stage MTP
-support model for that run rather than stacking with it.
+is not supported. On Metal, CUDA, and ROCm, the main model may be resident or
+use `--ssd-streaming`; the support model remains resident and adds its own
+weights and runtime state to the memory requirement. DSpark replaces the
+legacy one-stage MTP support model for that run rather than stacking with it.
 
 Run it with the normal sampling defaults:
 
@@ -390,6 +390,47 @@ decoding, which is useful for reproducibility checks.
 The same DSpark flags work with `ds4-agent` and with non-batched
 `ds4-server` requests. Session-batched serving currently uses ordinary target
 decoding.
+
+On a single accelerator, the main model can instead stream its routed experts
+from SSD while the DSpark support model remains mapped or device-cached
+separately. Select the backend with `--metal`, `--cuda`, or `--rocm`:
+
+```sh
+./ds4 -m ds4flash.gguf \
+  --mtp-model gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --dspark --metal --ssd-streaming \
+  --ssd-streaming-cache-experts 16 --temp 0
+```
+
+Use `--cuda` in a CUDA build. On ROCm, use `--rocm` and a verification-safe
+cache, for example `--ssd-streaming-cache-experts 32`.
+
+Tune the expert-cache count for the available accelerator memory. ROCm needs
+enough slots for a whole verification block (30 for the 0731 model; use at
+least 32), and currently supports the IQ2_XXS/Q2_K or all-Q2_K routed-expert
+layouts. CUDA uses a transient selected-expert cache for each target block.
+The DSpark support weights remain resident and are included in the startup
+memory budget. This combination is single-device only; CPU, distributed or
+multi-GPU placement, tensor parallelism, and legacy MTP support models remain
+incompatible with DSpark plus SSD streaming.
+
+The acceptance fixture can exercise the same SSD path on both the target-only
+baseline and the DSpark run. It also requires real proposals and accepted
+draft tokens, so an unavailable verifier cannot pass as a silent no-op:
+
+```sh
+DS4_DSPARK_FIXTURE_BACKEND=cuda \
+DS4_DSPARK_FIXTURE_SSD_STREAMING=1 \
+DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS=32 \
+make dspark-acceptance
+```
+
+For ROCm, use `make rocm-dspark-acceptance` with the same model, support, and
+SSD fixture environment variables. The ROCm-specific target preserves the HIP
+object set and linker; the generic target selects CUDA objects on non-Apple
+hosts. `make rocm-dspark-verify-depth` provides the corresponding verifier
+invariant test.
+
 
 ## Speed
 

@@ -5954,6 +5954,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_fd = -1;
+    g_model_fd_host_base = NULL;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
@@ -5961,6 +5962,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_ssd_streaming_mode = 0;
+    g_stream_expert_cache_budget = 0;
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -6229,6 +6232,45 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
     fprintf(stderr, DS4_GPU_LOG_PREFIX "mapped %.2f GiB auxiliary model\n",
             (double)map_size / 1073741824.0);
     return 1;
+}
+
+extern "C" int ds4_gpu_prepare_support_model(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size,
+        uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (!model_map || model_size == 0 || map_offset > model_size ||
+        map_size == 0 || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (g_model_fd < 0 || g_model_fd_host_base != model_map) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "support model fd does not match its mmap\n");
+        return 0;
+    }
+
+    /* ROCm's streaming range cache is intentionally replaced at every target
+     * layer. Store the small DSpark GGUF in the persistent, mmap-keyed image
+     * registry instead, while leaving the target map as the active mapping. */
+    const void *saved_host_base = g_model_host_base;
+    const char *saved_device_base = g_model_device_base;
+    const uint64_t saved_registered_size = g_model_registered_size;
+    const int saved_device_owned = g_model_device_owned;
+
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_for_multi_model = 1;
+    const int ok = cuda_model_copy_chunked(model_map,
+                                           model_size,
+                                           map_offset,
+                                           map_size);
+
+    g_model_host_base = saved_host_base;
+    g_model_device_base = saved_device_base;
+    g_model_registered_size = saved_registered_size;
+    g_model_device_owned = saved_device_owned;
+    return ok;
 }
 
 extern "C" int ds4_gpu_set_model_map_spans(
