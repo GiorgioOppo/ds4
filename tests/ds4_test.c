@@ -6731,9 +6731,6 @@ static void test_dspark_verify_depth(void) {
         return;
     }
 
-    char *saved_scheduler = test_save_env("DS4_DSPARK_SCHEDULER");
-    setenv("DS4_DSPARK_SCHEDULER", "0", 1);
-
     ds4_engine *engine = test_open_dspark_engine(support);
     ds4_tokens prompt = {0};
     int *spec = NULL;
@@ -6776,7 +6773,6 @@ static void test_dspark_verify_depth(void) {
     free(spec);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
-    test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
 }
 #endif
 
