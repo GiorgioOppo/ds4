@@ -74,10 +74,11 @@ different catalogs no longer share a global repository. Preserve cancellation,
 resume and progress callbacks; avoid buffers proportional to the model size.
 
 A downloadable target does not imply decoder compatibility. The main catalog
-declares runtime support per entry: the three Flash and single-file PRO Q2
-models are selectable, while the PRO Q4 package and the three GLM 5.2 remain
-`downloadOnly`. MTP remains internal; the 0730 and 0731 DSpark accessories
-appear in the downloader but cannot be selected as main models.
+declares runtime support per entry: the 0730/0731 Q2, mixed Q2/Q4 and Q4 Flash
+models plus single-file PRO Q2 are selectable, while Flash 0731 MXFP4, the PRO
+Q4 package and the gated families remain `downloadOnly`. MTP remains internal;
+the 0730 and 0731 DSpark accessories appear in the downloader but cannot be
+selected as main models.
 
 For Kimi K3 the GUI acquires five ordered `splitFragment` targets. Every part
 has independent resume, byte-size and SHA-256 validation, and the package is

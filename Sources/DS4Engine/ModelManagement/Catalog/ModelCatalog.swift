@@ -5,8 +5,12 @@ import DS4Metal
 /// Stable identifiers exposed to the GUI and persisted by callers.
 public enum ModelCatalogID: String, CaseIterable, Identifiable, Sendable, Hashable {
     case flashQ2Imatrix = "q2-imatrix"
+    case flashQ2Imatrix0731 = "q2-imatrix-0731"
     case flashQ2Q4Imatrix = "q2-q4-imatrix"
+    case flashQ2Q4Imatrix0731 = "q2-q4-imatrix-0731"
     case flashQ4Imatrix = "q4-imatrix"
+    case flashQ4Imatrix0731 = "q4-imatrix-0731"
+    case flashMXFP40731 = "mxfp4-0731"
     case proQ2Imatrix = "pro-q2-imatrix"
     case proQ4Split = "pro-q4-split"
     case glm52IQ2XXS = "glm-5.2-iq2-xxs"
@@ -233,9 +237,9 @@ public enum DeepSeekV4ModelCatalog {
     public static let entries: [ModelCatalogEntry] = [
         .init(
             id: .flashQ2Imatrix,
-            displayName: "DeepSeek V4 Flash · IQ2XXS",
+            displayName: "DeepSeek V4 Flash 0730 · IQ2XXS",
             profile: .deepSeekV4(.flash),
-            summary: "Quantizzazione più compatta, consigliata per Mac con 96–128 GB di memoria.",
+            summary: "Checkpoint 0730. Quantizzazione più compatta, consigliata per Mac con 96–128 GB di memoria.",
             artifacts: [
                 .init(
                     id: ModelCatalogID.flashQ2Imatrix.rawValue,
@@ -248,10 +252,27 @@ public enum DeepSeekV4ModelCatalog {
             runtimeAvailability: singleFileAvailability(for: .flash)
         ),
         .init(
-            id: .flashQ2Q4Imatrix,
-            displayName: "DeepSeek V4 Flash · IQ2XXS/Q4_K",
+            id: .flashQ2Imatrix0731,
+            displayName: "DeepSeek V4 Flash 0731 · IQ2XXS",
             profile: .deepSeekV4(.flash),
-            summary: "Quantizzazione mista: gli ultimi sei layer usano esperti Q4 per una qualità maggiore.",
+            summary: "Checkpoint 0731 aggiornato, compatto e compatibile con il supporto DSpark 0731.",
+            artifacts: [
+                .init(
+                    id: ModelCatalogID.flashQ2Imatrix0731.rawValue,
+                    file: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+                    approxGB: 87,
+                    note: "0731 · 2-bit routed experts",
+                    sha256: "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0",
+                    expectedSizeBytes: 86_720_111_488
+                ),
+            ],
+            runtimeAvailability: singleFileAvailability(for: .flash)
+        ),
+        .init(
+            id: .flashQ2Q4Imatrix,
+            displayName: "DeepSeek V4 Flash 0730 · IQ2XXS/Q4_K",
+            profile: .deepSeekV4(.flash),
+            summary: "Checkpoint 0730. Gli ultimi sei layer usano esperti Q4 per una qualità maggiore.",
             artifacts: [
                 .init(
                     id: ModelCatalogID.flashQ2Q4Imatrix.rawValue,
@@ -264,10 +285,27 @@ public enum DeepSeekV4ModelCatalog {
             runtimeAvailability: singleFileAvailability(for: .flash)
         ),
         .init(
-            id: .flashQ4Imatrix,
-            displayName: "DeepSeek V4 Flash · Q4_K",
+            id: .flashQ2Q4Imatrix0731,
+            displayName: "DeepSeek V4 Flash 0731 · IQ2XXS/Q4_K",
             profile: .deepSeekV4(.flash),
-            summary: "Quantizzazione a qualità più alta, consigliata per Mac con almeno 256 GB di memoria.",
+            summary: "Checkpoint 0731 misto: esperti Q4 negli ultimi sei layer e IQ2XXS/Q2_K negli altri.",
+            artifacts: [
+                .init(
+                    id: ModelCatalogID.flashQ2Q4Imatrix0731.rawValue,
+                    file: "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
+                    approxGB: 98,
+                    note: "0731 · mixed q2/q4 routed experts",
+                    sha256: "659e22fbd01c9e13ea37a57c8d9c41e0a8819dffa3473d3c5286ee44b2d3398f",
+                    expectedSizeBytes: 97_591_747_456
+                ),
+            ],
+            runtimeAvailability: singleFileAvailability(for: .flash)
+        ),
+        .init(
+            id: .flashQ4Imatrix,
+            displayName: "DeepSeek V4 Flash 0730 · Q4_K",
+            profile: .deepSeekV4(.flash),
+            summary: "Checkpoint 0730. Quantizzazione a qualità più alta, consigliata per Mac con almeno 256 GB di memoria.",
             artifacts: [
                 .init(
                     id: ModelCatalogID.flashQ4Imatrix.rawValue,
@@ -278,6 +316,42 @@ public enum DeepSeekV4ModelCatalog {
                 ),
             ],
             runtimeAvailability: singleFileAvailability(for: .flash)
+        ),
+        .init(
+            id: .flashQ4Imatrix0731,
+            displayName: "DeepSeek V4 Flash 0731 · Q4_K",
+            profile: .deepSeekV4(.flash),
+            summary: "Checkpoint 0731 con tutti gli esperti routed Q4_K; richiede molto spazio e memoria.",
+            artifacts: [
+                .init(
+                    id: ModelCatalogID.flashQ4Imatrix0731.rawValue,
+                    file: "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+                    approxGB: 165,
+                    note: "0731 · 4-bit routed experts",
+                    sha256: "6bb77b5ddcbc2d974c687cfb63d644ecfb295581b4a53fa4c1d810aea538254a",
+                    expectedSizeBytes: 164_633_502_592
+                ),
+            ],
+            runtimeAvailability: singleFileAvailability(for: .flash)
+        ),
+        .init(
+            id: .flashMXFP40731,
+            displayName: "DeepSeek V4 Flash 0731 · MXFP4",
+            profile: .deepSeekV4(.flash),
+            summary: "Pesi esperti MXFP4 nativi del checkpoint 0731. Scaricabile per ds4 C; il kernel MXFP4 non è ancora disponibile nel runtime Swift/Metal.",
+            artifacts: [
+                .init(
+                    id: ModelCatalogID.flashMXFP40731.rawValue,
+                    file: "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
+                    approxGB: 156,
+                    note: "0731 · native MXFP4 routed experts",
+                    sha256: "0e3a161b670f686128ec5f92a601dfde616a37bf5e7e48999fa2d32471b57ec6",
+                    expectedSizeBytes: 155_976_458_848
+                ),
+            ],
+            runtimeAvailability: .downloadOnly(
+                reason: "Il formato GGUF MXFP4 (type 39) non è ancora eseguibile dal backend Swift/Metal."
+            )
         ),
         .init(
             id: .proQ2Imatrix,
@@ -528,15 +602,15 @@ public enum DeepSeekV4AccessoryCatalog {
         role: .optionalComponent
     )
 
-    /// Checkpoint-specific support model for the 0731 refresh. The exact size
-    /// is learned from the pinned Hugging Face manifest before download; the
-    /// SHA is already pinned by the official publication.
+    /// Checkpoint-specific support model for the 0731 refresh. Digest and exact
+    /// size are pinned from the official Hugging Face manifest.
     public static let dspark0731 = ModelTarget(
         id: ModelCatalogID.dsparkSupport0731.rawValue,
         file: "DeepSeek-V4-Flash-DSpark-support-0731.gguf",
         approxGB: 6,
         note: "DSpark support model for the Flash 0731 checkpoint",
         sha256: "7e319924541db3f7a163ed7e11d7532a70d48228ab59d36cb81e1d4511885360",
+        expectedSizeBytes: 5_989_114_272,
         role: .optionalComponent
     )
 

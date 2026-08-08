@@ -31,16 +31,50 @@ final class ModelDownloaderTests: XCTestCase {
     }
 
     func testTypedCatalogSelectsFlashAndSingleFileProQ2() {
-        XCTAssertEqual(DeepSeekV4ModelCatalog.entries.count, 5)
+        XCTAssertEqual(DeepSeekV4ModelCatalog.entries.count, 9)
         XCTAssertEqual(GLM52ModelCatalog.entries.count, 3)
         XCTAssertEqual(LagunaModelCatalog.entries.count, 2)
         XCTAssertEqual(KimiK3ModelCatalog.entries.count, 1)
-        XCTAssertEqual(ModelCatalogRegistry.entries.count, 11)
-        XCTAssertEqual(ModelCatalogRegistry.downloadEntries.count, 13)
+        XCTAssertEqual(ModelCatalogRegistry.entries.count, 15)
+        XCTAssertEqual(ModelCatalogRegistry.downloadEntries.count, 17)
         XCTAssertEqual(
             Set(ModelCatalogRegistry.selectableEntries.map(\.id)),
-            Set([.flashQ2Imatrix, .flashQ2Q4Imatrix, .flashQ4Imatrix, .proQ2Imatrix,
+            Set([.flashQ2Imatrix, .flashQ2Imatrix0731,
+                 .flashQ2Q4Imatrix, .flashQ2Q4Imatrix0731,
+                 .flashQ4Imatrix, .flashQ4Imatrix0731, .proQ2Imatrix,
                  .glm52IQ2XXS, .glm52Q2K, .glm52Q4K])
+        )
+
+        let expected0731: [(ModelCatalogID, String, Int64, String)] = [
+            (.flashQ2Imatrix0731,
+             "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+             86_720_111_488,
+             "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0"),
+            (.flashQ2Q4Imatrix0731,
+             "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
+             97_591_747_456,
+             "659e22fbd01c9e13ea37a57c8d9c41e0a8819dffa3473d3c5286ee44b2d3398f"),
+            (.flashQ4Imatrix0731,
+             "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+             164_633_502_592,
+             "6bb77b5ddcbc2d974c687cfb63d644ecfb295581b4a53fa4c1d810aea538254a"),
+        ]
+        for (id, file, byteCount, digest) in expected0731 {
+            let entry = DeepSeekV4ModelCatalog.entry(id)
+            XCTAssertTrue(entry?.isSelectable ?? false)
+            XCTAssertEqual(entry?.primaryArtifact?.file, file)
+            XCTAssertEqual(entry?.primaryArtifact?.expectedSizeBytes, byteCount)
+            XCTAssertEqual(entry?.primaryArtifact?.sha256, digest)
+        }
+
+        let mxfp4 = DeepSeekV4ModelCatalog.entry(.flashMXFP40731)
+        XCTAssertFalse(mxfp4?.isSelectable ?? true)
+        XCTAssertFalse(mxfp4?.runtimeAvailability.isRunnable ?? true)
+        XCTAssertEqual(mxfp4?.primaryArtifact, nil)
+        XCTAssertEqual(mxfp4?.artifacts.first?.expectedSizeBytes, 155_976_458_848)
+        XCTAssertEqual(
+            mxfp4?.artifacts.first?.sha256,
+            "0e3a161b670f686128ec5f92a601dfde616a37bf5e7e48999fa2d32471b57ec6"
         )
 
         let proQ2 = DeepSeekV4ModelCatalog.entry(.proQ2Imatrix)
@@ -79,6 +113,8 @@ final class ModelDownloaderTests: XCTestCase {
             DeepSeekV4AccessoryCatalog.dspark0731.sha256,
             "7e319924541db3f7a163ed7e11d7532a70d48228ab59d36cb81e1d4511885360"
         )
+        XCTAssertEqual(DeepSeekV4AccessoryCatalog.dspark0731.expectedSizeBytes,
+                       5_989_114_272)
 
         let artifacts = ModelCatalogRegistry.allArtifacts
         XCTAssertEqual(Set(artifacts.map(\.id)).count, artifacts.count)

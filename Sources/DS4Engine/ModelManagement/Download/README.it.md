@@ -72,11 +72,11 @@ quindi cataloghi diversi non condividono più un repository globale. Conservare 
 di avanzamento; evitare buffer proporzionali alla dimensione del modello.
 
 Un target scaricabile non implica compatibilità con il decoder. Il catalogo
-principale dichiara il supporto runtime per entry: i tre Flash e PRO Q2
-singolo-file sono selezionabili, mentre il package PRO Q4 e i tre GLM 5.2
-restano `downloadOnly`. MTP resta interno; gli accessori DSpark 0730 e
-0731 compaiono nel downloader ma non possono essere selezionati come modelli
-principali.
+principale dichiara il supporto runtime per entry: i Flash 0730/0731 Q2, misti
+Q2/Q4 e Q4, insieme a PRO Q2 singolo-file, sono selezionabili; Flash 0731
+MXFP4, il package PRO Q4 e le famiglie ancora gated restano `downloadOnly`.
+MTP resta interno; gli accessori DSpark 0730 e 0731 compaiono nel downloader
+ma non possono essere selezionati come modelli principali.
 
 Per Kimi K3 la GUI acquisisce in ordine cinque `splitFragment`. Ogni parte ha
 resume, dimensione e SHA-256 indipendenti; il package risulta installato solo

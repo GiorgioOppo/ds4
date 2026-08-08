@@ -19,9 +19,13 @@ duplicare nomi file o dedurre il supporto dal filename.
 
 | ID | Edizione | Forma | Disponibilità |
 |---|---|---|---|
-| `q2-imatrix` | Flash | un GGUF Q2/IQ2XXS | `runnable` |
-| `q2-q4-imatrix` | Flash | un GGUF mixed Q2/Q4 | `runnable` |
-| `q4-imatrix` | Flash | un GGUF Q4 | `runnable` |
+| `q2-imatrix` | Flash 0730 | un GGUF Q2/IQ2XXS | `runnable` |
+| `q2-imatrix-0731` | Flash 0731 | un GGUF Q2/IQ2XXS | `runnable` |
+| `q2-q4-imatrix` | Flash 0730 | un GGUF mixed Q2/Q4 | `runnable` |
+| `q2-q4-imatrix-0731` | Flash 0731 | un GGUF mixed Q2/Q4 | `runnable` |
+| `q4-imatrix` | Flash 0730 | un GGUF Q4 | `runnable` |
+| `q4-imatrix-0731` | Flash 0731 | un GGUF Q4 | `runnable` |
+| `mxfp4-0731` | Flash 0731 | un GGUF MXFP4 nativo | `downloadOnly` |
 | `pro-q2-imatrix` | Pro | un GGUF Q2 | `runnable` |
 | `pro-q4-split` | Pro | due shard Q4 | `downloadOnly` |
 | `glm-5.2-iq2-xxs` | GLM 5.2 | un GGUF IQ2_XXS | `downloadOnly` |
@@ -47,6 +51,9 @@ La disponibilità dei profili singolo-file deriva da
 un secondo flag Pro. Quando si estende il catalogo, fissare filename e SHA-256
 dalla fonte remota, conservare gli ID già persistiti e abilitare un profilo solo
 dopo una validazione end-to-end di loader, tokenizer, decoder e forma.
+MXFP4 è l'eccezione legata alla quantizzazione: la geometria Flash è
+supportata, ma il GGUF type 39 resta solo scaricabile finché Swift non avrà il
+parser della dimensione dei blocchi e i kernel Metal per gli esperti routed.
 
 `GLM52ModelCatalog` usa il repository `antirez/glm-5.2-gguf` bloccato alla
 revisione `2638b3b878f5c6cc3ae7334b8dbea1275025f52e`. Il registro ombrello
