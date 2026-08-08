@@ -702,14 +702,21 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (g_model_hmm_direct &&
+    /* Whole-image ownership and host registration describe only the active
+     * target map. A second DSpark mmap must resolve through its own cache. */
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) {
+        return cuda_model_ptr(model_map, offset);
+    }
+    if (model_map == g_model_host_base && g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    if (model_map == g_model_host_base && direct_env && direct_env[0]) {
+        return cuda_model_ptr(model_map, offset);
+    }
 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
@@ -1307,7 +1314,8 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -1626,6 +1634,18 @@ static const __half *cuda_q8_f16_ptr(
                 return r.device_ptr;
             }
         }
+        /* Two GGUFs can legitimately reuse the same file offset. The fast
+         * offset index names only one of them, so fall back to the full key. */
+        for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+            if (r.host_base == model_map &&
+                r.offset == offset &&
+                r.weight_bytes == weight_bytes &&
+                r.in_dim == in_dim &&
+                r.out_dim == out_dim &&
+                r.device_id == expected_device) {
+                return r.device_ptr;
+            }
+        }
     } else {
         for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
             if (r.host_base == model_map &&
@@ -1738,6 +1758,16 @@ static float *cuda_q8_f32_ptr(
             const cuda_q8_f32_range &r = g_q8_f32_ranges[exact->second];
             if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
                 r.in_dim == in_dim && r.out_dim == out_dim) {
+                return r.device_ptr;
+            }
+        }
+        for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+            if (r.host_base == model_map &&
+                r.offset == offset &&
+                r.weight_bytes == weight_bytes &&
+                r.in_dim == in_dim &&
+                r.out_dim == out_dim &&
+                r.device_id == expected_device) {
                 return r.device_ptr;
             }
         }
@@ -2895,6 +2925,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_fd = -1;
+    g_model_fd_host_base = NULL;
+    g_support_host_base = NULL;
+    g_support_host_size = 0;
+    g_support_offset_bias = 0;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
@@ -3784,6 +3818,34 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
     return 1;
+}
+
+extern "C" int ds4_gpu_prepare_support_model(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size,
+        uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (!model_map || model_size == 0 || map_offset > model_size ||
+        map_size == 0 || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (g_model_fd < 0 || g_model_fd_host_base != model_map) {
+        fprintf(stderr,
+                "ds4: CUDA support model fd does not match its mmap\n");
+        return 0;
+    }
+    /* Keep the target mmap active and install the support payload as one
+     * host-base-keyed device range. Dynamic target SSD remaps then cannot
+     * unregister or reinterpret the secondary GGUF. The caller has selected
+     * the support fd before entering this function. */
+    const char *ptr = cuda_model_range_ptr(model_map,
+                                           map_offset,
+                                           map_size,
+                                           "DSpark support model");
+    return ptr != NULL &&
+           cuda_model_range_is_cached(model_map, map_offset, map_size);
 }
 
 /* Register the mmap'd host model pointer for selective-cache lookups WITHOUT
@@ -23830,7 +23892,8 @@ static int routed_moe_launch(
      * [n_tokens, n_expert, *] by the validation above.  Any entry
      * failure falls through to the legacy sorted-pairs path (the
      * buffers are scratch there too). */
-    if (iq2_path && n_tokens > 1u && !owned_filtered && cuda_use_mmq()) {
+    if (iq2_path && n_tokens > 1u && !owned_filtered && cuda_use_mmq() &&
+        !(g_ssd_streaming_mode && allow_streaming)) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
         const int mmq_tier = ds4_tensor_device_idx(out);
@@ -25409,7 +25472,6 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              layer_index, 1, force_resident ? 0 : 1, 0);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
-    (void)force_resident;
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -25418,7 +25480,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens, 1, 0);
+                             layer_index, n_tokens, force_resident ? 0 : 1, 0);
 }
 
 extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
@@ -30250,7 +30312,8 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected,
 }
 
 extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
-    (void)enabled;   /* SSD streaming is not used on the CUDA backend */
+    /* CUDA streams selected experts rather than pinning whole routed layers. */
+    (void)enabled;
 }
 
 extern "C" void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {

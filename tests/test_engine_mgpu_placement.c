@@ -39,6 +39,8 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
                                   int *out_multi_tier,
                                   int *out_n_entries);
 int ds4_test_tensor_to_entry(const char *name, int name_len);
+int ds4_test_dspark_runtime_policy(ds4_backend backend,
+                                   ds4_distributed_role distributed_role);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -178,6 +180,25 @@ static void test_null_config(void) {
     CHECK(rc == 0, "NULL cfg returns success");
     CHECK(multi_tier == 0, "NULL cfg -> multi_tier 0");
     CHECK(n_entries == 0, "NULL cfg -> n_entries 0");
+}
+
+static void test_dspark_runtime_policy(void) {
+    fprintf(stderr, "RUN: test_dspark_runtime_policy\n");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_METAL,
+                                        DS4_DISTRIBUTED_NONE) == 0,
+          "DSpark supports a local Metal graph backend");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CUDA,
+                                        DS4_DISTRIBUTED_NONE) == 0,
+          "DSpark supports a local CUDA/ROCm graph backend");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CPU,
+                                        DS4_DISTRIBUTED_NONE) != 0,
+          "DSpark rejects the CPU backend");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CUDA,
+                                        DS4_DISTRIBUTED_COORDINATOR) != 0,
+          "DSpark rejects a distributed coordinator");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CUDA,
+                                        DS4_DISTRIBUTED_WORKER) != 0,
+          "DSpark rejects a distributed worker");
 }
 
 /* Build a synthetic, model-shaped tensor list: 1 embedding + 43 layers
@@ -669,6 +690,7 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
+    test_dspark_runtime_policy();
     test_forced_two_tier_no_spill();
     test_cpu_spill();
     test_zero_budget_guard();

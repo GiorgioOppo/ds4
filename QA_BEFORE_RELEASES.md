@@ -227,6 +227,44 @@ producing a different greedy continuation.
   `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
   `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
+- When DSpark, support-model mapping, or SSD streaming changes, repeat both
+  the acceptance fixture and verifier invariant on every advertised graph
+  backend. Apply the backend and SSD options to the target-only baseline as
+  well as the DSpark run:
+
+  ```sh
+  DS4_DSPARK_MODEL=/path/to/flash-0731.gguf \
+  DS4_DSPARK_SUPPORT=/path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  DS4_DSPARK_FIXTURE_BACKEND=cuda \
+  DS4_DSPARK_FIXTURE_SSD_STREAMING=1 \
+  DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS=32 \
+  DS4_DSPARK_FIXTURE_CONFIDENCE=0 \
+  DS4_DSPARK_SCHEDULER=0 make dspark-acceptance
+
+  DS4_TEST_MODEL=/path/to/flash-0731.gguf \
+  DS4_DSPARK_SUPPORT=/path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  DS4_TEST_SSD_STREAMING=1 \
+  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=32 \
+  make dspark-verify-depth
+  ```
+
+  On Strix Halo use the same variables with
+  `DS4_DSPARK_FIXTURE_BACKEND=rocm make rocm-dspark-acceptance` and
+  `make rocm-dspark-verify-depth`. Do not use the generic targets after a ROCm
+  build: on non-Apple hosts their default object set is CUDA. For the 0731
+  Flash layout, ROCm needs at least 30 expert slots; use 32 in release tests.
+- The fixture must report aggregate `proposed>0`, `accepted_draft>0`,
+  `verifier_unavailable=0`, and `errors=0`; stdout must remain byte-identical
+  to the target-only SSD baseline. The verifier smoke must report
+  `max_chunk>1`, `nspec>64`, and `worst_argmax_gap<=2`.
+- Preserve baseline and DSpark `generation` t/s from the same fixture run,
+  with the same host, model, cache, scheduler, thermal state, and background
+  load. A DSpark path that is materially slower than the target-only SSD path
+  without a documented correctness tradeoff is a release blocker.
+- On ROCm, also run one `DS4_DSPARK_PROBE=1 DS4_DSPARK_SCHEDULER=0`
+  generation and require the non-causal attention and stage-chain probes to
+  pass. This covers the HIP draft-attention kernel before the end-to-end
+  verifier gate.
 - If shared support-model or verifier structures changed, also run legacy MTP:
   `make mtp-verify-depth` with `DS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.

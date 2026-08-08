@@ -57,12 +57,13 @@ HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+ROCM_CORE_OBJS := ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -131,6 +132,8 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make rocm-dspark-acceptance   Build ROCm and run the DSpark acceptance fixture"
+	@echo "  make rocm-dspark-verify-depth Build ROCm and run the DSpark verifier invariant"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
@@ -152,13 +155,48 @@ cuda:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
 strix-halo:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test \
+		CORE_OBJS="$(ROCM_CORE_OBJS)" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
 rocm: strix-halo
+
+rocm-dspark-acceptance:
+	@if [ ! -f "$(DS4_DSPARK_MODEL)" ]; then \
+		echo "rocm-dspark-acceptance: missing model $(DS4_DSPARK_MODEL)" >&2; \
+		exit 1; \
+	elif [ ! -f "$(DS4_DSPARK_SUPPORT)" ]; then \
+		echo "rocm-dspark-acceptance: missing DSpark support $(DS4_DSPARK_SUPPORT)" >&2; \
+		exit 1; \
+	fi
+	$(MAKE) -B ds4 \
+		CORE_OBJS="$(ROCM_CORE_OBJS)" \
+		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
+		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
+		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
+	DS4_DSPARK_SUPPORT="$(DS4_DSPARK_SUPPORT)" \
+	DS4_DSPARK_FIXTURE_BACKEND=rocm \
+	sh tests/dspark_acceptance_fixture.sh
+
+rocm-dspark-verify-depth:
+	@if [ ! -f "$(DS4_TEST_MODEL)" ]; then \
+		echo "rocm-dspark-verify-depth: missing model $(DS4_TEST_MODEL)" >&2; \
+		exit 1; \
+	elif [ ! -f "$(DS4_DSPARK_SUPPORT)" ]; then \
+		echo "rocm-dspark-verify-depth: missing DSpark support $(DS4_DSPARK_SUPPORT)" >&2; \
+		exit 1; \
+	fi
+	$(MAKE) -B ds4_test \
+		CORE_OBJS="$(ROCM_CORE_OBJS)" \
+		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
+		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
+		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" \
+	DS4_TEST_DSPARK="$(DS4_DSPARK_SUPPORT)" \
+	./ds4_test --dspark-verify-depth
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -405,7 +443,7 @@ ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(DS4_LINK) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
 ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
