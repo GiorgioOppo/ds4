@@ -27748,7 +27748,6 @@ static bool metal_graph_encode_layer_attention_batch(
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
     bool qkv_q4_pair_projected = false;
     if (ok && qkv_rms_fused && n_tokens >= 2u &&
-        getenv("DS4_CUDA_NO_Q4_QKV_PAIR") == NULL &&
         layer->attn_q_a->type == DS4_TENSOR_Q4_K &&
         layer->attn_kv->type == DS4_TENSOR_Q4_K) {
         qkv_q4_pair_projected = ds4_gpu_matmul_q4_K_pair_tensor(

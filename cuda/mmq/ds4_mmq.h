@@ -155,20 +155,6 @@ int ds4_mmq_q4_K_dense(
     int           K,
     cudaStream_t  stream);
 
-// Two dense Q4_K projections sharing the same activation matrix. The input
-// is quantized to MMQ Q8_1 once and consumed by both weight matrices.
-int ds4_mmq_q4_K_dense_pair(
-    const void  * W0_q4_K,
-    const void  * W1_q4_K,
-    const float * X_f32,
-    float       * out0_f32,
-    float       * out1_f32,
-    int           M0,
-    int           M1,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
-
 int ds4_mmq_mxfp4_dense(
     const void  * W_mxfp4,
     const float * X_f32,

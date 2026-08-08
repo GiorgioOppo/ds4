@@ -15252,51 +15252,9 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         uint64_t weight0_offset, uint64_t weight1_offset,
         uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
-    if (!out0 || !out1 || !x || !model_map || n_tok < 2u ||
-        in_dim == 0 || (in_dim % CUDA_QK_K) != 0u ||
-        in_dim > INT_MAX || out0_dim > INT_MAX || out1_dim > INT_MAX ||
-        n_tok > INT_MAX || !cuda_use_mmq()) {
-        return 0;
-    }
-    const uint64_t blocks = in_dim / CUDA_QK_K;
-    if (blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) return 0;
-    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
-    if (out0_dim > UINT64_MAX / row_bytes ||
-        out1_dim > UINT64_MAX / row_bytes ||
-        n_tok > UINT64_MAX / in_dim ||
-        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
-        n_tok > UINT64_MAX / out0_dim ||
-        n_tok > UINT64_MAX / out1_dim ||
-        n_tok * out0_dim > UINT64_MAX / sizeof(float) ||
-        n_tok * out1_dim > UINT64_MAX / sizeof(float)) {
-        return 0;
-    }
-    const uint64_t w0_bytes = out0_dim * row_bytes;
-    const uint64_t w1_bytes = out1_dim * row_bytes;
-    if (weight0_offset > model_size || w0_bytes > model_size - weight0_offset ||
-        weight1_offset > model_size || w1_bytes > model_size - weight1_offset ||
-        x->bytes < n_tok * in_dim * sizeof(float) ||
-        out0->bytes < n_tok * out0_dim * sizeof(float) ||
-        out1->bytes < n_tok * out1_dim * sizeof(float)) {
-        return 0;
-    }
-    const int tier = ds4_tensor_device_idx(out0);
-    if (ds4_tensor_device_idx(out1) != tier) return 0;
-    const char *w0 = cuda_resolve_weight_ptr(
-        model_map, weight0_offset, w0_bytes, tier, "q4_K pair0");
-    const char *w1 = cuda_resolve_weight_ptr(
-        model_map, weight1_offset, w1_bytes, tier, "q4_K pair1");
-    if (!w0 || !w1) return 0;
-    const int rc = ds4_mmq_q4_K_dense_pair(
-        w0, w1, (const float *)x->ptr,
-        (float *)out0->ptr, (float *)out1->ptr,
-        (int)out0_dim, (int)out1_dim, (int)n_tok, (int)in_dim,
-        cuda_decode_stream());
-    if (rc == 0) return 1;
-    fprintf(stderr,
-            "ds4: Q4_K pair MMQ returned %d (in=%llu out0=%llu out1=%llu n_tok=%llu); falling back\n",
-            rc, (unsigned long long)in_dim, (unsigned long long)out0_dim,
-            (unsigned long long)out1_dim, (unsigned long long)n_tok);
+    (void)out0; (void)out1; (void)model_map; (void)model_size;
+    (void)weight0_offset; (void)weight1_offset; (void)in_dim;
+    (void)out0_dim; (void)out1_dim; (void)x; (void)n_tok;
     return 0;
 }
 
@@ -30180,64 +30138,6 @@ static int cuda_matmul_q4_K_tensor(
     return cuda_ok(cudaGetLastError(), "q4_K dense matmul launch");
 }
 
-/* Grouped attention-output A projection for Q4_K.  Heads arrive as
- * [token, group, K] and the weights as [group, rank, K].  The previous
- * implementation packed one group, quantized it, launched MMQ, and unpacked
- * it again for every group.  This kernel consumes the native layouts
- * directly and evaluates eight token columns together, so each Q4_K block is
- * decoded once for eight dot products. */
-__global__ static void attention_output_q4_K_grouped_tok8_kernel(
-        float *low,
-        const char *w_base,
-        const cuda_block_q8_K *xq,
-        uint64_t row_bytes,
-        uint32_t xq_blocks,
-        uint32_t rank,
-        uint32_t n_groups,
-        uint32_t n_tokens) {
-    const uint32_t lane = threadIdx.x & 7u;
-    const uint32_t row_lane = threadIdx.x >> 3u;
-    const uint32_t low_dim = n_groups * rank;
-    const uint32_t row = blockIdx.x * 32u + row_lane;
-    if (row >= low_dim) return;
-
-    const uint32_t group = row / rank;
-    const uint32_t tok0 = blockIdx.y * 8u;
-    const uint32_t remaining = n_tokens - tok0;
-    const uint32_t np = remaining < 8u ? remaining : 8u;
-    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
-        w_base + (uint64_t)row * row_bytes);
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL,
-                                      NULL, NULL, NULL, NULL};
-    #pragma unroll
-    for (uint32_t p = 0; p < 8u; p++) {
-        if (p < np) {
-            xqb[p] = xq + ((uint64_t)(tok0 + p) * n_groups + group) *
-                            xq_blocks;
-        }
-    }
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f,
-                    0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-        dev_dot_q4_K_q8_K_block8(
-            wr + b,
-            xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL,
-            np, acc);
-    }
-    #pragma unroll
-    for (uint32_t p = 0; p < 8u; p++) {
-        if (p < np) {
-            acc[p] = quarter_warp_sum_f32(acc[p], lane);
-            if (lane == 0) {
-                low[(uint64_t)(tok0 + p) * low_dim + row] = acc[p];
-            }
-        }
-    }
-}
-
 __global__ static void matmul_q4_K_kslice_kernel(
         float *out,
         const char *w_base,
@@ -31048,67 +30948,29 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         model_map, out_a_offset, out_a_bytes, logical_tier, "q4 attn_out_a");
     if (!out_a) return 0;
 
-    int grouped_done = 0;
-    if (n_tokens >= 8u &&
-        getenv("DS4_CUDA_NO_Q4_ATTN_GROUPED_TOK8") == NULL) {
-        const uint64_t xq_blocks = group_dim / CUDA_QK_K;
-        const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
-        if (x_rows <= UINT32_MAX && xq_blocks <= UINT32_MAX &&
-            x_rows <= UINT64_MAX / xq_blocks &&
-            x_rows * xq_blocks <= UINT64_MAX / sizeof(cuda_block_q8_K)) {
-            const uint64_t xq_bytes =
-                x_rows * xq_blocks * sizeof(cuda_block_q8_K);
-            cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
-                logical_tier, xq_bytes, "q4 attention output grouped prequant");
-            if (xq) {
-                dim3 qgrid((unsigned)xq_blocks, (unsigned)x_rows, 1);
-                q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
-                    xq, (const float *)heads->ptr, (uint32_t)group_dim,
-                    (uint32_t)x_rows);
-                if (!cuda_ok(cudaGetLastError(),
-                             "q4 attention output grouped quantize launch")) {
-                    return 0;
-                }
-                dim3 grid(((unsigned)low_dim + 31u) / 32u,
-                          ((unsigned)n_tokens + 7u) / 8u, 1);
-                attention_output_q4_K_grouped_tok8_kernel<<<
-                    grid, 256, 0, cuda_decode_stream()>>>(
-                        (float *)low->ptr, out_a, xq, row_a_bytes,
-                        (uint32_t)xq_blocks, (uint32_t)rank, n_groups,
-                        n_tokens);
-                if (!cuda_ok(cudaGetLastError(),
-                             "q4 attention output grouped tok8 launch")) {
-                    return 0;
-                }
-                grouped_done = 1;
-            }
-        }
-    }
-
-    if (!grouped_done) {
-        /* Small batches retain MMQ: its setup cost is affordable here and the
-         * per-group scratch keeps the graph allocation bounded. */
-        for (uint32_t g = 0; g < n_groups; g++) {
-            cudaError_t ce = cudaMemcpy2DAsync(
-                group_tmp->ptr, group_dim * sizeof(float),
-                (const float *)heads->ptr + (uint64_t)g * group_dim,
-                (uint64_t)n_groups * group_dim * sizeof(float),
-                group_dim * sizeof(float), n_tokens,
-                cudaMemcpyDeviceToDevice, cuda_decode_stream());
-            if (!cuda_ok(ce, "q4 attention output heads pack")) return 0;
-            const int rc = ds4_mmq_q4_K_dense(
-                out_a + (uint64_t)g * rank * row_a_bytes,
-                (const float *)group_tmp->ptr, (float *)low_tmp->ptr,
-                (int)rank, (int)n_tokens, (int)group_dim,
-                cuda_decode_stream());
-            if (rc != 0) return 0;
-            ce = cudaMemcpy2DAsync(
-                (float *)low->ptr + (uint64_t)g * rank,
-                low_dim * sizeof(float), low_tmp->ptr, rank * sizeof(float),
-                rank * sizeof(float), n_tokens,
-                cudaMemcpyDeviceToDevice, cuda_decode_stream());
-            if (!cuda_ok(ce, "q4 attention output low unpack")) return 0;
-        }
+    /* Heads are token-major with groups interleaved. Pack one group at a time
+     * into graph scratch, run a token-batched MMQ, then scatter its rank rows
+     * into the token-major low tensor. This is the stable fast path on CUDA. */
+    for (uint32_t g = 0; g < n_groups; g++) {
+        cudaError_t ce = cudaMemcpy2DAsync(
+            group_tmp->ptr, group_dim * sizeof(float),
+            (const float *)heads->ptr + (uint64_t)g * group_dim,
+            (uint64_t)n_groups * group_dim * sizeof(float),
+            group_dim * sizeof(float), n_tokens,
+            cudaMemcpyDeviceToDevice, cuda_decode_stream());
+        if (!cuda_ok(ce, "q4 attention output heads pack")) return 0;
+        const int rc = ds4_mmq_q4_K_dense(
+            out_a + (uint64_t)g * rank * row_a_bytes,
+            (const float *)group_tmp->ptr, (float *)low_tmp->ptr,
+            (int)rank, (int)n_tokens, (int)group_dim,
+            cuda_decode_stream());
+        if (rc != 0) return 0;
+        ce = cudaMemcpy2DAsync(
+            (float *)low->ptr + (uint64_t)g * rank,
+            low_dim * sizeof(float), low_tmp->ptr, rank * sizeof(float),
+            rank * sizeof(float), n_tokens,
+            cudaMemcpyDeviceToDevice, cuda_decode_stream());
+        if (!cuda_ok(ce, "q4 attention output low unpack")) return 0;
     }
     if (out_b_type == 12u) {
         return cuda_matmul_q4_K_tensor(out, model_map, model_size,
