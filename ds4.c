@@ -32264,106 +32264,6 @@ static bool metal_graph_eval_dspark_stage_chain(
     return true;
 }
 
-/* Keep the support KV ring aligned while the scheduler skips proposals. */
-static bool metal_graph_dspark_ring_maintain(
-        ds4_gpu_graph            *g,
-        const ds4_model          *dspark_model,
-        const ds4_dspark_weights *dw,
-        uint32_t                  pos) {
-    if (!g || !dspark_model || !dw ||
-        !g->dspark_capture_valid ||
-        g->dspark_cache_len == 0 ||
-        !metal_graph_dspark_cache_ends_at(g, pos) ||
-        !dspark_stage0_weights_ready(g, dw) ||
-        !dspark_stage_cache_ready(g, dw) ||
-        !metal_graph_batch_kv_raw(g) || !metal_graph_batch_kv(g)) {
-        return false;
-    }
-    for (uint32_t stage = 0; stage < dw->n_stages; stage++) {
-        if (!dspark_stage_block_ready(g, dw, stage)) return false;
-    }
-
-    const ds4_dspark_stage_weights *stage0 = &dw->stage[0];
-    const uint64_t in_dim = (uint64_t)dw->target_layer_count * DS4_N_EMBD;
-    ds4_gpu_tensor *kv_raw_view =
-        ds4_gpu_tensor_view(metal_graph_batch_kv_raw(g),
-                            0,
-                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-    ds4_gpu_tensor *kv_view =
-        ds4_gpu_tensor_view(metal_graph_batch_kv(g),
-                            0,
-                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-    bool ok = kv_raw_view && kv_view && ds4_gpu_begin_commands() != 0;
-    if (ok) {
-        ok = metal_graph_matmul_plain_tensor(g->dspark_stage0_proj,
-                                             dspark_model,
-                                             stage0->main_proj,
-                                             in_dim,
-                                             DS4_N_EMBD,
-                                             g->dspark_target_hidden,
-                                             1);
-    }
-    if (ok) {
-        ok = ds4_gpu_rms_norm_weight_tensor(g->dspark_main_x,
-                                            g->dspark_stage0_proj,
-                                            dspark_model->map,
-                                            dspark_model->size,
-                                            stage0->main_norm->abs_offset,
-                                            DS4_N_EMBD,
-                                            DS4_RMS_EPS) != 0;
-    }
-    for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
-        const ds4_layer_weights *block = &dw->stage[stage].block;
-        ok = metal_graph_matmul_plain_tensor(kv_raw_view,
-                                             dspark_model,
-                                             block->attn_kv,
-                                             DS4_N_EMBD,
-                                             DS4_N_HEAD_DIM,
-                                             g->dspark_main_x,
-                                             1);
-        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(
-                         kv_view,
-                         kv_raw_view,
-                         dspark_model->map,
-                         dspark_model->size,
-                         block->attn_kv_a_norm->abs_offset,
-                         DS4_N_HEAD_DIM,
-                         1,
-                         DS4_RMS_EPS) != 0;
-        if (ok) ok = ds4_gpu_rope_tail_tensor(kv_view,
-                                               1,
-                                               1,
-                                               DS4_N_HEAD_DIM,
-                                               DS4_N_ROT,
-                                               pos,
-                                               0,
-                                               false,
-                                               DS4_ROPE_FREQ_BASE,
-                                               1.0f,
-                                               0.0f,
-                                               1.0f,
-                                               DS4_ROPE_YARN_BETA_FAST,
-                                               DS4_ROPE_YARN_BETA_SLOW) != 0;
-        if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv_view,
-                                                          1,
-                                                          DS4_N_HEAD_DIM,
-                                                          DS4_N_ROT) != 0;
-        if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(
-                         g->dspark_raw_cache[stage],
-                         kv_view,
-                         g->dspark_cache_cap,
-                         pos,
-                         1,
-                         DS4_N_HEAD_DIM) != 0;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    ds4_gpu_tensor_free(kv_view);
-    ds4_gpu_tensor_free(kv_raw_view);
-    if (ok) (void)metal_graph_dspark_cache_claim_appended_row(g, pos);
-    return ok;
-}
-
 static ds4_gpu_tensor *metal_graph_dspark_final_output_hc(const ds4_gpu_graph *g) {
     if (!g) return NULL;
     if (getenv("DS4_DSPARK_DISABLE_FINAL_OUTPUT_ALIAS") == NULL &&
@@ -48824,8 +48724,6 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t invalid_draft;
     uint64_t draft_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     uint64_t accepted_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
-    uint64_t scheduler_skips;
-    uint64_t tail_skips;
     uint64_t verifier_unavailable;
     uint64_t verifier_errors;
     double target_ms;
@@ -48889,23 +48787,8 @@ struct ds4_session {
 #ifndef DS4_NO_GPU
     int dspark_draft_tokens[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t dspark_draft_len;
-    uint32_t dspark_sched_cycles;
-    uint32_t dspark_sched_accepted;
-    uint32_t dspark_sched_no_draft;
-    uint32_t dspark_sched_skip;
-    uint32_t dspark_sched_backoff_level;
-    uint32_t dspark_sched_lifetime_accepted;
-    double dspark_sched_life_extra_ms;
-    double dspark_sched_life_saved_ms;
-    double dspark_sched_extra_ms;
-    double dspark_sched_saved_ms;
     double dspark_last_target_eval_ms;
-    double dspark_last_propose_ms;
-    float dspark_last_confidence0;
     bool dspark_draft_valid;
-    bool dspark_sched_skipped_cycle;
-    bool dspark_sched_long_accept_seen;
-    bool dspark_last_confidence0_valid;
     ds4_dspark_spec_stats dspark_stats;
 #endif
     uint64_t mtp_probe_total;
@@ -48941,11 +48824,6 @@ static uint32_t ds4_dspark_env_u32(const char *name, uint32_t fallback) {
     unsigned long v = strtoul(env, &end, 10);
     if (end == env || errno != 0 || v > UINT32_MAX) return fallback;
     return (uint32_t)v;
-}
-
-static bool ds4_dspark_scheduler_enabled(void) {
-    const char *env = getenv("DS4_DSPARK_SCHEDULER");
-    return !env || !env[0] || strcmp(env, "0") != 0;
 }
 
 /* A tiny SSD verifier may touch top-k experts for every speculative row.  On
@@ -49024,318 +48902,15 @@ static bool ds4_session_cuda_dspark_exact2_requested(
 #endif
 }
 
-static uint32_t ds4_dspark_scheduler_window(void) {
-    uint32_t v = ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_WINDOW", 4);
-    return v ? v : 4;
-}
-
-static uint32_t ds4_dspark_scheduler_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SKIP", 2);
-}
-
-static uint32_t ds4_dspark_scheduler_slow_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SLOW_SKIP", 4);
-}
-
-static uint32_t ds4_dspark_scheduler_min_avg_milli(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", 1500);
-}
-
-static uint32_t ds4_dspark_scheduler_max_ms_per_accept_milli(void) {
-    return ds4_dspark_env_u32(
-            "DS4_DSPARK_SCHEDULER_MAX_MS_PER_ACCEPT_MILLI", 0);
-}
-
-static uint32_t ds4_dspark_scheduler_max_extra_saved_ratio_milli(void) {
-    return ds4_dspark_env_u32(
-            "DS4_DSPARK_SCHEDULER_MAX_EXTRA_SAVED_RATIO_MILLI", 0);
-}
-
-static uint32_t ds4_dspark_scheduler_break_even_window(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_BREAK_EVEN_WINDOW", 0);
-}
-
-static bool ds4_session_dspark_low_memory_timing_default(
-        const ds4_session *s) {
-#if defined(__APPLE__)
-    if (!s || !s->engine ||
-        s->engine->backend != DS4_BACKEND_METAL ||
-        !s->graph.ssd_streaming ||
-        s->engine->support_kind != DS4_SUPPORT_DSPARK ||
-        s->graph.quality || s->engine->dspark_strict) {
-        return false;
-    }
-    static uint64_t host_bytes;
-    static bool host_bytes_ready;
-    if (!host_bytes_ready) {
-        host_bytes = ds4_graph_host_memory_bytes();
-        host_bytes_ready = true;
-    }
-    return host_bytes != 0 &&
-           host_bytes <= 24ull * 1024ull * 1024ull * 1024ull;
-#else
-    (void)s;
-    return false;
-#endif
-}
-
-/* Low-memory Metal SSD runs can spend several target-token equivalents on a
- * single verify/replay attempt.  Enable the existing measured break-even
- * scheduler there by default; explicit timing thresholds still take priority.
- * DS4_DSPARK_SCHEDULER_TIMING=0 restores the deterministic acceptance-only
- * scheduler used on resident/high-memory backends. */
-static bool ds4_session_dspark_scheduler_timing_policy(
-        const ds4_session *s) {
-    const char *env = getenv("DS4_DSPARK_SCHEDULER_TIMING");
-    if (env && env[0]) return strcmp(env, "0") != 0;
-    return ds4_session_dspark_low_memory_timing_default(s);
-}
-
-static uint32_t ds4_session_dspark_scheduler_extra_saved_ratio_milli(
-        const ds4_session *s) {
-    if (getenv("DS4_DSPARK_SCHEDULER_MAX_EXTRA_SAVED_RATIO_MILLI") != NULL) {
-        return ds4_dspark_scheduler_max_extra_saved_ratio_milli();
-    }
-    return ds4_session_dspark_scheduler_timing_policy(s) ? 1500u : 0u;
-}
-
-static uint32_t ds4_session_dspark_scheduler_break_even_window(
-        const ds4_session *s) {
-    if (getenv("DS4_DSPARK_SCHEDULER_BREAK_EVEN_WINDOW") != NULL) {
-        return ds4_dspark_scheduler_break_even_window();
-    }
-    if (!ds4_session_dspark_scheduler_timing_policy(s)) return 0u;
-    /* Measure two attempts before the first decision, then one probe is
-     * sufficient at each exponentially longer backoff level. */
-    return s && s->dspark_sched_backoff_level != 0 ? 1u : 2u;
-}
-
-static uint32_t ds4_session_dspark_scheduler_backoff_cycles(
-        const ds4_session *s) {
-    uint32_t skip = ds4_dspark_scheduler_slow_skip_cycles();
-    uint32_t level = s ? s->dspark_sched_backoff_level : 0;
-    if (level > 4u) level = 4u;
-    if (skip > (UINT32_MAX >> level)) return UINT32_MAX;
-    return skip << level;
-}
-
-static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
-}
-
-static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP", 4);
-}
-
-static uint32_t ds4_dspark_scheduler_cold_low_confidence_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_SKIP", 7);
-}
-
-static uint32_t ds4_dspark_scheduler_tail_min_tokens(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS", 10);
-}
-
-static float ds4_dspark_scheduler_cold_low_confidence_threshold(void) {
-    return (float)ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_MILLI", 500) / 1000.0f;
-}
-
-/* Timing-sensitive scheduling changes which arithmetic path advances a token.
- * It is automatic only for low-memory Metal SSD runtime decode; quality and
- * strict modes remain target-only. */
-static bool ds4_dspark_scheduler_timing_enabled(const ds4_session *s) {
-    return ds4_dspark_scheduler_max_ms_per_accept_milli() != 0 ||
-           ds4_session_dspark_scheduler_extra_saved_ratio_milli(s) != 0;
-}
-
-static void ds4_session_dspark_scheduler_reset(ds4_session *s) {
-    if (!s) return;
-    s->dspark_sched_cycles = 0;
-    s->dspark_sched_accepted = 0;
-    s->dspark_sched_no_draft = 0;
-    s->dspark_sched_extra_ms = 0.0;
-    s->dspark_sched_saved_ms = 0.0;
-}
-
-static bool ds4_session_dspark_scheduler_should_skip(ds4_session *s) {
-    if (!s || !ds4_dspark_scheduler_enabled()) return false;
-    s->dspark_sched_skipped_cycle = false;
-    if (s->dspark_sched_skip == 0) return false;
-    s->dspark_sched_skip--;
-    s->dspark_sched_skipped_cycle = true;
-    s->dspark_stats.scheduler_skips++;
-    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
-        fprintf(stderr,
-                "ds4: DSpark scheduler skip remaining=%u\n",
-                s->dspark_sched_skip);
-    }
-    return true;
-}
-
-static void ds4_session_dspark_scheduler_note(
+static void ds4_session_dspark_stats_note_saved(
         ds4_session *s,
-        uint32_t     accepted_drafts,
-        bool         no_draft,
-        double       extra_ms) {
-    if (!s || !ds4_dspark_scheduler_enabled()) return;
-    if (s->dspark_sched_skipped_cycle) {
-        s->dspark_sched_skipped_cycle = false;
-        return;
-    }
-
-    s->dspark_sched_cycles++;
-    s->dspark_sched_accepted += accepted_drafts;
-    if (accepted_drafts != 0) {
-        if (s->dspark_sched_lifetime_accepted <=
-            UINT32_MAX - accepted_drafts) {
-            s->dspark_sched_lifetime_accepted += accepted_drafts;
-        } else {
-            s->dspark_sched_lifetime_accepted = UINT32_MAX;
-        }
-        if (accepted_drafts > 2u) {
-            s->dspark_sched_long_accept_seen = true;
-        }
-    }
-    if (no_draft) s->dspark_sched_no_draft++;
-    if (extra_ms > 0.0 && isfinite(extra_ms)) {
-        s->dspark_sched_extra_ms += extra_ms;
-    }
-    if (accepted_drafts != 0 &&
-        s->dspark_last_target_eval_ms > 0.0 &&
+        uint32_t     accepted_drafts) {
+    if (!s || accepted_drafts == 0 || !ds4_dspark_stats_enabled()) return;
+    if (s->dspark_last_target_eval_ms > 0.0 &&
         isfinite(s->dspark_last_target_eval_ms)) {
-        const double saved_ms =
+        s->dspark_stats.saved_ms +=
             s->dspark_last_target_eval_ms * (double)accepted_drafts;
-        s->dspark_sched_saved_ms += saved_ms;
-        if (ds4_dspark_stats_enabled()) {
-            s->dspark_stats.saved_ms += saved_ms;
-        }
     }
-
-    const uint32_t no_draft_skip =
-        ds4_dspark_scheduler_no_draft_skip_cycles();
-    if (no_draft && no_draft_skip != 0) {
-        uint32_t skip = no_draft_skip;
-        if (s->dspark_sched_lifetime_accepted != 0 &&
-            !s->dspark_sched_long_accept_seen) {
-            const uint32_t short_accept_skip =
-                ds4_dspark_scheduler_short_accept_no_draft_skip_cycles();
-            if (skip < short_accept_skip) skip = short_accept_skip;
-        } else if (s->dspark_sched_lifetime_accepted == 0 &&
-                   s->dspark_last_confidence0_valid &&
-                   s->dspark_last_confidence0 <=
-                       ds4_dspark_scheduler_cold_low_confidence_threshold()) {
-            const uint32_t cold_low_conf_skip =
-                ds4_dspark_scheduler_cold_low_confidence_skip_cycles();
-            if (skip < cold_low_conf_skip) skip = cold_low_conf_skip;
-        }
-        if (s->dspark_sched_skip < skip) {
-            s->dspark_sched_skip = skip;
-        }
-        if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
-            fprintf(stderr,
-                    "ds4: DSpark scheduler no-draft pause skip=%u "
-                    "accepted_total=%u long_accept=%d confidence0=%s%.3f\n",
-                    s->dspark_sched_skip,
-                    s->dspark_sched_lifetime_accepted,
-                    s->dspark_sched_long_accept_seen ? 1 : 0,
-                    s->dspark_last_confidence0_valid ? "" : "n/a:",
-                    s->dspark_last_confidence0);
-        }
-    }
-
-    const uint32_t window = ds4_dspark_scheduler_window();
-    const uint32_t break_even_window =
-        ds4_session_dspark_scheduler_break_even_window(s);
-
-    const uint32_t max_extra_saved_ratio_milli =
-        ds4_session_dspark_scheduler_extra_saved_ratio_milli(s);
-    const bool measured_unprofitable =
-        max_extra_saved_ratio_milli != 0 &&
-        s->dspark_sched_extra_ms > 0.0 &&
-        (s->dspark_sched_saved_ms <= 0.0 ||
-         s->dspark_sched_extra_ms * 1000.0 >
-             s->dspark_sched_saved_ms *
-             (double)max_extra_saved_ratio_milli);
-
-    if (break_even_window != 0 &&
-        s->dspark_sched_cycles >= break_even_window &&
-        measured_unprofitable) {
-        const uint32_t backoff =
-            ds4_session_dspark_scheduler_backoff_cycles(s);
-        if (s->dspark_sched_skip < backoff) {
-            s->dspark_sched_skip = backoff;
-        }
-        if (s->dspark_sched_backoff_level < 4u) {
-            s->dspark_sched_backoff_level++;
-        }
-        if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
-            fprintf(stderr,
-                    "ds4: DSpark scheduler break-even pause cycles=%u "
-                    "accepted=%u saved=%.3fms extra=%.3fms skip=%u\n",
-                    s->dspark_sched_cycles,
-                    s->dspark_sched_accepted,
-                    s->dspark_sched_saved_ms,
-                    s->dspark_sched_extra_ms,
-                    s->dspark_sched_skip);
-        }
-        ds4_session_dspark_scheduler_reset(s);
-        return;
-    }
-
-    if (break_even_window != 0 &&
-        s->dspark_sched_cycles >= break_even_window &&
-        max_extra_saved_ratio_milli != 0 &&
-        s->dspark_sched_saved_ms > 0.0 &&
-        !measured_unprofitable) {
-        if (s->dspark_sched_backoff_level != 0) {
-            s->dspark_sched_backoff_level--;
-        }
-        ds4_session_dspark_scheduler_reset(s);
-        return;
-    }
-
-    if (s->dspark_sched_cycles < window) return;
-
-    const uint64_t avg_milli =
-        ((uint64_t)s->dspark_sched_accepted * 1000ull) /
-        (uint64_t)s->dspark_sched_cycles;
-    const uint32_t min_avg_milli =
-        ds4_dspark_scheduler_min_avg_milli();
-    const bool low_accept = avg_milli < min_avg_milli;
-    const bool many_no_draft =
-        s->dspark_sched_no_draft * 2u >= s->dspark_sched_cycles;
-    const uint32_t max_ms_per_accept_milli =
-        ds4_dspark_scheduler_max_ms_per_accept_milli();
-    const double extra_per_accept_ms =
-        s->dspark_sched_accepted != 0 ?
-        s->dspark_sched_extra_ms / (double)s->dspark_sched_accepted : 0.0;
-    const bool slow_accept =
-        max_ms_per_accept_milli != 0 &&
-        s->dspark_sched_accepted != 0 &&
-        extra_per_accept_ms * 1000.0 > (double)max_ms_per_accept_milli;
-    if (low_accept || many_no_draft || slow_accept || measured_unprofitable) {
-        s->dspark_sched_skip = ds4_dspark_scheduler_skip_cycles();
-        if (many_no_draft || slow_accept || measured_unprofitable) {
-            const uint32_t slow_skip = ds4_dspark_scheduler_slow_skip_cycles();
-            if (s->dspark_sched_skip < slow_skip) {
-                s->dspark_sched_skip = slow_skip;
-            }
-        }
-        if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
-            fprintf(stderr,
-                    "ds4: DSpark scheduler pause cycles=%u accepted=%u "
-                    "avg=%.3f no_draft=%u extra_per_accept=%.3fms "
-                    "saved=%.3fms extra=%.3fms skip=%u\n",
-                    s->dspark_sched_cycles,
-                    s->dspark_sched_accepted,
-                    (double)avg_milli / 1000.0,
-                    s->dspark_sched_no_draft,
-                    extra_per_accept_ms,
-                    s->dspark_sched_saved_ms,
-                    s->dspark_sched_extra_ms,
-                    s->dspark_sched_skip);
-        }
-    }
-    ds4_session_dspark_scheduler_reset(s);
 }
 #endif
 
@@ -58345,8 +57920,8 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "ds4: DSpark stats cycles=%llu first_tokens=%llu proposed=%llu "
             "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f "
             "full=%llu partial=%llu miss_first=%llu no_draft=%llu "
-            "no_room=%llu invalid=%llu scheduler_skips=%llu "
-            "tail_skips=%llu verifier_unavailable=%llu errors=%llu time_ms propose=%.3f "
+            "no_room=%llu invalid=%llu verifier_unavailable=%llu "
+            "errors=%llu time_ms propose=%.3f "
             "prop_stage0=%.3f prop_setup=%.3f prop_cache=%.3f "
             "prop_chain=%.3f prop_hidden=%.3f prop_conf0=%.3f "
             "prop_logits=%.3f prop_markov=%.3f prop_confidence=%.3f "
@@ -58367,8 +57942,6 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             (unsigned long long)st->no_draft,
             (unsigned long long)st->no_room,
             (unsigned long long)st->invalid_draft,
-            (unsigned long long)st->scheduler_skips,
-            (unsigned long long)st->tail_skips,
             (unsigned long long)st->verifier_unavailable,
             (unsigned long long)st->verifier_errors,
             st->propose_ms,
@@ -60848,11 +60421,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         fake_argmax && fake_argmax[0] && strcmp(fake_argmax, "0") != 0;
     const float confidence_threshold = s->engine->dspark_confidence_threshold;
     const bool stats_enabled = ds4_dspark_stats_enabled();
-    const bool scheduler_enabled = ds4_dspark_scheduler_enabled();
-    const bool time_enabled =
-        stats_enabled ||
-        (scheduler_enabled && ds4_dspark_scheduler_timing_enabled(s));
-    const double stats_t0 = time_enabled ? now_sec() : 0.0;
+    const double stats_t0 = stats_enabled ? now_sec() : 0.0;
 #define DS4_DSPARK_PROP_T0() (stats_enabled ? now_sec() : 0.0)
 #define DS4_DSPARK_PROP_ADD(field_, t0_) do {                              \
         if (stats_enabled) {                                                \
@@ -60861,23 +60430,6 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     } while (0)
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
-    s->dspark_last_confidence0 = 0.0f;
-    s->dspark_last_confidence0_valid = false;
-    if (scheduler_enabled) s->dspark_last_propose_ms = 0.0;
-    if (enabled && !fake_argmax_enabled &&
-        ds4_session_dspark_scheduler_should_skip(s)) {
-        (void)metal_graph_dspark_ring_maintain(&s->graph,
-                                               &s->engine->mtp_model,
-                                               &s->engine->dspark_weights,
-                                               pos);
-        const double propose_ms =
-            time_enabled ? (now_sec() - stats_t0) * 1000.0 : 0.0;
-        if (scheduler_enabled) s->dspark_last_propose_ms = propose_ms;
-        if (stats_enabled) {
-            s->dspark_stats.propose_ms += propose_ms;
-        }
-        return false;
-    }
     if (probe_log || enabled) {
         const bool capture_ok = ds4_session_dspark_capture_current(s);
         const bool batch_capture_ok =
@@ -61206,10 +60758,6 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             }
             s->dspark_draft_valid = s->dspark_draft_len != 0;
         }
-        if (confidence_ok && confidence_len != 0) {
-            s->dspark_last_confidence0 = confidence0;
-            s->dspark_last_confidence0_valid = true;
-        }
         bool fake_argmax_ok = false;
         if (!s->dspark_draft_valid && fake_argmax_enabled) {
             s->dspark_draft_tokens[0] = sample_argmax(s->logits, DS4_N_VOCAB);
@@ -61330,10 +60878,8 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                     dw->metadata_errors);
         }
     }
-    if (time_enabled) {
-        const double propose_ms = (now_sec() - stats_t0) * 1000.0;
-        if (scheduler_enabled) s->dspark_last_propose_ms = propose_ms;
-        if (stats_enabled) s->dspark_stats.propose_ms += propose_ms;
+    if (stats_enabled) {
+        s->dspark_stats.propose_ms += (now_sec() - stats_t0) * 1000.0;
     }
 #undef DS4_DSPARK_PROP_ADD
 #undef DS4_DSPARK_PROP_T0
@@ -61524,9 +61070,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     const bool dspark_target_timing =
         e->support_kind == DS4_SUPPORT_DSPARK &&
-        (ds4_dspark_stats_enabled() ||
-         (ds4_dspark_scheduler_enabled() &&
-          ds4_dspark_scheduler_timing_enabled(s)));
+        ds4_dspark_stats_enabled();
     const double target_t0 = dspark_target_timing ? now_sec() : 0.0;
     if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
@@ -61540,9 +61084,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (dspark_target_timing) {
         const double target_ms = (now_sec() - target_t0) * 1000.0;
         s->dspark_last_target_eval_ms = target_ms;
-        if (ds4_dspark_stats_enabled()) {
-            s->dspark_stats.target_ms += target_ms;
-        }
+        s->dspark_stats.target_ms += target_ms;
     }
     token_vec_push(&s->checkpoint, token);
     s->checkpoint_valid = true;
@@ -62523,19 +62065,12 @@ static int ds4_session_eval_dspark_speculative_argmax(
         size_t       errlen) {
     const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
     const bool stats_enabled = s && ds4_dspark_stats_enabled();
-    const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled();
-    const double stats_t0 =
-        (stats_enabled ||
-         (scheduler_enabled && ds4_dspark_scheduler_timing_enabled(s)))
-            ? now_sec() : 0.0;
+    const double stats_t0 = stats_enabled ? now_sec() : 0.0;
 #define DS4_DSPARK_STATS_FINISH() do {                                      \
         if (stats_enabled) {                                                \
             s->dspark_stats.total_ms += (now_sec() - stats_t0) * 1000.0;    \
         }                                                                   \
     } while (0)
-#define DS4_DSPARK_SCHED_EXTRA_MS()                                         \
-    ((scheduler_enabled && stats_t0 != 0.0) ?                                \
-     s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
     if (stats_enabled) {
         s->dspark_stats.cycles++;
         if (n_accept > 0) s->dspark_stats.first_tokens++;
@@ -62553,10 +62088,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
         if (stats_enabled) {
             s->dspark_stats.no_draft++;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
-        }
-        if (s) {
-            ds4_session_dspark_scheduler_note(
-                    s, 0, true, DS4_DSPARK_SCHED_EXTRA_MS());
         }
         if (spec_log) {
             fprintf(stderr, "ds4: DSpark spec skip no-draft\n");
@@ -62633,8 +62164,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
             s->dspark_stats.first_misses++;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
         }
-        ds4_session_dspark_scheduler_note(
-                s, 0, false, DS4_DSPARK_SCHED_EXTRA_MS());
         if (spec_log) {
             fprintf(stderr,
                     "ds4: DSpark spec miss first draft=%d base=%d\n",
@@ -62759,11 +62288,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
                         s->dspark_stats.accepted_len_hist,
                         (uint32_t)exact_commit);
             }
-            ds4_session_dspark_scheduler_note(
-                    s,
-                    (uint32_t)exact_commit,
-                    false,
-                    DS4_DSPARK_SCHED_EXTRA_MS());
+            ds4_session_dspark_stats_note_saved(
+                    s, (uint32_t)exact_commit);
             if (spec_log) {
                 fprintf(stderr,
                         "ds4: DSpark CUDA exact2 drafted=2 verified_next=%d "
@@ -62988,11 +62514,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
     } else if (stats_enabled) {
         ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
     }
-    ds4_session_dspark_scheduler_note(
-            s,
-            (uint32_t)replayed_drafts,
-            false,
-            DS4_DSPARK_SCHED_EXTRA_MS());
+    ds4_session_dspark_stats_note_saved(
+            s, (uint32_t)replayed_drafts);
     if (spec_log) {
         fprintf(stderr,
                 "ds4: DSpark spec partial drafted=%d verified=%d accepted=%d\n",
@@ -63002,7 +62525,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
     }
     spec_frontier_free(&frontier);
     DS4_DSPARK_STATS_FINISH();
-#undef DS4_DSPARK_SCHED_EXTRA_MS
 #undef DS4_DSPARK_STATS_FINISH
     return n_accept;
 }
@@ -66014,22 +65536,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
         can_prepare_support_draft = false;
     }
-    bool dspark_tail_skip = false;
-    if (can_prepare_support_draft && e->support_kind == DS4_SUPPORT_DSPARK &&
-        ds4_dspark_scheduler_enabled()) {
-        const uint32_t tail_min = ds4_dspark_scheduler_tail_min_tokens();
-        if (tail_min != 0 && (uint32_t)max_tokens < tail_min) {
-            can_prepare_support_draft = false;
-            dspark_tail_skip = true;
-            if (ds4_dspark_stats_enabled()) s->dspark_stats.tail_skips++;
-            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
-                fprintf(stderr,
-                        "ds4: DSpark scheduler tail skip max=%d min=%u\n",
-                        max_tokens,
-                        tail_min);
-            }
-        }
-    }
     if (ds4_session_eval_probe_tp(s,
                                   first_token,
                                   can_prepare_support_draft,
@@ -66039,7 +65545,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
     if (strict_dspark) return n_accept;
-    if (dspark_tail_skip) return n_accept;
 
     if (e->support_kind == DS4_SUPPORT_DSPARK) {
         return ds4_session_eval_dspark_speculative_argmax(s,

@@ -273,14 +273,9 @@ compatibility kill switches are
 `DS4_METAL_DISABLE_TOKEN_EMBED_EXACT_VIEW=1` and
 `DS4_METAL_DISABLE_SUPPORT_Q8_DECODE_EXACT_VIEWS=1`.
 
-The low-memory Metal SSD scheduler measures proposal plus verify/replay cost
-against the target decode time. After two unprofitable attempts (cost above
-1.5 times the estimated saved decode work), it backs off for 4, 8, 16, 32,
-then 64 target cycles, probing once before advancing to the next backoff
-level.
-`DS4_DSPARK_SCHEDULER_TIMING=0` restores acceptance-only scheduling;
-the existing `DS4_DSPARK_SCHEDULER=0` disables all scheduler pauses. Quality
-and strict DSpark modes remain target-only.
+DSpark attempts a proposal on every eligible cycle. Proposal cadence is not
+adaptively throttled, so the reported acceptance rate covers the full runtime
+sample. Quality and strict DSpark modes remain target-only.
 
 Tune the expert-cache count for the available accelerator memory. ROCm needs
 enough slots for a whole verification block (30 for the 0731 model; use at

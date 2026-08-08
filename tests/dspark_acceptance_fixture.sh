@@ -84,11 +84,6 @@ if proposal_quality_guard_enabled; then
     PROPOSAL_QUALITY_GUARD_ACTIVE=1
 fi
 
-if [ "$REQUIRE_PARTIAL" != 0 ] && [ "${DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS+x}" != x ]; then
-    DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS=0
-    export DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS
-fi
-
 file_bytes() {
     if stat -L -f %z "$1" >/dev/null 2>&1; then
         stat -L -f %z "$1"
@@ -116,12 +111,6 @@ print_metadata() {
     hw_model=$(sysctl -n hw.model 2>/dev/null || true)
     hw_cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
     confidence=${CONFIDENCE:-default}
-    scheduler=${DS4_DSPARK_SCHEDULER:-default}
-    no_draft_skip=${DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP:-default}
-    short_accept_skip=${DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP:-default}
-    cold_low_conf_skip=${DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_SKIP:-default}
-    cold_low_conf_milli=${DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_MILLI:-default}
-    tail_min_tokens=${DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS:-default}
 
     printf '# commit=%s\n' "$(git_commit_label)"
     printf '# hardware_os=%s hardware_model=%s hardware_cpu=%s\n' \
@@ -129,11 +118,9 @@ print_metadata() {
     printf '# model=%s model_bytes=%s support=%s support_bytes=%s\n' \
         "$MODEL" "$(file_bytes "$MODEL")" \
         "$SUPPORT" "$(file_bytes "$SUPPORT")"
-    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" backend=%s ssd_streaming=%s ssd_cache_experts=%s confidence=%s scheduler=%s no_draft_skip=%s short_accept_no_draft_skip=%s cold_low_confidence_skip=%s cold_low_confidence_milli=%s tail_min_tokens=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s\n' \
+    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" backend=%s ssd_streaming=%s ssd_cache_experts=%s confidence=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s\n' \
         "$TOKENS" "$BACKEND" "$SSD_STREAMING" "${SSD_CACHE_EXPERTS:-auto}" \
-        "$confidence" "$scheduler" "$no_draft_skip" \
-        "$short_accept_skip" "$cold_low_conf_skip" "$cold_low_conf_milli" \
-        "$tail_min_tokens" "$PROPOSAL_QUALITY_GUARD" \
+        "$confidence" "$PROPOSAL_QUALITY_GUARD" \
         "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED"
 }
 

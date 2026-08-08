@@ -211,8 +211,8 @@ Use the normal Flash GGUF that 128 GB users run.
 ### DSpark / DeepSpec Runtime
 
 DSpark is opt-in, but it mutates the verifier, target-hidden capture, support
-model loading, and scheduler paths.  Run these whenever DSpark support,
-speculative verification, confidence/scheduler policy, target hidden capture,
+model loading, and proposal paths. Run these whenever DSpark support,
+speculative verification, confidence policy, target hidden capture,
 tiny routed-MoE verifier kernels, or shared `--mtp` support-model code changes:
 
 Use the 0731 DSpark support GGUF only with a Flash 0731 target. A support model
@@ -254,7 +254,7 @@ producing a different greedy continuation.
   DS4_DSPARK_FIXTURE_SSD_STREAMING=1 \
   DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS=32 \
   DS4_DSPARK_FIXTURE_CONFIDENCE=0 \
-  DS4_DSPARK_SCHEDULER=0 make dspark-acceptance
+  make dspark-acceptance
 
   DS4_TEST_MODEL=/path/to/flash-0731.gguf \
   DS4_DSPARK_SUPPORT=/path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
@@ -273,10 +273,10 @@ producing a different greedy continuation.
   to the target-only SSD baseline. The verifier smoke must report
   `max_chunk>1`, `nspec>64`, and `worst_argmax_gap<=2`.
 - Preserve baseline and DSpark `generation` t/s from the same fixture run,
-  with the same host, model, cache, scheduler, thermal state, and background
-  load. A DSpark path that is materially slower than the target-only SSD path
-  without a documented correctness tradeoff is a release blocker.
-- On ROCm, also run one `DS4_DSPARK_PROBE=1 DS4_DSPARK_SCHEDULER=0`
+  with the same host, model, cache, runtime settings, thermal state, and
+  background load. A DSpark path that is materially slower than the target-only
+  SSD path without a documented correctness tradeoff is a release blocker.
+- On ROCm, also run one `DS4_DSPARK_PROBE=1`
   generation and require the non-causal attention and stage-chain probes to
   pass. This covers the HIP draft-attention kernel before the end-to-end
   verifier gate.
@@ -284,8 +284,9 @@ producing a different greedy continuation.
   `make mtp-verify-depth` with `DS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.
 - Record `c_add` `accepted_draft`, `errors=0`, `verify_layer`, and `net_saved`
-  for both 32-token and 64-token runs.  A faster run with lower proposal
-  quality is a regression unless it was an intentional scheduler change.
+  for both 32-token and 64-token runs. A faster run with lower proposal
+  quality is a regression unless it was an intentional confidence-policy
+  change.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
   `DS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the Metal MoE stage profiler and
   record the selected-expert footprint or stage timing in the DSpark log.
