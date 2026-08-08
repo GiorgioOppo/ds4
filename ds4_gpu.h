@@ -668,9 +668,8 @@ int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x);
 
-/* Optional dense Q4_K pair used by prefill q_a + kv. Both projections share
- * one MMQ activation quantization; a zero return requests separate fallback
- * matmuls from the graph. */
+/* Optional small-token dense Q4_K pair. Backends without a beneficial paired
+ * kernel return zero and request separate fallback matmuls from the graph. */
 int ds4_gpu_matmul_q4_K_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

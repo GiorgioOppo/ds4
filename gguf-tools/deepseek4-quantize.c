@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <pthread.h>
 
 #if defined(_WIN32)
@@ -1725,7 +1726,7 @@ static gguf_file load_gguf_metadata_with_override(const char *path,
     if (!fp) die_errno("open GGUF", path);
     char magic[4];
     if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic) || memcmp(magic, "GGUF", 4) != 0) {
-        die("bad GGUF template");
+        die("bad GGUF");
     }
     g.version = read_u32_le_fp(fp, "GGUF version");
     g.n_tensors = read_u64_le_fp(fp, "GGUF tensor count");
@@ -1872,7 +1873,7 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
                                            const hf_model_metadata *metadata) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = 1 + extra_imatrix_kv_count(im);
+    out.n_kv_extra = (metadata ? 1u : 0u) + extra_imatrix_kv_count(im);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1901,7 +1902,8 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
     }
     out.tensor_bytes = off;
     out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
-                    extra_hf_metadata_kv_size(metadata) + extra_imatrix_kv_size(im) + tensor_info;
+                    (metadata ? extra_hf_metadata_kv_size(metadata) : 0u) +
+                    extra_imatrix_kv_size(im) + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1984,6 +1986,34 @@ static void dequantize_q8_0_rows(const uint8_t *src, float *dst,
             for (int j = 0; j < 32; j++) out[b * 32 + j] = d * (float)qs[j];
         }
     }
+}
+
+static void validate_requant_plan(const gguf_file *src_g,
+                                  const output_context *out_ctx,
+                                  const imatrix_store *imatrix) {
+    size_t changed = 0;
+    for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
+        const tensor_meta *src = &src_g->tensors[i];
+        const tensor_meta *dst = &out_ctx->tensors[i];
+        if (src->type == dst->type) continue;
+        changed++;
+        if (src->type != DS4Q_TYPE_Q8_0 || dst->type != DS4Q_TYPE_Q4_K ||
+            src->ne[0] % 256 != 0) {
+            fprintf(stderr,
+                    "error: direct requantization unsupported for %s (%s -> %s)\n",
+                    src->name, ds4q_type_name(src->type),
+                    ds4q_type_name(dst->type));
+            exit(1);
+        }
+        const char *names[1] = { src->name };
+        (void)imatrix_find(imatrix, names, 1, src->ne[0], -1, 0);
+    }
+    if (changed == 0) {
+        die("direct requantization plan does not change any tensors");
+    }
+    fprintf(stderr,
+            "validated direct GGUF requantization plan: %zu Q8_0 -> Q4_K tensors\n",
+            changed);
 }
 
 static void write_requant_gguf(const gguf_file *src_g, const output_context *out_ctx,
@@ -2821,12 +2851,12 @@ static void free_dspark_support_plan(dspark_support_plan *plan) {
 }
 
 static void usage(const char *argv0) {
-    printf("usage: %s (--hf DIR | --source-gguf MODEL.gguf) --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("usage: %s (--hf DIR --template MODEL.gguf | --source-gguf MODEL.gguf) --out OUT.gguf [options]\n", argv0);
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --source-gguf FILE     requantize directly from a GGUF (currently Q8_0 -> Q4_K)\n");
-    printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
+    printf("  --template FILE        GGUF metadata/layout template required with --hf\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
     printf("  --compare-tensor NAME  regenerate one tensor, checksum, optionally byte-compare, and exit\n");
@@ -2906,6 +2936,40 @@ static bool file_exists(const char *path) {
     if (!fp) return false;
     fclose(fp);
     return true;
+}
+
+static bool same_existing_file(const char *a, const char *b) {
+    struct stat sa;
+    struct stat sb;
+    if (!a || !b || stat(a, &sa) != 0 || stat(b, &sb) != 0) return false;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+static void require_complete_gguf(const gguf_file *g) {
+    uint64_t required = (uint64_t)g->data_offset;
+    for (uint64_t i = 0; i < g->n_tensors; i++) {
+        const tensor_meta *t = &g->tensors[i];
+        if (t->old_offset > UINT64_MAX - (uint64_t)t->size ||
+            (uint64_t)g->data_offset >
+                UINT64_MAX - (t->old_offset + (uint64_t)t->size)) {
+            die("GGUF tensor extent overflows file size");
+        }
+        const uint64_t end =
+            (uint64_t)g->data_offset + t->old_offset + (uint64_t)t->size;
+        if (end > required) required = end;
+    }
+
+    struct stat st;
+    if (stat(g->path, &st) != 0) die_errno("stat source GGUF", g->path);
+    if (st.st_size < 0 || (uint64_t)st.st_size < required) {
+        fprintf(stderr,
+                "error: source GGUF is incomplete: %s has %" PRIu64
+                " bytes, needs at least %" PRIu64 "\n",
+                g->path,
+                st.st_size < 0 ? 0 : (uint64_t)st.st_size,
+                required);
+        exit(1);
+    }
 }
 
 static params parse_args(int argc, char **argv) {
@@ -2997,6 +3061,15 @@ static params parse_args(int argc, char **argv) {
     if (p.source_gguf && (p.dspark_manifest || p.dspark_support)) {
         die("--source-gguf is not supported for DSpark modes");
     }
+    if (p.source_gguf && p.template_gguf) {
+        die("--template is not used with --source-gguf");
+    }
+    if (p.source_gguf && p.compare_tensor) {
+        die("--compare-tensor is not supported with --source-gguf");
+    }
+    if (p.imatrix_strict && !p.imatrix_file) {
+        die("--imatrix-strict requires --imatrix");
+    }
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
     if (p.dspark_manifest) return p;
     if (p.dspark_support) {
@@ -3008,9 +3081,13 @@ static params parse_args(int argc, char **argv) {
         }
         return p;
     }
-    if (!p.template_gguf) die("--template is required");
+    if (p.hf_dir && !p.template_gguf) die("--template is required with --hf");
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
+    if (p.source_gguf && p.out_gguf &&
+        same_existing_file(p.source_gguf, p.out_gguf)) {
+        die("--out must differ from --source-gguf");
+    }
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
     return p;
 }
@@ -3155,12 +3232,19 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    hf_model_metadata metadata = load_hf_model_metadata(p.hf_dir);
-    gguf_file tmpl = load_gguf_metadata_with_override(p.template_gguf, &metadata);
+    hf_model_metadata metadata = {0};
+    gguf_file tmpl;
+    if (p.source_gguf) {
+        tmpl = load_gguf_metadata(p.source_gguf);
+        require_complete_gguf(&tmpl);
+    } else {
+        metadata = load_hf_model_metadata(p.hf_dir);
+        tmpl = load_gguf_metadata_with_override(p.template_gguf, &metadata);
+    }
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
-            fprintf(stderr, "using %d routed experts from template metadata\n", p.n_experts);
+            fprintf(stderr, "using %d routed experts from GGUF metadata\n", p.n_experts);
         } else {
             p.n_experts = 256;
             fprintf(stderr, "warning: template has no deepseek4.expert_count; using Flash default %d routed experts\n", p.n_experts);
@@ -3168,9 +3252,16 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
     }
-    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, &metadata);
+    output_context out_ctx = build_output_context(
+        &tmpl, &p.policy, &imatrix, p.source_gguf ? NULL : &metadata);
+    if (p.source_gguf) {
+        validate_requant_plan(&tmpl, &out_ctx, &imatrix);
+    }
     print_plan(&tmpl, &out_ctx);
-    printf("compress_ratios: source=config.json count=%" PRIu64 "\n", metadata.n_compress_ratios);
+    if (!p.source_gguf) {
+        printf("compress_ratios: source=config.json count=%" PRIu64 "\n",
+               metadata.n_compress_ratios);
+    }
     if (p.dry_run) {
         free_hf_model_metadata(&metadata);
         imatrix_free(&imatrix);
@@ -3184,6 +3275,7 @@ int main(int argc, char **argv) {
     if (p.source_gguf) {
         write_requant_gguf(&tmpl, &out_ctx, p.out_gguf, &imatrix);
         fprintf(stderr, "wrote %s\n", p.out_gguf);
+        free_hf_model_metadata(&metadata);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
