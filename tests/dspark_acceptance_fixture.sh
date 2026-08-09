@@ -6,6 +6,8 @@ MODEL=${DS4_DSPARK_MODEL:-${DS4_TEST_MODEL:-./ds4flash.gguf}}
 SUPPORT=${DS4_DSPARK_SUPPORT:-gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}
 TOKENS=${DS4_DSPARK_FIXTURE_TOKENS:-32}
 REQUIRE_PARTIAL=${DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL:-0}
+REQUIRE_DIRECT=${DS4_DSPARK_FIXTURE_REQUIRE_DIRECT_COMMIT:-0}
+REQUIRE_IDENTICAL=${DS4_DSPARK_FIXTURE_REQUIRE_IDENTICAL:-0}
 PROPOSAL_QUALITY_GUARD=${DS4_DSPARK_FIXTURE_REQUIRE_PROPOSAL_QUALITY:-auto}
 C_ADD_MIN_ACCEPTED=${DS4_DSPARK_FIXTURE_C_ADD_MIN_ACCEPTED:-8}
 CONFIDENCE=${DS4_DSPARK_FIXTURE_CONFIDENCE:-}
@@ -16,6 +18,8 @@ REQUIRE_ACTIVE=${DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE:-1}
 REQUIRE_EXACT2=${DS4_DSPARK_FIXTURE_REQUIRE_EXACT2:-0}
 REQUIRE_CUDA_EXACTN=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN:-0}
 partial_cases=0
+direct_partial_cases=0
+direct_commits=0
 total_proposed=0
 total_accepted_draft=0
 total_exact2_attempt=0
@@ -71,6 +75,23 @@ case "$REQUIRE_CUDA_EXACTN" in
     exit 1
     ;;
 esac
+case "$REQUIRE_DIRECT" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_DIRECT_COMMIT must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$REQUIRE_IDENTICAL" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_IDENTICAL must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+if [ "$REQUIRE_EXACT2" != 0 ] || [ "$REQUIRE_CUDA_EXACTN" != 0 ]; then
+    REQUIRE_IDENTICAL=1
+fi
 case "$SSD_CACHE_EXPERTS" in
 ""|*[!0-9]*)
     if [ -n "$SSD_CACHE_EXPERTS" ]; then
@@ -163,10 +184,11 @@ print_metadata() {
     printf '# model=%s model_bytes=%s support=%s support_bytes=%s\n' \
         "$MODEL" "$(file_bytes "$MODEL")" \
         "$SUPPORT" "$(file_bytes "$SUPPORT")"
-    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" backend=%s ssd_streaming=%s ssd_cache_experts=%s confidence=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s\n' \
+    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" backend=%s ssd_streaming=%s ssd_cache_experts=%s confidence=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
         "$TOKENS" "$BACKEND" "$SSD_STREAMING" "${SSD_CACHE_EXPERTS:-auto}" \
         "$confidence" "$PROPOSAL_QUALITY_GUARD" \
-        "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED"
+        "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED" \
+        "$REQUIRE_DIRECT" "$REQUIRE_IDENTICAL"
     printf '# exact2_cuda=%s exact2_metal=%s proposer_block_max_cuda=%s proposer_block_max_metal=%s verifier_block_max=%s require_exact2=%s\n' \
         "$exact2_cuda" "$exact2_metal" "$proposer_cap_cuda" \
         "$proposer_cap_metal" "$verifier_cap" "$REQUIRE_EXACT2"
@@ -175,6 +197,11 @@ print_metadata() {
         "$exactn_union_metal" "$noncausal_online_cuda" \
         "$noncausal_online_cuda_disable" "$verify_noncausal" \
         "$exact_rows_async_tails_metal"
+    printf '# baseline_command=%s -m %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
+        "$DS4_BIN" "$MODEL" "$TOKENS"
+    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s -m %s --mtp %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
+        "$DS4_BIN" "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
+        "$MODEL" "$SUPPORT" "$TOKENS"
 }
 
 if [ ! -x "$DS4_BIN" ]; then
@@ -237,13 +264,17 @@ run_case() {
     run_variant baseline "$prompt" "$base_out" "$base_err"
     run_variant dspark "$prompt" "$dspark_out" "$dspark_err"
 
+    output_match=1
     if ! cmp -s "$base_out" "$dspark_out"; then
-        echo "dspark-fixture: output mismatch for $id" >&2
-        echo "baseline:" >&2
-        sed 's/^/  /' "$base_out" >&2
-        echo "dspark:" >&2
-        sed 's/^/  /' "$dspark_out" >&2
-        return 1
+        output_match=0
+        if [ "$REQUIRE_IDENTICAL" != 0 ]; then
+            echo "dspark-fixture: output mismatch for $id" >&2
+            echo "baseline:" >&2
+            sed 's/^/  /' "$base_out" >&2
+            echo "dspark:" >&2
+            sed 's/^/  /' "$dspark_out" >&2
+            return 1
+        fi
     fi
 
     base_tps=$(sed -n 's/.*generation: \([0-9.][0-9.]*\) t\/s.*/\1/p' "$base_err" | tail -n 1)
@@ -264,6 +295,12 @@ run_case() {
     cuda_exactn_attempt=$(stats_field "$stats" cuda_exactn_attempt)
     cuda_exactn_fallback=$(stats_field "$stats" cuda_exactn_fallback)
     cuda_exactn_error_fallback=$(stats_field "$stats" cuda_exactn_error_fallback)
+    direct_full=$(stats_field "$stats" direct_full)
+    direct_partial=$(stats_field "$stats" direct_partial)
+    exact2_full=$(stats_field "$stats" exact2_full)
+    cuda_exactn_full=$(stats_field "$stats" cuda_exactn_full)
+    exactn_union_full=$(stats_field "$stats" exactn_union_full)
+    exactn_full=$(stats_field "$stats" exactn_full)
     partial=${partial:-0}
     errors=${errors:-0}
     verifier_unavailable=${verifier_unavailable:-0}
@@ -274,6 +311,12 @@ run_case() {
     cuda_exactn_attempt=${cuda_exactn_attempt:-0}
     cuda_exactn_fallback=${cuda_exactn_fallback:-0}
     cuda_exactn_error_fallback=${cuda_exactn_error_fallback:-0}
+    direct_full=${direct_full:-0}
+    direct_partial=${direct_partial:-0}
+    exact2_full=${exact2_full:-0}
+    cuda_exactn_full=${cuda_exactn_full:-0}
+    exactn_union_full=${exactn_union_full:-0}
+    exactn_full=${exactn_full:-0}
     if [ "$errors" -ne 0 ]; then
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
         return 1
@@ -306,13 +349,18 @@ run_case() {
     if [ "$REQUIRE_PARTIAL" != 0 ] && [ "$partial" -gt 0 ]; then
         partial_cases=$((partial_cases + 1))
     fi
+    if [ "$direct_partial" -gt 0 ]; then
+        direct_partial_cases=$((direct_partial_cases + 1))
+    fi
+    direct_commits=$((direct_commits + direct_full + direct_partial + \
+        exact2_full + cuda_exactn_full + exactn_union_full + exactn_full))
 
-    printf '%s\tbaseline_tps=%s\tdspark_tps=%s\t%s\n' \
-        "$id" "${base_tps:-n/a}" "${dspark_tps:-n/a}" "$stats"
+    printf '%s\toutput_match=%s\tbaseline_tps=%s\tdspark_tps=%s\t%s\n' \
+        "$id" "$output_match" "${base_tps:-n/a}" "${dspark_tps:-n/a}" "$stats"
 }
 
 print_metadata
-echo "id	baseline_tps	dspark_tps	dspark_stats"
+echo "id	output_match	baseline_tps	dspark_tps	dspark_stats"
 run_case hello 'Hello'
 run_case redis 'Explain Redis in one sentence.'
 run_case math 'What is 17 times 23?'
@@ -349,5 +397,14 @@ fi
 if [ "$REQUIRE_CUDA_EXACTN" != 0 ] &&
    [ "$total_cuda_exactn_error_fallback" -ne 0 ]; then
     echo "dspark-fixture: CUDA exact-N error fallback count=$total_cuda_exactn_error_fallback" >&2
+    exit 1
+fi
+if [ "$REQUIRE_PARTIAL" != 0 ] && [ "$REQUIRE_DIRECT" != 0 ] &&
+   [ "$direct_partial_cases" -eq 0 ]; then
+    echo "dspark-fixture: expected at least one direct partial commit" >&2
+    exit 1
+fi
+if [ "$REQUIRE_DIRECT" != 0 ] && [ "$direct_commits" -eq 0 ]; then
+    echo "dspark-fixture: expected at least one direct verifier-state commit" >&2
     exit 1
 fi

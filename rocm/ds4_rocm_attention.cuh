@@ -1,5 +1,5 @@
 // DS4 ROCm attention kernels (prefill/decode, raw/mixed KV).
-//
+
 // Included from ds4_cuda.cu in the same translation unit to keep launch/API
 // glue unchanged while kernel implementations are split into modules.
 
