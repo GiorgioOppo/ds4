@@ -319,6 +319,117 @@ kernel void kernel_dsv4_compressor_pack_ratio4(
     }
 }
 
+// Exact one-dispatch ratio-4 decode pool. This specializes the legacy
+// transpose -> softmax -> multiply -> sum_rows chain without changing any
+// floating-point operation or reduction topology. The normalized softmax and
+// product are still materialized and volatile-reloaded through device memory.
+// The two simd_sum calls in the final reduction execute under an eight-lane
+// active mask, exactly matching kernel_sum_rows_f32_f32's original TG8.
+kernel void kernel_dsv4_compressor_exact_pool_ratio4_decode_ggml(
+        constant ds4_metal_args_dsv4_compressor_pack_ratio4 & args,
+        device const float * state_kv,
+        device const float * state_score,
+        device       float * softmax,
+        device       float * product,
+        device       float * dst,
+        threadgroup  float * sum_scratch [[threadgroup(0)]],
+        uint col [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (col >= args.head_dim || args.n_comp != 1u ||
+        args.n_threads != 32u) {
+        return;
+    }
+
+    const uint64_t state_row_stride = 2ull * args.head_dim;
+    const float scale = (float)args.replay;
+    const float zero = (float)(args.n_comp - 1u);
+
+    // Match the packed float4 ownership: lane 0 owns rows 0..3 and lane 1
+    // rows 4..7. The gather itself is an integer-addressed bit-preserving load.
+    float4 score_values = -INFINITY;
+    if (tid < 2u) {
+        const uint row0 = 4u * tid;
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint row = row0 + j;
+            const uint64_t src = (uint64_t)row * state_row_stride +
+                                 (row >= 4u ? args.head_dim : 0u) + col;
+            score_values[j] = state_score[src];
+        }
+    }
+
+    const uint64_t scratch_base = (uint64_t)col * 8u;
+    device float4 * softmax4 =
+        (device float4 *)(softmax + scratch_base);
+
+    // Verbatim kernel_soft_max_f32_4(width=8, nth=32) arithmetic.
+    float4 lmax4 = -INFINITY;
+    for (int i00 = (int)tid; i00 < 2; i00 += 32) {
+        lmax4 = fmax(lmax4, score_values * scale + (float4)zero);
+    }
+    const float lmax =
+        MAX(MAX(lmax4[0], lmax4[1]), MAX(lmax4[2], lmax4[3]));
+    const float max_val = simd_max(lmax);
+
+    float4 lsum4 = 0.0f;
+    for (int i00 = (int)tid; i00 < 2; i00 += 32) {
+        const float4 exp_score4 =
+            exp((score_values * scale + (float4)zero) - max_val);
+        lsum4 += exp_score4;
+        softmax4[i00] = exp_score4;
+    }
+    const float lsum =
+        lsum4[0] + lsum4[1] + lsum4[2] + lsum4[3];
+    threadgroup_barrier(mem_flags::mem_none);
+    const float sum = simd_sum(lsum);
+    const float inv_sum = 1.0f / sum;
+    for (int i00 = (int)tid; i00 < 2; i00 += 32) {
+        softmax4[i00] *= inv_sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+    device volatile const float * reloaded_softmax =
+        (device volatile const float *)(softmax + scratch_base);
+    device float * product_row = product + scratch_base;
+
+    // Verbatim width=8, TG4 multiply ownership: low element, then +4.
+    if (tid < 4u) {
+        for (uint i0 = tid; i0 < 8u; i0 += 4u) {
+            const uint64_t src = (uint64_t)i0 * state_row_stride +
+                                 (i0 >= 4u ? args.head_dim : 0u) + col;
+            float value = state_kv[src];
+            value *= reloaded_softmax[i0];
+            product_row[i0] = value;
+        }
+    }
+
+    // Preserve the product dispatch's device store/reload boundary.
+    threadgroup_barrier(mem_flags::mem_device);
+    device volatile const float * reloaded_product =
+        (device volatile const float *)product_row;
+
+    // Reproduce kernel_sum_rows_f32_f32(width=8, TG8) literally. MSL defines
+    // simdgroup collectives over active lanes, so the branch recreates the
+    // original eight-lane partial SIMD group inside this 32-thread group.
+    sum_scratch[tid] = 0.0f;
+    float row_sum = 0.0f;
+    if (tid < 8u) {
+        row_sum += reloaded_product[tid];
+        row_sum = simd_sum(row_sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        sum_scratch[0] = row_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 8u) {
+        row_sum = sum_scratch[tid];
+        row_sum = simd_sum(row_sum);
+        if (tid == 0u) {
+            dst[col] = row_sum;
+        }
+    }
+}
+
 // Ratio-4 compression keeps two 4-row halves of recurrent state. After an
 // emitted compressed row, the second half becomes the next window's previous
 // half. The old encoder expressed this as four generic copies; this DS4-specific

@@ -278,9 +278,16 @@ producing a different greedy continuation.
   | --- | --- | --- |
   | HC RMSNorm + F16 mixer on M1-M4 | `DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE=1` | Leave the disable switch unset |
   | HC RMSNorm + F16 mixer on another Apple generation | Leave both HC norm/mix switches unset | `DS4_METAL_ENABLE_HC_NORM_MIX_FUSE=1` |
+  | HC producer + split/Sinkhorn/destination RMSNorm on M1-M5 | `DS4_METAL_DISABLE_HC_PRODUCER_PRE_NORM_FUSE=1` | Leave the disable switch unset |
   | Q4 Q-A/KV + compressor store in exact-union | `DS4_METAL_DSPARK_EXACTN_UNION=1` with the Q4 enable switch unset | Keep exact-union `=1`; set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
   | Q4 Q-A/KV + compressor store in ordinary `FULL` decode | Leave `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE` unset | Set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
+  | F16 attention+indexer quad compressor store in `FULL` decode | `DS4_METAL_DISABLE_COMPRESSOR_QUAD_STORE=1` | Leave the disable switch unset |
+  | F16 attention+indexer quad compressor store in exact-union | `DS4_METAL_DSPARK_EXACTN_UNION=1 DS4_METAL_DISABLE_COMPRESSOR_QUAD_STORE=1` | Keep exact-union `=1`; leave the quad disable switch unset |
+  | Exact ratio-4 one-row compressor pool on M1-M5 | `DS4_METAL_DISABLE_COMPRESSOR_EXACT_POOL_RATIO4=1` | Leave the disable switch unset |
   | Q4 attention-output B + HC expansion | `DS4_METAL_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` | Leave the disable switch unset |
+  | FlashAttention pad/block PSO memo | `DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PAD_BLK_MEMO=1` | Leave the disable switch unset |
+  | FlashAttention batched/vector PSO memo | `DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO=1` | Leave the disable switch unset |
+  | Exact-union asynchronous routed tails | `DS4_METAL_DSPARK_EXACTN_UNION=1` with `DS4_METAL_DSPARK_EXACT_ROWS_ASYNC_TAILS` unset | Keep exact-union `=1`; set `DS4_METAL_DSPARK_EXACT_ROWS_ASYNC_TAILS=1` |
 
   The Q4 Q-A/KV compound is opt-in in both exact-union and ordinary `FULL`
   decode; it is enabled only when the explicit enable variable is present.
@@ -290,6 +297,33 @@ producing a different greedy continuation.
   `exactn_union_full`, `exactn_union_partial_fallback`, `propose`, `verify`,
   `replay`, stage timings, page faults, and generation t/s. A candidate that
   is correct but slower remains disabled or opt-in according to its gate.
+  For asynchronous tails, also repeat the model-backed oracle with the switch
+  set and run enough exact-union cycles to cross cache eviction and raw-ring
+  wrap boundaries. The candidate removes a CPU wait but retains private expert
+  buffers until command-buffer completion; serialized state and process memory
+  after synchronization must match the synchronous control.
+  Before the model-backed runs, build `ds4_test` and run
+  `./ds4_test --metal-kernels`. This covers the isolated compound HC, F16 quad
+  compressor-store, exact ratio-4 pool, and tie-heavy Metal routing kernels.
+  For the exact one-row pool candidate, repeat once with
+  `DS4_METAL_REQUIRE_COMPRESSOR_EXACT_POOL_RATIO4=1`; the run must exercise the
+  specialization instead of silently falling back. Also exercise the global
+  kill switches plus the matching pre-M5 or M5 HC/pool rollback on the target
+  machine. Treat the FlashAttention memo rows as host-dispatch A/B tests: the
+  selected specialization and output must remain identical, and any timing
+  comparison must use repeated warm runs.
+- For the removed Metal 512-column streaming top-k path, there is no runtime
+  candidate gate. Compare the current binary with a build immediately before
+  its removal only if historical timing is needed. First require
+  `./ds4_test --metal-kernels` to pass, including tie-heavy routing cases, then
+  require identical selected expert ids and greedy output. Correct deterministic
+  ordering takes precedence over a timing difference.
+- For the default CPU unrolled argmax, run `tests/test_sampling`, then compare
+  an otherwise identical greedy workload with
+  `DS4_CPU_DISABLE_UNROLLED_ARGMAX=1` (scalar control) and with the variable
+  unset (candidate). Require identical tokens for ordinary, excluded-id,
+  cross-lane-tie, and vocabulary-tail cases; record median generation t/s over
+  repeated runs without claiming a speedup from the implementation alone.
 - For the experimental resident-CUDA exact-2 verifier, use three controlled
   runs with verifier cap two on the same single-GPU host: native proposer plus
   legacy verifier
@@ -306,6 +340,42 @@ producing a different greedy continuation.
   fixture enforces `exact2_attempt>0` and `exact2_fallback=0`.
   Record `prop_scheduled_rows/cycles`, `propose`, `verify`, `replay`, `net_saved`,
   `miss_first`, `no_draft`, `avg_accept`, and generation t/s from every run.
+- For resident CUDA exact-N, keep exact-2 disabled and compare
+  `DS4_CUDA_DSPARK_EXACTN=0` against `=1` with the native five-row proposer
+  and `DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=5`. Repeat N=2,3,4,5 with explicit
+  proposer/verifier caps, then exercise the kill switch with both
+  `DS4_CUDA_DSPARK_EXACTN=1` and
+  `DS4_CUDA_DISABLE_DSPARK_EXACTN=1`. Require byte-identical greedy stdout,
+  `errors=0`, `verifier_unavailable=0`, `cuda_exactn_attempt>0`, and at least
+  one `cuda_exactn_full`; partial cases must increment the partial and
+  aggregate fallback counters, never the error counter, and continue
+  identically through legacy replay. Include
+  EOS as the first and a middle draft, a raw-ring wrap boundary, a context
+  capacity cut, and prefill workspaces below five rows. Record
+  `cuda_exactn_rows`, its full/partial/error counters, `snapshot`, `verify`,
+  `replay`, acceptance, and generation t/s. Run with CUDA decode graphs both
+  enabled and disabled. Do not promote the gate without a CUDA device build
+  and serialized KV/compressor-state oracle; host syntax tests do not execute
+  this path. On candidate fixture runs set
+  `DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN=1`; it requires aggregate
+  `cuda_exactn_attempt>0` and `cuda_exactn_error_fallback=0`. It reports but
+  does not reject aggregate `cuda_exactn_fallback`, because valid partial
+  matches increment both the partial and aggregate fallback counters before
+  legacy replay.
+- For CUDA DSpark non-causal proposer attention, compare the reference with
+  `DS4_CUDA_ENABLE_DSPARK_NONCAUSAL_ONLINE=0` against the candidate with `=1`.
+  Repeat at proposal depths two and five, across every raw-ring start index,
+  and once with both the enable variable and
+  `DS4_CUDA_DISABLE_DSPARK_NONCAUSAL_ONLINE=1` to prove the kill switch restores
+  the reference dispatch. On the short diagnostic runs also set
+  `DS4_DSPARK_VERIFY_NONCAUSAL=1`; record all three reported `max_abs` and
+  `max_rel` comparisons and reject non-finite values or a material error
+  regression. Then run the acceptance fixture without the diagnostic host
+  readbacks and require byte-identical target stdout, `errors=0`, and
+  `verifier_unavailable=0`. Record proposal time, acceptance, generation t/s,
+  and the startup dispatch log. Draft logits or acceptance may differ slightly
+  because online softmax changes the floating-point reduction order; that is
+  not permission for the verified target continuation to differ.
 - For CUDA HC and tiny routed-MoE kernel changes, keep
   `DS4_CUDA_DSPARK_EXACT2` unset and repeat the resident acceptance fixture
   with these explicit A/B pairs: HC control

@@ -16243,6 +16243,131 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
     }
 }
 
+/* Experimental DSpark verifier attention for the native 512-wide head.  Eight
+ * heads share each staged raw row, while every warp maintains its own online
+ * softmax state.  Seeding (max,sum) with the sink gives the sink a zero value
+ * contribution without materializing scores or a sink row.  Keep this behind
+ * an explicit gate: the online recurrence is mathematically equivalent to the
+ * reference kernel, but its floating-point accumulation order is different. */
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
+__global__ static void __launch_bounds__(256, 2)
+attention_noncausal_raw_batch_heads_online_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t n_tokens,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t tok = blockIdx.x;
+    const uint32_t head_group = blockIdx.y;
+    if (tok >= n_tokens || raw_cap == 0u || raw_start >= raw_cap ||
+        n_raw == 0u || n_raw > raw_cap || head_dim != 512u) {
+        return;
+    }
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t h = head_group * HEADS_PER_GROUP + warp;
+    const bool valid_head = warp < HEADS_PER_GROUP && h < n_head;
+
+    /* One 512-float row is 128 float4 values.  Staging it once lets every
+     * verifier head reuse the same raw-ring traffic. */
+    __shared__ float4 kv_shared[ROWS_PER_STAGE * 128u];
+
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q + ((uint64_t)tok * n_head + h) * head_dim)
+        : NULL;
+    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q1 = q0, q2 = q0, q3 = q0;
+    if (valid_head) {
+        q0 = q4[lane +  0u];
+        q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u];
+        q3 = q4[lane + 96u];
+    }
+
+    const float scale = rsqrtf((float)head_dim);
+    float max_s = valid_head ? sinks[h] : -INFINITY;
+    float sum_s = valid_head ? 1.0f : 0.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+
+    for (uint32_t row0 = 0; row0 < n_raw; row0 += ROWS_PER_STAGE) {
+        const uint32_t nr = n_raw - row0 < ROWS_PER_STAGE
+            ? n_raw - row0 : ROWS_PER_STAGE;
+        for (uint32_t off = threadIdx.x;
+             off < nr * 128u;
+             off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t logical_row = row0 + rr;
+            /* n_raw <= raw_cap means the visible interval wraps at most once.
+             * Use 64-bit addition so a future large ring cannot overflow here. */
+            const uint32_t physical_row = (uint32_t)(
+                ((uint64_t)raw_start + logical_row) % raw_cap);
+            const float4 *src = (const float4 *)(
+                raw_kv + (uint64_t)physical_row * head_dim);
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+
+        if (valid_head) {
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                const float4 *kv4 = kv_shared + rr * 128u;
+                const float4 k0 = kv4[lane +  0u];
+                const float4 k1 = kv4[lane + 32u];
+                const float4 k2 = kv4[lane + 64u];
+                const float4 k3 = kv4[lane + 96u];
+                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
+                score = warp_sum_f32(score) * scale;
+                score = __shfl_sync(0xffffffffu, score, 0);
+
+                const float new_m = fmaxf(max_s, score);
+                const float old_scale = expf(max_s - new_m);
+                const float row_scale = expf(score - new_m);
+                sum_s = sum_s * old_scale + row_scale;
+                o0.x = o0.x * old_scale + k0.x * row_scale;
+                o0.y = o0.y * old_scale + k0.y * row_scale;
+                o0.z = o0.z * old_scale + k0.z * row_scale;
+                o0.w = o0.w * old_scale + k0.w * row_scale;
+                o1.x = o1.x * old_scale + k1.x * row_scale;
+                o1.y = o1.y * old_scale + k1.y * row_scale;
+                o1.z = o1.z * old_scale + k1.z * row_scale;
+                o1.w = o1.w * old_scale + k1.w * row_scale;
+                o2.x = o2.x * old_scale + k2.x * row_scale;
+                o2.y = o2.y * old_scale + k2.y * row_scale;
+                o2.z = o2.z * old_scale + k2.z * row_scale;
+                o2.w = o2.w * old_scale + k2.w * row_scale;
+                o3.x = o3.x * old_scale + k3.x * row_scale;
+                o3.y = o3.y * old_scale + k3.y * row_scale;
+                o3.z = o3.z * old_scale + k3.z * row_scale;
+                o3.w = o3.w * old_scale + k3.w * row_scale;
+                max_s = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_head) {
+        const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
+        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
+        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
+        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
+        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
+        float4 *out4 = (float4 *)(
+            heads + ((uint64_t)tok * n_head + h) * head_dim);
+        out4[lane +  0u] = o0;
+        out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2;
+        out4[lane + 96u] = o3;
+    }
+}
+
 extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -16256,14 +16381,27 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
         uint32_t                raw_start,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (!heads || !q || !raw_kv || !model_map ||
-        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw ||
-        raw_start >= raw_cap || n_head == 0 || head_dim == 0 ||
-        sinks_offset > model_size ||
-        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+    if (!heads || !q || !raw_kv || !heads->ptr || !q->ptr || !raw_kv->ptr ||
+        !model_map ||
+        n_tokens == 0u || n_raw == 0u || raw_cap < n_raw ||
+        raw_start >= raw_cap || n_head == 0u || head_dim == 0u) {
+        return 0;
+    }
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    if ((uint64_t)n_tokens > UINT64_MAX / n_head) return 0;
+    const uint64_t head_rows = (uint64_t)n_tokens * n_head;
+    if (head_rows > UINT64_MAX / head_dim) return 0;
+    const uint64_t head_elems = head_rows * head_dim;
+    if (head_elems > UINT64_MAX / sizeof(float) ||
+        (uint64_t)raw_cap > UINT64_MAX / head_dim) {
+        return 0;
+    }
+    const uint64_t raw_elems = (uint64_t)raw_cap * head_dim;
+    if (raw_elems > UINT64_MAX / sizeof(float) ||
+        sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        heads->bytes < head_elems * sizeof(float) ||
+        q->bytes < head_elems * sizeof(float) ||
+        raw_kv->bytes < raw_elems * sizeof(float)) {
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(heads);
@@ -16271,16 +16409,56 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier,
             "dspark_attn_sinks");
     if (!sinks) return 0;
-    const size_t shmem = (size_t)n_raw * sizeof(float);
-    if (shmem > 32768) return 0; /* draft blocks are tiny; guard anyway */
-    dim3 grid(n_tokens, n_head, 1);
-    attention_noncausal_raw_batch_heads_kernel<<<grid, 256, shmem>>>(
-            (float *)heads->ptr,
-            sinks,
-            (const float *)q->ptr,
-            (const float *)raw_kv->ptr,
-            n_tokens, n_raw, raw_cap, raw_start, n_head, head_dim);
-    if (!cuda_ok(cudaGetLastError(), "attention noncausal raw batch heads launch")) return 0;
+
+    /* The reference path remains the unconditional fallback.  The online path
+     * is deliberately narrow: DSpark's raw ring is eight rows, its current
+     * attention head is 512 floats, and float4 staging requires aligned device
+     * views.  The disable flag always wins over the enable flag. */
+    const bool online_requested =
+        cuda_env_flag_enabled("DS4_CUDA_ENABLE_DSPARK_NONCAUSAL_ONLINE", 0) &&
+        !cuda_env_flag_enabled("DS4_CUDA_DISABLE_DSPARK_NONCAUSAL_ONLINE", 0);
+    const bool online_shape =
+        n_tokens <= 8u && n_raw <= 8u && head_dim == 512u &&
+        n_head <= 256u &&
+        ds4_tensor_device_idx(q) == logical_tier &&
+        ds4_tensor_device_idx(raw_kv) == logical_tier &&
+        ((((uintptr_t)heads->ptr | (uintptr_t)q->ptr |
+           (uintptr_t)raw_kv->ptr) & 15u) == 0u);
+    if (online_requested && online_shape) {
+        static int logged_online = 0;
+        if (!logged_online) {
+            logged_online = 1;
+            fprintf(stderr,
+                    "ds4: CUDA DSpark noncausal attention using tiled "
+                    "online softmax\n");
+        }
+        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1u);
+        attention_noncausal_raw_batch_heads_online_kernel<4, 8>
+            <<<grid, 256>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_tokens, n_raw, raw_cap, raw_start, n_head, head_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention noncausal raw batch heads online launch")) {
+            return 0;
+        }
+    } else {
+        const size_t shmem = (size_t)n_raw * sizeof(float);
+        if (shmem > 32768u) return 0;
+        dim3 grid(n_tokens, n_head, 1u);
+        attention_noncausal_raw_batch_heads_kernel<<<grid, 256, shmem>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_tokens, n_raw, raw_cap, raw_start, n_head, head_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention noncausal raw batch heads launch")) {
+            return 0;
+        }
+    }
     static int verify_left = -1;
     if (verify_left < 0) {
         verify_left = getenv("DS4_DSPARK_VERIFY_NONCAUSAL") != NULL ? 3 : 0;

@@ -974,6 +974,93 @@ kernel void kernel_mul_mv_f16_f32_pair_compressor_store_4(
     state_score[dst] = projected_score[col] + ape_v;
 }
 
+// Decode compressor + indexer-compressor projection in one dispatch. Both
+// pairs read the same normalized activation with the same F16 matvec shape,
+// so one launch covers all four matrices. Per-row reduction trees and the
+// per-threadgroup state stores match the separate paired dispatches exactly.
+kernel void kernel_mul_mv_f16_f32_quad_compressor_store_4(
+        constant ds4_metal_args_mul_mv & args,
+        constant ds4_metal_args_compressor_pair_store & store0,
+        constant ds4_metal_args_compressor_pair_store & store1,
+        device const char * src0_a0,
+        device const char * src0_b0,
+        device const char * src0_a1,
+        device const char * src0_b1,
+        device const char * src1,
+        device       char * dst_a0,
+        device       char * dst_b0,
+        device       char * dst_a1,
+        device       char * dst_b1,
+        device const char * ape0,
+        device const char * ape1,
+        device       float * state0_kv,
+        device       float * state0_score,
+        device       float * state1_kv,
+        device       float * state1_score,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        ushort tiitg  [[thread_index_in_threadgroup]],
+        ushort tiisg  [[thread_index_in_simdgroup]],
+        ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    const uint tgs0 = ((uint)store0.width + NR0 - 1u) / NR0;
+    const bool second = tgpig.x >= tgs0;
+
+    uint3 local_tgpig = tgpig;
+    if (second) local_tgpig.x = tgpig.x - tgs0;
+
+    ds4_metal_args_mul_mv largs = args;
+    largs.nr0 = NR0;
+    largs.ne01 = second ? (int32_t)store1.width :
+                         (int32_t)store0.width;
+
+    if (!second) {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, src0_a0, src0_b0, src1, dst_a0, dst_b0,
+                shmem, local_tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, src0_a1, src0_b1, src1, dst_a1, dst_b1,
+                shmem, local_tgpig, tiisg, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    constant ds4_metal_args_compressor_pair_store & store =
+        second ? store1 : store0;
+    if (tiitg >= NR0 || store.width == 0u || store.ratio == 0u) {
+        return;
+    }
+    const uint col = local_tgpig.x * (uint)NR0 + tiitg;
+    if (col >= store.width) return;
+
+    const uint pos_mod = store.pos % store.ratio;
+    const uint dst_row = store.ratio == 4u ?
+        store.ratio + pos_mod : pos_mod;
+    const uint dst = dst_row * store.width + col;
+    const uint ape_i = pos_mod * store.width + col;
+
+    device volatile const float * projected_kv = second
+        ? (device volatile const float *)dst_a1
+        : (device volatile const float *)dst_a0;
+    device volatile const float * projected_score = second
+        ? (device volatile const float *)dst_b1
+        : (device volatile const float *)dst_b0;
+    device const char * ape = second ? ape1 : ape0;
+    device float * state_kv = second ? state1_kv : state0_kv;
+    device float * state_score = second ? state1_score : state0_score;
+
+    float ape_v;
+    if (store.ape_type == 1u) {
+        ape_v = (float)(((device const half *)ape)[ape_i]);
+    } else {
+        ape_v = ((device const float *)ape)[ape_i];
+    }
+
+    state_kv[dst] = projected_kv[col];
+    state_score[dst] = projected_score[col] + ape_v;
+}
+
 template<typename T0, typename T1, typename args_t>
 void kernel_mul_mv_t_t_short_impl(
         args_t args,

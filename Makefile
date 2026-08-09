@@ -3,7 +3,7 @@ UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
-SAMPLING_TEST :=
+SAMPLING_TEST := tests/test_sampling
 else
 NATIVE_CPU_FLAG ?= -march=native
 SAMPLING_TEST := tests/test_sampling
@@ -118,6 +118,12 @@ test-metal-exactn-oracle: tests/test_metal_exactn_oracle
 	DS4_TEST_REQUIRE_MODEL=1 \
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" \
 	./tests/test_metal_exactn_oracle
+
+tests/test_sampling.o: tests/test_sampling.c ds4.h
+	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -478,9 +484,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
-ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling
-endif
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \

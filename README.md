@@ -330,8 +330,17 @@ the target token already available at the start of the cycle cover the
 six-token speculative-cycle limit. Exact-union remains opt-in: correctness
 does not imply a throughput improvement on a particular memory configuration.
 
-The AProjQ4 Metal decode path has three exact dispatch fusions relevant to this
-verifier:
+Exact-union normally waits for every layer's routed-tail command buffer before
+releasing its private expert-address scope. For an isolated A/B,
+`DS4_METAL_DSPARK_EXACT_ROWS_ASYNC_TAILS=1` commits that tail without the CPU
+wait, retains all scope resources until command-buffer completion, and lets the
+next layer's router boundary provide the required ordering. The switch has no
+effect outside exact-union and is also opt-in; unset it for the synchronous
+control. Validate serialized state and greedy output as well as verifier time,
+because removing a host wait is not by itself evidence of an end-to-end gain.
+
+The AProjQ4 Metal decode path has several exact dispatch fusions relevant to
+this verifier:
 
 - HC RMSNorm plus the narrow F16 HC mixer is the M1-M4 default, including SSD
   split phases such as `TO_ROUTER`. Use
@@ -348,10 +357,62 @@ verifier:
   expansion in the same dispatch. Use
   `DS4_METAL_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` as its isolated A/B control.
 
+Additional PR #755 ports keep their established kernels as shape/resource
+fallbacks:
+
+- On Apple M1 through M5, an eligible one-row HC producer combines the F16
+  RMSNorm/mixer, HC split and Sinkhorn-weighted sum, and destination RMSNorm in
+  one compound dispatch for both attention and FFN producers. The global
+  rollback is `DS4_METAL_DISABLE_HC_PRODUCER_PRE_NORM_FUSE=1`; the narrower
+  controls are `DS4_METAL_DISABLE_PRE_M5_HC_PRODUCER_PRE_NORM_FUSE=1` and
+  `DS4_METAL_DISABLE_M5_HC_PRODUCER_PRE_NORM_FUSE=1`. The existing
+  `DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS=1` umbrella also disables it before
+  M5. `DS4_METAL_ENABLE_HC_PRODUCER_PRE_NORM_FUSE=1` permits a focused trial
+  on another eligible Metal device.
+- For an eligible ratio-4 layer on Apple M1 through M5, the standalone F16 compressor path can
+  project the attention and indexer KV/gate pairs and append both recurrent
+  states in one quad dispatch. It is the default in ordinary `FULL` decode and
+  the exact-union collection prefix when the larger Q4 compound dispatch did
+  not already store those states. Use
+  `DS4_METAL_DISABLE_COMPRESSOR_QUAD_STORE=1` for the reference path;
+  `DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_QUAD_STORE=1` is an additional
+  compatibility rollback. `DS4_METAL_ENABLE_COMPRESSOR_QUAD_STORE=1` permits
+  a focused trial on another Metal device and widens the phase scope for
+  diagnostics.
+- The exact ratio-4, one-compressed-row pool specialization is the M1-M5
+  default for supported 128- and 512-element head shapes. Disable it globally
+  with `DS4_METAL_DISABLE_COMPRESSOR_EXACT_POOL_RATIO4=1`, or use the
+  pre-M5/M5 controls
+  `DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_EXACT_POOL_RATIO4=1` and
+  `DS4_METAL_DISABLE_M5_COMPRESSOR_EXACT_POOL_RATIO4=1`. For a diagnostic run,
+  `DS4_METAL_REQUIRE_COMPRESSOR_EXACT_POOL_RATIO4=1` turns an unavailable
+  exact dispatch into a visible failure instead of silently selecting the
+  legacy reduction sequence.
+
+Metal FlashAttention pipeline selection also keeps a generation-aware
+one-entry host memo for hot specializations. This changes pipeline lookup, not
+kernel arithmetic. Disable the pad/block memo with
+`DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PAD_BLK_MEMO=1` and the batched/vector
+memo with `DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO=1` when isolating
+host-side dispatch overhead.
+
+The former 512-column streaming Metal top-k specialization has been removed;
+its ordering was not deterministic for every input. The regular deterministic
+top-k implementation is now used instead and has no runtime re-enable switch.
+Use a previous binary only as a performance control, and require identical
+selected ids on tie-heavy inputs before comparing timing.
+
 These gates change dispatch and intermediate-memory traffic, not model
 arithmetic. Compare byte-identical output, exact-union counters, stage timings,
 and generation rate on the same machine; do not infer a speedup from a lower
 dispatch count alone.
+
+CPU greedy decoding and the verifier's excluding-argmax scan use an unrolled
+eight-lane implementation by default, including scalar tail handling and
+first-index tie semantics. Set `DS4_CPU_DISABLE_UNROLLED_ARGMAX=1` to restore
+the scalar scan for an isolated A/B. `tests/test_sampling` compares both paths,
+including cross-lane ties, excluded ids, and non-multiple-of-eight vocabulary
+sizes.
 
 Exact file views for the two token embedding rows and repeatedly used Q8
 support tensors are automatic; the compatibility kill switches are
@@ -439,11 +500,55 @@ greedy continuation. For isolated A/B tests,
 `DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=0` preserves the native proposer and an
 explicit value such as `2` caps it independently of exact-2.
 
+CUDA also has an opt-in tiled online-softmax kernel for this non-causal support
+attention. It shares each raw KV row across a group of attention heads and is
+selected only for the DSpark raw-ring/head geometry it supports; every other
+shape keeps the reference kernel. Enable it with
+`DS4_CUDA_ENABLE_DSPARK_NONCAUSAL_ONLINE=1`. The emergency control
+`DS4_CUDA_DISABLE_DSPARK_NONCAUSAL_ONLINE=1` wins when both variables are set.
+The online reduction order can change draft floating-point results even though
+the target verifier still protects greedy output. Use
+`DS4_DSPARK_VERIFY_NONCAUSAL=1` to print the first three comparisons against a
+host double-precision reference, and require the final target continuation to
+remain byte-identical in the performance A/B.
+
 Keep this path opt-in until the CUDA acceptance fixture is byte-identical and
 the same-machine statistics show lower `propose`, `verify` plus `replay` time.
 The stats line reports `prop_capped`, `prop_scheduled_rows`, `exact2_attempt`,
 `exact2_full`, `exact2_partial`, and `exact2_fallback`; a valid run must
 exercise exact-2 and leave its fallback counter at zero.
+
+A separate resident exact-N CUDA experiment extends the same canonical
+one-token tape to two through five draft rows. It leaves hidden rows and all
+target weights on one GPU, submits the per-row ordinary decode kernels in one
+stream, and reads back only the `N-1` acceptance ids plus final logits. A full
+match therefore commits its already-exact KV/compressor state without replay;
+a partial match or backend error restores the pre-cycle frontier and uses the
+legacy verifier/replay fallback. Enable it independently with:
+
+```sh
+DS4_CUDA_DSPARK_EXACTN=1 DS4_DSPARK_STATS=1 \
+./ds4 --cuda -m ds4flash.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --dspark --temp 0 -p 'Write a Python quicksort function with comments.'
+```
+
+The default verifier cap under this gate is five (or the available prefill
+workspace when smaller). The proposer uses at most one fewer workspace row,
+because its support stage also carries the current target row; the existing
+explicit proposer and verifier cap variables still take precedence.
+`DS4_CUDA_DISABLE_DSPARK_EXACTN=1` is the
+kill switch and restores the previous path without changing the enable
+variable. Track `cuda_exactn_attempt`, `cuda_exactn_full`,
+`cuda_exactn_fallback`, its partial/error split, and `cuda_exactn_rows`. Keep
+this experiment disabled by default until a real CUDA oracle and a long greedy
+A/B show byte-identical output, no fallback errors, and a throughput win.
+
+Set `DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN=1` on the candidate acceptance
+fixture to require at least one `cuda_exactn_attempt` and zero
+`cuda_exactn_error_fallback`. The aggregate `cuda_exactn_fallback` is reported
+but is not required to be zero: it also includes valid partial draft matches,
+which deliberately restore the frontier and use legacy replay.
 
 The acceptance fixture can exercise the same SSD path on both the target-only
 baseline and the DSpark run. It also requires real proposals and accepted
