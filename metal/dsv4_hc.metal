@@ -1106,7 +1106,6 @@ kernel void kernel_dsv4_output_hc_weights4(
     }
 }
 
-
 struct ds4_metal_args_hc_norm_mix {
     int32_t n;
     int32_t out_dim;
@@ -1202,7 +1201,6 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
             FOR_UNROLL (short i = 0; i < NF4; ++i) {
                 sumq += dot(float4(xb4[i]), yl4[i]);
             }
-
             sumf_mv[row] += sumq;
         }
     }

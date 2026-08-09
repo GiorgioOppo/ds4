@@ -267,11 +267,85 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
   `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
-- For the experimental resident-CUDA exact-2 verifier, run the active
-  acceptance fixture both with and without `DS4_CUDA_DSPARK_EXACT2=1` on the
-  same single-GPU host. Keep SSD streaming and TP disabled, require
-  byte-identical stdout, `errors=0`, `verifier_unavailable=0`, and record
-  `verify`, `replay`, acceptance, and generation t/s from both runs.
+- For Metal DSpark verifier/proposer/replay changes, run this same-machine A/B
+  matrix with `DS4_DSPARK_STATS=1`, greedy decoding, the same prompt and token
+  limit, and no other environment changes:
+
+  | Target expert cache | Expected DSpark depth | Legacy control | Candidate |
+  | ---: | ---: | --- | --- |
+  | 16 | 2 | `DS4_METAL_DSPARK_PROPOSER_BLOCK_MAX=0 DS4_METAL_DSPARK_ACCEPTANCE_ONLY_VERIFY=0 DS4_METAL_DSPARK_HEADLESS_REPLAY=0` | Leave proposer/headless unset; keep acceptance-only `=0` |
+  | 32 | 5 | `DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=5 DS4_METAL_DSPARK_ACCEPTANCE_ONLY_VERIFY=0 DS4_METAL_DSPARK_HEADLESS_REPLAY=0` | Keep the verifier cap, set acceptance-only `=1`, and leave proposer/headless unset |
+
+  Use `--ssd-streaming-cache-experts 16` or `32` to match the row. The 0731
+  top-6 verifier needs 30 effective slots for five draft rows; 32 leaves a small
+  margin. Require byte-identical stdout between control and candidate and
+  `errors=0`, `verifier_unavailable=0`, `proposed>0`, and
+  `accepted_draft>0`. Record generation t/s, acceptance, `propose`, `verify`,
+  `replay`, `prop_capped`, `prop_scheduled_rows`, `metal_accept_only`,
+  `metal_verify_rows_saved`, and `metal_replay_headless`. In the candidate,
+  eligible `N >= 3` verification cycles should save one target row; aligned
+  ratio-4 boundaries intentionally remain on the legacy path. The
+  depth-2 run exercises proposer capping and headless replay while retaining
+  the legacy verifier; the depth-5 run should retain the checkpoint's native
+  five proposal rows and exercise acceptance-only verification.
+  On low-memory Metal, repeat the depth-5 candidate once with
+  `DS4_METAL_DSPARK_PIN_MAIN_PROJ=1`. Require a startup log confirming the
+  locked byte count, identical stdout and acceptance, and compare
+  `prop_setup`, total `propose`, page faults, and generation t/s. A lock
+  failure or a slower median keeps this optimization opt-in.
+- For the experimental Metal SSD exact-2 verifier, repeat the depth-2 row
+  above with `DS4_METAL_DSPARK_EXACT2=0` as the control and `=1` as the only
+  candidate change. Set `DS4_DSPARK_FIXTURE_REQUIRE_EXACT2=1` only on the
+  candidate. Require byte-identical stdout against both control and
+  target-only output, `exact2_attempt>0`, `exact2_full>0`,
+  `exact2_fallback=0`, and `errors=0`. Record generation t/s, `verify`, and
+  `replay`; then repeat for at least 100 generated tokens to catch cumulative
+  state drift. Do not infer that the generic five-row batch state is directly
+  committable from this two-row result.
+- For Metal exact-union or the AProjQ4/HC decode fusions, first run the
+  model-backed oracle with the target AProjQ4 GGUF:
+  `DS4_TEST_MODEL=/path/to/deepseek-v4-flash-aprojq4.gguf make test-metal-exactn-oracle`.
+  Require its N=2..5 cases to be byte-identical to sequential decode for
+  serialized KV/compressor state, logits, and the four-token continuation.
+  The matrix must include full accepts for N=2,3,4,5, all N=5 partial prefixes
+  1..4, and EOS in the first and a middle row. This is a correctness gate, not
+  evidence of a speedup.
+- Then run isolated, same-machine greedy A/B pairs with identical prompt,
+  context, cache, token limit, and `DS4_DSPARK_STATS=1`. Change only the gate
+  named by the row:
+
+  | Metal fusion | Reference control | Candidate |
+  | --- | --- | --- |
+  | HC RMSNorm + F16 mixer on M1-M4 | `DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE=1` | Leave the disable switch unset |
+  | HC RMSNorm + F16 mixer on another Apple generation | Leave both HC norm/mix switches unset | `DS4_METAL_ENABLE_HC_NORM_MIX_FUSE=1` |
+  | Q4 Q-A/KV + compressor store in exact-union | `DS4_METAL_DSPARK_EXACTN_UNION=1` with the Q4 enable switch unset | Keep exact-union `=1`; set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
+  | Q4 Q-A/KV + compressor store in ordinary `FULL` decode | Leave `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE` unset | Set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
+  | Q4 attention-output B + HC expansion | `DS4_METAL_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` | Leave the disable switch unset |
+
+  The Q4 Q-A/KV compound is opt-in in both exact-union and ordinary `FULL`
+  decode; it is enabled only when the explicit enable variable is present.
+  Require byte-identical stdout and `errors=0`; for exact-union also
+  require `exactn_union_attempt>0` and `exactn_union_error_fallback=0`.
+  Partial-accept fallback is expected when the draft diverges. Record
+  `exactn_union_full`, `exactn_union_partial_fallback`, `propose`, `verify`,
+  `replay`, stage timings, page faults, and generation t/s. A candidate that
+  is correct but slower remains disabled or opt-in according to its gate.
+- For the experimental resident-CUDA exact-2 verifier, use three controlled
+  runs with verifier cap two on the same single-GPU host: native proposer plus
+  legacy verifier
+  (`DS4_CUDA_DSPARK_EXACT2=0 DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=0 DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=2`),
+  two-row proposer plus legacy verifier
+  (`DS4_CUDA_DSPARK_EXACT2=0 DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=2 DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=2`),
+  and two-row proposer plus exact-2
+  (`DS4_CUDA_DSPARK_EXACT2=1 DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=2 DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=2`).
+  This separates the non-causal proposer-width change from the verifier and
+  replay change. Then compare uncapped legacy DSpark against exact-2 as an
+  end-to-end policy test. Keep SSD streaming and TP disabled. Require
+  byte-identical stdout, `errors=0`, and `verifier_unavailable=0` from every
+  run; set `DS4_DSPARK_FIXTURE_REQUIRE_EXACT2=1` on the exact-2 run so the
+  fixture enforces `exact2_attempt>0` and `exact2_fallback=0`.
+  Record `prop_scheduled_rows/cycles`, `propose`, `verify`, `replay`, `net_saved`,
+  `miss_first`, `no_draft`, `avg_accept`, and generation t/s from every run.
 - For CUDA HC and tiny routed-MoE kernel changes, keep
   `DS4_CUDA_DSPARK_EXACT2` unset and repeat the resident acceptance fixture
   with these explicit A/B pairs: HC control
@@ -282,6 +356,20 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   proposal/verify time, acceptance, and generation t/s. Also run
   `--decode-consistency 64` and the logprob-vector regression before enabling
   a numerically different kernel by default.
+- For the CUDA AProjQ4 ports, run an isolated A/B for each dispatch:
+  Q-A/KV pair control `DS4_CUDA_DISABLE_Q4_DENSE_PAIR=1` versus candidate with
+  that variable absent; HC norm/mix control
+  `DS4_CUDA_DISABLE_HC_NORM_MIX_FUSE=1` versus candidate
+  `DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE=1 DS4_CUDA_NO_F16_CUBLAS_ONE=1`; and Q4
+  attention-output/HC control `DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` versus
+  candidate `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1`. Repeat the pair and
+  attention-output cases with `DS4_CUDA_MMQ=0` to exercise the Q8_K fallback
+  arithmetic separately from the default MMVQ/Q8_1 path. Require
+  byte-identical stdout and full-logit/tensor equivalence before promoting an
+  opt-in gate. Run with decode graphs both enabled and disabled, and record
+  target, proposer, verifier, replay, acceptance, and generation t/s. A CUDA
+  build and hardware run are mandatory; a host-only build does not compile
+  the device kernels.
 - When DSpark, support-model mapping, or SSD streaming changes, repeat both
   the acceptance fixture and verifier invariant on every advertised graph
   backend. Apply the backend and SSD options to the target-only baseline as

@@ -891,6 +891,22 @@ int ds4_mmq_q4_K_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// Two independent dense Q4_K projections that share the canonical Q8_1
+// activation quantization.  Each output is dispatched through the same MMVQ
+// entry as ds4_mmq_q4_K_dense_vec, so its reduction and output bits are
+// unchanged; M0 and M1 may differ (the DS4 Q-A/KV decode shape does).
+int ds4_mmq_q4_K_dense_pair_vec(
+    const void  * W0_q4_K,
+    const void  * W1_q4_K,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 // Set the thread-local stream that the internal cuda pool uses for
 // cudaMallocAsync / cudaFreeAsync.  Defaults to cudaStreamPerThread.
 // Step 8 (CUDA Graphs) calls this with the capture stream so pool
