@@ -264,6 +264,7 @@ static id<MTLComputePipelineState> g_glm_q6_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
+static uint64_t g_pipeline_cache_generation;
 
 enum {
     DS4_METAL_DECODE_PIPELINE_FAST_CACHE_SLOTS = 64,
@@ -3198,11 +3199,14 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
     static struct {
         bool m;
         int32_t nc;
+        uint64_t generation;
         id<MTLComputePipelineState> pipeline;
     } memo;
     const bool memo_disabled =
         getenv("DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PAD_BLK_MEMO") != NULL;
-    if (!memo_disabled && memo.pipeline && memo.m == has_mask && memo.nc == ncpsg) {
+    if (!memo_disabled && memo.pipeline &&
+        memo.generation == g_pipeline_cache_generation &&
+        memo.m == has_mask && memo.nc == ncpsg) {
         return memo.pipeline;
     }
 
@@ -3211,7 +3215,9 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
         if (!memo_disabled) {
-            memo = (typeof(memo)){ has_mask, ncpsg, cached };
+            memo = (typeof(memo)){
+                has_mask, ncpsg, g_pipeline_cache_generation, cached
+            };
         }
         return cached;
     }
@@ -3240,7 +3246,9 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
 
     [g_pipeline_cache setObject:pipeline forKey:key];
     if (!memo_disabled) {
-        memo = (typeof(memo)){ has_mask, ncpsg, pipeline };
+        memo = (typeof(memo)){
+            has_mask, ncpsg, g_pipeline_cache_generation, pipeline
+        };
     }
     return pipeline;
 }
@@ -3257,11 +3265,14 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_blk_pipeline(
     static struct {
         int32_t nq;
         int32_t nc;
+        uint64_t generation;
         id<MTLComputePipelineState> pipeline;
     } memo;
     const bool memo_disabled =
         getenv("DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PAD_BLK_MEMO") != NULL;
-    if (!memo_disabled && memo.pipeline && memo.nq == nqptg && memo.nc == ncpsg) {
+    if (!memo_disabled && memo.pipeline &&
+        memo.generation == g_pipeline_cache_generation &&
+        memo.nq == nqptg && memo.nc == ncpsg) {
         return memo.pipeline;
     }
 
@@ -3270,7 +3281,9 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_blk_pipeline(
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
         if (!memo_disabled) {
-            memo = (typeof(memo)){ nqptg, ncpsg, cached };
+            memo = (typeof(memo)){
+                nqptg, ncpsg, g_pipeline_cache_generation, cached
+            };
         }
         return cached;
     }
@@ -3299,7 +3312,9 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_blk_pipeline(
 
     [g_pipeline_cache setObject:pipeline forKey:key];
     if (!memo_disabled) {
-        memo = (typeof(memo)){ nqptg, ncpsg, pipeline };
+        memo = (typeof(memo)){
+            nqptg, ncpsg, g_pipeline_cache_generation, pipeline
+        };
     }
     return pipeline;
 }
@@ -3326,11 +3341,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
         const char *fn;
         bool m, s, b, c, k, bc;
         int32_t n10, n20, sg;
+        uint64_t generation;
         id<MTLComputePipelineState> pipeline;
     } memo;
     const bool memo_disabled =
         getenv("DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO") != NULL;
-    if (!memo_disabled && memo.pipeline && memo.fn != NULL &&
+    if (!memo_disabled && memo.pipeline &&
+        memo.generation == g_pipeline_cache_generation && memo.fn != NULL &&
         strcmp(memo.fn, function_name) == 0 &&
         memo.m == has_mask && memo.s == has_sinks && memo.b == has_bias &&
         memo.c == has_scap && memo.k == has_kvpad && memo.bc == bc_mask &&
@@ -3354,7 +3371,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
         if (!memo_disabled) {
             memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
                                    has_scap, has_kvpad, bc_mask, ns10, ns20,
-                                   nsg, cached };
+                                   nsg, g_pipeline_cache_generation, cached };
         }
         return cached;
     }
@@ -3393,7 +3410,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
     if (!memo_disabled) {
         memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
                                has_scap, has_kvpad, bc_mask, ns10, ns20,
-                               nsg, pipeline };
+                               nsg, g_pipeline_cache_generation, pipeline };
     }
     return pipeline;
 }
@@ -3419,9 +3436,14 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
         const char *fn;
         bool m, s, b, c, k, sp;
         int32_t n10, n20, sg, wg;
+        uint64_t generation;
         id<MTLComputePipelineState> pipeline;
     } memo;
-    if (memo.pipeline && memo.fn != NULL && strcmp(memo.fn, function_name) == 0 &&
+    const bool memo_disabled =
+        getenv("DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO") != NULL;
+    if (!memo_disabled && memo.pipeline &&
+        memo.generation == g_pipeline_cache_generation && memo.fn != NULL &&
+        strcmp(memo.fn, function_name) == 0 &&
         memo.m == has_mask && memo.s == has_sinks && memo.b == has_bias &&
         memo.c == has_scap && memo.k == has_kvpad && memo.sp == shared_kvpad &&
         memo.n10 == ns10 && memo.n20 == ns20 && memo.sg == nsg && memo.wg == nwg) {
@@ -3442,9 +3464,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
                      (int)nwg];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
-        memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
-                               has_scap, has_kvpad, shared_kvpad, ns10, ns20,
-                               nsg, nwg, cached };
+        if (!memo_disabled) {
+            memo = (typeof(memo)){
+                function_name, has_mask, has_sinks, has_bias, has_scap,
+                has_kvpad, shared_kvpad, ns10, ns20, nsg, nwg,
+                g_pipeline_cache_generation, cached
+            };
+        }
         return cached;
     }
 
@@ -3480,9 +3506,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
-    memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
-                           has_scap, has_kvpad, shared_kvpad, ns10, ns20,
-                           nsg, nwg, pipeline };
+    if (!memo_disabled) {
+        memo = (typeof(memo)){
+            function_name, has_mask, has_sinks, has_bias, has_scap,
+            has_kvpad, shared_kvpad, ns10, ns20, nsg, nwg,
+            g_pipeline_cache_generation, pipeline
+        };
+    }
     return pipeline;
 }
 
@@ -3540,17 +3570,28 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
         int32_t dv,
         int32_t nwg) {
     /* Same per-layer memo pattern as the vec getter above. */
-    static int32_t memo_dv, memo_nwg;
-    static id<MTLComputePipelineState> memo_pipeline;
-    if (memo_pipeline && memo_dv == dv && memo_nwg == nwg) {
-        return memo_pipeline;
+    static struct {
+        int32_t dv, nwg;
+        uint64_t generation;
+        id<MTLComputePipelineState> pipeline;
+    } memo;
+    const bool memo_disabled =
+        getenv("DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO") != NULL;
+    if (!memo_disabled && memo.pipeline &&
+        memo.generation == g_pipeline_cache_generation &&
+        memo.dv == dv && memo.nwg == nwg) {
+        return memo.pipeline;
     }
 
     NSString *key = [NSString stringWithFormat:@"kernel_flash_attn_ext_vec_reduce_dv=%d_nwg=%d",
                      (int)dv, (int)nwg];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
-        memo_dv = dv; memo_nwg = nwg; memo_pipeline = cached;
+        if (!memo_disabled) {
+            memo = (typeof(memo)){
+                dv, nwg, g_pipeline_cache_generation, cached
+            };
+        }
         return cached;
     }
 
@@ -3577,7 +3618,11 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
-    memo_dv = dv; memo_nwg = nwg; memo_pipeline = pipeline;
+    if (!memo_disabled) {
+        memo = (typeof(memo)){
+            dv, nwg, g_pipeline_cache_generation, pipeline
+        };
+    }
     return pipeline;
 }
 
@@ -6517,6 +6562,8 @@ int ds4_gpu_init(void) {
         g_q4_expert_table_cache = [NSMutableDictionary dictionary];
         g_q4_expert_layer_residency_cache = [NSMutableDictionary dictionary];
         g_pipeline_cache = [NSMutableDictionary dictionary];
+        g_pipeline_cache_generation++;
+        if (g_pipeline_cache_generation == 0) g_pipeline_cache_generation++;
         g_dsv4_completion_cache = [NSCache new];
         g_dsv4_completion_cache.countLimit = 256u;
         g_transient_buffers = [NSMutableArray array];
@@ -10619,6 +10666,9 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache_over_limit = 0;
         ds4_gpu_model_residency_clear();
         ds4_gpu_model_views_clear();
+        g_dsv4_hc_producer_last_completion = nil;
+        g_dsv4_hc_producer_last_mix_buffer = nil;
+        g_dsv4_hc_producer_last_mix_offset = 0;
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
         [g_q4_expert_layer_residency_cache removeAllObjects];
@@ -17514,6 +17564,58 @@ int ds4_gpu_stream_expert_exact_rows_set_row(uint32_t row) {
     return 1;
 }
 
+int ds4_gpu_stream_expert_exact_rows_end_async(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_stream_expert_exact_rows_scope *scope =
+        &g_stream_expert_exact_rows_scope;
+    if (!scope->collecting || !scope->active || scope->row_armed ||
+        scope->next_row != scope->n_rows || !g_batch_cb) {
+        return 0;
+    }
+
+    /* Command buffers normally retain encoded resources, but the diagnostic
+     * DS4_METAL_UNRETAINED_COMMAND_BUFFERS mode deliberately disables that.
+     * Capture the complete immutable scope in the completion handler so the
+     * asynchronous boundary is correct in both modes.  Cache-entry structs
+     * themselves live in the static cache; their three buffers are retained
+     * independently so later cache maintenance cannot invalidate an address
+     * already published in a private table. */
+    NSMutableArray<id<MTLBuffer>> *resources = [NSMutableArray array];
+#define DS4_EXACT_ROWS_RETAIN(buffer_) do { \
+        id<MTLBuffer> retained_buffer_ = (buffer_); \
+        if (retained_buffer_) [resources addObject:retained_buffer_]; \
+    } while (0)
+    DS4_EXACT_ROWS_RETAIN(scope->selected_buffer);
+    DS4_EXACT_ROWS_RETAIN(scope->gate_addrs);
+    DS4_EXACT_ROWS_RETAIN(scope->up_addrs);
+    DS4_EXACT_ROWS_RETAIN(scope->down_addrs);
+    DS4_EXACT_ROWS_RETAIN(scope->overflow_gate);
+    DS4_EXACT_ROWS_RETAIN(scope->overflow_up);
+    DS4_EXACT_ROWS_RETAIN(scope->overflow_down);
+    for (uint32_t i = 0; i < scope->n_resources; i++) {
+        DS4_EXACT_ROWS_RETAIN(scope->resource_gate[i]);
+        DS4_EXACT_ROWS_RETAIN(scope->resource_up[i]);
+        DS4_EXACT_ROWS_RETAIN(scope->resource_down[i]);
+    }
+#undef DS4_EXACT_ROWS_RETAIN
+    NSArray<id<MTLBuffer>> *retained_resources = [resources copy];
+
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        (void)completed;
+        /* Referencing the array is intentional: the block owns the last
+         * scope-independent strong refs until Metal invokes it. */
+        (void)[retained_resources count];
+    }];
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    ds4_gpu_stream_expert_cache_note_batch_committed();
+    return 1;
+}
+
 void ds4_gpu_stream_expert_exact_rows_release(void) {
     /* release() is also the fail-clean exit for a collection that did not
      * reach prepare().  Neither ordinary selected state is allowed to escape
@@ -21269,6 +21371,15 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_f16_quad_compressor_store_auto_available(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
+           g_metal_device_name[7] >= '1' &&
+           g_metal_device_name[7] <= '5' &&
+           (g_metal_device_name[8] == '\0' ||
+            g_metal_device_name[8] == ' ');
 }
 
 /* Quad variant of the paired compressor projection: the attention compressor

@@ -286,6 +286,12 @@ int ds4_gpu_stream_expert_exact_rows_prepare(
         uint32_t                           n_rows,
         uint32_t                           n_selected);
 int ds4_gpu_stream_expert_exact_rows_set_row(uint32_t row);
+/* Commit the completed routed-tail command buffer without waiting.  The
+ * backend retains every private address/overflow/cache buffer owned by the
+ * exact-row scope until that command buffer completes, so release() may be
+ * called immediately after a successful return.  This is an experimental
+ * boundary used only when the caller explicitly enables asynchronous tails. */
+int ds4_gpu_stream_expert_exact_rows_end_async(void);
 void ds4_gpu_stream_expert_exact_rows_release(void);
 #endif
 void ds4_gpu_print_memory_report(const char *label);
@@ -947,6 +953,11 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         uint32_t                ratio,
         uint32_t                pos);
 
+/* Optional Metal ratio-4 decode fusion.  Returns 1 when both paired
+ * compressor projections and their recurrent-state stores were encoded in a
+ * single dispatch, 0 when the caller should keep the established separate
+ * paths, and -1 on an attempted-path error. */
+int ds4_gpu_f16_quad_compressor_store_auto_available(void);
 int ds4_gpu_matmul_f16_quad_compressor_store_tensor(
         ds4_gpu_tensor       *out0_kv,
         ds4_gpu_tensor       *out0_score,
@@ -2818,6 +2829,32 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         uint32_t              n,
         uint32_t              out_dim,
         float                 eps);
+
+#ifdef __APPLE__
+/* Exact one-row continuation of HC RMSNorm+mix: split/Sinkhorn, HC collapse,
+ * and the following weighted RMSNorm are encoded in the producer dispatch. */
+int ds4_gpu_hc_rms_norm_mix_split_norm_f16_available(void);
+int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n,
+        uint32_t              mix_dim,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps);
+#endif
 
 /* Batched HC RMSNorm followed by its narrow F16 mixer projection. On the
  * tuned Metal path, scale_scratch stores one float per row instead of the

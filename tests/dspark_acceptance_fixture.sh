@@ -28,10 +28,14 @@ SSD_STREAMING=${DS4_DSPARK_FIXTURE_SSD_STREAMING:-0}
 SSD_CACHE_EXPERTS=${DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS:-}
 REQUIRE_ACTIVE=${DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE:-1}
 REQUIRE_EXACT2=${DS4_DSPARK_FIXTURE_REQUIRE_EXACT2:-0}
+REQUIRE_CUDA_EXACTN=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN:-0}
 total_proposed=0
 total_accepted_draft=0
 total_exact2_attempt=0
 total_exact2_fallback=0
+total_cuda_exactn_attempt=0
+total_cuda_exactn_fallback=0
+total_cuda_exactn_error_fallback=0
 
 stats_field() {
     printf '%s\n' "$1" | awk -v key="$2" '
@@ -70,6 +74,13 @@ case "$REQUIRE_EXACT2" in
 0|1) ;;
 *)
     echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_EXACT2 must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$REQUIRE_CUDA_EXACTN" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN must be 0 or 1" >&2
     exit 1
     ;;
 esac
@@ -148,6 +159,13 @@ print_metadata() {
     confidence=${CONFIDENCE:-default}
     exact2_cuda=${DS4_CUDA_DSPARK_EXACT2:-unset}
     exact2_metal=${DS4_METAL_DSPARK_EXACT2:-unset}
+    exactn_cuda=${DS4_CUDA_DSPARK_EXACTN:-unset}
+    exactn_cuda_disable=${DS4_CUDA_DISABLE_DSPARK_EXACTN:-unset}
+    exactn_union_metal=${DS4_METAL_DSPARK_EXACTN_UNION:-unset}
+    noncausal_online_cuda=${DS4_CUDA_ENABLE_DSPARK_NONCAUSAL_ONLINE:-unset}
+    noncausal_online_cuda_disable=${DS4_CUDA_DISABLE_DSPARK_NONCAUSAL_ONLINE:-unset}
+    verify_noncausal=${DS4_DSPARK_VERIFY_NONCAUSAL:-unset}
+    exact_rows_async_tails_metal=${DS4_METAL_DSPARK_EXACT_ROWS_ASYNC_TAILS:-unset}
     proposer_cap_cuda=${DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX:-unset}
     proposer_cap_metal=${DS4_METAL_DSPARK_PROPOSER_BLOCK_MAX:-unset}
     verifier_cap=${DS4_DSPARK_SSD_VERIFY_BLOCK_MAX:-unset}
@@ -174,6 +192,11 @@ print_metadata() {
     printf '# exact2_cuda=%s exact2_metal=%s proposer_block_max_cuda=%s proposer_block_max_metal=%s verifier_block_max=%s require_exact2=%s\n' \
         "$exact2_cuda" "$exact2_metal" "$proposer_cap_cuda" \
         "$proposer_cap_metal" "$verifier_cap" "$REQUIRE_EXACT2"
+    printf '# exactn_cuda=%s exactn_cuda_disable=%s require_cuda_exactn=%s exactn_union_metal=%s noncausal_online_cuda=%s noncausal_online_cuda_disable=%s verify_noncausal=%s exact_rows_async_tails_metal=%s\n' \
+        "$exactn_cuda" "$exactn_cuda_disable" "$REQUIRE_CUDA_EXACTN" \
+        "$exactn_union_metal" "$noncausal_online_cuda" \
+        "$noncausal_online_cuda_disable" "$verify_noncausal" \
+        "$exact_rows_async_tails_metal"
 }
 
 if [ ! -x "$DS4_BIN" ]; then
@@ -271,6 +294,9 @@ run_case() {
     direct_partial=$(stats_field "$stats" direct_partial)
     exact2_attempt=$(stats_field "$stats" exact2_attempt)
     exact2_fallback=$(stats_field "$stats" exact2_fallback)
+    cuda_exactn_attempt=$(stats_field "$stats" cuda_exactn_attempt)
+    cuda_exactn_fallback=$(stats_field "$stats" cuda_exactn_fallback)
+    cuda_exactn_error_fallback=$(stats_field "$stats" cuda_exactn_error_fallback)
     partial=${partial:-0}
     errors=${errors:-0}
     verifier_unavailable=${verifier_unavailable:-0}
@@ -280,6 +306,9 @@ run_case() {
     direct_partial=${direct_partial:-0}
     exact2_attempt=${exact2_attempt:-0}
     exact2_fallback=${exact2_fallback:-0}
+    cuda_exactn_attempt=${cuda_exactn_attempt:-0}
+    cuda_exactn_fallback=${cuda_exactn_fallback:-0}
+    cuda_exactn_error_fallback=${cuda_exactn_error_fallback:-0}
     if [ "$errors" -ne 0 ]; then
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
         return 1
@@ -292,8 +321,16 @@ run_case() {
     total_accepted_draft=$((total_accepted_draft + accepted_draft))
     total_exact2_attempt=$((total_exact2_attempt + exact2_attempt))
     total_exact2_fallback=$((total_exact2_fallback + exact2_fallback))
+    total_cuda_exactn_attempt=$((total_cuda_exactn_attempt + cuda_exactn_attempt))
+    total_cuda_exactn_fallback=$((total_cuda_exactn_fallback + cuda_exactn_fallback))
+    total_cuda_exactn_error_fallback=$((total_cuda_exactn_error_fallback + cuda_exactn_error_fallback))
     if [ "$REQUIRE_EXACT2" != 0 ] && [ "$exact2_fallback" -ne 0 ]; then
         echo "dspark-fixture: exact2 fallback for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$REQUIRE_CUDA_EXACTN" != 0 ] &&
+       [ "$cuda_exactn_error_fallback" -ne 0 ]; then
+        echo "dspark-fixture: CUDA exact-N error fallback for $id: $stats" >&2
         return 1
     fi
     if [ "$PROPOSAL_QUALITY_GUARD_ACTIVE" -ne 0 ] && [ "$id" = c_add ] &&
@@ -344,5 +381,20 @@ if [ "$REQUIRE_EXACT2" != 0 ] && [ "$total_exact2_attempt" -eq 0 ]; then
 fi
 if [ "$REQUIRE_EXACT2" != 0 ] && [ "$total_exact2_fallback" -ne 0 ]; then
     echo "dspark-fixture: exact2 fallback count=$total_exact2_fallback" >&2
+    exit 1
+fi
+if [ "$REQUIRE_CUDA_EXACTN" != 0 ]; then
+    printf '# cuda_exactn_attempt=%s cuda_exactn_fallback=%s cuda_exactn_error_fallback=%s\n' \
+        "$total_cuda_exactn_attempt" "$total_cuda_exactn_fallback" \
+        "$total_cuda_exactn_error_fallback"
+fi
+if [ "$REQUIRE_CUDA_EXACTN" != 0 ] &&
+   [ "$total_cuda_exactn_attempt" -eq 0 ]; then
+    echo "dspark-fixture: CUDA exact-N was required but never attempted" >&2
+    exit 1
+fi
+if [ "$REQUIRE_CUDA_EXACTN" != 0 ] &&
+   [ "$total_cuda_exactn_error_fallback" -ne 0 ]; then
+    echo "dspark-fixture: CUDA exact-N error fallback count=$total_cuda_exactn_error_fallback" >&2
     exit 1
 fi
