@@ -3744,6 +3744,216 @@ kernel void kernel_mul_mv_q4_K_dense_pair_f32(
     }
 }
 
+// Decode Q4_K Q-A/KV pair plus the attention/indexer F16 compressor pairs.
+// The Q4_K range calls the same per-row implementation as the standalone
+// dense-pair kernel.  With NSG=8 each simdgroup still owns an independent
+// two-row cohort, so changing the number of cohorts in a threadgroup does not
+// change the K walk or the simd reduction for any output row.  The shifted
+// compressor ranges are the standalone F16 pair/store body verbatim.  The
+// fused dispatch therefore removes encoder/dispatch transitions while
+// preserving the bits produced by all three original kernels.
+kernel void kernel_dsv4_q4_K_qkv_pair_quad_compressor_store(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        constant ds4_metal_args_mul_mv & cargs,
+        constant ds4_metal_args_compressor_pair_store & store0,
+        constant ds4_metal_args_compressor_pair_store & store1,
+        constant uint & pair_tgs,
+        device const char * qw0,
+        device const char * qw1,
+        device const char * cw0a,
+        device const char * cw0b,
+        device const char * cw1a,
+        device const char * cw1b,
+        device const char * src1,
+        device       char * dst0,
+        device       char * dst1,
+        device       char * cdst_a0,
+        device       char * cdst_b0,
+        device       char * cdst_a1,
+        device       char * cdst_b1,
+        device const char * ape0,
+        device const char * ape1,
+        device       float * state0_kv,
+        device       float * state0_score,
+        device       float * state1_kv,
+        device       float * state1_score,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        ushort tiitg  [[thread_index_in_threadgroup]],
+        ushort tiisg  [[thread_index_in_simdgroup]],
+        ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
+    if (tgpig.x < pair_tgs) {
+        const int first_row =
+            (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+        if (first_row < args0.ne0) {
+            kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+                args0, qw0, src1, dst0, shmem, tgpig, tiisg, sgitg);
+        }
+        if (first_row < args1.ne0) {
+            kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+                args1, qw1, src1, dst1, shmem, tgpig, tiisg, sgitg);
+        }
+        return;
+    }
+
+    constexpr short NR0 = 2;
+    const uint lx = tgpig.x - pair_tgs;
+    const uint tgs0 = ((uint)store0.width + NR0 - 1u) / NR0;
+    const uint tgs1 = ((uint)store1.width + NR0 - 1u) / NR0;
+    if (lx >= tgs0 + tgs1) return;
+    const bool second = lx >= tgs0;
+
+    uint3 local_tgpig = tgpig;
+    local_tgpig.x = second ? lx - tgs0 : lx;
+
+    ds4_metal_args_mul_mv largs = cargs;
+    largs.nr0 = NR0;
+    largs.ne01 = second ? (int32_t)store1.width : (int32_t)store0.width;
+
+    if (!second) {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+            largs, cw0a, cw0b, src1, cdst_a0, cdst_b0,
+            shmem, local_tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+            largs, cw1a, cw1b, src1, cdst_a1, cdst_b1,
+            shmem, local_tgpig, tiisg, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    constant ds4_metal_args_compressor_pair_store & store =
+        second ? store1 : store0;
+    if (tiitg >= NR0 || store.width == 0u || store.ratio == 0u) {
+        return;
+    }
+    const uint col = local_tgpig.x * (uint)NR0 + tiitg;
+    if (col >= store.width) return;
+
+    const uint pos_mod = store.pos % store.ratio;
+    const uint dst_row = store.ratio == 4u ? store.ratio + pos_mod : pos_mod;
+    const uint dst = dst_row * store.width + col;
+    const uint ape_i = pos_mod * store.width + col;
+
+    device volatile const float * projected_kv = second
+        ? (device volatile const float *)cdst_a1
+        : (device volatile const float *)cdst_a0;
+    device volatile const float * projected_score = second
+        ? (device volatile const float *)cdst_b1
+        : (device volatile const float *)cdst_b0;
+    device const char * ape = second ? ape1 : ape0;
+    device float * state_kv = second ? state1_kv : state0_kv;
+    device float * state_score = second ? state1_score : state0_score;
+
+    float ape_v;
+    if (store.ape_type == 1u) {
+        ape_v = (float)(((device const half *)ape)[ape_i]);
+    } else {
+        ape_v = ((device const float *)ape)[ape_i];
+    }
+
+    state_kv[dst] = projected_kv[col];
+    state_score[dst] = projected_score[col] + ape_v;
+}
+
+// ABI-compatible subset of ds4_metal_args_dsv4_hc_expand.  The Q4_K kernel
+// lives in this source file beside the classic Q4 implementation, while the
+// generic HC kernels are concatenated later from dsv4_hc.metal.
+struct ds4_metal_args_q4_hc_expand {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    uint64_t nb_block0;
+    uint64_t nb_block1;
+    uint64_t nb_add0;
+    uint64_t nb_add1;
+    uint64_t nb_res0;
+    uint64_t nb_res1;
+    uint64_t nb_res2;
+    uint64_t nb_post0;
+    uint64_t nb_post1;
+    uint64_t nb_comb0;
+    uint64_t nb_comb1;
+    uint64_t nb_comb2;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    int32_t  has_add;
+};
+
+// Decode attention-output tail for AProjQ4:
+//
+//     block_out = input @ Wob(Q4_K)
+//     out_hc    = HCPost(block_out, residual_hc, split)
+//
+// The matvec is the exact standalone classic Q4_K implementation.  Once its
+// stored F32 row is visible to the threadgroup, the owning simdgroup expands
+// the same value into the four HC streams.  Materializing block_out preserves
+// diagnostics and makes an A/B memcmp possible.
+kernel void kernel_dsv4_q4_K_hc_expand4(
+        constant ds4_metal_args_mul_mv & mv,
+        constant ds4_metal_args_q4_hc_expand & hc,
+        device const char * weight,
+        device const char * input,
+        device       char * block_out,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    if (hc.n_hc != 4 || hc.n_tokens != 1 || hc.has_add != 0 ||
+        mv.ne0 != hc.n_embd || (mv.ne0 & 1) != 0 ||
+        hc.nb_block0 != sizeof(float)) {
+        return;
+    }
+
+    const int first_row =
+        (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+    if (first_row < mv.ne0) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            mv, weight, input, block_out, shmem,
+            tgpig, tiisg, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tiisg != 0) return;
+    FOR_UNROLL(short row = 0; row < N_R0_Q4_K; ++row) {
+        const int d = first_row + row;
+        if (d >= mv.ne0) continue;
+
+        const float block_v = *((device const float *)(
+            block_out + (uint64_t)d * hc.nb_block0));
+        const float r0 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+        const float r1 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+        const float r2 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+        const float r3 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+        FOR_UNROLL(short dst_hc = 0; dst_hc < 4; ++dst_hc) {
+            float acc = block_v * *((device const float *)(
+                post + (uint64_t)dst_hc * hc.nb_post0));
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+            *((device float *)(dst + (uint64_t)d * hc.nb0 +
+                                (uint64_t)dst_hc * hc.nb1)) = acc;
+        }
+    }
+}
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //

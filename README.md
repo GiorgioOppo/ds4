@@ -264,12 +264,97 @@ When DSpark+SSD runs on a Mac with at most 24 GiB and neither
 automatically. Set `DS4_DSPARK_LOW_MEMORY_PREFILL_CHUNK=0` to retain the normal
 workspace policy, or set it to another row count.
 
-The Metal SSD verifier automatically limits a speculative block to the number
-of complete top-k rows that fit in the effective target expert cache (two rows
-with 12 effective slots and top-6 routing). Override this diagnostic policy
-with `DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=N`. Exact file views for the two token
-embedding rows and repeatedly used Q8 support tensors are automatic; the
-compatibility kill switches are
+The Metal SSD verifier already supports the checkpoint's full five-draft
+speculative block. With top-6 routing it needs at least 30 effective target
+expert-cache slots; `--ssd-streaming-cache-experts 32` is the practical
+five-draft setting. Smaller caches automatically limit the verifier to the
+number of complete top-k rows that fit (a 16-expert cache normally selects two
+rows). The Metal proposer follows that effective verifier/cache cap, avoiding
+work on a suffix that cannot be consumed. Set
+`DS4_METAL_DSPARK_PROPOSER_BLOCK_MAX=0` to restore the checkpoint's native
+five-row proposer for an A/B control, or set a positive value to cap it
+explicitly. Override the verifier policy independently with
+`DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=N`.
+
+An experimental single-device Metal verifier can use the current target
+logits for the first draft and evaluate only the remaining `N-1` target rows.
+Enable it with `DS4_METAL_DSPARK_ACCEPTANCE_ONLY_VERIFY=1`; it remains opt-in
+because the smaller batch did not improve throughput on the measured M1 Pro
+SSD path. Two-draft blocks retain the legacy verifier
+because its one-row SSD routed-FFN path does not yet use the tiny-batch expert
+table. A five-draft block starting exactly on a ratio-4 compressor boundary
+also retains the legacy path so acceptance arithmetic does not switch to the
+aligned compressor kernel. After verification rolls back,
+the exact replay also skips the output head and logits readback for accepted
+prefix tokens whose logits would be discarded; set
+`DS4_METAL_DSPARK_HEADLESS_REPLAY=0` to restore the legacy replay. With
+`DS4_DSPARK_STATS=1`, `metal_accept_only`, `metal_verify_rows_saved`, and
+`metal_replay_headless` show how often these paths were exercised.
+
+On very small unified-memory Macs, an additional diagnostic can keep only the
+stage-0 `main_norm` and `main_proj` support tensors resident. Set
+`DS4_METAL_DSPARK_PIN_MAIN_PROJ=1`; the 0731 support file locks about 51 MiB,
+not the full 5.6 GiB GGUF. A failed lock is non-fatal and leaves the existing
+pageable path active. Keep this opt-in until a same-machine A/B shows lower
+`prop_setup`/generation time without reducing target-only throughput.
+
+An experimental two-draft Metal SSD verifier can commit a full accept without
+the normal rollback/replay pass:
+
+```sh
+DS4_METAL_DSPARK_EXACT2=1 DS4_DSPARK_STATS=1 \
+./ds4 -m ds4flash.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --dspark --metal --ssd-streaming \
+  --ssd-streaming-cache-experts 16 --ctx 4096 --prefill-chunk 128 \
+  --temp 0
+```
+
+It uses the canonical one-row decode kernels in layer order, restores and
+replays token zero on a partial accept, and defaults both proposal and verify
+width to two. Keep it opt-in until a long same-machine run is byte-identical,
+has `exact2_attempt>0` and `exact2_fallback=0`, and improves throughput. The
+generic Metal verifier can already evaluate five drafts together with a
+32-expert cache, but its batch state is not numerically interchangeable with
+ordinary decode and therefore still requires rollback plus exact replay.
+
+`DS4_METAL_DSPARK_EXACTN_UNION=1` enables a separate experimental Metal SSD
+verifier for two through five draft tokens. It executes canonical one-row
+target decode in layer order, loads the union of the rows' routed experts once
+per layer, and commits directly only after a full accept; partial accepts keep
+the established rollback/replay fallback. The model-backed
+`test-metal-exactn-oracle` is byte-identical to sequential decode for N=2..5,
+including every N=5 partial prefix, EOS in the first or a middle row, serialized
+KV/compressor state, logits, and a four-token continuation. Five drafts plus
+the target token already available at the start of the cycle cover the
+six-token speculative-cycle limit. Exact-union remains opt-in: correctness
+does not imply a throughput improvement on a particular memory configuration.
+
+The AProjQ4 Metal decode path has three exact dispatch fusions relevant to this
+verifier:
+
+- HC RMSNorm plus the narrow F16 HC mixer is the M1-M4 default, including SSD
+  split phases such as `TO_ROUTER`. Use
+  `DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE=1` for the reference control;
+  `DS4_METAL_ENABLE_HC_NORM_MIX_FUSE=1` is the explicit non-default gate on
+  other Apple generations.
+- The Q4 Q-A/KV projections can share a dispatch with eligible F16 compressor
+  projection/store work. It remains opt-in in both exact-union and ordinary
+  `FULL` decode via `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1`; the first M1
+  Pro SSD A/B reduced dispatch count but did not improve verifier time. In
+  either scope,
+  `DS4_METAL_DISABLE_Q4_QKV_COMPRESSOR_FUSE=1` selects the existing fallback.
+- The eligible Q4 attention-output B projection can perform the following HC
+  expansion in the same dispatch. Use
+  `DS4_METAL_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` as its isolated A/B control.
+
+These gates change dispatch and intermediate-memory traffic, not model
+arithmetic. Compare byte-identical output, exact-union counters, stage timings,
+and generation rate on the same machine; do not infer a speedup from a lower
+dispatch count alone.
+
+Exact file views for the two token embedding rows and repeatedly used Q8
+support tensors are automatic; the compatibility kill switches are
 `DS4_METAL_DISABLE_TOKEN_EMBED_EXACT_VIEW=1` and
 `DS4_METAL_DISABLE_SUPPORT_Q8_DECODE_EXACT_VIEWS=1`.
 
@@ -301,8 +386,26 @@ measurements are
 CUDA fuses HC split, weighted sum, and RMSNorm across multiple batch rows,
 including the DSpark proposer and verifier; use
 `DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED=1` for an A/B fallback to the separate
-kernels. An experimental resident-CUDA path can run the existing aligned
-IQ2_XXS/Q2_K vector MoE kernels for two-to-five-token routed batches,
+kernels. AProjQ4 CUDA decode can also share the activation quantization for
+the Q-A/KV dense pair; `DS4_CUDA_DISABLE_Q4_DENSE_PAIR=1` selects the two
+standalone projections. The canonical Q4 path submits to the decode stream so
+these projections and the attention-output tail can participate in CUDA
+decode graphs.
+
+Two additional CUDA fusions remain experimental until a device oracle passes
+on the target GPU. `DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE=1` combines HC RMSNorm
+with the narrow F16 mixer when the selected standalone kernels have the same
+reduction order; with the normal one-token cuBLAS path, also set
+`DS4_CUDA_NO_F16_CUBLAS_ONE=1` to exercise it. The controls are
+`DS4_CUDA_DISABLE_HC_NORM_MIX_FUSE=1` and
+`DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1`. The Q4 attention-output B plus HC
+expansion is automatic only when MMQ is disabled, where it preserves the
+existing Q8_K activation quantizer. With the normal MMVQ/Q8_1 decode path it
+requires the explicit `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1` experiment and
+may not be numerically identical until validated on CUDA hardware.
+
+An experimental resident-CUDA path can run the existing aligned
+IQ2_XXS/Q2_K vector MoE kernels for two-to-five-draft routed batches,
 preserving the established fused-SoA path as an automatic fallback:
 
 ```sh
@@ -318,7 +421,9 @@ decode-consistency, and throughput comparisons pass on CUDA hardware.
 An experimental exact two-token resident-CUDA verifier is available for a
 DGX Spark A/B test. It uses the ordinary decode kernels, commits a two-token
 full accept without rollback/replay, and replays only the first token on a
-partial accept. The switch also caps verification to the first two drafts:
+partial accept. By default the switch runs both the proposer and verifier at
+width two, instead of evaluating the checkpoint's native five-row proposal
+when only two drafts can be consumed:
 
 ```sh
 DS4_CUDA_DSPARK_EXACT2=1 DS4_DSPARK_STATS=1 \
@@ -327,8 +432,18 @@ DS4_CUDA_DSPARK_EXACT2=1 DS4_DSPARK_STATS=1 \
   --dspark --temp 0 -p 'Write a Python quicksort function with comments.'
 ```
 
+The support model uses non-causal attention across the proposal block, so a
+two-row proposal is not guaranteed to be a prefix-identical version of its
+native five-row proposal. The target verifier still protects the emitted
+greedy continuation. For isolated A/B tests,
+`DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=0` preserves the native proposer and an
+explicit value such as `2` caps it independently of exact-2.
+
 Keep this path opt-in until the CUDA acceptance fixture is byte-identical and
-the same-machine statistics show lower `verify` plus `replay` time.
+the same-machine statistics show lower `propose`, `verify` plus `replay` time.
+The stats line reports `prop_capped`, `prop_scheduled_rows`, `exact2_attempt`,
+`exact2_full`, `exact2_partial`, and `exact2_fallback`; a valid run must
+exercise exact-2 and leave its fallback counter at zero.
 
 The acceptance fixture can exercise the same SSD path on both the target-only
 baseline and the DSpark run. It also requires real proposals and accepted
@@ -350,7 +465,7 @@ invariant test.
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
 The default confidence threshold is `0.7`; it prunes suffixes that are unlikely
 to repay their verification cost. `--dspark-confidence 0` forces fixed
-five-token blocks and is intended for diagnostics. Sampled decoding does not
+five-draft blocks and is intended for diagnostics. Sampled decoding does not
 use DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
 decoding, which is useful for comparisons and correctness checks.
 

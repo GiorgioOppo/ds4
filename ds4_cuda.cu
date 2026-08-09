@@ -4771,6 +4771,99 @@ __global__ static void matmul_f16_small_out_hx_ordered_chunks_kernel(
     }
 }
 
+/* One-row DS4 HC prelude: unweighted RMSNorm (16384 floats) followed by the
+ * narrow 24-row F16 mixer.  Every block recreates the 256-thread reduction of
+ * rms_norm_plain_batch8_kernel, then two warps reproduce the contiguous
+ * 32-chunk accumulation and lane-ordered final sum used by the established
+ * one-token F16 matvec.  Recomputing the tiny norm in twelve blocks keeps all
+ * mixer rows parallel while avoiding the normalized 64 KiB device round trip
+ * and one launch. */
+__global__ static void hc_rms_norm_mix_f16_kernel(
+        float *out,
+        const float *x,
+        const __half *w,
+        float eps,
+        int round_x_to_f16) {
+    constexpr uint32_t N = 16384u;
+    constexpr uint32_t OUT_DIM = 24u;
+    constexpr uint32_t NORM_THREADS = 256u;
+    constexpr uint32_t ROWS_PER_BLOCK = 2u;
+    constexpr uint32_t MATVEC_THREADS = 32u;
+    constexpr uint32_t MATVEC_CHUNK = N / MATVEC_THREADS;
+
+    const uint32_t tid = threadIdx.x;
+    float norm_sum = 0.0f;
+    if (tid < NORM_THREADS) {
+#pragma unroll 1
+        for (uint32_t i = tid; i < N; i += 2048u) {
+            const float v0 = x[i];
+            const float v1 = x[i + 256u];
+            const float v2 = x[i + 512u];
+            const float v3 = x[i + 768u];
+            const float v4 = x[i + 1024u];
+            const float v5 = x[i + 1280u];
+            const float v6 = x[i + 1536u];
+            const float v7 = x[i + 1792u];
+            norm_sum += v0 * v0;
+            norm_sum += v1 * v1;
+            norm_sum += v2 * v2;
+            norm_sum += v3 * v3;
+            norm_sum += v4 * v4;
+            norm_sum += v5 * v5;
+            norm_sum += v6 * v6;
+            norm_sum += v7 * v7;
+        }
+    }
+
+    __shared__ float norm_partial[NORM_THREADS];
+    __shared__ float mv_partial[ROWS_PER_BLOCK * MATVEC_THREADS];
+    if (tid < NORM_THREADS) norm_partial[tid] = norm_sum;
+    __syncthreads();
+    for (uint32_t stride = NORM_THREADS >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            norm_partial[tid] += norm_partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(norm_partial[0] / (float)N + eps);
+
+    if (tid < ROWS_PER_BLOCK * MATVEC_THREADS) {
+        const uint32_t local_row = tid / MATVEC_THREADS;
+        const uint32_t lane = tid % MATVEC_THREADS;
+        const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + local_row;
+        float sum = 0.0f;
+        if (row < OUT_DIM) {
+            const uint32_t k0 = lane * MATVEC_CHUNK;
+            const uint32_t k1 = k0 + MATVEC_CHUNK;
+            const __half *wr = w + (uint64_t)row * N;
+#pragma unroll 1
+            for (uint32_t i = k0; i < k1; i++) {
+                float xv = x[i] * scale;
+                if (round_x_to_f16) {
+                    xv = __half2float(__float2half(xv));
+                }
+                sum += __half2float(wr[i]) * xv;
+            }
+        }
+        mv_partial[local_row * MATVEC_THREADS + lane] = sum;
+    }
+    __syncthreads();
+
+    if (tid < ROWS_PER_BLOCK * MATVEC_THREADS &&
+        (tid % MATVEC_THREADS) == 0u) {
+        const uint32_t local_row = tid / MATVEC_THREADS;
+        const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + local_row;
+        if (row < OUT_DIM) {
+            float total = 0.0f;
+#pragma unroll 1
+            for (uint32_t lane = 0; lane < MATVEC_THREADS; lane++) {
+                total += mv_partial[local_row * MATVEC_THREADS + lane];
+            }
+            out[row] = total;
+        }
+    }
+}
+
 __global__ static void matmul_f16_small_out_batch_kernel(
         float *out,
         const __half *w,
@@ -15308,16 +15401,24 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
 
+static int cuda_matmul_q4_K_pair_tensor_impl(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset,
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok);
+
 extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
         const void *model_map, uint64_t model_size,
         uint64_t weight0_offset, uint64_t weight1_offset,
         uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
-    (void)out0; (void)out1; (void)model_map; (void)model_size;
-    (void)weight0_offset; (void)weight1_offset; (void)in_dim;
-    (void)out0_dim; (void)out1_dim; (void)x; (void)n_tok;
-    return 0;
+    if (getenv("DS4_CUDA_DISABLE_Q4_DENSE_PAIR") != NULL) return 0;
+    return cuda_matmul_q4_K_pair_tensor_impl(
+        out0, out1, model_map, model_size,
+        weight0_offset, weight1_offset,
+        in_dim, out0_dim, out1_dim, x, n_tok);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
@@ -15642,6 +15743,78 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     matmul_f16_kernel<<<grid, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+}
+
+/* Return the activation mode that exactly matches the currently selected
+ * standalone one-token path: 1 keeps normalized activations in F32, 2 rounds
+ * them through F16.  cuBLAS and alternate reduction modes deliberately reject
+ * the fusion, so the graph caller retains its established fallback. */
+static int cuda_hc_rms_norm_mix_f16_mode(void) {
+    const char *enable = getenv("DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE");
+    if (!enable || !enable[0] ||
+        (enable[0] == '0' && enable[1] == '\0') ||
+        getenv("DS4_CUDA_DISABLE_HC_NORM_MIX_FUSE") != NULL ||
+        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        return 0;
+    }
+
+    const int small_out_one_token =
+        !g_quality_mode &&
+        getenv("DS4_CUDA_F16_SMALL_OUT") != NULL &&
+        getenv("DS4_CUDA_NO_F16_SMALL_OUT") == NULL;
+    if (small_out_one_token) return 2;
+
+    const int cublas_one_token =
+        g_cublas_ready &&
+        getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") == NULL &&
+        (!g_quality_mode || getenv("DS4_CUDA_F16_CUBLAS_ONE") != NULL);
+    if (cublas_one_token) return 0;
+    return 1;
+}
+
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_available(void) {
+    return cuda_hc_rms_norm_mix_f16_mode() != 0;
+}
+
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint32_t n,
+        uint32_t out_dim,
+        float eps) {
+    const int mode = cuda_hc_rms_norm_mix_f16_mode();
+    if (mode == 0 || !out || !x || !model_map ||
+        n != 16384u || out_dim != 24u ||
+        weight_offset > model_size) {
+        return 0;
+    }
+
+    const uint64_t weight_bytes =
+        (uint64_t)n * out_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < (uint64_t)n * sizeof(float) ||
+        out->bytes < (uint64_t)out_dim * sizeof(float) ||
+        ds4_tensor_device_idx(x) != ds4_tensor_device_idx(out)) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "hc rms-norm/f16-mix");
+    if (!wptr) return 0;
+
+    hc_rms_norm_mix_f16_kernel<<<12u, 256u, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr,
+        (const float *)x->ptr,
+        (const __half *)wptr,
+        eps,
+        mode == 2 ? 1 : 0);
+    return cuda_ok(cudaGetLastError(), "hc rms-norm/f16-mix launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
@@ -30157,6 +30330,105 @@ __global__ static void matmul_q4_K_dense_kernel(
     if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
 }
 
+/* Two independently-sized Q4_K projections over one canonical Q8_K row.
+ * Each accumulator keeps the same block walk and quarter-warp reduction as
+ * matmul_q4_K_dense_kernel; interleaving the weight loads does not alter either
+ * output's arithmetic order. */
+__global__ static void matmul_q4_K_dense_pair_kernel(
+        float *out0,
+        float *out1,
+        const char *w0_base,
+        const char *w1_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out0_dim,
+        uint32_t out1_dim,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t tok = blockIdx.y;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (tok >= n_tok || (row >= out0_dim && row >= out1_dim)) return;
+
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr0 = row < out0_dim
+        ? (const cuda_block_q4_K *)(w0_base + (uint64_t)row * row_bytes)
+        : NULL;
+    const cuda_block_q4_K *wr1 = row < out1_dim
+        ? (const cuda_block_q4_K *)(w1_base + (uint64_t)row * row_bytes)
+        : NULL;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        if (wr0) acc0 += dev_dot_q4_K_q8_K_block(wr0 + b, xqb + b);
+        if (wr1) acc1 += dev_dot_q4_K_q8_K_block(wr1 + b, xqb + b);
+    }
+    acc0 = quarter_warp_sum_f32(acc0, lane);
+    acc1 = quarter_warp_sum_f32(acc1, lane);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[(uint64_t)tok * out0_dim + row] = acc0;
+        if (row < out1_dim) out1[(uint64_t)tok * out1_dim + row] = acc1;
+    }
+}
+
+/* Decode attention-output tail for AProjQ4:
+ *
+ *     block_out = input @ Wob(Q4_K)
+ *     out_hc    = HCPost(block_out, residual_hc, split)
+ *
+ * Keep the Q4_K dot-product and quarter-warp reduction identical to
+ * matmul_q4_K_dense_kernel.  The row-owning lane then materializes the
+ * diagnostic block output and immediately expands the same F32 value into
+ * the four HC streams.  This removes the standalone hc_expand launch without
+ * changing the Q4 accumulation order used by the non-MMQ fallback. */
+__global__ static void matmul_q4_K_hc_expand4_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *residual_hc,
+        const float *split,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out_dim,
+        uint32_t n_embd) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (row >= out_dim) return;
+
+    const cuda_block_q4_K *wr =
+        (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    const bool vector_aligned = (((uintptr_t)w_base & 15u) == 0u);
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        if (vector_aligned) {
+            dev_dot_q4_K_q8_K_block_vec(wr + b, xq + b, &acc);
+        } else {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        }
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+
+    if (lane == 0u) {
+        block_out[row] = acc;
+
+        const float *post = split + 4u;
+        const float *comb = split + 8u;
+#pragma unroll
+        for (uint32_t dst_hc = 0; dst_hc < 4u; dst_hc++) {
+            float hc_acc = acc * post[dst_hc];
+#pragma unroll
+            for (uint32_t src_hc = 0; src_hc < 4u; src_hc++) {
+                hc_acc += comb[dst_hc + src_hc * 4u] *
+                          residual_hc[(uint64_t)src_hc * n_embd + row];
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + row] = hc_acc;
+        }
+    }
+}
+
 static int cuda_matmul_q4_K_tensor(
         ds4_gpu_tensor *out,
         const void     *model_map,
@@ -30197,10 +30469,12 @@ static int cuda_matmul_q4_K_tensor(
         const int rc = n_tok <= 8u
             ? ds4_mmq_q4_K_dense_vec(
                   wptr, (const float *)x->ptr, (float *)out->ptr,
-                  (int)out_dim, (int)n_tok, (int)in_dim, (cudaStream_t)0)
+                  (int)out_dim, (int)n_tok, (int)in_dim,
+                  cuda_decode_stream())
             : ds4_mmq_q4_K_dense(
                   wptr, (const float *)x->ptr, (float *)out->ptr,
-                  (int)out_dim, (int)n_tok, (int)in_dim, (cudaStream_t)0);
+                  (int)out_dim, (int)n_tok, (int)in_dim,
+                  cuda_decode_stream());
         if (rc == 0) return 1;
         fprintf(stderr,
                 "ds4: Q4_K MMQ returned %d "
@@ -30215,18 +30489,229 @@ static int cuda_matmul_q4_K_tensor(
     if (!tmp) return 0;
     cuda_block_q8_K *xq = (cuda_block_q8_K *)tmp;
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    q8_K_quantize_kernel<<<qgrid, 256>>>(xq, (const float *)x->ptr,
-                                         (uint32_t)in_dim, (uint32_t)n_tok);
+    q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+            xq, (const float *)x->ptr,
+            (uint32_t)in_dim, (uint32_t)n_tok);
     if (!cuda_ok(cudaGetLastError(), "q4_K dense quantize launch")) return 0;
     dim3 grid(((unsigned)out_dim + 31u) / 32u, (unsigned)n_tok, 1);
-    matmul_q4_K_dense_kernel<<<grid, 256>>>((float *)out->ptr,
-                                            wptr,
-                                            xq,
-                                            row_bytes,
-                                            (uint32_t)blocks,
-                                            (uint32_t)out_dim,
-                                            (uint32_t)n_tok);
+    matmul_q4_K_dense_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr,
+            wptr,
+            xq,
+            row_bytes,
+            (uint32_t)blocks,
+            (uint32_t)out_dim,
+            (uint32_t)n_tok);
     return cuda_ok(cudaGetLastError(), "q4_K dense matmul launch");
+}
+
+static int cuda_matmul_q4_K_pair_tensor_impl(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out0 || !out1 || !x || !model_map || n_tok == 0u || n_tok > 8u ||
+        in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
+        in_dim > INT_MAX || out0_dim == 0u || out1_dim == 0u ||
+        out0_dim > INT_MAX || out1_dim > INT_MAX) {
+        return 0;
+    }
+
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    if (blocks == 0u || blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out0_dim > UINT64_MAX / row_bytes ||
+        out1_dim > UINT64_MAX / row_bytes ||
+        weight0_offset > model_size || weight1_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight0_bytes = out0_dim * row_bytes;
+    const uint64_t weight1_bytes = out1_dim * row_bytes;
+    if (weight0_bytes > model_size - weight0_offset ||
+        weight1_bytes > model_size - weight1_offset ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out0_dim ||
+        n_tok * out0_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out1_dim ||
+        n_tok * out1_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+    const uint64_t out0_bytes = n_tok * out0_dim * sizeof(float);
+    const uint64_t out1_bytes = n_tok * out1_dim * sizeof(float);
+    if (x->bytes < x_bytes || out0->bytes < out0_bytes ||
+        out1->bytes < out1_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(out0);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(out1) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const char *w0 = cuda_resolve_weight_ptr(
+        model_map, weight0_offset, weight0_bytes, logical_tier,
+        "q4_K dense pair0");
+    const char *w1 = cuda_resolve_weight_ptr(
+        model_map, weight1_offset, weight1_bytes, logical_tier,
+        "q4_K dense pair1");
+    if (!w0 || !w1) return 0;
+
+    if (cuda_use_mmq()) {
+        const int rc = ds4_mmq_q4_K_dense_pair_vec(
+            w0, w1, (const float *)x->ptr,
+            (float *)out0->ptr, (float *)out1->ptr,
+            (int)out0_dim, (int)out1_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        if (rc == 0) return 1;
+        fprintf(stderr,
+                "ds4: Q4_K MMVQ pair returned %d "
+                "(in=%llu out0=%llu out1=%llu n_tok=%llu); falling back\n",
+                rc, (unsigned long long)in_dim,
+                (unsigned long long)out0_dim,
+                (unsigned long long)out1_dim,
+                (unsigned long long)n_tok);
+    }
+
+    if (n_tok > UINT64_MAX / blocks ||
+        n_tok * blocks > UINT64_MAX / sizeof(cuda_block_q8_K)) {
+        return 0;
+    }
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, n_tok * blocks * sizeof(cuda_block_q8_K),
+        "q4_K dense pair prequant");
+    if (!xq) return 0;
+
+    const dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1u);
+    q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+        xq, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
+    if (!cuda_ok(cudaGetLastError(), "q4_K dense pair quantize launch")) {
+        return 0;
+    }
+
+    const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    const dim3 grid(((unsigned)max_out + 31u) / 32u,
+                    (unsigned)n_tok, 1u);
+    matmul_q4_K_dense_pair_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+        (float *)out0->ptr,
+        (float *)out1->ptr,
+        w0,
+        w1,
+        xq,
+        row_bytes,
+        (uint32_t)blocks,
+        (uint32_t)out0_dim,
+        (uint32_t)out1_dim,
+        (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch");
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_hc_expand_available(void) {
+    if (getenv("DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE") != NULL) return 0;
+    /* The fused implementation is byte-compatible with the native Q8_K
+     * fallback.  Single-GPU decode normally selects the vendored MMVQ/Q8_1
+     * path instead, whose activation quantizer intentionally has different
+     * numerics.  Preserve that default until an on-device oracle validates a
+     * switch; multi-GPU/quality/DS4_CUDA_MMQ=0 configurations already use
+     * Q8_K and can enable the compound transparently. */
+    return getenv("DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE") != NULL ||
+           !cuda_use_mmq();
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc) {
+    if (!ds4_gpu_matmul_q4_K_hc_expand_available() ||
+        !out_hc || !block_out || !model_map || !x || !residual_hc || !split ||
+        in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
+        out_dim == 0u || out_dim != n_embd || (out_dim & 1u) != 0u ||
+        n_hc != 4u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    if (blocks == 0u || blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out_dim > UINT64_MAX / row_bytes || weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        out_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t x_bytes = in_dim * sizeof(float);
+    const uint64_t embd_bytes = out_dim * sizeof(float);
+    const uint64_t hc_bytes = 4u * embd_bytes;
+    const uint64_t split_bytes = 24u * sizeof(float);
+    if (x->bytes < x_bytes || block_out->bytes < embd_bytes ||
+        residual_hc->bytes < hc_bytes || split->bytes < split_bytes ||
+        out_hc->bytes < hc_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(out_hc);
+    if (ds4_tensor_device_idx(block_out) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier ||
+        ds4_tensor_device_idx(residual_hc) != logical_tier ||
+        ds4_tensor_device_idx(split) != logical_tier) {
+        return 0;
+    }
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "q4_K hc expand");
+    if (!wptr) return 0;
+
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, blocks * sizeof(cuda_block_q8_K),
+        "q4_K hc expand prequant");
+    if (!xq) return 0;
+
+    q8_K_quantize_kernel<<<(unsigned)blocks, 256, 0,
+                           cuda_decode_stream()>>>(
+        xq, (const float *)x->ptr, (uint32_t)in_dim, 1u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4_K hc expand quantize launch")) {
+        return 0;
+    }
+
+    matmul_q4_K_hc_expand4_kernel<<<((unsigned)out_dim + 31u) / 32u,
+                                      256, 0, cuda_decode_stream()>>>(
+        (float *)out_hc->ptr,
+        (float *)block_out->ptr,
+        (const float *)residual_hc->ptr,
+        (const float *)split->ptr,
+        wptr,
+        xq,
+        row_bytes,
+        (uint32_t)blocks,
+        (uint32_t)out_dim,
+        n_embd);
+    return cuda_ok(cudaGetLastError(), "q4_K hc expand launch");
 }
 
 __global__ static void matmul_q4_K_kslice_kernel(

@@ -13,9 +13,24 @@ BACKEND=${DS4_DSPARK_FIXTURE_BACKEND:-auto}
 SSD_STREAMING=${DS4_DSPARK_FIXTURE_SSD_STREAMING:-0}
 SSD_CACHE_EXPERTS=${DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS:-}
 REQUIRE_ACTIVE=${DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE:-1}
+REQUIRE_EXACT2=${DS4_DSPARK_FIXTURE_REQUIRE_EXACT2:-0}
 partial_cases=0
 total_proposed=0
 total_accepted_draft=0
+total_exact2_attempt=0
+total_exact2_fallback=0
+
+stats_field() {
+    printf '%s\n' "$1" | awk -v key="$2" '
+        { prefix = key "="
+          for (i = 1; i <= NF; i++) {
+              if (index($i, prefix) == 1) {
+                  print substr($i, length(prefix) + 1)
+                  exit
+              }
+          }
+        }'
+}
 
 case "$BACKEND" in
 auto|metal|cuda|rocm) ;;
@@ -35,6 +50,13 @@ case "$REQUIRE_ACTIVE" in
 0|1) ;;
 *)
     echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$REQUIRE_EXACT2" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_EXACT2 must be 0 or 1" >&2
     exit 1
     ;;
 esac
@@ -111,6 +133,11 @@ print_metadata() {
     hw_model=$(sysctl -n hw.model 2>/dev/null || true)
     hw_cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
     confidence=${CONFIDENCE:-default}
+    exact2_cuda=${DS4_CUDA_DSPARK_EXACT2:-unset}
+    exact2_metal=${DS4_METAL_DSPARK_EXACT2:-unset}
+    proposer_cap_cuda=${DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX:-unset}
+    proposer_cap_metal=${DS4_METAL_DSPARK_PROPOSER_BLOCK_MAX:-unset}
+    verifier_cap=${DS4_DSPARK_SSD_VERIFY_BLOCK_MAX:-unset}
 
     printf '# commit=%s\n' "$(git_commit_label)"
     printf '# hardware_os=%s hardware_model=%s hardware_cpu=%s\n' \
@@ -122,6 +149,9 @@ print_metadata() {
         "$TOKENS" "$BACKEND" "$SSD_STREAMING" "${SSD_CACHE_EXPERTS:-auto}" \
         "$confidence" "$PROPOSAL_QUALITY_GUARD" \
         "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED"
+    printf '# exact2_cuda=%s exact2_metal=%s proposer_block_max_cuda=%s proposer_block_max_metal=%s verifier_block_max=%s require_exact2=%s\n' \
+        "$exact2_cuda" "$exact2_metal" "$proposer_cap_cuda" \
+        "$proposer_cap_metal" "$verifier_cap" "$REQUIRE_EXACT2"
 }
 
 if [ ! -x "$DS4_BIN" ]; then
@@ -201,16 +231,20 @@ run_case() {
         return 1
     fi
 
-    partial=$(printf '%s\n' "$stats" | sed -n 's/.*partial=\([0-9][0-9]*\).*/\1/p')
-    errors=$(printf '%s\n' "$stats" | sed -n 's/.*errors=\([0-9][0-9]*\).*/\1/p')
-    verifier_unavailable=$(printf '%s\n' "$stats" | sed -n 's/.*verifier_unavailable=\([0-9][0-9]*\).*/\1/p')
-    proposed=$(printf '%s\n' "$stats" | sed -n 's/.*proposed=\([0-9][0-9]*\).*/\1/p')
-    accepted_draft=$(printf '%s\n' "$stats" | sed -n 's/.*accepted_draft=\([0-9][0-9]*\).*/\1/p')
+    partial=$(stats_field "$stats" partial)
+    errors=$(stats_field "$stats" errors)
+    verifier_unavailable=$(stats_field "$stats" verifier_unavailable)
+    proposed=$(stats_field "$stats" proposed)
+    accepted_draft=$(stats_field "$stats" accepted_draft)
+    exact2_attempt=$(stats_field "$stats" exact2_attempt)
+    exact2_fallback=$(stats_field "$stats" exact2_fallback)
     partial=${partial:-0}
     errors=${errors:-0}
     verifier_unavailable=${verifier_unavailable:-0}
     proposed=${proposed:-0}
     accepted_draft=${accepted_draft:-0}
+    exact2_attempt=${exact2_attempt:-0}
+    exact2_fallback=${exact2_fallback:-0}
     if [ "$errors" -ne 0 ]; then
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
         return 1
@@ -221,6 +255,12 @@ run_case() {
     fi
     total_proposed=$((total_proposed + proposed))
     total_accepted_draft=$((total_accepted_draft + accepted_draft))
+    total_exact2_attempt=$((total_exact2_attempt + exact2_attempt))
+    total_exact2_fallback=$((total_exact2_fallback + exact2_fallback))
+    if [ "$REQUIRE_EXACT2" != 0 ] && [ "$exact2_fallback" -ne 0 ]; then
+        echo "dspark-fixture: exact2 fallback for $id: $stats" >&2
+        return 1
+    fi
     if [ "$PROPOSAL_QUALITY_GUARD_ACTIVE" -ne 0 ] && [ "$id" = c_add ] &&
         [ "$accepted_draft" -lt "$C_ADD_MIN_ACCEPTED" ]; then
         echo "dspark-fixture: c_add accepted_draft $accepted_draft below required $C_ADD_MIN_ACCEPTED: $stats" >&2
@@ -249,5 +289,13 @@ fi
 if [ "$REQUIRE_ACTIVE" != 0 ] &&
    { [ "$total_proposed" -eq 0 ] || [ "$total_accepted_draft" -eq 0 ]; }; then
     echo "dspark-fixture: DSpark runtime was not active (proposed=$total_proposed accepted_draft=$total_accepted_draft)" >&2
+    exit 1
+fi
+if [ "$REQUIRE_EXACT2" != 0 ] && [ "$total_exact2_attempt" -eq 0 ]; then
+    echo "dspark-fixture: exact2 was required but never attempted" >&2
+    exit 1
+fi
+if [ "$REQUIRE_EXACT2" != 0 ] && [ "$total_exact2_fallback" -ne 0 ]; then
+    echo "dspark-fixture: exact2 fallback count=$total_exact2_fallback" >&2
     exit 1
 fi

@@ -224,6 +224,23 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+/* Exact speculative decode may compute up to five independent router rows
+ * before executing their routed MoE tails.  begin_collect() first isolates
+ * this layer from ordinary decode's pending selected-expert load and global
+ * selected-id override.  prepare() then builds one immutable SSD address table
+ * for the union of those rows, and set_row() arms exactly one routed-MoE call
+ * at a time in increasing row order.  prepare() is a Metal command-stream
+ * boundary: it waits for the router rows to become CPU-visible and reopens the
+ * command batch.  release() is required on every success/error exit after
+ * begin_collect(), and before collecting the next layer. */
+int ds4_gpu_stream_expert_exact_rows_begin_collect(void);
+int ds4_gpu_stream_expert_exact_rows_prepare(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected_rows,
+        uint32_t                           n_rows,
+        uint32_t                           n_selected);
+int ds4_gpu_stream_expert_exact_rows_set_row(uint32_t row);
+void ds4_gpu_stream_expert_exact_rows_release(void);
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
@@ -630,6 +647,41 @@ int ds4_gpu_matmul_q4_K_pair_tensor(
         uint64_t              out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t              n_tok);
+
+/* Metal decode compound for AProjQ4: Q-A/KV Q4_K pair plus the attention
+ * and indexer F16 compressor pairs/state stores. Returns 1 when encoded,
+ * 0 to use the separate fallback, and -1 on an attempted-path error. */
+int ds4_gpu_q4_K_pair_quad_compressor_store_tensor(
+        ds4_gpu_tensor       *qr,
+        ds4_gpu_tensor       *kv_raw,
+        ds4_gpu_tensor       *out0_kv,
+        ds4_gpu_tensor       *out0_score,
+        ds4_gpu_tensor       *out1_kv,
+        ds4_gpu_tensor       *out1_score,
+        ds4_gpu_tensor       *state0_kv,
+        ds4_gpu_tensor       *state0_score,
+        ds4_gpu_tensor       *state1_kv,
+        ds4_gpu_tensor       *state1_score,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_a_offset,
+        uint64_t              kv_offset,
+        uint64_t              weight0_kv_offset,
+        uint64_t              weight0_score_offset,
+        uint64_t              weight1_kv_offset,
+        uint64_t              weight1_score_offset,
+        uint64_t              ape0_offset,
+        uint32_t              ape0_type,
+        uint64_t              ape1_offset,
+        uint32_t              ape1_type,
+        uint32_t              in_dim,
+        uint32_t              q_rank,
+        uint32_t              kv_dim,
+        uint32_t              width0,
+        uint32_t              width1,
+        const ds4_gpu_tensor *x,
+        uint32_t              ratio,
+        uint32_t              pos);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
@@ -2492,6 +2544,21 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   eps,
         float                   norm_eps);
 
+/* Exact one-row HC decode fusion: unweighted RMSNorm followed by the narrow
+ * F16 HC-mix projection. The Metal and CUDA implementations are specialized
+ * for the 16384 -> 24 DS4 Flash shape and preserve their standalone reduction
+ * trees. */
+int ds4_gpu_hc_rms_norm_mix_f16_available(void);
+int ds4_gpu_hc_rms_norm_mix_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        uint32_t              out_dim,
+        float                 eps);
+
 /* Batched HC RMSNorm followed by its narrow F16 mixer projection. On the
  * tuned Metal path, scale_scratch stores one float per row instead of the
  * full normalized HC tensor; other shapes retain the established fallback. */
@@ -2642,6 +2709,22 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Q4_K sibling of the decode attention-output/HC compound. */
+int ds4_gpu_matmul_q4_K_hc_expand_available(void);
+int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
 
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving

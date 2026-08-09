@@ -1015,3 +1015,95 @@ kernel void kernel_dsv4_output_hc_weights4(
             args.post_scale * x + args.eps;
     }
 }
+
+struct ds4_metal_args_hc_norm_mix {
+    int32_t n;
+    int32_t out_dim;
+    float   eps;
+};
+
+// Exact one-row unweighted RMSNorm + F16 HC-mix projection. The standalone
+// decode path uses kernel_rms_norm_f32_4 with 1024 virtual threads, followed
+// by kernel_mul_mv_f16_f32_4 with nsg=8 and nr0=2. Each 256-thread projection
+// group recreates the same norm reduction tree locally, then consumes x*scale
+// in the original matvec lane order. This removes a dispatch and the 64 KiB
+// normalized-row round trip without changing the arithmetic tree.
+kernel void kernel_dsv4_hc_rms_norm_mix_f16(
+        constant ds4_metal_args_hc_norm_mix & args,
+        device const char  * x,
+        device const char  * weight,
+        device       char  * dst,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 8;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NR0 = 2;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+    constexpr uint  VTHREADS = 1024u;
+    constexpr short VSLICES  = VTHREADS/(NSG*NW);
+
+    const uint n  = (uint)args.n;
+    const uint n4 = n >> 2;
+    device const float4 *x4 = (device const float4 *)x;
+
+    threadgroup float *norm_shmem = (threadgroup float *)shmem;
+    threadgroup float *mv_shmem = norm_shmem + NW;
+
+    for (short v = 0; v < VSLICES; ++v) {
+        const uint vt = (uint)(sgitg + NSG*v)*NW + tiisg;
+        float sumf = 0.0f;
+        for (uint i00 = vt; i00 < n4; i00 += VTHREADS) {
+            sumf += dot(x4[i00], x4[i00]);
+        }
+        sumf = simd_sum(sumf);
+        if (tiisg == 0) {
+            norm_shmem[sgitg + NSG*v] = sumf;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = norm_shmem[tiisg];
+    total = simd_sum(total);
+    const float mean = total/(float)args.n;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    const int nb = args.n/NB;
+    const int r0 = tgpig.x*NR0;
+    device const half4 *ax4[NR0];
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        ax4[row] = (device const half4 *)(
+                weight + (uint64_t)(r0 + row)*(uint64_t)n*sizeof(half));
+    }
+
+    float sumf_mv[NR0] = { 0.0f };
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        float4 yl4[NF4];
+        FOR_UNROLL(short i = 0; i < NF4; ++i) {
+            yl4[i] = x4[(ib*NB + il*NF)/4 + i]*scale;
+        }
+
+        FOR_UNROLL(short row = 0; row < NR0; ++row) {
+            device const half4 *xb4 =
+                ax4[row] + (ib*NB + il*NF)/4;
+            float sumq = 0.0f;
+            FOR_UNROLL(short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), yl4[i]);
+            }
+            sumf_mv[row] += sumq;
+        }
+    }
+
+    device float *dst_f32 = (device float *)dst;
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf_mv, r0, args.out_dim,
+                                    tiisg, sgitg,
+                                    (threadgroup char *)mv_shmem);
+}

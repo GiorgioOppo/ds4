@@ -2987,6 +2987,136 @@ int ds4_mmq_dense_vec_impl(
     return 0;
 }
 
+template <ggml_type type>
+int ds4_mmq_dense_pair_vec_impl(
+        const char  * tag,
+        const void  * W0,
+        const void  * W1,
+        const float * X_f32,
+        float       * out0_f32,
+        float       * out1_f32,
+        int           M0,
+        int           M1,
+        int           N,
+        int           K,
+        cudaStream_t  stream) {
+
+    if (!W0 || !W1 || !X_f32 || !out0_f32 || !out1_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M0 <= 0 || M1 <= 0 || N <= 0 || K <= 0) {
+        fprintf(stderr, "%s: bad shape M0=%d M1=%d N=%d K=%d\n",
+                tag, M0, M1, N, K);
+        return -1;
+    }
+    if (K % 256 != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+        return -1;
+    }
+    if (N > MMVQ_MAX_BATCH_SIZE) {
+        fprintf(stderr, "%s: N=%d exceeds MMVQ_MAX_BATCH_SIZE=%d\n",
+                tag, N, MMVQ_MAX_BATCH_SIZE);
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n",
+                tag, dev);
+        return -1;
+    }
+
+    ds4_pool_set_stream(stream);
+
+    /* Match ds4_mmq_dense_vec_impl's activation layout and quantizer exactly,
+     * but retain the Q8_1 row for both projections. */
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t nbytes_q8_1 = (size_t)N * ne10_padded *
+                               sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        type, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N,
+        /*s13=*/(int64_t)K * N,
+        /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
+        stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const int64_t blck = ggml_blck_size(type);
+    const int64_t s01_row = (int64_t)K / blck;
+    const int64_t s11_y = ne10_padded / QK8_1;
+    const int64_t s12_y = (int64_t)N * s11_y;
+    ggml_cuda_mm_fusion_args_device fusion = {};
+
+    /* Keep each leg's memset, canonical MMVQ dispatch, error check, and
+     * sanitizer in the same order as two dense_vec calls.  Only the activation
+     * quantization/allocation above is shared. */
+    cudaMemsetAsync(out0_f32, 0,
+                    (size_t)M0 * (size_t)N * sizeof(float), stream);
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W0, /*type_x=*/type,
+        /*vy=*/(const void *)src1_q8_1.get(),
+        /*ids=*/nullptr, /*fusion=*/fusion,
+        /*dst=*/out0_f32,
+        /*ncols_x=*/K, /*nrows_x=*/M0, /*ncols_dst=*/N,
+        /*stride_row_x=*/(int)s01_row,
+        /*stride_col_y=*/(int)s11_y,
+        /*stride_col_dst=*/M0,
+        /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1,
+        /*stride_channel_x=*/0,
+        /*stride_channel_y=*/(int)s12_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0,
+        /*stride_sample_dst=*/0,
+        /*ids_stride=*/0, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: first dense MMVQ launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+    ds4_mmq_sanitize_f32(out0_f32, (uint64_t)M0 * (uint64_t)N, stream);
+
+    cudaMemsetAsync(out1_f32, 0,
+                    (size_t)M1 * (size_t)N * sizeof(float), stream);
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W1, /*type_x=*/type,
+        /*vy=*/(const void *)src1_q8_1.get(),
+        /*ids=*/nullptr, /*fusion=*/fusion,
+        /*dst=*/out1_f32,
+        /*ncols_x=*/K, /*nrows_x=*/M1, /*ncols_dst=*/N,
+        /*stride_row_x=*/(int)s01_row,
+        /*stride_col_y=*/(int)s11_y,
+        /*stride_col_dst=*/M1,
+        /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1,
+        /*stride_channel_x=*/0,
+        /*stride_channel_y=*/(int)s12_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0,
+        /*stride_sample_dst=*/0,
+        /*ids_stride=*/0, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: second dense MMVQ launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -4;
+    }
+    ds4_mmq_sanitize_f32(out1_f32, (uint64_t)M1 * (uint64_t)N, stream);
+    return 0;
+}
+
 template <ggml_type type> struct ds4_mmq_vdr_mmvq_value;
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_IQ2_XXS> { static constexpr int value = VDR_IQ2_XXS_Q8_1_MMVQ; };
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q2_K>    { static constexpr int value = VDR_Q2_K_Q8_1_MMVQ; };
@@ -4501,6 +4631,15 @@ extern "C" int ds4_mmq_q4_K_dense_vec(
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_pair_vec(
+        const void * W0, const void * W1, const float * X,
+        float * out0, float * out1,
+        int M0, int M1, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_pair_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_pair_vec", W0, W1, X, out0, out1,
+        M0, M1, N, K, stream);
 }
 
 // Explicit instantiations. One per quant type the public API exposes.
