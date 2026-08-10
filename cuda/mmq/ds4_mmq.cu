@@ -116,6 +116,7 @@ static size_t g_q81_scratch_bytes = 0;
 static bool   g_q81_scratch_enabled = false;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
+static int    g_gb10_optimizations = 0;
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
@@ -2912,6 +2913,102 @@ int ds4_mmq_moe_pair_vec_impl(
     return 0;
 }
 
+/* GB10 AProjQ4 Q-b decode specialization (M=32768, N=1, K=1024).
+ *
+ * The canonical MMVQ small-K launch uses four warps to evaluate four rows:
+ * warp 0 owns Q4_K superblocks 0/1, warp 1 owns 2/3, and warps 2/3
+ * contribute +0.0f.  Its reduction first adds the three peer-warp partials
+ * lane by lane, then applies warp_reduce_sum's XOR tree.  Two independent
+ * four-warp groups below preserve that assignment and arithmetic order while
+ * persistent CTAs walk eight-row tiles at a grid stride.  The immutable
+ * canonical Q8_1 activation is staged once per CTA; no Q8_K re-quantization
+ * or Q4_K weight repack is involved.
+ *
+ * Keep this kernel paired with the exact M/N/K admission in
+ * ds4_mmq_dense_vec_impl.  Generalizing the row-warp mapping would change
+ * floating-point association relative to MMVQ. */
+static __global__ __launch_bounds__(256, 4) void
+q4_K_dense_vec_k1024_persistent_kernel(
+        const block_q4_K * __restrict__ W,
+        const block_q8_1 * __restrict__ x8,
+        float            * __restrict__ out,
+        int                              M) {
+    constexpr int k_q4_blocks = 4;       /* 1024 / QK_K */
+    constexpr int k_q8_blocks = 32;      /* 1024 / QK8_1 */
+    constexpr int k_rows_per_group = 4;  /* canonical MMVQ small-K tile */
+    constexpr int k_groups = 2;
+
+    /* block_q8_1 is 36 bytes.  A uint32_t backing array both copies it
+     * efficiently and preserves the alignment required by vec_dot's int
+     * loads from qs. */
+    __shared__ __align__(16) uint32_t x8_words[
+        (k_q8_blocks * sizeof(block_q8_1)) / sizeof(uint32_t)];
+    __shared__ float partial[k_groups][3][k_rows_per_group][32];
+
+    const uint32_t *x8_src = (const uint32_t *)x8;
+    for (uint32_t i = threadIdx.x;
+         i < (uint32_t)(sizeof(x8_words) / sizeof(x8_words[0]));
+         i += blockDim.x) {
+        x8_words[i] = x8_src[i];
+    }
+    __syncthreads();
+
+    const block_q8_1 *x8_shared = (const block_q8_1 *)x8_words;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t group = warp >> 2u;
+    const uint32_t warp_in_group = warp & 3u;
+    const uint32_t group_tid = warp_in_group * 32u + lane;
+    const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
+
+    for (uint64_t tile = blockIdx.x; tile < row_tiles; tile += gridDim.x) {
+        const uint32_t row0 = (uint32_t)(tile * 8u) +
+                              group * k_rows_per_group;
+        float tmp[k_rows_per_group] = {0.0f};
+
+        /* This is the canonical N=1, K=1024 MMVQ small-K loop verbatim:
+         * qi/vdr = 16 and blocks_per_iter = 8 for Q4_K. */
+        const int kqs = VDR_Q4_K_Q8_1_MMVQ * (int)(group_tid % 16u);
+        for (int kbx = (int)(group_tid / 16u);
+             kbx < k_q4_blocks;
+             kbx += 8) {
+            const int kby = kbx * (QK_K / QK8_1);
+#pragma unroll
+            for (int i = 0; i < k_rows_per_group; ++i) {
+                tmp[i] += vec_dot_q4_K_q8_1(
+                    W, &x8_shared[kby],
+                    (int)((uint64_t)(row0 + (uint32_t)i) * k_q4_blocks) + kbx,
+                    kqs);
+            }
+        }
+
+        if (warp_in_group > 0u) {
+#pragma unroll
+            for (int i = 0; i < k_rows_per_group; ++i) {
+                partial[group][warp_in_group - 1u][i][lane] = tmp[i];
+            }
+        }
+        __syncthreads();
+
+        if (warp_in_group == 0u) {
+#pragma unroll
+            for (int i = 0; i < k_rows_per_group; ++i) {
+#pragma unroll
+                for (int peer = 0; peer < 3; ++peer) {
+                    tmp[i] += partial[group][peer][i][lane];
+                }
+                tmp[i] = warp_reduce_sum<32>(tmp[i]);
+            }
+            if (lane < k_rows_per_group) {
+                out[row0 + lane] = tmp[lane];
+            }
+        }
+        /* Both groups must finish consuming partial before the next
+         * grid-stride tile reuses it. */
+        __syncthreads();
+    }
+}
+
 template <ggml_type type>
 int ds4_mmq_dense_vec_impl(
         const char  * tag,
@@ -2956,11 +3053,25 @@ int ds4_mmq_dense_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)N * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    char *x8 = nullptr;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (g_gb10_optimizations &&
+            getenv("DS4_CUDA_NO_Q4_GB10_FAST") == nullptr &&
+            getenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH") == nullptr &&
+            g_aligned_q81_scratch_ptr &&
+            g_aligned_q81_scratch_bytes >= nbytes_q8_1) {
+            x8 = (char *)g_aligned_q81_scratch_ptr;
+        }
+    }
+    if (!x8) {
+        src1_q8_1.alloc(ctx->pool(), nbytes_q8_1);
+        x8 = src1_q8_1.get();
+    }
 
     // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
     quantize_row_q8_1_cuda(
-        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        X_f32, /*ids=*/nullptr, (void *)x8,
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
         /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
@@ -2989,24 +3100,61 @@ int ds4_mmq_dense_vec_impl(
 
     cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
 
-    mul_mat_vec_q_switch_type(
-        /*vx=*/W, /*type_x=*/type,
-        /*vy=*/(const void *)src1_q8_1.get(),
-        /*ids=*/nullptr, /*fusion=*/fusion,
-        /*dst=*/out_f32,
-        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
-        /*stride_row_x=*/(int)s01_row,
-        /*stride_col_y=*/(int)s11_y,
-        /*stride_col_dst=*/(int)s1_dst,
-        /*nchannels_x=*/1,
-        /*nchannels_y=*/1,
-        /*nchannels_dst=*/1,
-        /*stride_channel_x=*/0,
-        /*stride_channel_y=*/(int)s12_y,
-        /*stride_channel_dst=*/0,
-        /*nsamples_x=*/1, /*nsamples_dst=*/1,
-        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
-        /*ids_stride=*/0, stream);
+    bool q4_k1024_persistent = false;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        const bool exact_shape = M == 32768 && N == 1 && K == 1024;
+        const bool enable =
+            getenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT") != nullptr;
+        const bool disable =
+            getenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT") != nullptr ||
+            getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr;
+        if (g_gb10_optimizations && enable && !disable && exact_shape &&
+            (((uintptr_t)W & 15u) == 0u)) {
+            const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
+            const int nsm = ggml_cuda_info().devices[dev].nsm;
+            const uint64_t resident_blocks =
+                nsm > 0 ? (uint64_t)(uint32_t)nsm * 4u : 0u;
+            const uint64_t grid64 = row_tiles < resident_blocks
+                ? row_tiles : resident_blocks;
+            if (grid64 > 0u && grid64 <= UINT32_MAX) {
+                q4_K_dense_vec_k1024_persistent_kernel<<<
+                    (unsigned)grid64, 256, 0, stream>>>(
+                        (const block_q4_K *)W,
+                        (const block_q8_1 *)x8,
+                        out_f32, M);
+                q4_k1024_persistent = true;
+            }
+        }
+        if (exact_shape &&
+            getenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT") != nullptr &&
+            !q4_k1024_persistent) {
+            fprintf(stderr,
+                    "%s: required Q4_K K1024 persistent path unavailable\n",
+                    tag);
+            return -4;
+        }
+    }
+
+    if (!q4_k1024_persistent) {
+        mul_mat_vec_q_switch_type(
+            /*vx=*/W, /*type_x=*/type,
+            /*vy=*/(const void *)x8,
+            /*ids=*/nullptr, /*fusion=*/fusion,
+            /*dst=*/out_f32,
+            /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
+            /*stride_row_x=*/(int)s01_row,
+            /*stride_col_y=*/(int)s11_y,
+            /*stride_col_dst=*/(int)s1_dst,
+            /*nchannels_x=*/1,
+            /*nchannels_y=*/1,
+            /*nchannels_dst=*/1,
+            /*stride_channel_x=*/0,
+            /*stride_channel_y=*/(int)s12_y,
+            /*stride_channel_dst=*/0,
+            /*nsamples_x=*/1, /*nsamples_dst=*/1,
+            /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+            /*ids_stride=*/0, stream);
+    }
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -3066,10 +3214,24 @@ int ds4_mmq_dense_pair_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t nbytes_q8_1 = (size_t)N * ne10_padded *
                                sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    char *x8 = nullptr;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (g_gb10_optimizations &&
+            getenv("DS4_CUDA_NO_Q4_GB10_FAST") == nullptr &&
+            getenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH") == nullptr &&
+            g_aligned_q81_scratch_ptr &&
+            g_aligned_q81_scratch_bytes >= nbytes_q8_1) {
+            x8 = (char *)g_aligned_q81_scratch_ptr;
+        }
+    }
+    if (!x8) {
+        src1_q8_1.alloc(ctx->pool(), nbytes_q8_1);
+        x8 = src1_q8_1.get();
+    }
 
     quantize_row_q8_1_cuda(
-        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        X_f32, /*ids=*/nullptr, (void *)x8,
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N,
         /*s13=*/(int64_t)K * N,
@@ -3096,7 +3258,7 @@ int ds4_mmq_dense_pair_vec_impl(
                     (size_t)M0 * (size_t)N * sizeof(float), stream);
     mul_mat_vec_q_switch_type(
         /*vx=*/W0, /*type_x=*/type,
-        /*vy=*/(const void *)src1_q8_1.get(),
+        /*vy=*/(const void *)x8,
         /*ids=*/nullptr, /*fusion=*/fusion,
         /*dst=*/out0_f32,
         /*ncols_x=*/K, /*nrows_x=*/M0, /*ncols_dst=*/N,
@@ -3123,7 +3285,7 @@ int ds4_mmq_dense_pair_vec_impl(
                     (size_t)M1 * (size_t)N * sizeof(float), stream);
     mul_mat_vec_q_switch_type(
         /*vx=*/W1, /*type_x=*/type,
-        /*vy=*/(const void *)src1_q8_1.get(),
+        /*vy=*/(const void *)x8,
         /*ids=*/nullptr, /*fusion=*/fusion,
         /*dst=*/out1_f32,
         /*ncols_x=*/K, /*nrows_x=*/M1, /*ncols_dst=*/N,
@@ -3145,6 +3307,116 @@ int ds4_mmq_dense_pair_vec_impl(
         return -4;
     }
     ds4_mmq_sanitize_f32(out1_f32, (uint64_t)M1 * (uint64_t)N, stream);
+    return 0;
+}
+
+__global__ static void ds4_mmq_identity_i32_kernel(
+        int32_t *ids, int n) {
+    const int i = (int)threadIdx.x;
+    if (i < n) ids[i] = i;
+}
+
+/* Grouped AProjQ4 attention-A projection.  Treat each attention group as an
+ * MMVQ channel (not as a column): ncols_dst stays one, so each channel uses
+ * exactly the same one-row Q4_K MMVQ specialization, K partition, peer-warp
+ * fold, and reduction tree as the canonical per-group loop.  Only activation
+ * quantization and launch setup are shared across groups. */
+static int ds4_mmq_q4_K_grouped_vec_impl(
+        const void  *W,
+        const float *X,
+        float       *out,
+        int          M,
+        int          K,
+        int          n_groups,
+        cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q4_K_grouped_vec";
+    if (!W || !X || !out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (!g_gb10_optimizations ||
+        getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A") != nullptr ||
+        M <= 0 || K <= 0 || n_groups <= 0 || n_groups > 16 ||
+        K % 256 != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int64_t row_blocks = (int64_t)K / ggml_blck_size(GGML_TYPE_Q4_K);
+    const int64_t weight_channel_stride = (int64_t)M * row_blocks;
+    if (row_blocks <= 0 || row_blocks > INT_MAX ||
+        weight_channel_stride > INT_MAX) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t nbytes_q8_1 = (size_t)n_groups * (size_t)ne10_padded *
+                               sizeof(block_q8_1) / QK8_1;
+    if (nbytes_q8_1 > SIZE_MAX - 15u) return DS4_MMQ_NOT_APPLICABLE;
+    const size_t ids_offset = (nbytes_q8_1 + 15u) & ~(size_t)15u;
+    const size_t ids_bytes = (size_t)n_groups * sizeof(int32_t);
+    if (!g_aligned_q81_scratch_ptr ||
+        ids_offset > g_aligned_q81_scratch_bytes ||
+        ids_bytes > g_aligned_q81_scratch_bytes - ids_offset) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    char *x8 = (char *)g_aligned_q81_scratch_ptr;
+    int32_t *ids = (int32_t *)(x8 + ids_offset);
+    ds4_mmq_identity_i32_kernel<<<1, 32, 0, stream>>>(ids, n_groups);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: identity launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    quantize_row_q8_1_cuda(
+        X, /*ids=*/nullptr, (void *)x8,
+        GGML_TYPE_Q4_K, /*ne00=*/K,
+        /*s11=*/(int64_t)K,
+        /*s12=*/(int64_t)K * n_groups,
+        /*s13=*/(int64_t)K * n_groups,
+        /*ne0=*/ne10_padded, /*ne1=*/n_groups, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+
+    const int64_t y_channel_stride = ne10_padded / QK8_1;
+    ggml_cuda_mm_fusion_args_device fusion = {};
+    cudaMemsetAsync(out, 0,
+                    (size_t)n_groups * (size_t)M * sizeof(float), stream);
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W, /*type_x=*/GGML_TYPE_Q4_K,
+        /*vy=*/(const void *)x8,
+        /*ids=*/ids, /*fusion=*/fusion,
+        /*dst=*/out,
+        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/1,
+        /*stride_row_x=*/(int)row_blocks,
+        /*stride_col_y=*/(int)y_channel_stride,
+        /*stride_col_dst=*/M,
+        /*nchannels_x=*/n_groups,
+        /*nchannels_y=*/n_groups,
+        /*nchannels_dst=*/n_groups,
+        /*stride_channel_x=*/(int)weight_channel_stride,
+        /*stride_channel_y=*/(int)y_channel_stride,
+        /*stride_channel_dst=*/M,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0,
+        /*stride_sample_dst=*/0,
+        /*ids_stride=*/1, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: grouped MMVQ launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -4;
+    }
+    ds4_mmq_sanitize_f32(
+        out, (uint64_t)(uint32_t)n_groups * (uint64_t)(uint32_t)M, stream);
     return 0;
 }
 
@@ -3818,8 +4090,6 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
     }
     return 0;
 }
-
-static int g_gb10_optimizations = 0;
 
 extern "C" void ds4_mmq_set_gb10_optimizations(int enabled) {
     g_gb10_optimizations = enabled != 0;
@@ -4780,6 +5050,13 @@ extern "C" int ds4_mmq_q4_K_dense_vec(
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_vec(
+        const void *W, const float *X, float *out,
+        int M, int K, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_vec_impl(
+        W, X, out, M, K, n_groups, stream);
 }
 
 extern "C" int ds4_mmq_q4_K_dense_pair_vec(

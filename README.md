@@ -542,6 +542,31 @@ standalone projections. The canonical Q4 path submits to the decode stream so
 these projections and the attention-output tail can participate in CUDA
 decode graphs.
 
+On a single DGX Spark/GB10, the AProjQ4 path also mirrors the safe parts of
+the aligned-Q8 decode work while retaining canonical Q4_K MMVQ/Q8_1
+arithmetic:
+
+- dense and paired Q4 projections reuse the persistent 256-KiB Q8_1 scratch;
+  `DS4_CUDA_NO_Q4_DENSE_SCRATCH=1` restores pool allocation;
+- attention-output A evaluates all output groups through one channel-grouped
+  MMVQ dispatch per token, preserving the one-row reduction tree of every
+  group; `DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1` restores the per-group loop;
+- attention-output B keeps its canonical MMVQ result and automatically uses
+  the row-packed HC epilogue described below;
+- the exact Q-b shape `32768x1024` has an experimental persistent-CTA kernel
+  behind `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1`, with
+  `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1` taking precedence. Tests can add
+  `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1` to fail instead of silently using
+  canonical MMVQ when the persistent dispatch is unavailable.
+
+`DS4_CUDA_NO_Q4_GB10_FAST=1` is the umbrella rollback for these new GB10
+choices; it does not disable the older cross-CUDA Q-A/KV pair itself. For a
+fail-closed grouped attention comparison,
+`DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1` computes the established per-group
+MMVQ reference, reports calls/mismatches/skips, and retains the reference on
+any mismatch. The scratch, grouped, and persistent paths are also covered by
+`make test-mmq-parity-cuda CUDA_ARCH=sm_121`.
+
 Two additional CUDA fusions remain experimental until a device oracle passes
 on the target GPU. `DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE=1` combines HC RMSNorm
 with the narrow F16 mixer when the selected standalone kernels have the same

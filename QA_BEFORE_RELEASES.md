@@ -639,9 +639,21 @@ release-ready without this pass.
   byte-identical greedy stdout and per-token logprobs, then run the same pair
   under Compute Sanitizer.  Record prefill, decode, and steady decode rather
   than copying the upstream PR numbers into a release claim.
-- Repeat the GB10 comparison with AProjQ4/OutQ8.  The persistent vocabulary,
-  compressor, HC split, scratch, and direct routed-MoE paths remain relevant,
-  while Q8 attention-projection consumers are intentionally ineligible.
+- Repeat the GB10 comparison with AProjQ4/OutQ8.  First run
+  `make test-mmq-parity-cuda CUDA_ARCH=sm_121`; its Q4 cases must report zero
+  bit mismatches for persistent scratch, grouped attention-A, and the
+  opt-in K1024 persistent kernel.  For the model A/B, use
+  `DS4_CUDA_NO_Q4_GB10_FAST=1` in the control and leave it unset in the
+  candidate.  Run a separate candidate with
+  `DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1` and require `calls>0`,
+  `mismatches=0`, and `skips=0`.  Benchmark the K1024 persistent kernel as a
+  separate fail-closed arm with both
+  `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1` and
+  `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1`; its rollback is
+  `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1`.  The persistent OutQ8
+  vocabulary, compressor, HC split, direct routed-MoE paths, Q4 scratch,
+  grouped attention-A, and canonical B+HC epilogue remain relevant, while
+  the Q8-only attention-projection consumers are intentionally ineligible.
 - Exercise CUDA DSpark at verifier/proposer depth 5 with the fast paths enabled
   and disabled.  Require identical final output, zero verifier errors, and
   matching full/partial acceptance histograms.  Test both the generic batch

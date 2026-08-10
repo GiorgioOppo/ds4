@@ -946,12 +946,16 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) {
              strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
         const char *oracle =
             getenv("DS4_CUDA_Q4_ATTN_OUT_HC_ORACLE");
-        const int oracle_on = oracle && *oracle &&
-            strcmp(oracle, "0") != 0;
+        const char *grouped_oracle =
+            getenv("DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE");
+        const int oracle_on =
+            (oracle && *oracle && strcmp(oracle, "0") != 0) ||
+            (grouped_oracle && *grouped_oracle &&
+             strcmp(grouped_oracle, "0") != 0);
         if (oracle_on) {
             fprintf(stderr,
                     "ds4: CUDA decode graph capture disabled for Q4 "
-                    "attention-output/HC oracle\n");
+                    "attention oracle\n");
             enabled = 0;
         } else if (off) {
             fprintf(stderr, "ds4: DS4_CUDA_DECODE_GRAPHS=%s - decode graph capture disabled\n", s);
@@ -1416,6 +1420,24 @@ static int cuda_env_flag_enabled(const char *name, int fallback) {
     const char *env = getenv(name);
     if (!env || !env[0]) return fallback;
     return strcmp(env, "0") != 0;
+}
+
+/* Conservative AProjQ4 port of the GB10 Q8 decode dispatch ideas.  Q4_K
+ * must keep the canonical MMVQ Q8_1 activation quantizer and reduction DAG;
+ * switching these projections to the local Q8_K fallback changes output
+ * bits.  The helpers below therefore only select launch/packing consumers
+ * around the existing MMVQ entries.  Non-GB10, multi-GPU, quality mode and
+ * DS4_CUDA_MMQ=0 all retain the ordinary caller fallback.  The global kill
+ * switch is intentionally checked in addition to each path's local rollback.
+ */
+static int cuda_q4_gb10_fast_path_enabled(
+        int logical_tier, const char *local_rollback_env) {
+    if (g_n_gpus != 1) return 0;
+    if (logical_tier < 0) logical_tier = 0;
+    if (logical_tier != 0 || !g_cuda_is_gb10[logical_tier]) return 0;
+    if (getenv("DS4_CUDA_NO_Q4_GB10_FAST") != NULL) return 0;
+    if (local_rollback_env && getenv(local_rollback_env) != NULL) return 0;
+    return cuda_use_mmq();
 }
 
 extern "C" int ds4_gpu_set_decode_fast_attention(int enabled) {
@@ -16377,6 +16399,8 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         uint64_t weight0_offset, uint64_t weight1_offset,
         uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
+    /* Cross-CUDA pair dispatch predates the GB10 specialization.  Preserve it
+     * verbatim outside GB10; this switch remains its established rollback. */
     if (getenv("DS4_CUDA_DISABLE_Q4_DENSE_PAIR") != NULL) return 0;
     return cuda_matmul_q4_K_pair_tensor_impl(
         out0, out1, model_map, model_size,
@@ -31991,6 +32015,10 @@ static int cuda_matmul_q4_K_tensor(
                 rc, (unsigned long long)in_dim,
                 (unsigned long long)out_dim,
                 (unsigned long long)n_tok);
+        if (in_dim == 1024u && out_dim == 32768u && n_tok == 1u &&
+            getenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT") != NULL) {
+            return 0;
+        }
     }
     void *tmp = cuda_tmp_alloc_on(logical_tier,
                                   n_tok * blocks * sizeof(cuda_block_q8_K),
@@ -32077,7 +32105,13 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
         "q4_K dense pair1");
     if (!w0 || !w1) return 0;
 
+    const int gb10_canonical = cuda_q4_gb10_fast_path_enabled(
+        logical_tier, "DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
     if (cuda_use_mmq()) {
+        /* One Q8_1 activation allocation/quantization is shared by both
+         * canonical MMVQ legs.  On GB10 a rejected launch fails closed to
+         * ds4.c's independent projections; the Q8_K pair fallback below is
+         * intentionally retained only for the pre-existing non-GB10 path. */
         const int rc = ds4_mmq_q4_K_dense_pair_vec(
             w0, w1, (const float *)x->ptr,
             (float *)out0->ptr, (float *)out1->ptr,
@@ -32091,6 +32125,7 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
                 (unsigned long long)out0_dim,
                 (unsigned long long)out1_dim,
                 (unsigned long long)n_tok);
+        if (gb10_canonical) return 0;
     }
 
     if (n_tok > UINT64_MAX / blocks ||
@@ -32241,10 +32276,15 @@ extern "C" int ds4_gpu_matmul_q4_K_hc_expand_available(void) {
          * zero-call summary that makes an ineligible/unused A/B visible. */
         cuda_q4_attn_hc_oracle_register_report();
     }
-    /* MMQ decode stays opt-in until its row-packed HC epilogue is timed on
-     * CUDA hardware.  Unlike the old experiment, the normal enable switch no
-     * longer changes Q8_1 activation quantization.  The explicitly named
-     * Q8_K experiment remains available behind a separate gate and oracle. */
+    /* On GB10 the default candidate keeps the ordinary Q4_K MMVQ result and
+     * only replaces the four-way HC launch with a row-packed epilogue.  The
+     * existing disable variable (plus DS4_CUDA_NO_Q4_GB10_FAST) is a complete
+     * rollback to the caller's separate B projection + HC expansion.  Legacy
+     * explicit experiment/oracle switches remain usable for diagnostics. */
+    if (cuda_q4_gb10_fast_path_enabled(
+            g_current_logical_tier, NULL)) {
+        return 1;
+    }
     return !cuda_use_mmq() ||
            cuda_env_flag_enabled("DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE", 0) ||
            cuda_env_flag_enabled(
@@ -33290,29 +33330,55 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         model_map, out_a_offset, out_a_bytes, logical_tier, "q4 attn_out_a");
     if (!out_a) return 0;
 
-    /* Heads are token-major with groups interleaved. Pack one group at a time
-     * into graph scratch, run a token-batched MMQ, then scatter its rank rows
-     * into the token-major low tensor. This is the stable fast path on CUDA. */
-    for (uint32_t g = 0; g < n_groups; g++) {
-        cudaError_t ce = cudaMemcpy2DAsync(
-            group_tmp->ptr, group_dim * sizeof(float),
-            (const float *)heads->ptr + (uint64_t)g * group_dim,
-            (uint64_t)n_groups * group_dim * sizeof(float),
-            group_dim * sizeof(float), n_tokens,
-            cudaMemcpyDeviceToDevice, cuda_decode_stream());
-        if (!cuda_ok(ce, "q4 attention output heads pack")) return 0;
-        const int rc = ds4_mmq_q4_K_dense(
-            out_a + (uint64_t)g * rank * row_a_bytes,
-            (const float *)group_tmp->ptr, (float *)low_tmp->ptr,
-            (int)rank, (int)n_tokens, (int)group_dim,
-            cuda_decode_stream());
-        if (rc != 0) return 0;
-        ce = cudaMemcpy2DAsync(
-            (float *)low->ptr + (uint64_t)g * rank,
-            low_dim * sizeof(float), low_tmp->ptr, rank * sizeof(float),
-            rank * sizeof(float), n_tokens,
-            cudaMemcpyDeviceToDevice, cuda_decode_stream());
-        if (!cuda_ok(ce, "q4 attention output low unpack")) return 0;
+    const int grouped_gb10 =
+        n_tokens <= 8u && n_groups <= INT_MAX &&
+        ds4_tensor_device_idx(low) == logical_tier &&
+        ds4_tensor_device_idx(heads) == logical_tier &&
+        cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    if (grouped_gb10) {
+        /* DSpark verification stores [token][group][K].  Dispatch one exact
+         * grouped MMVQ per token: each group keeps its own Q8_1 row and Q4_K
+         * weights, while the grouped entry amortizes setup/launch overhead.
+         * A preflight rejection returns 0 to the unchanged row-wise caller;
+         * a negative post-launch result is fatal (the caller understands the
+         * tri-state contract for this tiny-batch hook). */
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const int rc = ds4_mmq_q4_K_grouped_vec(
+                out_a,
+                (const float *)heads->ptr +
+                    (uint64_t)t * n_groups * group_dim,
+                (float *)low->ptr + (uint64_t)t * low_dim,
+                (int)rank, (int)group_dim, (int)n_groups,
+                cuda_decode_stream());
+            if (rc == DS4_MMQ_NOT_APPLICABLE) return 0;
+            if (rc != 0) return -1;
+        }
+    } else {
+        /* Existing cross-CUDA path: pack one group at a time, run a
+         * token-batched MMQ, then scatter rank rows back to token-major low.
+         * Keep this byte-for-byte outside the new GB10 dispatch. */
+        for (uint32_t g = 0; g < n_groups; g++) {
+            cudaError_t ce = cudaMemcpy2DAsync(
+                group_tmp->ptr, group_dim * sizeof(float),
+                (const float *)heads->ptr + (uint64_t)g * group_dim,
+                (uint64_t)n_groups * group_dim * sizeof(float),
+                group_dim * sizeof(float), n_tokens,
+                cudaMemcpyDeviceToDevice, cuda_decode_stream());
+            if (!cuda_ok(ce, "q4 attention output heads pack")) return 0;
+            const int rc = ds4_mmq_q4_K_dense(
+                out_a + (uint64_t)g * rank * row_a_bytes,
+                (const float *)group_tmp->ptr, (float *)low_tmp->ptr,
+                (int)rank, (int)n_tokens, (int)group_dim,
+                cuda_decode_stream());
+            if (rc != 0) return 0;
+            ce = cudaMemcpy2DAsync(
+                (float *)low->ptr + (uint64_t)g * rank,
+                low_dim * sizeof(float), low_tmp->ptr, rank * sizeof(float),
+                rank * sizeof(float), n_tokens,
+                cudaMemcpyDeviceToDevice, cuda_decode_stream());
+            if (!cuda_ok(ce, "q4 attention output low unpack")) return 0;
+        }
     }
     if (out_b_type == 12u) {
         return cuda_matmul_q4_K_tensor(out, model_map, model_size,
@@ -33327,15 +33393,183 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
     return 0;
 }
 
+static uint64_t g_q4_grouped_attn_a_oracle_calls;
+static uint64_t g_q4_grouped_attn_a_oracle_mismatches;
+static uint64_t g_q4_grouped_attn_a_oracle_skips;
+static int g_q4_grouped_attn_a_oracle_report_registered;
+static int g_q4_grouped_attn_a_oracle_mismatch_reported;
+
+static void cuda_q4_grouped_attn_a_oracle_report(void) {
+    fprintf(stderr,
+            "ds4: CUDA Q4 grouped attention-A oracle: "
+            "calls=%llu mismatches=%llu skips=%llu "
+            "(canonical MMVQ output retained)\n",
+            (unsigned long long)g_q4_grouped_attn_a_oracle_calls,
+            (unsigned long long)g_q4_grouped_attn_a_oracle_mismatches,
+            (unsigned long long)g_q4_grouped_attn_a_oracle_skips);
+}
+
+static void cuda_q4_grouped_attn_a_oracle_register_report(void) {
+    if (!g_q4_grouped_attn_a_oracle_report_registered) {
+        g_q4_grouped_attn_a_oracle_report_registered = 1;
+        (void)atexit(cuda_q4_grouped_attn_a_oracle_report);
+    }
+}
+
 extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t group0, uint32_t group_cnt,
         const ds4_gpu_tensor *heads) {
-    (void)low; (void)model_map; (void)model_size; (void)out_a_offset;
-    (void)group_dim; (void)rank; (void)group0; (void)group_cnt;
-    (void)heads;
-    return 0;
+    const int oracle = cuda_env_flag_enabled(
+        "DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE", 0);
+    if (oracle) cuda_q4_grouped_attn_a_oracle_register_report();
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        group_cnt == 0u || group0 > UINT32_MAX - group_cnt ||
+        group_dim > INT_MAX || rank > INT_MAX || group_cnt > INT_MAX ||
+        (group_dim % CUDA_QK_K) != 0u) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(low);
+    if (ds4_tensor_device_idx(heads) != logical_tier ||
+        !cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A")) {
+        return 0;
+    }
+
+    const uint64_t blocks = group_dim / CUDA_QK_K;
+    if (blocks == 0u ||
+        blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (rank > UINT64_MAX / row_bytes ||
+        group_dim > UINT64_MAX / group_cnt ||
+        rank > UINT64_MAX / group_cnt) {
+        return 0;
+    }
+    const uint64_t group_weight_bytes = rank * row_bytes;
+    if ((uint64_t)group0 > UINT64_MAX / group_weight_bytes ||
+        (uint64_t)group_cnt > UINT64_MAX / group_weight_bytes) {
+        return 0;
+    }
+    const uint64_t group_weight_offset =
+        (uint64_t)group0 * group_weight_bytes;
+    const uint64_t selected_weight_bytes =
+        (uint64_t)group_cnt * group_weight_bytes;
+    if (out_a_offset > model_size ||
+        group_weight_offset > model_size - out_a_offset) {
+        return 0;
+    }
+    const uint64_t selected_offset = out_a_offset + group_weight_offset;
+    if (selected_weight_bytes > model_size - selected_offset) return 0;
+
+    const uint64_t heads_elems = (uint64_t)group_cnt * group_dim;
+    const uint64_t low_elems = (uint64_t)group_cnt * rank;
+    if (heads_elems > UINT64_MAX / sizeof(float) ||
+        low_elems > UINT64_MAX / sizeof(float) ||
+        heads->bytes < heads_elems * sizeof(float) ||
+        low->bytes < low_elems * sizeof(float)) {
+        return 0;
+    }
+
+    const char *out_a = cuda_resolve_weight_ptr(
+        model_map, selected_offset, selected_weight_bytes, logical_tier,
+        "q4 grouped attn_out_a");
+    if (!out_a) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    const int rc = ds4_mmq_q4_K_grouped_vec(
+        out_a, (const float *)heads->ptr, (float *)low->ptr,
+        (int)rank, (int)group_dim, (int)group_cnt, stream);
+    if (rc != 0) {
+        /* NOT_APPLICABLE is pre-enqueue and cleanly retries the established
+         * per-group loop. A negative result may follow a launch; returning
+         * zero still avoids consuming a possibly incomplete candidate. */
+        return 0;
+    }
+
+    if (!oracle) return 1;
+
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const cudaError_t capture_err = cudaStreamIsCapturing(stream, &capture);
+    if (capture_err != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        g_q4_grouped_attn_a_oracle_skips++;
+        return 1;
+    }
+
+    const uint64_t reference_bytes = low_elems * sizeof(float);
+    const uint64_t mismatch_offset =
+        (reference_bytes + 255u) & ~255ull;
+    if (mismatch_offset < reference_bytes ||
+        mismatch_offset > UINT64_MAX - sizeof(uint32_t)) {
+        g_q4_grouped_attn_a_oracle_skips++;
+        return 1;
+    }
+    unsigned char *scratch = (unsigned char *)cuda_tmp_alloc_on(
+        logical_tier, mismatch_offset + sizeof(uint32_t),
+        "q4 grouped attention-A oracle");
+    if (!scratch) {
+        g_q4_grouped_attn_a_oracle_skips++;
+        return 1;
+    }
+    float *reference = (float *)scratch;
+    uint32_t *mismatch_device =
+        (uint32_t *)(scratch + mismatch_offset);
+
+    int reference_ok = 1;
+    for (uint32_t g = 0; g < group_cnt; g++) {
+        const int group_rc = ds4_mmq_q4_K_dense_vec(
+            out_a + (uint64_t)g * group_weight_bytes,
+            (const float *)heads->ptr + (uint64_t)g * group_dim,
+            reference + (uint64_t)g * rank,
+            (int)rank, 1, (int)group_dim, stream);
+        if (group_rc != 0) {
+            reference_ok = 0;
+            break;
+        }
+    }
+    if (!reference_ok ||
+        !cuda_ok(cudaMemsetAsync(mismatch_device, 0, sizeof(uint32_t),
+                                 stream),
+                 "clear q4 grouped attention-A oracle")) {
+        g_q4_grouped_attn_a_oracle_skips++;
+        return 1;
+    }
+    q4_K_attn_hc_bitwise_compare_kernel
+        <<<(low_elems + 255u) / 256u, 256, 0, stream>>>(
+            mismatch_device, reference, (const float *)low->ptr, low_elems);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4 grouped attention-A oracle compare launch")) {
+        return 0;
+    }
+
+    uint32_t mismatch_host = 0u;
+    if (!cuda_ok(cudaMemcpyAsync(&mismatch_host, mismatch_device,
+                                 sizeof(mismatch_host),
+                                 cudaMemcpyDeviceToHost, stream),
+                 "read q4 grouped attention-A oracle") ||
+        !cuda_ok(cudaStreamSynchronize(stream),
+                 "synchronize q4 grouped attention-A oracle")) {
+        return 0;
+    }
+    g_q4_grouped_attn_a_oracle_calls++;
+    if (mismatch_host != 0u) {
+        g_q4_grouped_attn_a_oracle_mismatches++;
+        if (!g_q4_grouped_attn_a_oracle_mismatch_reported) {
+            g_q4_grouped_attn_a_oracle_mismatch_reported = 1;
+            fprintf(stderr,
+                    "ds4: CUDA Q4 grouped attention-A oracle found a "
+                    "bitwise mismatch; retaining per-group MMVQ output\n");
+        }
+        if (!cuda_ok(cudaMemcpyAsync(low->ptr, reference, reference_bytes,
+                                     cudaMemcpyDeviceToDevice, stream),
+                     "restore q4 grouped attention-A oracle reference")) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_hc_expand_split_half_tensor(
