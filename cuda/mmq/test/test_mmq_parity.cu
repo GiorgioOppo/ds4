@@ -1106,6 +1106,205 @@ bool run_q8_0_dense_vec(int M, int N, int K, uint32_t seed) {
     return ok;
 }
 
+bool run_q4_K_dense_vec_gb10_parity(
+        int M, int N, int K, uint32_t seed, bool persistent_k1024) {
+    fprintf(stderr,
+            "=== Q4_K/DENSE_VEC_%s  M=%d N=%d K=%d  seed=%u ===\n",
+            persistent_k1024 ? "PERSISTENT" : "SCRATCH",
+            M, N, K, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    std::vector<block_q4_K> W((size_t)M * blocks_per_row);
+    for (auto &blk : W) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)N * K);
+    for (float &v : X) v = nd(rng);
+
+    cudaStream_t stream = nullptr;
+    void *dW = nullptr;
+    void *scratch = nullptr;
+    float *dX = nullptr;
+    float *dRef = nullptr;
+    float *dGot = nullptr;
+    bool ok = cudaStreamCreate(&stream) == cudaSuccess &&
+              cudaMalloc(&dW, W.size() * sizeof(block_q4_K)) == cudaSuccess &&
+              cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dRef, (size_t)M * N * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dGot, (size_t)M * N * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&scratch, 256u * 1024u) == cudaSuccess;
+    if (!ok) {
+        fprintf(stderr, "Q4_K dense vec parity allocation failed\n");
+        if (scratch) cudaFree(scratch);
+        if (dGot) cudaFree(dGot);
+        if (dRef) cudaFree(dRef);
+        if (dX) cudaFree(dX);
+        if (dW) cudaFree(dW);
+        if (stream) cudaStreamDestroy(stream);
+        return false;
+    }
+    cudaMemcpyAsync(dW, W.data(), W.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+
+    unsetenv("DS4_CUDA_NO_Q4_GB10_FAST");
+    unsetenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH");
+    unsetenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT");
+    unsetenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT");
+    unsetenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT");
+    ds4_mmq_set_gb10_optimizations(persistent_k1024 ? 1 : 0);
+    ds4_mmq_set_aligned_q81_scratch(
+        persistent_k1024 ? scratch : nullptr,
+        persistent_k1024 ? 256u * 1024u : 0u);
+    const int rc_ref = ds4_mmq_q4_K_dense_vec(
+        dW, dX, dRef, M, N, K, stream);
+
+    ds4_mmq_set_gb10_optimizations(1);
+    ds4_mmq_set_aligned_q81_scratch(scratch, 256u * 1024u);
+    if (persistent_k1024) {
+        setenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT", "1", 1);
+        setenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT", "1", 1);
+    }
+    const int rc_got = ds4_mmq_q4_K_dense_vec(
+        dW, dX, dGot, M, N, K, stream);
+
+    std::vector<float> ref((size_t)M * N);
+    std::vector<float> got((size_t)M * N);
+    cudaMemcpyAsync(ref.data(), dRef, ref.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(got.data(), dGot, got.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    int rc_required_disabled = 0;
+    if (persistent_k1024) {
+        setenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT", "1", 1);
+        rc_required_disabled = ds4_mmq_q4_K_dense_vec(
+            dW, dX, dGot, M, N, K, stream);
+        unsetenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT");
+    }
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+    size_t mismatches = 0;
+    for (size_t i = 0; i < ref.size(); i++) {
+        if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0) mismatches++;
+    }
+    ok = rc_ref == 0 && rc_got == 0 &&
+         (!persistent_k1024 || rc_required_disabled != 0) &&
+         sync_err == cudaSuccess &&
+         mismatches == 0;
+    fprintf(stderr,
+            "rc_ref=%d rc_candidate=%d rc_required_disabled=%d "
+            "mismatches=%zu sync=%s\n%s\n\n",
+            rc_ref, rc_got, rc_required_disabled, mismatches,
+            cudaGetErrorString(sync_err),
+            ok ? "PASS" : "FAIL");
+
+    unsetenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT");
+    unsetenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT");
+    ds4_mmq_set_aligned_q81_scratch(nullptr, 0u);
+    ds4_mmq_set_gb10_optimizations(0);
+    cudaFree(scratch);
+    cudaFree(dGot);
+    cudaFree(dRef);
+    cudaFree(dX);
+    cudaFree(dW);
+    cudaStreamDestroy(stream);
+    return ok;
+}
+
+bool run_q4_K_grouped_vec_parity(
+        int M, int K, int n_groups, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/GROUPED_VEC  M=%d K=%d groups=%d seed=%u ===\n",
+            M, K, n_groups, seed);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    const size_t blocks_per_group = (size_t)M * blocks_per_row;
+    std::vector<block_q4_K> W((size_t)n_groups * blocks_per_group);
+    for (auto &blk : W) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)n_groups * K);
+    for (float &v : X) v = nd(rng);
+
+    cudaStream_t stream = nullptr;
+    void *dW = nullptr;
+    void *scratch = nullptr;
+    float *dX = nullptr;
+    float *dRef = nullptr;
+    float *dGot = nullptr;
+    bool ok = cudaStreamCreate(&stream) == cudaSuccess &&
+              cudaMalloc(&dW, W.size() * sizeof(block_q4_K)) == cudaSuccess &&
+              cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dRef, (size_t)n_groups * M * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&dGot, (size_t)n_groups * M * sizeof(float)) == cudaSuccess &&
+              cudaMalloc(&scratch, 256u * 1024u) == cudaSuccess;
+    if (!ok) {
+        fprintf(stderr, "Q4_K grouped vec parity allocation failed\n");
+        if (scratch) cudaFree(scratch);
+        if (dGot) cudaFree(dGot);
+        if (dRef) cudaFree(dRef);
+        if (dX) cudaFree(dX);
+        if (dW) cudaFree(dW);
+        if (stream) cudaStreamDestroy(stream);
+        return false;
+    }
+    cudaMemcpyAsync(dW, W.data(), W.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    unsetenv("DS4_CUDA_NO_Q4_GB10_FAST");
+    unsetenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    ds4_mmq_set_gb10_optimizations(1);
+    ds4_mmq_set_aligned_q81_scratch(scratch, 256u * 1024u);
+
+    int rc_ref = 0;
+    for (int g = 0; g < n_groups && rc_ref == 0; g++) {
+        rc_ref = ds4_mmq_q4_K_dense_vec(
+            (const char *)dW + (size_t)g * blocks_per_group *
+                sizeof(block_q4_K),
+            dX + (size_t)g * K,
+            dRef + (size_t)g * M,
+            M, 1, K, stream);
+    }
+    const int rc_got = ds4_mmq_q4_K_grouped_vec(
+        dW, dX, dGot, M, K, n_groups, stream);
+    setenv("DS4_CUDA_NO_Q4_GB10_FAST", "1", 1);
+    const int rc_disabled = ds4_mmq_q4_K_grouped_vec(
+        dW, dX, dGot, M, K, n_groups, stream);
+    unsetenv("DS4_CUDA_NO_Q4_GB10_FAST");
+
+    std::vector<float> ref((size_t)n_groups * M);
+    std::vector<float> got((size_t)n_groups * M);
+    cudaMemcpyAsync(ref.data(), dRef, ref.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(got.data(), dGot, got.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+    size_t mismatches = 0;
+    for (size_t i = 0; i < ref.size(); i++) {
+        if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0) mismatches++;
+    }
+    ok = rc_ref == 0 && rc_got == 0 &&
+         rc_disabled == DS4_MMQ_NOT_APPLICABLE &&
+         sync_err == cudaSuccess &&
+         mismatches == 0;
+    fprintf(stderr,
+            "rc_ref=%d rc_grouped=%d rc_disabled=%d "
+            "mismatches=%zu sync=%s\n%s\n\n",
+            rc_ref, rc_got, rc_disabled, mismatches,
+            cudaGetErrorString(sync_err),
+            ok ? "PASS" : "FAIL");
+
+    ds4_mmq_set_aligned_q81_scratch(nullptr, 0u);
+    ds4_mmq_set_gb10_optimizations(0);
+    cudaFree(scratch);
+    cudaFree(dGot);
+    cudaFree(dRef);
+    cudaFree(dX);
+    cudaFree(dW);
+    cudaStreamDestroy(stream);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -1238,6 +1437,18 @@ int main(int argc, char ** argv) {
     all_ok &= run_q8_0_dense_vec(/*M=*/64,   /*N=*/1, /*K=*/256,  0xC0FE40);
     all_ok &= run_q8_0_dense_vec(/*M=*/256,  /*N=*/1, /*K=*/512,  0xC0FE41);
     all_ok &= run_q8_0_dense_vec(/*M=*/1024, /*N=*/1, /*K=*/4096, 0xC0FE42);
+    all_ok &= run_q4_K_dense_vec_gb10_parity(
+        /*M=*/1024, /*N=*/5, /*K=*/4096, 0xC4FE40, false);
+    all_ok &= run_q4_K_dense_vec_gb10_parity(
+        /*M=*/32768, /*N=*/1, /*K=*/1024, 0xC4FE41, true);
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/256, /*K=*/8192, /*groups=*/4, 0xC4FE42);
+    // DeepSeek-V4 Flash AProjQ4 attention-A production shape.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/128, /*K=*/4096, /*groups=*/8, 0xC4FE43);
+    // Pro-style maximum group count accepted by the grouped entry.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/64, /*K=*/4096, /*groups=*/16, 0xC4FE44);
 
     fprintf(stderr, "===================\n");
     fprintf(stderr, "%s\n", all_ok ? "ALL PASS" : "SOME FAILED");

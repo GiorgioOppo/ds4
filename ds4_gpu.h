@@ -2351,8 +2351,8 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 /* Returns 1 when the batch path ran, 0 for the ordinary row fallback, and -1
- * when the Metal REQUIRE diagnostic made an ineligible/failed tiny batch a
- * hard error. */
+ * for a required Metal path that is unavailable or a CUDA grouped launch
+ * that failed after enqueue and therefore cannot safely fall back. */
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,

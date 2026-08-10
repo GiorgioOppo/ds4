@@ -883,16 +883,6 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
-int ds4_mmq_q4_K_dense_pair_vec(
-    const void  * W0_q4_K,
-    const void  * W1_q4_K,
-    const float * X_f32,
-    float       * out0_f32,
-    float       * out1_f32,
-    int           M,
-    int           K,
-    cudaStream_t  stream);
-
 int ds4_mmq_q4_K_dense_vec(
     const void  * W_q4_K,
     const float * X_f32,
@@ -901,6 +891,30 @@ int ds4_mmq_q4_K_dense_vec(
     int           N,
     int           K,
     cudaStream_t  stream);
+
+// Exact grouped one-row Q4_K MMVQ for AProjQ4 attention-A on a single GB10.
+// W is [n_groups][M][K], X is [n_groups][K], and out is
+// [n_groups][M].  Each group retains the canonical dense_vec reduction tree;
+// only Q8_1 quantization and launch setup are shared.  Returns
+// DS4_MMQ_NOT_APPLICABLE before enqueue when its GB10/scratch/shape gates do
+// not hold.
+int ds4_mmq_q4_K_grouped_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+// On a single GB10, the exact AProjQ4 Q-b shape (M=32768, N=1, K=1024)
+// can opt into a persistent-CTA form with
+// DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1.  The rollback switch
+// DS4_CUDA_NO_Q4_K1024_PERSISTENT=1 is authoritative when both are set.
+// DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1 makes an unavailable exact-shape
+// dispatch fail closed instead of silently running canonical MMVQ.
+// DS4_CUDA_NO_Q4_GB10_FAST=1 is the umbrella rollback for this and the
+// GB10 Q4 activation scratch. Other shapes and devices retain canonical MMVQ.
 
 // Two independent dense Q4_K projections that share the canonical Q8_1
 // activation quantization.  Each output is dispatched through the same MMVQ
