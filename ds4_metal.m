@@ -11944,8 +11944,18 @@ static id<MTLBuffer> ds4_gpu_wrap_q8_decode_model_range(
                         4096u);
     const uint64_t exact_decode_max_bytes =
         exact_decode_max_mib * 1024ull * 1024ull;
+    /* Keep the target GGUF on its established one-row contract.  The support
+     * GGUF is independently identified and DSpark only submits tiny batches;
+     * narrowing those Q8 bindings to the exact range avoids touching a wider
+     * overlapping mmap view without changing the kernel arithmetic. */
+    const bool support_model =
+        model_map == g_support_model_map_ptr &&
+        model_size == g_support_model_map_size;
+    const bool exact_decode_batch = support_model ?
+        n_tokens >= 1u && n_tokens <= 6u :
+        n_tokens == 1u;
     const bool exact_decode_weight_view =
-        n_tokens == 1u &&
+        exact_decode_batch &&
         len <= exact_decode_max_bytes &&
         ds4_gpu_q8_decode_exact_views_enabled(model_map, model_size);
     if (exact_decode_weight_view) {
