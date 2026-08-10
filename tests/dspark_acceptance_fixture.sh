@@ -17,6 +17,11 @@ SSD_CACHE_EXPERTS=${DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS:-}
 REQUIRE_ACTIVE=${DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE:-1}
 REQUIRE_EXACT2=${DS4_DSPARK_FIXTURE_REQUIRE_EXACT2:-0}
 REQUIRE_CUDA_EXACTN=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN:-0}
+REQUIRE_CUDA_EXACTN_BATCH_HEAD=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN_BATCH_HEAD:-0}
+REQUIRE_CUDA_DEVICE_PROPOSER=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_DEVICE_PROPOSER:-0}
+REQUIRE_METAL_EXACTN_BATCH_HEAD=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_BATCH_HEAD:-0}
+REQUIRE_METAL_EXACTN_PARTIAL=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_PARTIAL:-0}
+REQUIRE_METAL_DEVICE_PROPOSER=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_DEVICE_PROPOSER:-0}
 partial_cases=0
 direct_partial_cases=0
 direct_commits=0
@@ -27,6 +32,23 @@ total_exact2_fallback=0
 total_cuda_exactn_attempt=0
 total_cuda_exactn_fallback=0
 total_cuda_exactn_error_fallback=0
+total_cuda_exactn_batch_head_attempt=0
+total_cuda_exactn_batch_head_use=0
+total_cuda_exactn_batch_head_fallback=0
+total_cuda_device_proposer_attempt=0
+total_cuda_device_proposer_use=0
+total_cuda_device_proposer_fallback=0
+total_cuda_device_proposer_policy_mismatch=0
+total_exactn_union_error_fallback=0
+total_exactn_union_partial_replay=0
+total_exactn_union_verify_skip=0
+total_metal_exactn_batch_head_attempt=0
+total_metal_exactn_batch_head_use=0
+total_metal_exactn_batch_head_fallback=0
+total_metal_device_proposer_attempt=0
+total_metal_device_proposer_use=0
+total_metal_device_proposer_fallback=0
+total_metal_device_proposer_policy_mismatch=0
 
 stats_field() {
     printf '%s\n' "$1" | awk -v key="$2" '
@@ -75,6 +97,44 @@ case "$REQUIRE_CUDA_EXACTN" in
     exit 1
     ;;
 esac
+case "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN_BATCH_HEAD must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+if [ "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" != 0 ]; then
+    REQUIRE_CUDA_EXACTN=1
+fi
+case "$REQUIRE_CUDA_DEVICE_PROPOSER" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_CUDA_DEVICE_PROPOSER must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$REQUIRE_METAL_EXACTN_BATCH_HEAD" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_BATCH_HEAD must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$REQUIRE_METAL_EXACTN_PARTIAL" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_PARTIAL must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+case "$REQUIRE_METAL_DEVICE_PROPOSER" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_METAL_DEVICE_PROPOSER must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
 case "$REQUIRE_DIRECT" in
 0|1) ;;
 *)
@@ -89,7 +149,11 @@ case "$REQUIRE_IDENTICAL" in
     exit 1
     ;;
 esac
-if [ "$REQUIRE_EXACT2" != 0 ] || [ "$REQUIRE_CUDA_EXACTN" != 0 ]; then
+if [ "$REQUIRE_EXACT2" != 0 ] || [ "$REQUIRE_CUDA_EXACTN" != 0 ] ||
+   [ "$REQUIRE_CUDA_DEVICE_PROPOSER" != 0 ] ||
+   [ "$REQUIRE_METAL_EXACTN_BATCH_HEAD" != 0 ] ||
+   [ "$REQUIRE_METAL_EXACTN_PARTIAL" != 0 ] ||
+   [ "$REQUIRE_METAL_DEVICE_PROPOSER" != 0 ]; then
     REQUIRE_IDENTICAL=1
 fi
 case "$SSD_CACHE_EXPERTS" in
@@ -169,7 +233,15 @@ print_metadata() {
     exact2_metal=${DS4_METAL_DSPARK_EXACT2:-unset}
     exactn_cuda=${DS4_CUDA_DSPARK_EXACTN:-unset}
     exactn_cuda_disable=${DS4_CUDA_DISABLE_DSPARK_EXACTN:-unset}
+    exactn_cuda_batch_head=${DS4_CUDA_DSPARK_EXACTN_BATCH_HEAD:-unset}
+    exactn_cuda_batch_head_disable=${DS4_CUDA_DISABLE_DSPARK_EXACTN_BATCH_HEAD:-unset}
+    cuda_device_proposer=${DS4_CUDA_DSPARK_DEVICE_PROPOSER:-unset}
+    cuda_device_proposer_disable=${DS4_CUDA_DSPARK_NO_DEVICE_PROPOSER:-unset}
     exactn_union_metal=${DS4_METAL_DSPARK_EXACTN_UNION:-unset}
+    exactn_metal_batch_head=${DS4_METAL_DSPARK_EXACTN_BATCH_HEAD:-unset}
+    exactn_metal_batch_head_disable=${DS4_METAL_DISABLE_DSPARK_EXACTN_BATCH_HEAD:-unset}
+    metal_device_proposer=${DS4_METAL_DSPARK_DEVICE_PROPOSER:-unset}
+    metal_device_proposer_disable=${DS4_METAL_DSPARK_NO_DEVICE_PROPOSER:-unset}
     noncausal_online_cuda=${DS4_CUDA_ENABLE_DSPARK_NONCAUSAL_ONLINE:-unset}
     noncausal_online_cuda_disable=${DS4_CUDA_DISABLE_DSPARK_NONCAUSAL_ONLINE:-unset}
     verify_noncausal=${DS4_DSPARK_VERIFY_NONCAUSAL:-unset}
@@ -192,11 +264,20 @@ print_metadata() {
     printf '# exact2_cuda=%s exact2_metal=%s proposer_block_max_cuda=%s proposer_block_max_metal=%s verifier_block_max=%s require_exact2=%s\n' \
         "$exact2_cuda" "$exact2_metal" "$proposer_cap_cuda" \
         "$proposer_cap_metal" "$verifier_cap" "$REQUIRE_EXACT2"
-    printf '# exactn_cuda=%s exactn_cuda_disable=%s require_cuda_exactn=%s exactn_union_metal=%s noncausal_online_cuda=%s noncausal_online_cuda_disable=%s verify_noncausal=%s exact_rows_async_tails_metal=%s\n' \
+    printf '# exactn_cuda=%s exactn_cuda_disable=%s require_cuda_exactn=%s exactn_cuda_batch_head=%s exactn_cuda_batch_head_disable=%s require_cuda_exactn_batch_head=%s cuda_device_proposer=%s cuda_device_proposer_disable=%s require_cuda_device_proposer=%s exactn_union_metal=%s noncausal_online_cuda=%s noncausal_online_cuda_disable=%s verify_noncausal=%s exact_rows_async_tails_metal=%s\n' \
         "$exactn_cuda" "$exactn_cuda_disable" "$REQUIRE_CUDA_EXACTN" \
+        "$exactn_cuda_batch_head" "$exactn_cuda_batch_head_disable" \
+        "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" \
+        "$cuda_device_proposer" "$cuda_device_proposer_disable" \
+        "$REQUIRE_CUDA_DEVICE_PROPOSER" \
         "$exactn_union_metal" "$noncausal_online_cuda" \
         "$noncausal_online_cuda_disable" "$verify_noncausal" \
         "$exact_rows_async_tails_metal"
+    printf '# exactn_metal_batch_head=%s exactn_metal_batch_head_disable=%s require_metal_exactn_batch_head=%s require_metal_exactn_partial=%s metal_device_proposer=%s metal_device_proposer_disable=%s require_metal_device_proposer=%s\n' \
+        "$exactn_metal_batch_head" "$exactn_metal_batch_head_disable" \
+        "$REQUIRE_METAL_EXACTN_BATCH_HEAD" "$REQUIRE_METAL_EXACTN_PARTIAL" \
+        "$metal_device_proposer" "$metal_device_proposer_disable" \
+        "$REQUIRE_METAL_DEVICE_PROPOSER"
     printf '# baseline_command=%s -m %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
         "$DS4_BIN" "$MODEL" "$TOKENS"
     printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s -m %s --mtp %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
@@ -295,6 +376,23 @@ run_case() {
     cuda_exactn_attempt=$(stats_field "$stats" cuda_exactn_attempt)
     cuda_exactn_fallback=$(stats_field "$stats" cuda_exactn_fallback)
     cuda_exactn_error_fallback=$(stats_field "$stats" cuda_exactn_error_fallback)
+    cuda_exactn_batch_head_attempt=$(stats_field "$stats" cuda_exactn_batch_head_attempt)
+    cuda_exactn_batch_head_use=$(stats_field "$stats" cuda_exactn_batch_head_use)
+    cuda_exactn_batch_head_fallback=$(stats_field "$stats" cuda_exactn_batch_head_fallback)
+    cuda_device_proposer_attempt=$(stats_field "$stats" cuda_device_proposer_attempt)
+    cuda_device_proposer_use=$(stats_field "$stats" cuda_device_proposer_use)
+    cuda_device_proposer_fallback=$(stats_field "$stats" cuda_device_proposer_fallback)
+    cuda_device_proposer_policy_mismatch=$(stats_field "$stats" cuda_device_proposer_policy_mismatch)
+    exactn_union_error_fallback=$(stats_field "$stats" exactn_union_error_fallback)
+    exactn_union_partial_replay=$(stats_field "$stats" exactn_union_partial_replay)
+    exactn_union_verify_skip=$(stats_field "$stats" exactn_union_verify_skip)
+    metal_exactn_batch_head_attempt=$(stats_field "$stats" metal_exactn_batch_head_attempt)
+    metal_exactn_batch_head_use=$(stats_field "$stats" metal_exactn_batch_head_use)
+    metal_exactn_batch_head_fallback=$(stats_field "$stats" metal_exactn_batch_head_fallback)
+    metal_device_proposer_attempt=$(stats_field "$stats" metal_device_proposer_attempt)
+    metal_device_proposer_use=$(stats_field "$stats" metal_device_proposer_use)
+    metal_device_proposer_fallback=$(stats_field "$stats" metal_device_proposer_fallback)
+    metal_device_proposer_policy_mismatch=$(stats_field "$stats" metal_device_proposer_policy_mismatch)
     direct_full=$(stats_field "$stats" direct_full)
     direct_partial=$(stats_field "$stats" direct_partial)
     exact2_full=$(stats_field "$stats" exact2_full)
@@ -311,6 +409,23 @@ run_case() {
     cuda_exactn_attempt=${cuda_exactn_attempt:-0}
     cuda_exactn_fallback=${cuda_exactn_fallback:-0}
     cuda_exactn_error_fallback=${cuda_exactn_error_fallback:-0}
+    cuda_exactn_batch_head_attempt=${cuda_exactn_batch_head_attempt:-0}
+    cuda_exactn_batch_head_use=${cuda_exactn_batch_head_use:-0}
+    cuda_exactn_batch_head_fallback=${cuda_exactn_batch_head_fallback:-0}
+    cuda_device_proposer_attempt=${cuda_device_proposer_attempt:-0}
+    cuda_device_proposer_use=${cuda_device_proposer_use:-0}
+    cuda_device_proposer_fallback=${cuda_device_proposer_fallback:-0}
+    cuda_device_proposer_policy_mismatch=${cuda_device_proposer_policy_mismatch:-0}
+    exactn_union_error_fallback=${exactn_union_error_fallback:-0}
+    exactn_union_partial_replay=${exactn_union_partial_replay:-0}
+    exactn_union_verify_skip=${exactn_union_verify_skip:-0}
+    metal_exactn_batch_head_attempt=${metal_exactn_batch_head_attempt:-0}
+    metal_exactn_batch_head_use=${metal_exactn_batch_head_use:-0}
+    metal_exactn_batch_head_fallback=${metal_exactn_batch_head_fallback:-0}
+    metal_device_proposer_attempt=${metal_device_proposer_attempt:-0}
+    metal_device_proposer_use=${metal_device_proposer_use:-0}
+    metal_device_proposer_fallback=${metal_device_proposer_fallback:-0}
+    metal_device_proposer_policy_mismatch=${metal_device_proposer_policy_mismatch:-0}
     direct_full=${direct_full:-0}
     direct_partial=${direct_partial:-0}
     exact2_full=${exact2_full:-0}
@@ -332,6 +447,23 @@ run_case() {
     total_cuda_exactn_attempt=$((total_cuda_exactn_attempt + cuda_exactn_attempt))
     total_cuda_exactn_fallback=$((total_cuda_exactn_fallback + cuda_exactn_fallback))
     total_cuda_exactn_error_fallback=$((total_cuda_exactn_error_fallback + cuda_exactn_error_fallback))
+    total_cuda_exactn_batch_head_attempt=$((total_cuda_exactn_batch_head_attempt + cuda_exactn_batch_head_attempt))
+    total_cuda_exactn_batch_head_use=$((total_cuda_exactn_batch_head_use + cuda_exactn_batch_head_use))
+    total_cuda_exactn_batch_head_fallback=$((total_cuda_exactn_batch_head_fallback + cuda_exactn_batch_head_fallback))
+    total_cuda_device_proposer_attempt=$((total_cuda_device_proposer_attempt + cuda_device_proposer_attempt))
+    total_cuda_device_proposer_use=$((total_cuda_device_proposer_use + cuda_device_proposer_use))
+    total_cuda_device_proposer_fallback=$((total_cuda_device_proposer_fallback + cuda_device_proposer_fallback))
+    total_cuda_device_proposer_policy_mismatch=$((total_cuda_device_proposer_policy_mismatch + cuda_device_proposer_policy_mismatch))
+    total_exactn_union_error_fallback=$((total_exactn_union_error_fallback + exactn_union_error_fallback))
+    total_exactn_union_partial_replay=$((total_exactn_union_partial_replay + exactn_union_partial_replay))
+    total_exactn_union_verify_skip=$((total_exactn_union_verify_skip + exactn_union_verify_skip))
+    total_metal_exactn_batch_head_attempt=$((total_metal_exactn_batch_head_attempt + metal_exactn_batch_head_attempt))
+    total_metal_exactn_batch_head_use=$((total_metal_exactn_batch_head_use + metal_exactn_batch_head_use))
+    total_metal_exactn_batch_head_fallback=$((total_metal_exactn_batch_head_fallback + metal_exactn_batch_head_fallback))
+    total_metal_device_proposer_attempt=$((total_metal_device_proposer_attempt + metal_device_proposer_attempt))
+    total_metal_device_proposer_use=$((total_metal_device_proposer_use + metal_device_proposer_use))
+    total_metal_device_proposer_fallback=$((total_metal_device_proposer_fallback + metal_device_proposer_fallback))
+    total_metal_device_proposer_policy_mismatch=$((total_metal_device_proposer_policy_mismatch + metal_device_proposer_policy_mismatch))
     if [ "$REQUIRE_EXACT2" != 0 ] && [ "$exact2_fallback" -ne 0 ]; then
         echo "dspark-fixture: exact2 fallback for $id: $stats" >&2
         return 1
@@ -339,6 +471,34 @@ run_case() {
     if [ "$REQUIRE_CUDA_EXACTN" != 0 ] &&
        [ "$cuda_exactn_error_fallback" -ne 0 ]; then
         echo "dspark-fixture: CUDA exact-N error fallback for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" != 0 ] &&
+       [ "$cuda_exactn_batch_head_fallback" -ne 0 ]; then
+        echo "dspark-fixture: CUDA exact-N batch-head fallback for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$REQUIRE_CUDA_DEVICE_PROPOSER" != 0 ] &&
+       { [ "$cuda_device_proposer_fallback" -ne 0 ] ||
+         [ "$cuda_device_proposer_policy_mismatch" -ne 0 ]; }; then
+        echo "dspark-fixture: CUDA device proposer fallback/mismatch for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$REQUIRE_METAL_EXACTN_BATCH_HEAD" != 0 ] &&
+       [ "$metal_exactn_batch_head_fallback" -ne 0 ]; then
+        echo "dspark-fixture: Metal exact-N batch-head fallback for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$REQUIRE_METAL_EXACTN_PARTIAL" != 0 ] &&
+       { [ "$exactn_union_error_fallback" -ne 0 ] ||
+         [ "$exactn_union_partial_replay" -ne "$exactn_union_verify_skip" ]; }; then
+        echo "dspark-fixture: Metal exact-N partial replay/skip mismatch for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$REQUIRE_METAL_DEVICE_PROPOSER" != 0 ] &&
+       { [ "$metal_device_proposer_fallback" -ne 0 ] ||
+         [ "$metal_device_proposer_policy_mismatch" -ne 0 ]; }; then
+        echo "dspark-fixture: Metal device proposer fallback/mismatch for $id: $stats" >&2
         return 1
     fi
     if [ "$PROPOSAL_QUALITY_GUARD_ACTIVE" -ne 0 ] && [ "$id" = c_add ] &&
@@ -389,6 +549,38 @@ if [ "$REQUIRE_CUDA_EXACTN" != 0 ]; then
         "$total_cuda_exactn_attempt" "$total_cuda_exactn_fallback" \
         "$total_cuda_exactn_error_fallback"
 fi
+if [ "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" != 0 ]; then
+    printf '# cuda_exactn_batch_head_attempt=%s cuda_exactn_batch_head_use=%s cuda_exactn_batch_head_fallback=%s\n' \
+        "$total_cuda_exactn_batch_head_attempt" \
+        "$total_cuda_exactn_batch_head_use" \
+        "$total_cuda_exactn_batch_head_fallback"
+fi
+if [ "$REQUIRE_CUDA_DEVICE_PROPOSER" != 0 ]; then
+    printf '# cuda_device_proposer_attempt=%s cuda_device_proposer_use=%s cuda_device_proposer_fallback=%s cuda_device_proposer_policy_mismatch=%s\n' \
+        "$total_cuda_device_proposer_attempt" \
+        "$total_cuda_device_proposer_use" \
+        "$total_cuda_device_proposer_fallback" \
+        "$total_cuda_device_proposer_policy_mismatch"
+fi
+if [ "$REQUIRE_METAL_EXACTN_BATCH_HEAD" != 0 ]; then
+    printf '# metal_exactn_batch_head_attempt=%s metal_exactn_batch_head_use=%s metal_exactn_batch_head_fallback=%s\n' \
+        "$total_metal_exactn_batch_head_attempt" \
+        "$total_metal_exactn_batch_head_use" \
+        "$total_metal_exactn_batch_head_fallback"
+fi
+if [ "$REQUIRE_METAL_EXACTN_PARTIAL" != 0 ]; then
+    printf '# exactn_union_error_fallback=%s exactn_union_partial_replay=%s exactn_union_verify_skip=%s\n' \
+        "$total_exactn_union_error_fallback" \
+        "$total_exactn_union_partial_replay" \
+        "$total_exactn_union_verify_skip"
+fi
+if [ "$REQUIRE_METAL_DEVICE_PROPOSER" != 0 ]; then
+    printf '# metal_device_proposer_attempt=%s metal_device_proposer_use=%s metal_device_proposer_fallback=%s metal_device_proposer_policy_mismatch=%s\n' \
+        "$total_metal_device_proposer_attempt" \
+        "$total_metal_device_proposer_use" \
+        "$total_metal_device_proposer_fallback" \
+        "$total_metal_device_proposer_policy_mismatch"
+fi
 if [ "$REQUIRE_CUDA_EXACTN" != 0 ] &&
    [ "$total_cuda_exactn_attempt" -eq 0 ]; then
     echo "dspark-fixture: CUDA exact-N was required but never attempted" >&2
@@ -397,6 +589,45 @@ fi
 if [ "$REQUIRE_CUDA_EXACTN" != 0 ] &&
    [ "$total_cuda_exactn_error_fallback" -ne 0 ]; then
     echo "dspark-fixture: CUDA exact-N error fallback count=$total_cuda_exactn_error_fallback" >&2
+    exit 1
+fi
+if [ "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" != 0 ] &&
+   { [ "$total_cuda_exactn_batch_head_attempt" -eq 0 ] ||
+     [ "$total_cuda_exactn_batch_head_use" -eq 0 ] ||
+     [ "$total_cuda_exactn_batch_head_fallback" -ne 0 ]; }; then
+    echo "dspark-fixture: CUDA exact-N batch head not cleanly exercised (attempt=$total_cuda_exactn_batch_head_attempt use=$total_cuda_exactn_batch_head_use fallback=$total_cuda_exactn_batch_head_fallback)" >&2
+    exit 1
+fi
+if [ "$REQUIRE_CUDA_DEVICE_PROPOSER" != 0 ] &&
+   { [ "$total_cuda_device_proposer_attempt" -eq 0 ] ||
+     [ "$total_cuda_device_proposer_use" -eq 0 ] ||
+     [ "$total_cuda_device_proposer_attempt" -ne "$total_cuda_device_proposer_use" ] ||
+     [ "$total_cuda_device_proposer_fallback" -ne 0 ] ||
+     [ "$total_cuda_device_proposer_policy_mismatch" -ne 0 ]; }; then
+    echo "dspark-fixture: CUDA device proposer not cleanly exercised (attempt=$total_cuda_device_proposer_attempt use=$total_cuda_device_proposer_use fallback=$total_cuda_device_proposer_fallback policy_mismatch=$total_cuda_device_proposer_policy_mismatch)" >&2
+    exit 1
+fi
+if [ "$REQUIRE_METAL_EXACTN_BATCH_HEAD" != 0 ] &&
+   { [ "$total_metal_exactn_batch_head_attempt" -eq 0 ] ||
+     [ "$total_metal_exactn_batch_head_use" -eq 0 ] ||
+     [ "$total_metal_exactn_batch_head_fallback" -ne 0 ]; }; then
+    echo "dspark-fixture: Metal exact-N batch head not cleanly exercised (attempt=$total_metal_exactn_batch_head_attempt use=$total_metal_exactn_batch_head_use fallback=$total_metal_exactn_batch_head_fallback)" >&2
+    exit 1
+fi
+if [ "$REQUIRE_METAL_EXACTN_PARTIAL" != 0 ] &&
+   { [ "$total_exactn_union_partial_replay" -eq 0 ] ||
+     [ "$total_exactn_union_partial_replay" -ne "$total_exactn_union_verify_skip" ] ||
+     [ "$total_exactn_union_error_fallback" -ne 0 ]; }; then
+    echo "dspark-fixture: Metal exact-N partial path not cleanly exercised (replay=$total_exactn_union_partial_replay verify_skip=$total_exactn_union_verify_skip error_fallback=$total_exactn_union_error_fallback)" >&2
+    exit 1
+fi
+if [ "$REQUIRE_METAL_DEVICE_PROPOSER" != 0 ] &&
+   { [ "$total_metal_device_proposer_attempt" -eq 0 ] ||
+     [ "$total_metal_device_proposer_use" -eq 0 ] ||
+     [ "$total_metal_device_proposer_attempt" -ne "$total_metal_device_proposer_use" ] ||
+     [ "$total_metal_device_proposer_fallback" -ne 0 ] ||
+     [ "$total_metal_device_proposer_policy_mismatch" -ne 0 ]; }; then
+    echo "dspark-fixture: Metal device proposer not cleanly exercised (attempt=$total_metal_device_proposer_attempt use=$total_metal_device_proposer_use fallback=$total_metal_device_proposer_fallback policy_mismatch=$total_metal_device_proposer_policy_mismatch)" >&2
     exit 1
 fi
 if [ "$REQUIRE_PARTIAL" != 0 ] && [ "$REQUIRE_DIRECT" != 0 ] &&

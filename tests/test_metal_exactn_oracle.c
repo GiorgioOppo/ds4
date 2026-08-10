@@ -50,6 +50,11 @@ enum {
     EXACTN_UNION_FALLBACKS,
     EXACTN_UNION_PARTIAL_FALLBACKS,
     EXACTN_UNION_ERROR_FALLBACKS,
+    EXACTN_UNION_PARTIAL_REPLAYS,
+    EXACTN_UNION_VERIFY_SKIPS,
+    EXACTN_UNION_BATCH_HEAD_ATTEMPTS,
+    EXACTN_UNION_BATCH_HEAD_USES,
+    EXACTN_UNION_BATCH_HEAD_FALLBACKS,
     EXACTN_UNION_COUNTER_COUNT
 };
 
@@ -230,26 +235,35 @@ static void read_union_stats(
 }
 
 static void check_union_stats_delta(
-        const uint64_t before[EXACTN_UNION_COUNTER_COUNT],
-        const uint64_t after[EXACTN_UNION_COUNTER_COUNT],
-        const exactn_case *tc) {
+    const uint64_t before[EXACTN_UNION_COUNTER_COUNT],
+    const uint64_t after[EXACTN_UNION_COUNTER_COUNT],
+    const exactn_case *tc,
+    bool expect_batch_head) {
     uint64_t expected[EXACTN_UNION_COUNTER_COUNT] = {0};
     /* EOS in the first draft row truncates the block to N=1 before exact-N
      * dispatch.  Every other full block (including middle EOS) is committed
-     * by the union path; a deliberately wrong row falls back to the slow
-     * exact-N oracle after recording a partial mismatch. */
+     * by the union path; a deliberately wrong row restores once and exactly
+     * replays the already verified prefix. */
     if (tc->eos_at != 0) {
         expected[EXACTN_UNION_ATTEMPTS] = 1;
         if (tc->reject_at >= 0) {
             expected[EXACTN_UNION_FALLBACKS] = 1;
             expected[EXACTN_UNION_PARTIAL_FALLBACKS] = 1;
+            expected[EXACTN_UNION_PARTIAL_REPLAYS] = 1;
+            expected[EXACTN_UNION_VERIFY_SKIPS] = 1;
         } else {
             expected[EXACTN_UNION_FULL_ACCEPTS] = 1;
+        }
+        if (expect_batch_head) {
+            expected[EXACTN_UNION_BATCH_HEAD_ATTEMPTS] = 1;
+            expected[EXACTN_UNION_BATCH_HEAD_USES] = 1;
         }
     }
 
     static const char *const names[EXACTN_UNION_COUNTER_COUNT] = {
-        "attempt", "full", "fallback", "partial", "error"
+        "attempt", "full", "fallback", "partial", "error",
+        "partial-replay", "verify-skip", "batch-head-attempt",
+        "batch-head-use", "batch-head-fallback"
     };
     for (int i = 0; i < EXACTN_UNION_COUNTER_COUNT; i++) {
         if (after[i] < before[i] || after[i] - before[i] != expected[i]) {
@@ -273,10 +287,11 @@ static void run_case(ds4_session *session,
                      const int correct[MAX_DRAFT],
                      const int wrong[MAX_DRAFT],
                      int model_eos,
-                     int vocab,
-                     float *expected_logits,
-                     float *actual_logits,
-                     const exactn_case *tc) {
+                      int vocab,
+                      float *expected_logits,
+                      float *actual_logits,
+                      const exactn_case *tc,
+                      bool expect_batch_head) {
     int drafts[MAX_DRAFT];
     memcpy(drafts, correct, (size_t)tc->draft_n * sizeof(drafts[0]));
     if (tc->reject_at >= 0) drafts[tc->reject_at] = wrong[tc->reject_at];
@@ -286,10 +301,9 @@ static void run_case(ds4_session *session,
         cycle_eos = drafts[tc->eos_at];
     }
 
-    /* Run the production path first.  A partial fallback may conservatively
-     * accept fewer correct prefix rows if the legacy batch top differs near a
-     * tie; it must never accept the deliberately wrong row.  The sequential
-     * oracle is therefore built for the prefix production actually commits. */
+    /* Run the production path first.  A partial union result already proves
+     * the complete correct prefix and skips the legacy batch verifier, so the
+     * commit must stop exactly at the deliberately wrong row. */
     restore_snapshot(session, base, tc->name);
     int accepted[MAX_DRAFT] = {-1, -1, -1, -1, -1};
     char err[256] = "";
@@ -301,7 +315,8 @@ static void run_case(ds4_session *session,
             accepted, MAX_DRAFT, err, sizeof(err));
     if (accepted_n < 0) fail("exact-N cycle", tc->name, err);
     read_union_stats(session, union_after, tc->name);
-    check_union_stats_delta(union_before, union_after, tc);
+    check_union_stats_delta(union_before, union_after, tc,
+                            expect_batch_head);
     int full_expected = tc->draft_n;
     if (tc->eos_at >= 0) {
         /* Production truncates at the first occurrence of EOS.  The fixture
@@ -320,8 +335,7 @@ static void run_case(ds4_session *session,
                  full_expected, accepted_n, err);
         fail("accepted prefix length", tc->name, detail);
     }
-    if (tc->reject_at >= 0 &&
-        (accepted_n <= 0 || accepted_n > tc->reject_at)) {
+    if (tc->reject_at >= 0 && accepted_n != tc->reject_at) {
         char detail[160];
         snprintf(detail, sizeof(detail),
                  "reject_at=%d accepted=%d err=%s",
@@ -383,9 +397,21 @@ int main(void) {
         return required && required[0] && strcmp(required, "0") != 0 ? 1 : 0;
     }
 
+    const char *batch_head_env =
+        getenv("DS4_TEST_METAL_EXACTN_BATCH_HEAD");
+    const bool expect_batch_head =
+        batch_head_env && batch_head_env[0] &&
+        strcmp(batch_head_env, "0") != 0;
+
     setenv("DS4_TEST_METAL_EXACTN_ORACLE", "1", 1);
     setenv("DS4_METAL_DSPARK_EXACTN_UNION", "1", 1);
     setenv("DS4_METAL_DSPARK_EXACTN", "1", 1);
+    if (expect_batch_head) {
+        setenv("DS4_METAL_DSPARK_EXACTN_BATCH_HEAD", "1", 1);
+        unsetenv("DS4_METAL_DISABLE_DSPARK_EXACTN_BATCH_HEAD");
+    } else {
+        unsetenv("DS4_METAL_DSPARK_EXACTN_BATCH_HEAD");
+    }
     setenv("DS4_DSPARK_STATS", "1", 1);
     setenv("DS4_DSPARK_SSD_VERIFY_BLOCK_MAX", "5", 1);
     setenv("DS4_METAL_DSPARK_ACCEPTANCE_ONLY_VERIFY", "0", 1);
@@ -493,14 +519,16 @@ int main(void) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         run_case(session, &base, prompt.len, &expected_state, &actual_state,
                  correct, wrong, model_eos, vocab,
-                 expected_logits, actual_logits, &cases[i]);
+                 expected_logits, actual_logits, &cases[i],
+                 expect_batch_head);
     }
 
     fprintf(stderr,
             "test_metal_exactn_oracle PASS cases=%zu N=2..5 "
             "(six-token cycle at N=5) partial_prefixes=1..4 "
-            "eos=first,middle\n",
-            sizeof(cases) / sizeof(cases[0]));
+            "eos=first,middle batch_head=%s\n",
+            sizeof(cases) / sizeof(cases[0]),
+            expect_batch_head ? "required" : "disabled");
 
     free(actual_logits);
     free(expected_logits);
