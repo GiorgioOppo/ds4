@@ -481,14 +481,66 @@ ordinary decode and therefore still requires rollback plus exact replay.
 `DS4_METAL_DSPARK_EXACTN_UNION=1` enables a separate experimental Metal SSD
 verifier for two through five draft tokens. It executes canonical one-row
 target decode in layer order, loads the union of the rows' routed experts once
-per layer, and commits directly only after a full accept; partial accepts keep
-the established rollback/replay fallback. The model-backed
+per layer, and commits its verifier state directly after a full accept. On a
+partial match it restores the frontier once, skips the boundary oracle,
+exact-two path, and legacy token-by-token verifier, then exactly replays only
+the already verified prefix. With `DS4_DSPARK_STATS=1`,
+`exactn_union_partial_replay` and `exactn_union_verify_skip` should advance
+together; `exactn_union_partial_replay_ms` isolates the required commit replay.
+Set `DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_PARTIAL=1` to require at least one
+such partial match, equal replay/skip counts, no exact-union error fallback,
+and byte-identical fixture output. The model-backed
 `test-metal-exactn-oracle` is byte-identical to sequential decode for N=2..5,
 including every N=5 partial prefix, EOS in the first or a middle row, serialized
 KV/compressor state, logits, and a four-token continuation. Five drafts plus
 the target token already available at the start of the cycle cover the
 six-token speculative-cycle limit. Exact-union remains opt-in: correctness
 does not imply a throughput improvement on a particular memory configuration.
+
+For an independent Q8 output-head A/B inside exact-union, set
+`DS4_METAL_DSPARK_EXACTN_BATCH_HEAD=1`. HC collapse and normalization remain on
+the canonical one-row kernels, while one bit-exact decode-row dispatch projects
+all two through five verifier rows to vocabulary logits. Non-Q8 output weights
+are ineligible and a dispatch failure falls back to the ordinary per-row heads.
+`DS4_METAL_DISABLE_DSPARK_EXACTN_BATCH_HEAD=1` is the unconditional kill switch
+and wins if both variables are set. The
+`metal_exactn_batch_head_attempt`, `metal_exactn_batch_head_use`, and
+`metal_exactn_batch_head_fallback` counters identify the selected path; set
+`DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_BATCH_HEAD=1` to require a nonzero,
+fallback-free use with byte-identical output.
+
+The generic model-backed exact-N oracle keeps this Q8-only experiment disabled,
+so it remains valid for target models with another output quantization. To add
+model-backed batch-head coverage, use an OutQ8 target explicitly:
+
+```sh
+DS4_TEST_METAL_EXACTN_BATCH_HEAD=1 \
+DS4_TEST_MODEL=/path/to/target-OutQ8.gguf \
+make test-metal-exactn-oracle
+```
+
+The Metal proposer also has an independent experiment for confidence/Markov
+synchronization overhead. Set `DS4_METAL_DSPARK_DEVICE_PROPOSER=1` when the
+final confidence projection and both Markov matrices are Q8_0. On an eligible
+single-device, tier-zero run it keeps the previous token, confidence decisions,
+and Markov argmax chain on Metal, reuses the first confidence already computed
+by the proposer, and returns one result for the complete draft block. Unlike
+the CUDA experiment, the Metal path is eligible with SSD streaming; tensor
+placement and proposal-quality mode remain excluded. It stops at the first
+rejected confidence row and preserves the smaller-token argmax tie break.
+Unsupported layouts, an incomplete result, or a CPU sigmoid-policy mismatch
+fall back to the existing per-row implementation.
+
+`DS4_METAL_DSPARK_NO_DEVICE_PROPOSER=1` is the unconditional kill switch;
+`DS4_DSPARK_NO_GPU_MARKOV=1` and `DS4_DSPARK_NO_MARKOV=1` also keep the path
+disabled. This remains opt-in because Q8 confidence accumulation moves from the
+host CPU to Metal and therefore needs a same-machine greedy oracle and A/B.
+With `DS4_DSPARK_STATS=1`, require
+`metal_device_proposer_attempt == metal_device_proposer_use > 0`,
+`metal_device_proposer_fallback=0`, and
+`metal_device_proposer_policy_mismatch=0`. The acceptance fixture enforces
+those conditions and byte-identical output with
+`DS4_DSPARK_FIXTURE_REQUIRE_METAL_DEVICE_PROPOSER=1`.
 
 Exact-union normally waits for every layer's routed-tail command buffer before
 releasing its private expert-address scope. For an isolated A/B,
@@ -516,6 +568,34 @@ this verifier:
 - The eligible Q4 attention-output B projection can perform the following HC
   expansion in the same dispatch. Use
   `DS4_METAL_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` as its isolated A/B control.
+- For an AProjQ4 multi-row attention-output batch with either attention B in
+  Q8 or Q4_K, the opt-in
+  `DS4_METAL_ENABLE_Q4_ATTN_OUT_TINY_BATCH=1` evaluates two through five rows
+  in two dispatches while retaining the canonical one-row reduction order for
+  every row. This covers the generic suffix verifier; the exact-union tape is
+  intentionally still row-by-row and does not select this helper. Other
+  output formats, unsupported shapes, a disabled Q4 classic matvec, or a
+  dispatch setup failure return to the existing row-wise path.
+  `DS4_METAL_DISABLE_Q4_ATTN_OUT_TINY_BATCH=1` is the unconditional kill
+  switch and wins when both variables are set. For a fail-closed model-backed
+  generic-verifier test, `DS4_METAL_REQUIRE_Q4_ATTN_OUT_TINY_BATCH=1` implies
+  the enable gate for N=2..5 and turns an ineligible shape, the kill switch, or
+  a dispatch failure into a hard error instead of a silent row-wise fallback.
+
+The AProjQ8 Q-A/KV plus compressor compound remains the M1-M5 default for
+eligible resident `FULL` decode. For an SSD-streaming A/B, including the
+exact-union `TO_ROUTER` collection prefix, set
+`DS4_METAL_ENABLE_Q8_QKV_COMPRESSOR_FUSE=1`. Ratio-4 layers combine the Q8
+Q-A/KV pair with both attention and indexer F16 compressor pairs; ratio-128
+layers combine it with the attention pair. The kernel preserves the canonical
+NSG=4 Q8 and NR0=2 F16 reduction trees. A diagnostic Q8 NSG override or the
+experimental NR0=4 compressor schedule therefore selects the separate
+dispatches. `DS4_METAL_REQUIRE_Q8_QKV_COMPRESSOR_FUSE=1` turns such a fallback
+into a visible error for model-backed tests. The existing ratio-specific
+pre-M5/M5 QKV compound disable variables remain authoritative. Keep the SSD
+extension opt-in until warm and cold A/B runs show a gain: it removes a launch
+per row and layer but reads the same model bytes, and a compound grid can
+change the order in which distant GGUF pages are faulted.
 
 Additional PR #755 ports keep their established kernels as shape/resource
 fallbacks:
@@ -620,10 +700,24 @@ reduction order; with the normal one-token cuBLAS path, also set
 `DS4_CUDA_NO_F16_CUBLAS_ONE=1` to exercise it. The controls are
 `DS4_CUDA_DISABLE_HC_NORM_MIX_FUSE=1` and
 `DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1`. The Q4 attention-output B plus HC
-expansion is automatic only when MMQ is disabled, where it preserves the
-existing Q8_K activation quantizer. With the normal MMVQ/Q8_1 decode path it
-requires the explicit `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1` experiment and
-may not be numerically identical until validated on CUDA hardware.
+path is automatic when MMQ is disabled, where the existing one-dispatch Q8_K
+implementation is bit-compatible with its fallback. With the normal
+MMVQ/Q8_1 decode path, `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1` now preserves
+the canonical MMVQ projection and replaces only the following HC expansion
+with a row-packed epilogue that reads each projected row once. It therefore
+does not change activation quantization. The older, truly single-dispatch
+Q8_K experiment is isolated behind
+`DS4_CUDA_Q4_ATTN_OUT_HC_Q8K_EXPERIMENT=1` and may differ numerically from
+MMVQ/Q8_1.
+
+For a fail-closed hardware comparison, set
+`DS4_CUDA_Q4_ATTN_OUT_HC_ORACLE=1`. It retains the canonical MMVQ/Q8_1 output,
+compares both the row-packed epilogue and the Q8_K compound bit-for-bit, and
+prints `epilogue_mismatches`, `q8k_mismatches`, and `skips` at exit. The
+oracle avoids readback while CUDA graph capture is active; run a separate
+non-captured diagnostic and require `calls>0`, `skips=0`, and
+`epilogue_mismatches=0` before promoting the row-packed path. A zero-call
+summary is therefore an explicit failed coverage gate, not a silent pass.
 
 An experimental resident-CUDA path can run the existing aligned
 IQ2_XXS/Q2_K vector MoE kernels for two-to-five-draft routed batches,
@@ -683,13 +777,15 @@ one-token tape to two through five draft rows. It leaves hidden rows and all
 target weights on one GPU, submits the per-row ordinary decode kernels in one
 stream, and reads back only the `N-1` acceptance ids plus final logits. A full
 match therefore commits its already-exact KV/compressor state without replay;
-a partial match or backend error restores the pre-cycle frontier and uses the
-legacy verifier/replay fallback. Enable it independently with:
+a partial match restores the pre-cycle frontier once and replays the prefix
+already proven by exact-N, without running the legacy verifier a second time.
+Only a backend error retains the legacy verifier/replay fallback. Enable it
+independently with:
 
 ```sh
 DS4_CUDA_DSPARK_EXACTN=1 DS4_DSPARK_STATS=1 \
 ./ds4 --cuda -m ds4flash.gguf \
-  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --mtp-model gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
   --dspark --temp 0 -p 'Write a Python quicksort function with comments.'
 ```
 
@@ -704,11 +800,54 @@ variable. Track `cuda_exactn_attempt`, `cuda_exactn_full`,
 this experiment disabled by default until a real CUDA oracle and a long greedy
 A/B show byte-identical output, no fallback errors, and a throughput win.
 
+For a separate output-head A/B, set
+`DS4_CUDA_DSPARK_EXACTN_BATCH_HEAD=1`. The experiment keeps HC collapse and
+normalization on the canonical one-row kernels, then runs the Q8 vocabulary
+projection for all exact-N rows through the bit-exact decode-row kernel. It is
+automatically ineligible for non-Q8 output weights and falls back to the
+ordinary per-row heads on a dispatch failure. The emergency kill switch is
+`DS4_CUDA_DISABLE_DSPARK_EXACTN_BATCH_HEAD=1` and wins when both variables are
+present.
+
+The CUDA proposer tail has a second, independent experiment for the fixed
+confidence/Markov synchronization overhead:
+
+```sh
+DS4_CUDA_DSPARK_DEVICE_PROPOSER=1
+```
+
+When the final confidence projection and both Markov matrices are Q8_0, this
+keeps the previous token, confidence decisions, and all Markov argmax steps on
+the decode stream and reads one 64-byte result for the whole draft block.  It
+stops at the first rejected confidence row, preserves the Markov smaller-token
+tie break, and rechecks the returned confidence prefix with the established
+CPU sigmoid policy.  Unsupported layouts, an incomplete result, or a policy
+mismatch fall back to the per-row implementation.  The unconditional kill
+switch is `DS4_CUDA_DSPARK_NO_DEVICE_PROPOSER=1`; the older
+`DS4_DSPARK_NO_GPU_MARKOV` switch also keeps this path disabled.
+The initial gate is intentionally limited to resident, single-GPU, non-quality
+CUDA and reuses the already-computed first confidence value.
+
+This remains opt-in because the Q8 confidence accumulation moves from the host
+CPU to CUDA and must pass the DGX proposal/acceptance oracle before promotion.
+With `DS4_DSPARK_STATS=1`, require
+`cuda_device_proposer_attempt == cuda_device_proposer_use > 0`,
+`cuda_device_proposer_fallback=0`, and
+`cuda_device_proposer_policy_mismatch=0`.  The acceptance fixture can enforce
+those conditions with
+`DS4_DSPARK_FIXTURE_REQUIRE_CUDA_DEVICE_PROPOSER=1`.
+
+The stats line separates `cuda_exactn_ms` into setup, layer, head, and read
+components, and reports restore, legacy-error-fallback verification, and
+partial replay time independently. `cuda_exactn_partial_replay` and
+`cuda_exactn_verify_skip` should advance together on valid partial matches;
+the batch-head attempt/use/fallback counters make its dispatch unambiguous.
+
 Set `DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN=1` on the candidate acceptance
 fixture to require at least one `cuda_exactn_attempt` and zero
 `cuda_exactn_error_fallback`. The aggregate `cuda_exactn_fallback` is reported
 but is not required to be zero: it also includes valid partial draft matches,
-which deliberately restore the frontier and use legacy replay.
+which deliberately restore the frontier and use exact replay.
 
 The acceptance fixture can exercise the same SSD path on both the target-only
 baseline and the DSpark run. It also requires real proposals and accepted
@@ -733,7 +872,9 @@ The current q2 results use `ds4-bench` with the standard *Promessi sposi*
 input, 2048-token context steps, and 128 greedy generation tokens at every
 frontier. Each prefill number is for the next 2048-token chunk. The complete
 sweeps are in [m5_max.csv](speed-bench/m5_max.csv) and
-[gb10.csv](speed-bench/gb10.csv).
+[gb10.csv](speed-bench/gb10.csv). The GB10 optimization methodology and
+validation are documented in
+[ds4_gb10_q2_cuda_port_results.md](speed-bench/ds4_gb10_q2_cuda_port_results.md).
 
 | Machine | Backend | Context | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: |
@@ -741,10 +882,10 @@ sweeps are in [m5_max.csv](speed-bench/m5_max.csv) and
 | MacBook Pro M5 Max, 128 GB | Metal | 16384 | 572.53 t/s | 36.14 t/s |
 | MacBook Pro M5 Max, 128 GB | Metal | 32768 | 557.04 t/s | 34.36 t/s |
 | MacBook Pro M5 Max, 128 GB | Metal | 65536 | 398.50 t/s | 27.64 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 2048 | 825.76 t/s | 18.05 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 16384 | 872.44 t/s | 15.10 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 32768 | 855.94 t/s | 14.43 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 65536 | 822.98 t/s | 13.84 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 2048 | 832.86 t/s | 20.58 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 16384 | 883.81 t/s | 16.80 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 32768 | 865.40 t/s | 15.99 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 65536 | 833.44 t/s | 15.27 t/s |
 
 Older measurements for machines and model variants not rerun in this pass are
 kept for reference. They used the earlier CLI prompt procedure and are not

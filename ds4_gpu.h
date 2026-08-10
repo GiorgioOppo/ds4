@@ -540,6 +540,51 @@ int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         uint32_t prev_token,
                                         uint32_t vocab,
                                         uint32_t rank);
+
+/* Optional GPU-resident DSpark proposer tail.  The backend keeps the Markov
+ * token chain on-device across all draft rows, stops it at the first rejected
+ * confidence row, and returns proposals plus the evaluated confidence logits
+ * in one result/readback.  Callers must re-evaluate the returned prefix with
+ * the established CPU sigmoid policy and fall back if the device stopped a
+ * row that policy accepts.
+ *
+ * This acceleration hook is deliberately fail-closed: it returns zero for
+ * disabled or unsupported inputs and callers must use the established
+ * per-row path.  CUDA requires DS4_CUDA_DSPARK_DEVICE_PROPOSER=1; Metal uses
+ * DS4_METAL_DSPARK_DEVICE_PROPOSER=1.  The corresponding NO_DEVICE_PROPOSER
+ * variables are unconditional kill switches.  The first implementation
+ * supports Q8_0 w1, w2, and confidence weights with 32-aligned hidden/rank
+ * dimensions.  The caller-owned result tensor must provide
+ * DS4_GPU_DSPARK_DEVICE_PROPOSAL_BYTES; the first sizeof(result) bytes are the
+ * public payload and the remainder is private per-call backend state. */
+#define DS4_GPU_DSPARK_MAX_DRAFTS 6u
+#define DS4_GPU_DSPARK_DEVICE_PROPOSAL_BYTES 2048u
+typedef struct {
+    int32_t  tokens[DS4_GPU_DSPARK_MAX_DRAFTS];
+    float    confidence_logits[DS4_GPU_DSPARK_MAX_DRAFTS];
+    uint32_t proposal_len;
+    uint32_t confidence_len;
+    uint32_t status;       /* 1: complete; 0: device-side failure */
+    uint32_t reserved;
+} ds4_gpu_dspark_device_proposal;
+
+int ds4_gpu_dspark_markov_confidence_q8_tensor(
+        ds4_gpu_tensor       *out_result,
+        const ds4_gpu_tensor *logits_rows,
+        const ds4_gpu_tensor *hidden_rows,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w1_offset,
+        uint64_t              w2_offset,
+        uint64_t              confidence_offset,
+        uint32_t              first_prev_token,
+        uint32_t              vocab,
+        uint32_t              rank,
+        uint32_t              hidden_dim,
+        uint32_t              n_drafts,
+        float                 confidence_threshold,
+        int                   reuse_confidence0,
+        float                 confidence0);
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -2305,6 +2350,9 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+/* Returns 1 when the batch path ran, 0 for the ordinary row fallback, and -1
+ * when the Metal REQUIRE diagnostic made an ineligible/failed tiny batch a
+ * hard error. */
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,

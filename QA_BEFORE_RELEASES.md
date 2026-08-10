@@ -310,6 +310,10 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   The matrix must include full accepts for N=2,3,4,5, all N=5 partial prefixes
   1..4, and EOS in the first and a middle row. This is a correctness gate, not
   evidence of a speedup.
+- The Q8 Q-A/KV compound rows below require a separate AProjQ8 target whose
+  metadata includes both ratio-4 and ratio-128 compressor layers. An AProjQ4
+  oracle cannot exercise that compound and is a failed coverage gate even if
+  greedy output remains correct.
 - Then run isolated, same-machine greedy A/B pairs with identical prompt,
   context, cache, token limit, and `DS4_DSPARK_STATS=1`. Change only the gate
   named by the row:
@@ -321,6 +325,9 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   | HC producer + split/Sinkhorn/destination RMSNorm on M1-M5 | `DS4_METAL_DISABLE_HC_PRODUCER_PRE_NORM_FUSE=1` | Leave the disable switch unset |
   | Q4 Q-A/KV + compressor store in exact-union | `DS4_METAL_DSPARK_EXACTN_UNION=1` with the Q4 enable switch unset | Keep exact-union `=1`; set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
   | Q4 Q-A/KV + compressor store in ordinary `FULL` decode | Leave `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE` unset | Set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
+  | Q8 Q-A/KV + compressor store in SSD `FULL` (AProjQ8) | Leave the Q8 enable/require switches unset | Set `DS4_METAL_ENABLE_Q8_QKV_COMPRESSOR_FUSE=1 DS4_METAL_REQUIRE_Q8_QKV_COMPRESSOR_FUSE=1` |
+  | Q8 Q-A/KV + compressor store in SSD exact-union (AProjQ8) | `DS4_METAL_DSPARK_EXACTN_UNION=1` with the Q8 enable/require switches unset | Keep exact-union `=1`; set `DS4_METAL_ENABLE_Q8_QKV_COMPRESSOR_FUSE=1 DS4_METAL_REQUIRE_Q8_QKV_COMPRESSOR_FUSE=1` |
+  | Q4 attention-output tiny batch in the generic verifier | Set `DS4_METAL_DSPARK_EXACTN_UNION=0 DS4_METAL_DSPARK_EXACTN=0 DS4_METAL_DSPARK_EXACT2=0`; leave tiny enable/require unset | Keep all three exact gates `=0`; set `DS4_METAL_REQUIRE_Q4_ATTN_OUT_TINY_BATCH=1` and require at least one proposed block of depth 3–5 (the acceptance-only suffix evaluates one fewer row) |
   | F16 attention+indexer quad compressor store in `FULL` decode | `DS4_METAL_DISABLE_COMPRESSOR_QUAD_STORE=1` | Leave the disable switch unset |
   | F16 attention+indexer quad compressor store in exact-union | `DS4_METAL_DSPARK_EXACTN_UNION=1 DS4_METAL_DISABLE_COMPRESSOR_QUAD_STORE=1` | Keep exact-union `=1`; leave the quad disable switch unset |
   | Exact ratio-4 one-row compressor pool on M1-M5 | `DS4_METAL_DISABLE_COMPRESSOR_EXACT_POOL_RATIO4=1` | Leave the disable switch unset |
@@ -432,14 +439,20 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   `DS4_CUDA_DISABLE_HC_NORM_MIX_FUSE=1` versus candidate
   `DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE=1 DS4_CUDA_NO_F16_CUBLAS_ONE=1`; and Q4
   attention-output/HC control `DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` versus
-  candidate `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1`. Repeat the pair and
-  attention-output cases with `DS4_CUDA_MMQ=0` to exercise the Q8_K fallback
-  arithmetic separately from the default MMVQ/Q8_1 path. Require
-  byte-identical stdout and full-logit/tensor equivalence before promoting an
-  opt-in gate. Run with decode graphs both enabled and disabled, and record
-  target, proposer, verifier, replay, acceptance, and generation t/s. A CUDA
-  build and hardware run are mandatory; a host-only build does not compile
-  the device kernels.
+  MMVQ-safe candidate `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1`. Run a separate
+  non-captured diagnostic with `DS4_CUDA_Q4_ATTN_OUT_HC_ORACLE=1`; require
+  the summary to be present with `calls>0`, `skips=0`, and
+  `epilogue_mismatches=0`, while `q8k_mismatches` records the expected
+  numerical distance from the optional one-dispatch Q8_K experiment. A
+  zero-call summary is a failed coverage gate. Only
+  test `DS4_CUDA_Q4_ATTN_OUT_HC_Q8K_EXPERIMENT=1` as a promotion candidate if
+  its oracle mismatches are also zero. Repeat the pair and attention-output
+  cases with `DS4_CUDA_MMQ=0` to exercise the canonical Q8_K fallback
+  separately from the default MMVQ/Q8_1 path. Require byte-identical stdout
+  and full-logit/tensor equivalence before promoting an opt-in gate. Run with
+  decode graphs both enabled and disabled, and record target, proposer,
+  verifier, replay, acceptance, and generation t/s. A CUDA build and hardware
+  run are mandatory; a host-only build does not compile the device kernels.
 - When DSpark, support-model mapping, or SSD streaming changes, repeat both
   the acceptance fixture and verifier invariant on every advertised graph
   backend. Apply the backend and SSD options to the target-only baseline as
@@ -948,6 +961,28 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   receiving explicit permission to use `192.168.60.250` for this QA pass.
 - Run:
   `make cuda-regression`.
+- On a single GB10 (`sm_121`), validate the imported Q2 decode fast paths with
+  the AProjQ8/OutQ8 Flash GGUF.  Compare the default against a rollback process
+  that sets all of:
+  `DS4_CUDA_NO_DIRECT_Q2_PREFILL=1`,
+  `DS4_CUDA_NO_F16_PAIR_COMPRESSOR_STORE=1`,
+  `DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE=1`,
+  `DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE_PREFETCH8=1`,
+  `DS4_CUDA_NO_Q8_FUSED_ALIGNED=1`,
+  `DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT=1`,
+  `DS4_CUDA_NO_Q8_ALIGNED_DENSE_SCRATCH=1`, and
+  `DS4_CUDA_NO_HC_SPLIT_NORM_SPLIT4096=1`.  Use separate processes, require
+  byte-identical greedy stdout and per-token logprobs, then run the same pair
+  under Compute Sanitizer.  Record prefill, decode, and steady decode rather
+  than copying the upstream PR numbers into a release claim.
+- Repeat the GB10 comparison with AProjQ4/OutQ8.  The persistent vocabulary,
+  compressor, HC split, scratch, and direct routed-MoE paths remain relevant,
+  while Q8 attention-projection consumers are intentionally ineligible.
+- Exercise CUDA DSpark at verifier/proposer depth 5 with the fast paths enabled
+  and disabled.  Require identical final output, zero verifier errors, and
+  matching full/partial acceptance histograms.  Test both the generic batch
+  verifier (direct Q2 path) and CUDA exact-N (one-row decode paths); do not
+  infer speculative speedup from the target-only benchmark.
 - For native MXFP4 changes, run
   `make test-mxfp4-cuda CUDA_ARCH=native` on the multi-GPU CUDA host only after
   receiving explicit permission for `192.168.60.250`, and

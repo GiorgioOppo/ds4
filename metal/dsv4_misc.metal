@@ -6894,3 +6894,245 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+/* DSpark confidence/Markov tail.  The public result occupies the first
+ * 64 bytes of a shared buffer; this private state starts immediately after
+ * it.  Keeping the previous token and the 128 group candidates here lets a
+ * complete draft block use one CPU readback instead of one per row. */
+#define DS4_METAL_DSPARK_MAX_DRAFTS 6u
+#define DS4_METAL_DSPARK_MARKOV_GROUPS 128u
+
+struct ds4_metal_dspark_device_args {
+    uint  vocab;
+    uint  rank_blocks;
+    uint  hidden_dim;
+    uint  n_drafts;
+    uint  draft;
+    uint  reuse_confidence0;
+    float confidence_threshold;
+    float confidence0;
+};
+
+struct ds4_metal_dspark_device_result {
+    int   tokens[DS4_METAL_DSPARK_MAX_DRAFTS];
+    float confidence_logits[DS4_METAL_DSPARK_MAX_DRAFTS];
+    uint  proposal_len;
+    uint  confidence_len;
+    uint  status;
+    uint  reserved;
+};
+
+struct ds4_metal_dspark_device_state {
+    uint  prev_token;
+    uint  status;
+    uint  active;
+    uint  proposal_len;
+    uint  confidence_len;
+    uint  pad0;
+    uint  pad1;
+    uint  pad2;
+    int   tokens[DS4_METAL_DSPARK_MAX_DRAFTS];
+    float confidence_logits[DS4_METAL_DSPARK_MAX_DRAFTS];
+    float group_values[DS4_METAL_DSPARK_MARKOV_GROUPS];
+    uint  group_indices[DS4_METAL_DSPARK_MARKOV_GROUPS];
+};
+
+kernel void kernel_dsv4_dspark_device_proposal_init(
+        constant uint &first_prev_token [[buffer(0)]],
+        device ds4_metal_dspark_device_state *state [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    state->prev_token = first_prev_token;
+    state->status = 1u;
+    state->active = 1u;
+    state->proposal_len = 0u;
+    state->confidence_len = 0u;
+    for (uint i = 0u; i < DS4_METAL_DSPARK_MAX_DRAFTS; i++) {
+        state->tokens[i] = -1;
+        state->confidence_logits[i] = 0.0f;
+    }
+}
+
+static inline float ds4_metal_dspark_q8_value(
+        device const block_q8_0 *row,
+        uint index) {
+    const uint b = index >> 5u;
+    return float(row[b].d) * float(row[b].qs[index & 31u]);
+}
+
+kernel void kernel_dsv4_dspark_device_confidence_q8(
+        constant ds4_metal_dspark_device_args &args [[buffer(0)]],
+        device const float *hidden_rows [[buffer(1)]],
+        device const block_q8_0 *w1 [[buffer(2)]],
+        device const block_q8_0 *confidence [[buffer(3)]],
+        device ds4_metal_dspark_device_state *state [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u || state->status == 0u || state->active == 0u ||
+        args.draft >= args.n_drafts) return;
+
+    float acc = 0.0f;
+    if (args.draft == 0u && args.reuse_confidence0 != 0u) {
+        acc = args.confidence0;
+    } else {
+        const uint hidden_blocks = args.hidden_dim >> 5u;
+        const uint feature_blocks = hidden_blocks + args.rank_blocks;
+        device const block_q8_0 *w1_row =
+            w1 + (ulong)state->prev_token * args.rank_blocks;
+        device const float *hidden =
+            hidden_rows + (ulong)args.draft * args.hidden_dim;
+
+        for (uint b = 0u; b < feature_blocks; b++) {
+            float values[32];
+            float amax = 0.0f;
+            for (uint k = 0u; k < 32u; k++) {
+                const uint feature = b * 32u + k;
+                const float v = feature < args.hidden_dim
+                    ? hidden[feature]
+                    : ds4_metal_dspark_q8_value(
+                          w1_row, feature - args.hidden_dim);
+                values[k] = v;
+                amax = max(amax, abs(v));
+            }
+            const float xscale = amax / 127.0f;
+            const float inv = xscale != 0.0f ? 1.0f / xscale : 0.0f;
+            int isum = 0;
+            for (uint k = 0u; k < 32u; k++) {
+                int q = int(rint(values[k] * inv));
+                q = clamp(q, -128, 127);
+                isum += int(confidence[b].qs[k]) * q;
+            }
+            acc += float(confidence[b].d) * xscale * float(isum);
+        }
+    }
+
+    state->confidence_logits[args.draft] = acc;
+    state->confidence_len = args.draft + 1u;
+    const float e = exp(acc >= 0.0f ? -acc : acc);
+    const float probability = acc >= 0.0f
+        ? 1.0f / (1.0f + e)
+        : e / (1.0f + e);
+    if (probability < args.confidence_threshold) state->active = 0u;
+}
+
+static inline bool ds4_metal_dspark_score_better(
+        float av, uint ai, float bv, uint bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+kernel void kernel_dsv4_dspark_device_markov_scan_q8(
+        constant ds4_metal_dspark_device_args &args [[buffer(0)]],
+        device const float *logits [[buffer(1)]],
+        device const block_q8_0 *w1 [[buffer(2)]],
+        device const block_q8_0 *w2 [[buffer(3)]],
+        device ds4_metal_dspark_device_state *state [[buffer(4)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float markov_state[256];
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+
+    if (state->active == 0u || state->status == 0u) {
+        if (tid == 0u && group < DS4_METAL_DSPARK_MARKOV_GROUPS) {
+            state->group_values[group] = -INFINITY;
+            state->group_indices[group] = 0u;
+        }
+        return;
+    }
+
+    const uint rank = args.rank_blocks * 32u;
+    device const block_q8_0 *w1_row =
+        w1 + (ulong)state->prev_token * args.rank_blocks;
+    if (tid < rank) {
+        markov_state[tid] = ds4_metal_dspark_q8_value(w1_row, tid);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_v = -INFINITY;
+    uint best_i = 0u;
+    const uint first = group * 256u + tid;
+    const uint stride = DS4_METAL_DSPARK_MARKOV_GROUPS * 256u;
+    for (uint i = first; i < args.vocab; i += stride) {
+        device const block_q8_0 *row =
+            w2 + (ulong)i * args.rank_blocks;
+        float acc = 0.0f;
+        for (uint b = 0u; b < args.rank_blocks; b++) {
+            float s = 0.0f;
+            for (uint k = 0u; k < 32u; k++) {
+                s += float(row[b].qs[k]) * markov_state[b * 32u + k];
+            }
+            acc += float(row[b].d) * s;
+        }
+        const float v = logits[i] + acc;
+        if (ds4_metal_dspark_score_better(v, i, best_v, best_i)) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+
+    values[tid] = best_v;
+    indices[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128u; step != 0u; step >>= 1u) {
+        if (tid < step &&
+            ds4_metal_dspark_score_better(
+                    values[tid + step], indices[tid + step],
+                    values[tid], indices[tid])) {
+            values[tid] = values[tid + step];
+            indices[tid] = indices[tid + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        state->group_values[group] = values[0];
+        state->group_indices[group] = indices[0];
+    }
+}
+
+kernel void kernel_dsv4_dspark_device_markov_reduce(
+        constant ds4_metal_dspark_device_args &args [[buffer(0)]],
+        device ds4_metal_dspark_device_state *state [[buffer(1)]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float values[DS4_METAL_DSPARK_MARKOV_GROUPS];
+    threadgroup uint indices[DS4_METAL_DSPARK_MARKOV_GROUPS];
+    if (state->active == 0u || state->status == 0u) return;
+
+    values[tid] = state->group_values[tid];
+    indices[tid] = state->group_indices[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = DS4_METAL_DSPARK_MARKOV_GROUPS / 2u;
+         step != 0u; step >>= 1u) {
+        if (tid < step &&
+            ds4_metal_dspark_score_better(
+                    values[tid + step], indices[tid + step],
+                    values[tid], indices[tid])) {
+            values[tid] = values[tid + step];
+            indices[tid] = indices[tid + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        const uint token = indices[0];
+        if (!isfinite(values[0]) || token >= args.vocab) {
+            state->status = 0u;
+            return;
+        }
+        state->tokens[args.draft] = int(token);
+        state->prev_token = token;
+        state->proposal_len = args.draft + 1u;
+    }
+}
+
+kernel void kernel_dsv4_dspark_device_proposal_export(
+        device ds4_metal_dspark_device_result *out [[buffer(0)]],
+        device const ds4_metal_dspark_device_state *state [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    for (uint i = 0u; i < DS4_METAL_DSPARK_MAX_DRAFTS; i++) {
+        out->tokens[i] = state->tokens[i];
+        out->confidence_logits[i] = state->confidence_logits[i];
+    }
+    out->proposal_len = state->proposal_len;
+    out->confidence_len = state->confidence_len;
+    out->status = state->status;
+    out->reserved = 0u;
+}
