@@ -18,6 +18,7 @@ REQUIRE_ACTIVE=${DS4_DSPARK_FIXTURE_REQUIRE_ACTIVE:-1}
 REQUIRE_EXACT2=${DS4_DSPARK_FIXTURE_REQUIRE_EXACT2:-0}
 REQUIRE_CUDA_EXACTN=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN:-0}
 REQUIRE_CUDA_EXACTN_BATCH_HEAD=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN_BATCH_HEAD:-0}
+REQUIRE_CUDA_EXACTN_GRAPHS=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN_GRAPHS:-0}
 REQUIRE_CUDA_DEVICE_PROPOSER=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_DEVICE_PROPOSER:-0}
 REQUIRE_METAL_EXACTN_BATCH_HEAD=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_BATCH_HEAD:-0}
 REQUIRE_METAL_EXACTN_PARTIAL=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_PARTIAL:-0}
@@ -35,6 +36,13 @@ total_cuda_exactn_error_fallback=0
 total_cuda_exactn_batch_head_attempt=0
 total_cuda_exactn_batch_head_use=0
 total_cuda_exactn_batch_head_fallback=0
+total_cuda_exactn_graph_attempt=0
+total_cuda_exactn_graph_use=0
+total_cuda_exactn_graph_capture=0
+total_cuda_exactn_graph_replay=0
+total_cuda_exactn_graph_warm=0
+total_cuda_exactn_graph_no_slot=0
+total_cuda_exactn_graph_failure=0
 total_cuda_device_proposer_attempt=0
 total_cuda_device_proposer_use=0
 total_cuda_device_proposer_fallback=0
@@ -105,6 +113,16 @@ case "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" in
     ;;
 esac
 if [ "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" != 0 ]; then
+    REQUIRE_CUDA_EXACTN=1
+fi
+case "$REQUIRE_CUDA_EXACTN_GRAPHS" in
+0|1) ;;
+*)
+    echo "dspark-fixture: DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN_GRAPHS must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+if [ "$REQUIRE_CUDA_EXACTN_GRAPHS" != 0 ]; then
     REQUIRE_CUDA_EXACTN=1
 fi
 case "$REQUIRE_CUDA_DEVICE_PROPOSER" in
@@ -235,6 +253,8 @@ print_metadata() {
     exactn_cuda_disable=${DS4_CUDA_DISABLE_DSPARK_EXACTN:-unset}
     exactn_cuda_batch_head=${DS4_CUDA_DSPARK_EXACTN_BATCH_HEAD:-unset}
     exactn_cuda_batch_head_disable=${DS4_CUDA_DISABLE_DSPARK_EXACTN_BATCH_HEAD:-unset}
+    exactn_cuda_graphs=${DS4_CUDA_DSPARK_EXACTN_GRAPHS:-unset}
+    exactn_cuda_graphs_disable=${DS4_CUDA_DISABLE_DSPARK_EXACTN_GRAPHS:-unset}
     cuda_device_proposer=${DS4_CUDA_DSPARK_DEVICE_PROPOSER:-unset}
     cuda_device_proposer_disable=${DS4_CUDA_DSPARK_NO_DEVICE_PROPOSER:-unset}
     exactn_union_metal=${DS4_METAL_DSPARK_EXACTN_UNION:-unset}
@@ -273,6 +293,9 @@ print_metadata() {
         "$exactn_union_metal" "$noncausal_online_cuda" \
         "$noncausal_online_cuda_disable" "$verify_noncausal" \
         "$exact_rows_async_tails_metal"
+    printf '# exactn_cuda_graphs=%s exactn_cuda_graphs_disable=%s require_cuda_exactn_graphs=%s\n' \
+        "$exactn_cuda_graphs" "$exactn_cuda_graphs_disable" \
+        "$REQUIRE_CUDA_EXACTN_GRAPHS"
     printf '# exactn_metal_batch_head=%s exactn_metal_batch_head_disable=%s require_metal_exactn_batch_head=%s require_metal_exactn_partial=%s metal_device_proposer=%s metal_device_proposer_disable=%s require_metal_device_proposer=%s\n' \
         "$exactn_metal_batch_head" "$exactn_metal_batch_head_disable" \
         "$REQUIRE_METAL_EXACTN_BATCH_HEAD" "$REQUIRE_METAL_EXACTN_PARTIAL" \
@@ -379,6 +402,13 @@ run_case() {
     cuda_exactn_batch_head_attempt=$(stats_field "$stats" cuda_exactn_batch_head_attempt)
     cuda_exactn_batch_head_use=$(stats_field "$stats" cuda_exactn_batch_head_use)
     cuda_exactn_batch_head_fallback=$(stats_field "$stats" cuda_exactn_batch_head_fallback)
+    cuda_exactn_graph_attempt=$(stats_field "$stats" cuda_exactn_graph_attempt)
+    cuda_exactn_graph_use=$(stats_field "$stats" cuda_exactn_graph_use)
+    cuda_exactn_graph_capture=$(stats_field "$stats" cuda_exactn_graph_capture)
+    cuda_exactn_graph_replay=$(stats_field "$stats" cuda_exactn_graph_replay)
+    cuda_exactn_graph_warm=$(stats_field "$stats" cuda_exactn_graph_warm)
+    cuda_exactn_graph_no_slot=$(stats_field "$stats" cuda_exactn_graph_no_slot)
+    cuda_exactn_graph_failure=$(stats_field "$stats" cuda_exactn_graph_failure)
     cuda_device_proposer_attempt=$(stats_field "$stats" cuda_device_proposer_attempt)
     cuda_device_proposer_use=$(stats_field "$stats" cuda_device_proposer_use)
     cuda_device_proposer_fallback=$(stats_field "$stats" cuda_device_proposer_fallback)
@@ -412,6 +442,13 @@ run_case() {
     cuda_exactn_batch_head_attempt=${cuda_exactn_batch_head_attempt:-0}
     cuda_exactn_batch_head_use=${cuda_exactn_batch_head_use:-0}
     cuda_exactn_batch_head_fallback=${cuda_exactn_batch_head_fallback:-0}
+    cuda_exactn_graph_attempt=${cuda_exactn_graph_attempt:-0}
+    cuda_exactn_graph_use=${cuda_exactn_graph_use:-0}
+    cuda_exactn_graph_capture=${cuda_exactn_graph_capture:-0}
+    cuda_exactn_graph_replay=${cuda_exactn_graph_replay:-0}
+    cuda_exactn_graph_warm=${cuda_exactn_graph_warm:-0}
+    cuda_exactn_graph_no_slot=${cuda_exactn_graph_no_slot:-0}
+    cuda_exactn_graph_failure=${cuda_exactn_graph_failure:-0}
     cuda_device_proposer_attempt=${cuda_device_proposer_attempt:-0}
     cuda_device_proposer_use=${cuda_device_proposer_use:-0}
     cuda_device_proposer_fallback=${cuda_device_proposer_fallback:-0}
@@ -450,6 +487,13 @@ run_case() {
     total_cuda_exactn_batch_head_attempt=$((total_cuda_exactn_batch_head_attempt + cuda_exactn_batch_head_attempt))
     total_cuda_exactn_batch_head_use=$((total_cuda_exactn_batch_head_use + cuda_exactn_batch_head_use))
     total_cuda_exactn_batch_head_fallback=$((total_cuda_exactn_batch_head_fallback + cuda_exactn_batch_head_fallback))
+    total_cuda_exactn_graph_attempt=$((total_cuda_exactn_graph_attempt + cuda_exactn_graph_attempt))
+    total_cuda_exactn_graph_use=$((total_cuda_exactn_graph_use + cuda_exactn_graph_use))
+    total_cuda_exactn_graph_capture=$((total_cuda_exactn_graph_capture + cuda_exactn_graph_capture))
+    total_cuda_exactn_graph_replay=$((total_cuda_exactn_graph_replay + cuda_exactn_graph_replay))
+    total_cuda_exactn_graph_warm=$((total_cuda_exactn_graph_warm + cuda_exactn_graph_warm))
+    total_cuda_exactn_graph_no_slot=$((total_cuda_exactn_graph_no_slot + cuda_exactn_graph_no_slot))
+    total_cuda_exactn_graph_failure=$((total_cuda_exactn_graph_failure + cuda_exactn_graph_failure))
     total_cuda_device_proposer_attempt=$((total_cuda_device_proposer_attempt + cuda_device_proposer_attempt))
     total_cuda_device_proposer_use=$((total_cuda_device_proposer_use + cuda_device_proposer_use))
     total_cuda_device_proposer_fallback=$((total_cuda_device_proposer_fallback + cuda_device_proposer_fallback))
@@ -555,6 +599,16 @@ if [ "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" != 0 ]; then
         "$total_cuda_exactn_batch_head_use" \
         "$total_cuda_exactn_batch_head_fallback"
 fi
+if [ "$REQUIRE_CUDA_EXACTN_GRAPHS" != 0 ]; then
+    printf '# cuda_exactn_graph_attempt=%s cuda_exactn_graph_use=%s cuda_exactn_graph_capture=%s cuda_exactn_graph_replay=%s cuda_exactn_graph_warm=%s cuda_exactn_graph_no_slot=%s cuda_exactn_graph_failure=%s\n' \
+        "$total_cuda_exactn_graph_attempt" \
+        "$total_cuda_exactn_graph_use" \
+        "$total_cuda_exactn_graph_capture" \
+        "$total_cuda_exactn_graph_replay" \
+        "$total_cuda_exactn_graph_warm" \
+        "$total_cuda_exactn_graph_no_slot" \
+        "$total_cuda_exactn_graph_failure"
+fi
 if [ "$REQUIRE_CUDA_DEVICE_PROPOSER" != 0 ]; then
     printf '# cuda_device_proposer_attempt=%s cuda_device_proposer_use=%s cuda_device_proposer_fallback=%s cuda_device_proposer_policy_mismatch=%s\n' \
         "$total_cuda_device_proposer_attempt" \
@@ -596,6 +650,16 @@ if [ "$REQUIRE_CUDA_EXACTN_BATCH_HEAD" != 0 ] &&
      [ "$total_cuda_exactn_batch_head_use" -eq 0 ] ||
      [ "$total_cuda_exactn_batch_head_fallback" -ne 0 ]; }; then
     echo "dspark-fixture: CUDA exact-N batch head not cleanly exercised (attempt=$total_cuda_exactn_batch_head_attempt use=$total_cuda_exactn_batch_head_use fallback=$total_cuda_exactn_batch_head_fallback)" >&2
+    exit 1
+fi
+if [ "$REQUIRE_CUDA_EXACTN_GRAPHS" != 0 ] &&
+   { [ "$total_cuda_exactn_graph_attempt" -eq 0 ] ||
+     [ "$total_cuda_exactn_graph_use" -eq 0 ] ||
+     [ "$total_cuda_exactn_graph_capture" -eq 0 ] ||
+     [ "$total_cuda_exactn_graph_replay" -eq 0 ] ||
+     [ "$total_cuda_exactn_graph_no_slot" -ne 0 ] ||
+     [ "$total_cuda_exactn_graph_failure" -ne 0 ]; }; then
+    echo "dspark-fixture: CUDA exact-N graphs were not cleanly replayed after warmup (attempt=$total_cuda_exactn_graph_attempt use=$total_cuda_exactn_graph_use warm=$total_cuda_exactn_graph_warm capture=$total_cuda_exactn_graph_capture replay=$total_cuda_exactn_graph_replay no_slot=$total_cuda_exactn_graph_no_slot failure=$total_cuda_exactn_graph_failure)" >&2
     exit 1
 fi
 if [ "$REQUIRE_CUDA_DEVICE_PROPOSER" != 0 ] &&

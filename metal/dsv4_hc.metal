@@ -1070,6 +1070,38 @@ kernel void kernel_dsv4_hc_weighted_sum(
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
 }
 
+// DSpark needs both the complete prompt matrix and its final reduced row.
+// Keep this as a separate entry point so the ordinary HC weighted-sum shader
+// retains its original ABI and instruction stream. The extra store reuses the
+// same accumulator before it leaves the register and replaces a 16 KiB blit.
+kernel void kernel_dsv4_hc_weighted_sum_capture_last(
+        constant ds4_metal_args_dsv4_hc_weighted_sum & args,
+        device  const char * x,
+        device  const char * weights,
+        device        char * dst,
+        device        char * last_dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd;
+    const int64_t t = ((int64_t) gid) / args.n_embd;
+
+    float acc = 0.0f;
+    for (int64_t h = 0; h < args.n_hc; ++h) {
+        const float xv = *((device const float *) (x       + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2));
+        const float wv = *((device const float *) (weights + h*args.nb_w0 + t*args.nb_w1));
+        acc += xv * wv;
+    }
+
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+    if (t + 1 == args.n_tokens) {
+        *((device float *) (last_dst + d*args.nb0)) = acc;
+    }
+}
+
 // The one-row HC=4 output head historically materializes four device-F32
 // stages across separate launches. Collapse those launches into one tiny
 // two-thread group while preserving the scalar/vector lane mapping and every

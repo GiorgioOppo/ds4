@@ -50,6 +50,12 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Stable CUDA allocation identity, including a view's byte offset.  Unlike
+ * the wrapper handle, this stays unchanged when an equivalent tensor view is
+ * recreated and is therefore suitable for CUDA graph-cache keys. */
+uintptr_t ds4_gpu_tensor_storage_key(const ds4_gpu_tensor *tensor);
+#endif
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
@@ -2273,8 +2279,8 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 /* Returns 1 when the batch path ran, 0 for the ordinary row fallback, and -1
- * when the Metal REQUIRE diagnostic made an ineligible/failed tiny batch a
- * hard error. */
+ * for a post-enqueue failure or a backend REQUIRE diagnostic.  The caller
+ * must not retry the row fallback after -1. */
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -2738,6 +2744,19 @@ int ds4_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+#ifdef __APPLE__
+/* Metal DSpark prefill capture: materialize every reduced HC row and mirror
+ * the final row in the same compute dispatch. `out` and `last_out` must refer
+ * to non-overlapping storage; production uses separate persistent tensors. */
+int ds4_gpu_hc_weighted_sum_capture_last_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *last_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+#endif
+
 int ds4_gpu_hc_weighted_sum_split_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
@@ -2989,8 +3008,9 @@ int ds4_gpu_matmul_q4_K_hc_expand_tensor(
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
- * island: layer, island index, and the activation buffers whose addresses
- * the captured kernels bake in.  ds4_cuda.cu mirrors this struct
+ * island: layer, island index, and the stable device-storage addresses that
+ * the captured kernels bake in (never short-lived view-wrapper addresses).
+ * ds4_cuda.cu mirrors this struct
  * byte-for-byte (it does not include this header); keep both in sync. */
 typedef struct ds4_decode_graph_key {
     uint32_t il;
@@ -3003,6 +3023,10 @@ typedef struct ds4_decode_graph_key {
     void    *attn_norm;
 } ds4_decode_graph_key;
 
+/* Exact-N uses a disjoint CUDA graph-cache domain so its five batch-row
+ * activation addresses cannot evict the ordinary decode variants. */
+#define DS4_DECODE_GRAPH_VARIANT_EXACTN 0x80000000u
+
 int  ds4_gpu_decode_graphs_supported(void);
 /* 1: replayed (island already executed; skip encoding it)
  * 0: capturing (encode the island, then call _end)
@@ -3013,6 +3037,14 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+void ds4_gpu_decode_graph_counters(
+        uint64_t *captures,
+        uint64_t *replays,
+        uint64_t *warms,
+        uint64_t *no_slots,
+        uint64_t *failures);
+#endif
 
 #ifdef __cplusplus
 }
