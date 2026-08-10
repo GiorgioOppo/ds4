@@ -980,9 +980,13 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   bit mismatches for persistent scratch, grouped attention-A, and the
   opt-in K1024 persistent kernel.  For the model A/B, use
   `DS4_CUDA_NO_Q4_GB10_FAST=1` in the control and leave it unset in the
-  candidate.  Run a separate candidate with
-  `DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1` and require `calls>0`,
-  `mismatches=0`, and `skips=0`.  Benchmark the K1024 persistent kernel as a
+  candidate. Run a separate generic-verifier candidate with
+  `DS4_CUDA_DISABLE_DSPARK_EXACTN=1`,
+  `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH=1`,
+  `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH=1`, and
+  `DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1`; require `batch_candidates>0`,
+  `batch_calls>0`, `batch_mismatches=0`, and `batch_skips=0`, plus
+  byte-identical stdout. Benchmark the K1024 persistent kernel as a
   separate fail-closed arm with both
   `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1` and
   `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1`; its rollback is

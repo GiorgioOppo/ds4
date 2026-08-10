@@ -907,6 +907,30 @@ int ds4_mmq_q4_K_grouped_vec(
     int           n_groups,
     cudaStream_t  stream);
 
+// Token-aware form of the exact grouped Q4_K entry above.  X and out are
+// token-major: [n_tokens][n_groups][K] and
+// [n_tokens][n_groups][M].  Internally (token, group) is flattened into the
+// MMVQ channel dimension while ncols_dst remains one.  This is deliberate:
+// every pair therefore retains the canonical one-row Q8_1 quantization,
+// Q4_K K partition, peer-warp fold and reduction tree.  The GB10 path accepts
+// at most eight tokens and is opt-in with
+// DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH=1.  Either
+// DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1 or the existing grouped/global kill
+// switches disables it.  DS4_MMQ_NOT_APPLICABLE is returned before enqueue
+// whenever a gate or scratch-capacity check fails.
+// The graph-level diagnostic
+// DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH=1 turns such ineligibility into a
+// visible failure when this attention-output path is reached.
+int ds4_mmq_q4_K_grouped_batch_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           K,
+    int           n_tokens,
+    int           n_groups,
+    cudaStream_t  stream);
+
 // On a single GB10, the exact AProjQ4 Q-b shape (M=32768, N=1, K=1024)
 // can opt into a persistent-CTA form with
 // DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1.  The rollback switch

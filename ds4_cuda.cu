@@ -433,6 +433,10 @@ static uint64_t g_derived_artifact_bytes;
 static double g_derived_artifact_build_secs;
 static int g_derived_replaces_complete;
 static void *g_aligned_q81_scratch;
+/* Preserve the larger direct-prefill arena while also covering token-aware
+ * Q4 grouped attention-A (8 tokens * 16 groups * K=4096 plus ids/alignment). */
+static const size_t CUDA_ALIGNED_Q81_SCRATCH_BYTES =
+    96u * 1024u * 1024u;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
@@ -465,6 +469,7 @@ static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
+static void cuda_decode_graphs_shutdown(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -890,7 +895,11 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
 #define CUDA_DECODE_GRAPH_ISLANDS   2u
-#define CUDA_DECODE_GRAPH_VARIANTS  4u
+#define CUDA_DECODE_GRAPH_BASE_VARIANTS    4u
+#define CUDA_DECODE_GRAPH_EXACTN_VARIANTS  5u
+#define CUDA_DECODE_GRAPH_VARIANTS \
+    (CUDA_DECODE_GRAPH_BASE_VARIANTS + CUDA_DECODE_GRAPH_EXACTN_VARIANTS)
+#define CUDA_DECODE_GRAPH_VARIANT_EXACTN 0x80000000u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
@@ -924,6 +933,22 @@ static cudaStream_t g_decode_graph_stream = NULL;
 static int g_decode_graph_capturing = 0;
 static uint64_t g_decode_graph_replays = 0;
 static uint64_t g_decode_graph_captures = 0;
+static uint64_t g_decode_graph_warms = 0;
+static uint64_t g_decode_graph_no_slots = 0;
+static uint64_t g_decode_graph_failures = 0;
+
+extern "C" void ds4_gpu_decode_graph_counters(
+        uint64_t *captures,
+        uint64_t *replays,
+        uint64_t *warms,
+        uint64_t *no_slots,
+        uint64_t *failures) {
+    if (captures) *captures = g_decode_graph_captures;
+    if (replays) *replays = g_decode_graph_replays;
+    if (warms) *warms = g_decode_graph_warms;
+    if (no_slots) *no_slots = g_decode_graph_no_slots;
+    if (failures) *failures = g_decode_graph_failures;
+}
 
 extern "C" int ds4_gpu_decode_graphs_supported(void) {
     static int init = 0;
@@ -991,12 +1016,35 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
     }
 }
 
+static void cuda_decode_graphs_shutdown(void) {
+    if (g_decode_graph_stream) {
+        (void)cudaStreamSynchronize(g_decode_graph_stream);
+    }
+    ds4_gpu_decode_graphs_invalidate();
+    if (g_decode_graph_stream) {
+        (void)cudaStreamDestroy(g_decode_graph_stream);
+        g_decode_graph_stream = NULL;
+    }
+    g_decode_graph_capturing = 0;
+    g_decode_graph_replays = 0;
+    g_decode_graph_captures = 0;
+    g_decode_graph_warms = 0;
+    g_decode_graph_no_slots = 0;
+    g_decode_graph_failures = 0;
+}
+
 static cuda_decode_graph_entry *cuda_decode_graph_find(
         const ds4_decode_graph_key *key) {
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||
         key->island >= CUDA_DECODE_GRAPH_ISLANDS) return NULL;
+    const bool exactn_domain =
+        (key->variant & CUDA_DECODE_GRAPH_VARIANT_EXACTN) != 0u;
+    const uint32_t first = exactn_domain ?
+        CUDA_DECODE_GRAPH_BASE_VARIANTS : 0u;
+    const uint32_t end = exactn_domain ?
+        CUDA_DECODE_GRAPH_VARIANTS : CUDA_DECODE_GRAPH_BASE_VARIANTS;
     cuda_decode_graph_entry *slot = NULL;
-    for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
+    for (uint32_t v = first; v < end; v++) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 0 &&
             memcmp(&e->key, key, sizeof(*key)) == 0) return e;
@@ -1014,11 +1062,23 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
     cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
-    if (!e || e->state == 3) return -1;
+    if (!e) {
+        g_decode_graph_no_slots++;
+        if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
+            fprintf(stderr,
+                    "ds4: decode graph no slot il=%u island=%u variant=0x%08x domain=%s\n",
+                    key->il, key->island, key->variant,
+                    (key->variant & CUDA_DECODE_GRAPH_VARIANT_EXACTN) ?
+                        "exactn" : "decode");
+        }
+        return -1;
+    }
+    if (e->state == 3) return -1;
     if (e->state == 0) {
         /* Warm pass: run eagerly once so lazy allocators (tmp scratch,
          * cuBLAS workspaces) reach steady-state sizes before capture. */
         e->state = 1;
+        g_decode_graph_warms++;
         return -1;
     }
     if (e->state == 2) {
@@ -1028,6 +1088,7 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
                     key->il, key->island, cudaGetErrorString(err));
             (void)cudaGetLastError();
             cuda_decode_graph_entry_kill(e);
+            g_decode_graph_failures++;
             return -1;     /* caller encodes eagerly; nothing was consumed */
         }
         e->hits++;
@@ -1040,6 +1101,7 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
                      "decode graph stream create")) {
             g_decode_graph_stream = NULL;
             cuda_decode_graph_entry_kill(e);
+            g_decode_graph_failures++;
             return -1;
         }
     }
@@ -1051,6 +1113,7 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
                  "decode graph begin capture")) {
         (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
         cuda_decode_graph_entry_kill(e);
+        g_decode_graph_failures++;
         return -1;
     }
     g_decode_graph_capturing = 1;
@@ -1070,10 +1133,12 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
         (void)cudaGetLastError();
         if (graph) (void)cudaGraphDestroy(graph);
         if (e) cuda_decode_graph_entry_kill(e);
+        g_decode_graph_failures++;
         return -1;         /* caller re-encodes the island eagerly */
     }
     if (!e) {              /* cannot happen: begin() found it */
         (void)cudaGraphDestroy(graph);
+        g_decode_graph_failures++;
         return -1;
     }
     cudaGraphExec_t exec = NULL;
@@ -1084,6 +1149,7 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
                 key->il, key->island, cudaGetErrorString(err));
         (void)cudaGetLastError();
         cuda_decode_graph_entry_kill(e);
+        g_decode_graph_failures++;
         return -1;
     }
     /* Capture recorded the work without executing it: launch now so this
@@ -1095,14 +1161,17 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
         (void)cudaGetLastError();
         (void)cudaGraphExecDestroy(exec);
         cuda_decode_graph_entry_kill(e);
+        g_decode_graph_failures++;
         return -1;
     }
     e->exec = exec;
     e->state = 2;
     g_decode_graph_captures++;
     if (getenv("DS4_CUDA_DECODE_GRAPH_LOG") != NULL) {
-        fprintf(stderr, "ds4: decode graph captured il=%u island=%u (total %llu)\n",
-                key->il, key->island,
+        fprintf(stderr, "ds4: decode graph captured il=%u island=%u variant=0x%08x domain=%s (total %llu)\n",
+                key->il, key->island, key->variant,
+                (key->variant & CUDA_DECODE_GRAPH_VARIANT_EXACTN) ?
+                    "exactn" : "decode",
                 (unsigned long long)g_decode_graph_captures);
     }
     return 0;
@@ -1247,6 +1316,7 @@ extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
         cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
         if (e) cuda_decode_graph_entry_kill(e);
     }
+    g_decode_graph_failures++;
 }
 
 /* Multi-tier-aware weight pointer resolver.
@@ -2878,6 +2948,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    cuda_decode_graphs_shutdown();
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -3214,6 +3285,11 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
 
 extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
+}
+
+extern "C" uintptr_t ds4_gpu_tensor_storage_key(
+        const ds4_gpu_tensor *tensor) {
+    return tensor ? (uintptr_t)tensor->ptr : (uintptr_t)0;
 }
 
 extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
@@ -4668,12 +4744,11 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     g_derived_artifact_bytes = built_bytes;
     g_derived_artifact_build_secs = cuda_wall_sec() - t0;
     if (!g_aligned_q81_scratch) {
-        const size_t scratch_bytes = 96u * 1024u * 1024u;
         cudaError_t scratch_err = cudaMalloc(&g_aligned_q81_scratch,
-                                             scratch_bytes);
+                                             CUDA_ALIGNED_Q81_SCRATCH_BYTES);
         if (scratch_err == cudaSuccess) {
             ds4_mmq_set_aligned_q81_scratch(g_aligned_q81_scratch,
-                                             scratch_bytes);
+                                             CUDA_ALIGNED_Q81_SCRATCH_BYTES);
         } else {
             g_aligned_q81_scratch = NULL;
             (void)cudaGetLastError();
@@ -35317,6 +35392,22 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
     return 0;
 }
 
+static void cuda_q4_grouped_attn_a_oracle_register_report(void);
+static uint64_t g_q4_grouped_attn_a_oracle_calls;
+static uint64_t g_q4_grouped_attn_a_oracle_mismatches;
+static uint64_t g_q4_grouped_attn_a_oracle_skips;
+static uint64_t g_q4_grouped_attn_a_oracle_batch_candidates;
+static uint64_t g_q4_grouped_attn_a_oracle_batch_calls;
+static uint64_t g_q4_grouped_attn_a_oracle_batch_mismatches;
+static uint64_t g_q4_grouped_attn_a_oracle_batch_skips;
+static int g_q4_grouped_attn_a_oracle_report_registered;
+static int g_q4_grouped_attn_a_oracle_mismatch_reported;
+static int cuda_q4_grouped_attn_a_batch_oracle(
+        const char *out_a, const float *heads, float *low,
+        uint32_t n_tokens, uint32_t n_groups,
+        uint32_t group_dim, uint32_t rank,
+        int logical_tier, cudaStream_t stream);
+
 extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         ds4_gpu_tensor *group_tmp, ds4_gpu_tensor *low_tmp,
@@ -35324,22 +35415,24 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         uint64_t out_a_offset, uint64_t out_b_offset, uint32_t out_b_type,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups,
         uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    const int grouped_batch_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH", 0);
     if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
         n_tokens < 2u || group_dim > INT_MAX || rank > INT_MAX ||
         out_dim > INT_MAX || n_tokens > INT_MAX || !cuda_use_mmq()) {
-        return 0;
+        return grouped_batch_require ? -1 : 0;
     }
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (low_dim > INT_MAX || (group_dim % CUDA_QK_K) != 0u ||
         (low_dim % CUDA_QK_K) != 0u) {
-        return 0;
+        return grouped_batch_require ? -1 : 0;
     }
     const uint64_t row_a_bytes =
         (group_dim / CUDA_QK_K) * sizeof(cuda_block_q4_K);
     if (rank > UINT64_MAX / row_a_bytes ||
         n_groups > UINT64_MAX / (rank * row_a_bytes)) {
-        return 0;
+        return grouped_batch_require ? -1 : 0;
     }
     const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
     if (out_a_offset > model_size ||
@@ -35349,12 +35442,17 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
         group_tmp->bytes < (uint64_t)n_tokens * group_dim * sizeof(float) ||
         low_tmp->bytes < (uint64_t)n_tokens * rank * sizeof(float)) {
-        return 0;
+        return grouped_batch_require ? -1 : 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
     const char *out_a = cuda_resolve_weight_ptr(
         model_map, out_a_offset, out_a_bytes, logical_tier, "q4 attn_out_a");
-    if (!out_a) return 0;
+    if (!out_a) return grouped_batch_require ? -1 : 0;
+    const int grouped_oracle = cuda_env_flag_enabled(
+        "DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE", 0);
+    const int grouped_batch_enable = cuda_env_flag_enabled(
+        "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH", 0);
+    if (grouped_oracle) cuda_q4_grouped_attn_a_oracle_register_report();
 
     const int grouped_gb10 =
         n_tokens <= 8u && n_groups <= INT_MAX &&
@@ -35362,23 +35460,54 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_tensor_device_idx(heads) == logical_tier &&
         cuda_q4_gb10_fast_path_enabled(
             logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    if (grouped_batch_require &&
+        (!grouped_batch_enable || !grouped_gb10)) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A batch path is "
+                "not eligible\n");
+        return -1;
+    }
     if (grouped_gb10) {
-        /* DSpark verification stores [token][group][K].  Dispatch one exact
-         * grouped MMVQ per token: each group keeps its own Q8_1 row and Q4_K
-         * weights, while the grouped entry amortizes setup/launch overhead.
-         * A preflight rejection returns 0 to the unchanged row-wise caller;
-         * a negative post-launch result is fatal (the caller understands the
-         * tri-state contract for this tiny-batch hook). */
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            const int rc = ds4_mmq_q4_K_grouped_vec(
-                out_a,
-                (const float *)heads->ptr +
-                    (uint64_t)t * n_groups * group_dim,
-                (float *)low->ptr + (uint64_t)t * low_dim,
-                (int)rank, (int)group_dim, (int)n_groups,
-                cuda_decode_stream());
-            if (rc == DS4_MMQ_NOT_APPLICABLE) return 0;
-            if (rc != 0) return -1;
+        /* DSpark verification stores [token][group][K].  The opt-in batch
+         * entry flattens (token, group) into channels while keeping
+         * ncols_dst=1, preserving the canonical per-pair Q8_1 quantization
+         * and MMVQ reduction.  NOT_APPLICABLE is guaranteed pre-enqueue, so
+         * it safely falls back to the established per-token grouped loop.
+         * Any other error may follow an enqueue and therefore fails closed. */
+        const int batch_rc = ds4_mmq_q4_K_grouped_batch_vec(
+            out_a, (const float *)heads->ptr, (float *)low->ptr,
+            (int)rank, (int)group_dim, (int)n_tokens, (int)n_groups,
+            cuda_decode_stream());
+        if (batch_rc == DS4_MMQ_NOT_APPLICABLE) {
+            if (grouped_batch_require) {
+                fprintf(stderr,
+                        "ds4: required CUDA Q4 grouped attention-A batch "
+                        "dispatch was not applicable\n");
+                return -1;
+            }
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                const int rc = ds4_mmq_q4_K_grouped_vec(
+                    out_a,
+                    (const float *)heads->ptr +
+                        (uint64_t)t * n_groups * group_dim,
+                    (float *)low->ptr + (uint64_t)t * low_dim,
+                    (int)rank, (int)group_dim, (int)n_groups,
+                    cuda_decode_stream());
+                if (rc == DS4_MMQ_NOT_APPLICABLE) return 0;
+                if (rc != 0) return -1;
+            }
+        } else if (batch_rc != 0) {
+            return -1;
+        } else if (grouped_oracle) {
+            g_q4_grouped_attn_a_oracle_batch_candidates++;
+        }
+        if (batch_rc == 0 && grouped_oracle &&
+                   !cuda_q4_grouped_attn_a_batch_oracle(
+                       out_a, (const float *)heads->ptr,
+                       (float *)low->ptr, n_tokens, n_groups,
+                       (uint32_t)group_dim, (uint32_t)rank,
+                       logical_tier, cuda_decode_stream())) {
+            return -1;
         }
     } else {
         /* Existing cross-CUDA path: pack one group at a time, run a
@@ -35419,20 +35548,20 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
     return 0;
 }
 
-static uint64_t g_q4_grouped_attn_a_oracle_calls;
-static uint64_t g_q4_grouped_attn_a_oracle_mismatches;
-static uint64_t g_q4_grouped_attn_a_oracle_skips;
-static int g_q4_grouped_attn_a_oracle_report_registered;
-static int g_q4_grouped_attn_a_oracle_mismatch_reported;
-
 static void cuda_q4_grouped_attn_a_oracle_report(void) {
     fprintf(stderr,
             "ds4: CUDA Q4 grouped attention-A oracle: "
             "calls=%llu mismatches=%llu skips=%llu "
+            "batch_candidates=%llu batch_calls=%llu "
+            "batch_mismatches=%llu batch_skips=%llu "
             "(canonical MMVQ output retained)\n",
             (unsigned long long)g_q4_grouped_attn_a_oracle_calls,
             (unsigned long long)g_q4_grouped_attn_a_oracle_mismatches,
-            (unsigned long long)g_q4_grouped_attn_a_oracle_skips);
+            (unsigned long long)g_q4_grouped_attn_a_oracle_skips,
+            (unsigned long long)g_q4_grouped_attn_a_oracle_batch_candidates,
+            (unsigned long long)g_q4_grouped_attn_a_oracle_batch_calls,
+            (unsigned long long)g_q4_grouped_attn_a_oracle_batch_mismatches,
+            (unsigned long long)g_q4_grouped_attn_a_oracle_batch_skips);
 }
 
 static void cuda_q4_grouped_attn_a_oracle_register_report(void) {
@@ -35440,6 +35569,139 @@ static void cuda_q4_grouped_attn_a_oracle_register_report(void) {
         g_q4_grouped_attn_a_oracle_report_registered = 1;
         (void)atexit(cuda_q4_grouped_attn_a_oracle_report);
     }
+}
+
+static int cuda_q4_grouped_attn_a_batch_reference(
+        const char *out_a, const float *heads, float *reference,
+        uint32_t n_tokens, uint32_t n_groups,
+        uint32_t group_dim, uint32_t rank,
+        cudaStream_t stream) {
+    const uint64_t heads_token_stride =
+        (uint64_t)n_groups * group_dim;
+    const uint64_t low_token_stride =
+        (uint64_t)n_groups * rank;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const int rc = ds4_mmq_q4_K_grouped_vec(
+            out_a,
+            heads + (uint64_t)t * heads_token_stride,
+            reference + (uint64_t)t * low_token_stride,
+            (int)rank, (int)group_dim, (int)n_groups, stream);
+        if (rc != 0) return 0;
+    }
+    return 1;
+}
+
+/* Diagnostic oracle for the token-aware grouped dispatch.  The old
+ * per-token grouped loop is the canonical reference.  With the oracle on,
+ * that reference always replaces the candidate before the output-B consumer;
+ * the candidate is used only for a bitwise comparison.  Decode graphs are
+ * disabled globally for this env, but a capture check remains here so dynamic
+ * env changes and foreign captures still retain canonical output without a
+ * host synchronization. */
+static int cuda_q4_grouped_attn_a_batch_oracle(
+        const char *out_a, const float *heads, float *low,
+        uint32_t n_tokens, uint32_t n_groups,
+        uint32_t group_dim, uint32_t rank,
+        int logical_tier, cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const cudaError_t capture_err = cudaStreamIsCapturing(stream, &capture);
+    if (capture_err != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        g_q4_grouped_attn_a_oracle_skips++;
+        g_q4_grouped_attn_a_oracle_batch_skips++;
+        return cuda_q4_grouped_attn_a_batch_reference(
+            out_a, heads, low, n_tokens, n_groups,
+            group_dim, rank, stream);
+    }
+
+    const uint64_t low_elems =
+        (uint64_t)n_tokens * n_groups * rank;
+    if (low_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t reference_bytes = low_elems * sizeof(float);
+    if (reference_bytes > UINT64_MAX - 255u) return 0;
+    const uint64_t mismatch_offset =
+        (reference_bytes + 255u) & ~255ull;
+    if (mismatch_offset > UINT64_MAX - sizeof(uint32_t)) return 0;
+    unsigned char *scratch = (unsigned char *)cuda_tmp_alloc_on(
+        logical_tier, mismatch_offset + sizeof(uint32_t),
+        "q4 grouped attention-A batch oracle");
+    if (!scratch) {
+        g_q4_grouped_attn_a_oracle_skips++;
+        g_q4_grouped_attn_a_oracle_batch_skips++;
+        return cuda_q4_grouped_attn_a_batch_reference(
+            out_a, heads, low, n_tokens, n_groups,
+            group_dim, rank, stream);
+    }
+    float *reference = (float *)scratch;
+    uint32_t *mismatch_device =
+        (uint32_t *)(scratch + mismatch_offset);
+    if (!cuda_q4_grouped_attn_a_batch_reference(
+            out_a, heads, reference, n_tokens, n_groups,
+            group_dim, rank, stream)) {
+        return 0;
+    }
+
+    if (!cuda_ok(cudaMemsetAsync(mismatch_device, 0, sizeof(uint32_t),
+                                 stream),
+                 "clear q4 grouped attention-A batch oracle")) {
+        g_q4_grouped_attn_a_oracle_skips++;
+        g_q4_grouped_attn_a_oracle_batch_skips++;
+        return cuda_ok(cudaMemcpyAsync(
+                           low, reference, reference_bytes,
+                           cudaMemcpyDeviceToDevice, stream),
+                       "retain q4 grouped attention-A batch reference");
+    }
+    q4_K_attn_hc_bitwise_compare_kernel
+        <<<(unsigned)((low_elems + 255u) / 256u), 256, 0, stream>>>(
+            mismatch_device, reference, low, low_elems);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4 grouped attention-A batch oracle compare launch")) {
+        g_q4_grouped_attn_a_oracle_skips++;
+        g_q4_grouped_attn_a_oracle_batch_skips++;
+        return cuda_ok(cudaMemcpyAsync(
+                           low, reference, reference_bytes,
+                           cudaMemcpyDeviceToDevice, stream),
+                       "retain q4 grouped attention-A batch reference");
+    }
+
+    uint32_t mismatch_host = 0u;
+    const cudaError_t retain_err = cudaMemcpyAsync(
+        low, reference, reference_bytes, cudaMemcpyDeviceToDevice, stream);
+    if (retain_err != cudaSuccess) {
+        return cuda_ok(retain_err,
+                       "retain q4 grouped attention-A batch reference");
+    }
+    const cudaError_t read_err = cudaMemcpyAsync(
+        &mismatch_host, mismatch_device, sizeof(mismatch_host),
+        cudaMemcpyDeviceToHost, stream);
+    if (read_err != cudaSuccess) {
+        (void)cuda_ok(read_err,
+                      "read q4 grouped attention-A batch oracle");
+        g_q4_grouped_attn_a_oracle_skips++;
+        g_q4_grouped_attn_a_oracle_batch_skips++;
+        return cuda_ok(cudaStreamSynchronize(stream),
+                       "synchronize retained q4 grouped batch reference");
+    }
+    if (!cuda_ok(cudaStreamSynchronize(stream),
+                 "synchronize q4 grouped attention-A batch oracle")) {
+        return 0;
+    }
+
+    g_q4_grouped_attn_a_oracle_calls++;
+    g_q4_grouped_attn_a_oracle_batch_calls++;
+    if (mismatch_host != 0u) {
+        g_q4_grouped_attn_a_oracle_mismatches++;
+        g_q4_grouped_attn_a_oracle_batch_mismatches++;
+        if (!g_q4_grouped_attn_a_oracle_mismatch_reported) {
+            g_q4_grouped_attn_a_oracle_mismatch_reported = 1;
+            fprintf(stderr,
+                    "ds4: CUDA Q4 grouped attention-A oracle found a "
+                    "bitwise batch mismatch; retained per-token MMVQ "
+                    "output\n");
+        }
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(

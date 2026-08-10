@@ -436,6 +436,14 @@ five-row proposer for an A/B control, or set a positive value to cap it
 explicitly. Override the verifier policy independently with
 `DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=N`.
 
+Metal can experimentally mirror the final target-hidden prefill row from the
+HC weighted-sum kernel itself, avoiding a separate 16 KiB blit and
+compute/blit encoder transition on each captured target layer. Enable it with
+`DS4_METAL_ENABLE_DSPARK_CAPTURE_FUSED_LAST=1`; the historical
+weighted-sum-plus-blit sequence remains the default because short M1 Pro SSD
+A/B runs were bit-identical but did not show a repeatable throughput win.
+`DS4_METAL_DISABLE_DSPARK_CAPTURE_FUSED_LAST=1` is the dominant kill switch.
+
 An experimental single-device Metal verifier can use the current target
 logits for the first draft and evaluate only the remaining `N-1` target rows.
 Enable it with `DS4_METAL_DSPARK_ACCEPTANCE_ONLY_VERIFY=1`; it remains opt-in
@@ -697,11 +705,16 @@ On a single DGX Spark/GB10, the AProjQ4 path also mirrors the safe parts of
 the aligned-Q8 decode work while retaining canonical Q4_K MMVQ/Q8_1
 arithmetic:
 
-- dense and paired Q4 projections reuse the persistent 256-KiB Q8_1 scratch;
+- dense and paired Q4 projections reuse the persistent 1-MiB Q8_1 scratch;
   `DS4_CUDA_NO_Q4_DENSE_SCRATCH=1` restores pool allocation;
 - attention-output A evaluates all output groups through one channel-grouped
   MMVQ dispatch per token, preserving the one-row reduction tree of every
-  group; `DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1` restores the per-group loop;
+  group. For DSpark verification widths 2--8,
+  `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH=1` flattens `(token, group)` into
+  MMVQ channels and replaces the per-token loop with one grouped MMVQ
+  dispatch while keeping `ncols_dst=1`;
+  `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1` restores the per-token grouped loop
+  and `DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1` restores the per-group loop;
 - attention-output B keeps its canonical MMVQ result and automatically uses
   the row-packed HC epilogue described below;
 - the exact Q-b shape `32768x1024` has an experimental persistent-CTA kernel
@@ -712,10 +725,19 @@ arithmetic:
 
 `DS4_CUDA_NO_Q4_GB10_FAST=1` is the umbrella rollback for these new GB10
 choices; it does not disable the older cross-CUDA Q-A/KV pair itself. For a
-fail-closed grouped attention comparison,
-`DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1` computes the established per-group
-MMVQ reference, reports calls/mismatches/skips, and retains the reference on
-any mismatch. The scratch, grouped, and persistent paths are also covered by
+fail-closed grouped attention comparison, set
+`DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH=1`,
+`DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH=1`, and
+`DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1`. The oracle computes the established per-group
+MMVQ reference (or the established per-token grouped loop for a multi-token
+candidate), reports aggregate calls/mismatches/skips plus separate
+batch_candidates/batch_calls/batch_mismatches/batch_skips, and retains
+canonical output. A valid multi-token test has nonzero candidates/calls and
+zero batch mismatches/skips. The
+oracle disables decode-graph capture. For a multi-token candidate, if it
+encounters another active capture or cannot allocate comparison scratch, it
+directly enqueues the canonical reference instead of consuming an unchecked
+candidate. The scratch, grouped, and persistent paths are also covered by
 `make test-mmq-parity-cuda CUDA_ARCH=sm_121`.
 
 Two additional CUDA fusions remain experimental until a device oracle passes
@@ -824,6 +846,24 @@ variable. Track `cuda_exactn_attempt`, `cuda_exactn_full`,
 `cuda_exactn_fallback`, its partial/error split, and `cuda_exactn_rows`. Keep
 this experiment disabled by default until a real CUDA oracle and a long greedy
 A/B show byte-identical output, no fallback errors, and a throughput win.
+
+The layer tape can separately reuse its position-independent CUDA decode
+islands with `DS4_CUDA_DSPARK_EXACTN_GRAPHS=1`. Graph keys use the stable
+device address (including each batch-row offset), not the short-lived tensor
+view wrapper. Four cache entries per layer/island remain reserved for ordinary
+decode and five more are isolated for exact-N rows, so a width-five verifier
+cannot evict the normal decode keys. The first encounter warms lazy allocators,
+the second captures/instantiates, and only later encounters are pure replay;
+benchmark at least 128--256 generated tokens rather than judging a short
+capture-heavy run. `DS4_CUDA_DISABLE_DSPARK_EXACTN_GRAPHS=1` is the dedicated
+kill switch, while `DS4_CUDA_DECODE_GRAPHS=0` still disables all decode graphs.
+The stats fields `cuda_exactn_graph_attempt`, `..._use`, `..._warm`,
+`..._capture`, `..._replay`, `..._no_slot`, and `..._failure` expose warmup,
+reuse, capacity misses, and retired captures. This first rollout is for
+serialized, single-session DGX testing; the graph cache and cuBLAS capture
+state remain process-global. The fixture can require a clean post-warmup
+replay (including zero no-slot/failure events) with
+`DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN_GRAPHS=1`.
 
 For a separate output-head A/B, set
 `DS4_CUDA_DSPARK_EXACTN_BATCH_HEAD=1`. The experiment keeps HC collapse and
@@ -966,7 +1006,18 @@ context, and backend working-set limit leave less room. A plain number such as
 `--ssd-streaming-cache-experts 4000` requests 4000 dynamic expert slots without
 the two-layer reserve, but it can be reduced by the same final memory check.
 Non-routed weights, KV cache, graph scratch, and activations need additional
-memory. The automatic cache budget takes
+memory.
+
+Metal SSD+DSpark also has an experimental, support-aware pre-cap for A/B tests.
+Set `DS4_METAL_DSPARK_SAFE_EXPERT_COUNT=1` to convert a numeric count to bytes
+and cap it, when measurable, after accounting for the target's non-routed
+weights, the context/KV estimate, and a 2 GiB active reserve for the mmap-backed
+support model. It does not yet price the complete batch-prefill workspace or a
+separate routed-prefill transient reserve. Startup reports requested/effective
+slots and the support reserve. If this policy cannot measure safe room, it
+retains the explicit count with a warning; the normal final memory check remains
+authoritative. The experiment does not affect `NGB` budgets or CUDA/ROCm.
+Prefer an `NGB` budget for normal use. The automatic cache budget takes
 80% of the backend's recommended working set, subtracts non-routed weights, then
 applies the same routed-prefill headroom before sizing the dynamic cache. Leave
 the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and

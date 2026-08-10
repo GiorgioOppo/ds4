@@ -100,19 +100,13 @@ private:
 // Init
 // ----------------------------------------------------------------------------
 
-// Step 7 task #29: experimental persistent Q8_1 scratch buffer.
-//
-// Hypothesis: ggml_cuda_pool_alloc inside ds4_mmq_moe_vec_impl records a
-// cudaMallocAsync graph node into the captured layer graph.  At replay
-// time the alloc node returns a (potentially different) address, but the
-// matvec kernel's pointer argument was baked in at capture time.  Result:
-// the matvec reads stale/wrong memory and produces a different output
-// than eager execution, even with identical inputs.
-//
-// Mitigation under test: pre-allocate a persistent device buffer at
-// startup via plain cudaMalloc (NOT cudaMallocAsync, NOT inside any
-// capture).  When the env flag DS4_CUDA_MMQ_Q81_PERSISTENT=1 is set,
-// ds4_mmq_moe_vec_impl uses this persistent buffer instead of pool_alloc.
+// Step 7 task #29: experimental persistent Q8_1 scratch buffer. CUDA graph
+// memory nodes already preserve the allocation's virtual address for the
+// lifetime of the graph, so the ordinary same-stream pool path is correct.
+// This startup allocation is instead an optimization experiment: it removes
+// captured alloc/free nodes and their allocator/instantiation overhead. When
+// DS4_CUDA_MMQ_Q81_PERSISTENT=1 is set, ds4_mmq_moe_vec_impl uses this buffer
+// instead of pool_alloc.
 //
 // Sized for V4 Flash decode shapes: gate Q8_1 ~8 KB, down Q8_1 ~14 KB.
 // 256 KB allocation gives generous headroom for short prefill batches.
@@ -351,9 +345,10 @@ extern "C" int ds4_mmq_init(int device) {
     }
 
     // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
-    // Must happen here (before any layer-graph capture) so the cudaMalloc
-    // is not forbidden by capture-mode restrictions, and so the kernel
-    // pointer arg baked into the captured graph stays valid at replay.
+    // This happens before layer-graph capture to keep allocator nodes and
+    // their instantiation overhead out of the graph. The ordinary same-stream
+    // cudaMallocAsync path remains correct: CUDA graph memory nodes preserve
+    // their virtual address for the lifetime of the graph.
     if (getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
         const size_t bytes = 256 * 1024;
         cudaError_t err = cudaMalloc(&g_q81_scratch_ptr, bytes);
@@ -2323,11 +2318,10 @@ int ds4_mmq_moe_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    // Step 7 task #29: experimental persistent Q8_1 scratch.  Avoids
-    // pool_alloc (cudaMallocAsync) graph nodes whose pointer baked at
-    // capture time may not match the address resolved at replay.  When
-    // disabled (default) or when the persistent buffer is too small,
-    // fall back to the pool path.  See ds4_mmq_init for setup.
+    // Step 7 task #29: experimental persistent Q8_1 scratch. It avoids
+    // captured pool alloc/free nodes as a performance experiment. When
+    // disabled (default) or too small, the valid same-stream graph-memory
+    // pool path remains the fallback. See ds4_mmq_init for setup.
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
     if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
@@ -3472,26 +3466,31 @@ int ds4_mmq_dense_pair_vec_impl(
     return 0;
 }
 
-__global__ static void ds4_mmq_identity_i32_kernel(
-        int32_t *ids, int n) {
-    const int i = (int)threadIdx.x;
-    if (i < n) ids[i] = i;
+__global__ static void ds4_mmq_group_ids_i32_kernel(
+        int32_t *ids, int n, int n_groups) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) ids[i] = i % n_groups;
 }
 
-/* Grouped AProjQ4 attention-A projection.  Treat each attention group as an
- * MMVQ channel (not as a column): ncols_dst stays one, so each channel uses
- * exactly the same one-row Q4_K MMVQ specialization, K partition, peer-warp
- * fold, and reduction tree as the canonical per-group loop.  Only activation
- * quantization and launch setup are shared across groups. */
-static int ds4_mmq_q4_K_grouped_vec_impl(
+/* Grouped AProjQ4 attention-A projection.  Flatten (token, group) into the
+ * MMVQ channel dimension (never the column dimension): ncols_dst stays one,
+ * so every pair uses exactly the same one-row Q4_K MMVQ specialization, K
+ * partition, peer-warp fold, and reduction tree as the canonical nested
+ * token/group loop.  The repeated ids select W[group], while channel_y and
+ * channel_dst retain the token-major flat index.  Only activation
+ * quantization and launch setup are shared. */
+static int ds4_mmq_q4_K_grouped_batch_vec_impl(
         const void  *W,
         const float *X,
         float       *out,
         int          M,
         int          K,
+        int          n_tokens,
         int          n_groups,
         cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q4_K_grouped_vec";
+    const char *tag = n_tokens == 1
+        ? "ds4_mmq_q4_K_grouped_vec"
+        : "ds4_mmq_q4_K_grouped_batch_vec";
     if (!W || !X || !out) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -3499,10 +3498,21 @@ static int ds4_mmq_q4_K_grouped_vec_impl(
     if (!g_gb10_optimizations ||
         getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr ||
         getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A") != nullptr ||
-        M <= 0 || K <= 0 || n_groups <= 0 || n_groups > 16 ||
+        M <= 0 || K <= 0 || n_tokens <= 0 || n_tokens > 8 ||
+        n_groups <= 0 || n_groups > 16 ||
         K % 256 != 0) {
         return DS4_MMQ_NOT_APPLICABLE;
     }
+    if (n_tokens > 1) {
+        const char *enable =
+            getenv("DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH");
+        if (!enable || !enable[0] || strcmp(enable, "0") == 0 ||
+            getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH") != nullptr) {
+            return DS4_MMQ_NOT_APPLICABLE;
+        }
+    }
+
+    const int flat_channels = n_tokens * n_groups; /* <= 8 * 16 */
 
     const int64_t row_blocks = (int64_t)K / ggml_blck_size(GGML_TYPE_Q4_K);
     const int64_t weight_channel_stride = (int64_t)M * row_blocks;
@@ -3512,11 +3522,15 @@ static int ds4_mmq_q4_K_grouped_vec_impl(
     }
 
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
-    const size_t nbytes_q8_1 = (size_t)n_groups * (size_t)ne10_padded *
-                               sizeof(block_q8_1) / QK8_1;
+    const size_t q8_row_bytes = (size_t)ne10_padded *
+                                sizeof(block_q8_1) / QK8_1;
+    if ((size_t)flat_channels > SIZE_MAX / q8_row_bytes) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t nbytes_q8_1 = (size_t)flat_channels * q8_row_bytes;
     if (nbytes_q8_1 > SIZE_MAX - 15u) return DS4_MMQ_NOT_APPLICABLE;
     const size_t ids_offset = (nbytes_q8_1 + 15u) & ~(size_t)15u;
-    const size_t ids_bytes = (size_t)n_groups * sizeof(int32_t);
+    const size_t ids_bytes = (size_t)flat_channels * sizeof(int32_t);
     if (ids_offset > SIZE_MAX - ids_bytes) {
         return DS4_MMQ_NOT_APPLICABLE;
     }
@@ -3526,10 +3540,12 @@ static int ds4_mmq_q4_K_grouped_vec_impl(
         dev, ids_offset + ids_bytes);
     if (!x8) return DS4_MMQ_NOT_APPLICABLE;
     int32_t *ids = (int32_t *)(x8 + ids_offset);
-    ds4_mmq_identity_i32_kernel<<<1, 32, 0, stream>>>(ids, n_groups);
+    ds4_mmq_group_ids_i32_kernel<<<
+        (unsigned)(flat_channels + 31) / 32u, 32, 0, stream>>>(
+            ids, flat_channels, n_groups);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "%s: identity launch failed: %s\n",
+        fprintf(stderr, "%s: group-id launch failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -2;
     }
@@ -3538,9 +3554,9 @@ static int ds4_mmq_q4_K_grouped_vec_impl(
         X, /*ids=*/nullptr, (void *)x8,
         GGML_TYPE_Q4_K, /*ne00=*/K,
         /*s11=*/(int64_t)K,
-        /*s12=*/(int64_t)K * n_groups,
-        /*s13=*/(int64_t)K * n_groups,
-        /*ne0=*/ne10_padded, /*ne1=*/n_groups, /*ne2=*/1, /*ne3=*/1,
+        /*s12=*/(int64_t)K * flat_channels,
+        /*s13=*/(int64_t)K * flat_channels,
+        /*ne0=*/ne10_padded, /*ne1=*/flat_channels, /*ne2=*/1, /*ne3=*/1,
         stream);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -3551,8 +3567,13 @@ static int ds4_mmq_q4_K_grouped_vec_impl(
 
     const int64_t y_channel_stride = ne10_padded / QK8_1;
     ggml_cuda_mm_fusion_args_device fusion = {};
-    cudaMemsetAsync(out, 0,
-                    (size_t)n_groups * (size_t)M * sizeof(float), stream);
+    err = cudaMemsetAsync(
+        out, 0, (size_t)flat_channels * (size_t)M * sizeof(float), stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: output clear failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -4;
+    }
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/GGML_TYPE_Q4_K,
         /*vy=*/(const void *)x8,
@@ -3563,8 +3584,8 @@ static int ds4_mmq_q4_K_grouped_vec_impl(
         /*stride_col_y=*/(int)y_channel_stride,
         /*stride_col_dst=*/M,
         /*nchannels_x=*/n_groups,
-        /*nchannels_y=*/n_groups,
-        /*nchannels_dst=*/n_groups,
+        /*nchannels_y=*/flat_channels,
+        /*nchannels_dst=*/flat_channels,
         /*stride_channel_x=*/(int)weight_channel_stride,
         /*stride_channel_y=*/(int)y_channel_stride,
         /*stride_channel_dst=*/M,
@@ -3576,10 +3597,11 @@ static int ds4_mmq_q4_K_grouped_vec_impl(
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: grouped MMVQ launch failed: %s\n",
                 tag, cudaGetErrorString(err));
-        return -4;
+        return -5;
     }
     ds4_mmq_sanitize_f32(
-        out, (uint64_t)(uint32_t)n_groups * (uint64_t)(uint32_t)M, stream);
+        out, (uint64_t)(uint32_t)flat_channels * (uint64_t)(uint32_t)M,
+        stream);
     return 0;
 }
 
@@ -5484,8 +5506,15 @@ extern "C" int ds4_mmq_q4_K_dense_vec(
 extern "C" int ds4_mmq_q4_K_grouped_vec(
         const void *W, const float *X, float *out,
         int M, int K, int n_groups, cudaStream_t stream) {
-    return ds4_mmq_q4_K_grouped_vec_impl(
-        W, X, out, M, K, n_groups, stream);
+    return ds4_mmq_q4_K_grouped_batch_vec_impl(
+        W, X, out, M, K, 1, n_groups, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_batch_vec(
+        const void *W, const float *X, float *out,
+        int M, int K, int n_tokens, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_batch_vec_impl(
+        W, X, out, M, K, n_tokens, n_groups, stream);
 }
 
 extern "C" int ds4_mmq_q4_K_dense_pair_vec(

@@ -50,6 +50,12 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Stable CUDA allocation identity, including a view's byte offset.  Unlike
+ * the wrapper handle, this stays unchanged when an equivalent tensor view is
+ * recreated and is therefore suitable for CUDA graph-cache keys. */
+uintptr_t ds4_gpu_tensor_storage_key(const ds4_gpu_tensor *tensor);
+#endif
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
@@ -412,21 +418,6 @@ int ds4_gpu_matmul_quant_kslice_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                x_elem_off);
-int ds4_gpu_attention_output_q8_tp_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *low,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
-        uint64_t                group_dim,
-        uint64_t                rank,
-        uint32_t                n_groups_total,
-        uint32_t                group0,
-        uint32_t                group_cnt,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *heads);
-
 /* =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================
@@ -2351,8 +2342,8 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 /* Returns 1 when the batch path ran, 0 for the ordinary row fallback, and -1
- * for a required Metal path that is unavailable or a CUDA grouped launch
- * that failed after enqueue and therefore cannot safely fall back. */
+ * for a post-enqueue failure or a backend REQUIRE diagnostic.  The caller
+ * must not retry the row fallback after -1. */
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -2823,6 +2814,19 @@ int ds4_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+#ifdef __APPLE__
+/* Metal DSpark prefill capture: materialize every reduced HC row and mirror
+ * the final row in the same compute dispatch. `out` and `last_out` must refer
+ * to non-overlapping storage; production uses separate persistent tensors. */
+int ds4_gpu_hc_weighted_sum_capture_last_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *last_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+#endif
+
 int ds4_gpu_hc_weighted_sum_split_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
@@ -2919,29 +2923,6 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
         uint32_t                n_rows,
         float                   eps);
 
-#ifdef __APPLE__
-int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
-        ds4_gpu_tensor       *mix,
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *norm_out,
-        ds4_gpu_tensor       *split,
-        const ds4_gpu_tensor *residual_hc,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              mix_weight_offset,
-        uint64_t              scale_offset,
-        uint64_t              base_offset,
-        uint64_t              norm_weight_offset,
-        uint32_t              n,
-        uint32_t              mix_dim,
-        uint32_t              n_embd,
-        uint32_t              n_hc,
-        uint32_t              sinkhorn_iters,
-        float                 eps,
-        float                 hc_eps,
-        float                 norm_eps);
-
-#endif
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,
@@ -2969,18 +2950,6 @@ int ds4_gpu_hc_expand_add_tensor(
         const ds4_gpu_tensor *comb,
         uint32_t                n_embd,
         uint32_t                n_hc);
-
-
-int ds4_gpu_hc_expand_add_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *post,
-        const ds4_gpu_tensor *comb,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
-
 int ds4_gpu_hc_expand_split_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
@@ -3237,8 +3206,9 @@ int ds4_gpu_matmul_q4_K_hc_expand_tensor(
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
- * island: layer, island index, and the activation buffers whose addresses
- * the captured kernels bake in.  ds4_cuda.cu mirrors this struct
+ * island: layer, island index, and the stable device-storage addresses that
+ * the captured kernels bake in (never short-lived view-wrapper addresses).
+ * ds4_cuda.cu mirrors this struct
  * byte-for-byte (it does not include this header); keep both in sync. */
 typedef struct ds4_decode_graph_key {
     uint32_t il;
@@ -3251,6 +3221,10 @@ typedef struct ds4_decode_graph_key {
     void    *attn_norm;
 } ds4_decode_graph_key;
 
+/* Exact-N uses a disjoint CUDA graph-cache domain so its five batch-row
+ * activation addresses cannot evict the ordinary decode variants. */
+#define DS4_DECODE_GRAPH_VARIANT_EXACTN 0x80000000u
+
 int  ds4_gpu_decode_graphs_supported(void);
 /* 1: replayed (island already executed; skip encoding it)
  * 0: capturing (encode the island, then call _end)
@@ -3261,6 +3235,14 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+void ds4_gpu_decode_graph_counters(
+        uint64_t *captures,
+        uint64_t *replays,
+        uint64_t *warms,
+        uint64_t *no_slots,
+        uint64_t *failures);
+#endif
 
 #ifdef __cplusplus
 }

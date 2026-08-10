@@ -95,6 +95,7 @@ static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
+static id<MTLComputePipelineState> g_hc_weighted_sum_capture_last_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 static uint32_t g_test_flags;
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
@@ -8364,6 +8365,25 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
+        fn = [library newFunctionWithName:@"kernel_dsv4_hc_weighted_sum_capture_last"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_hc_weighted_sum_capture_last function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_hc_weighted_sum_capture_last_pipeline =
+            [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_hc_weighted_sum_capture_last_pipeline) {
+            fprintf(stderr,
+                    "ds4: Metal kernel_dsv4_hc_weighted_sum_capture_last pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
         fn = [library newFunctionWithName:@"kernel_dsv4_output_hc_weights4"];
         if (fn) {
             g_output_hc_weights4_pipeline =
@@ -10421,6 +10441,7 @@ void ds4_gpu_cleanup(void) {
         g_hc_split_weighted_sum_norm_pipeline = nil;
         g_dsv4_hc_producer_pre_norm_pipeline = nil;
         g_hc_weighted_sum_pipeline = nil;
+        g_hc_weighted_sum_capture_last_pipeline = nil;
         g_output_hc_weights4_pipeline = nil;
         g_hc_expand_pipeline = nil;
         g_moe_mul_mv_id_iq2_xxs_pipeline = nil;
@@ -44209,6 +44230,7 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
 
 static int ds4_gpu_hc_weighted_sum_strided(
         ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *last_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *weights,
         uint64_t                weight_offset,
@@ -44226,6 +44248,8 @@ static int ds4_gpu_hc_weighted_sum_strided(
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(residual_hc);
         id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weights);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> lastbuf = last_out ?
+            ds4_gpu_tensor_buffer(last_out) : nil;
         const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
         const uint64_t out_tensor_bytes = ds4_gpu_tensor_bytes(out);
         if (out_row_bytes == 0 || out_tensor_bytes < out_row_bytes || out_tensor_bytes % out_row_bytes != 0) {
@@ -44252,9 +44276,10 @@ static int ds4_gpu_hc_weighted_sum_strided(
         const uint64_t w_last = weight_offset +
                                 (n_tokens64 - 1u) * weight_row_stride +
                                 (uint64_t)n_hc * sizeof(float);
-        if (!xbuf || !wbuf || !outbuf ||
+        if (!xbuf || !wbuf || !outbuf || (last_out && !lastbuf) ||
             ds4_gpu_tensor_bytes(residual_hc) < x_bytes ||
-            ds4_gpu_tensor_bytes(weights) < w_last) {
+            ds4_gpu_tensor_bytes(weights) < w_last ||
+            (last_out && ds4_gpu_tensor_bytes(last_out) < out_row_bytes)) {
             fprintf(stderr, "ds4: Metal HC weighted sum received undersized activation buffers\n");
             return 0;
         }
@@ -44279,11 +44304,18 @@ static int ds4_gpu_hc_weighted_sum_strided(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_hc_weighted_sum_pipeline];
+        [enc setComputePipelineState:last_out ?
+             g_hc_weighted_sum_capture_last_pipeline :
+             g_hc_weighted_sum_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:1];
         [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        if (last_out) {
+            [enc setBuffer:lastbuf
+                     offset:ds4_gpu_tensor_offset(last_out)
+                    atIndex:4];
+        }
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -44301,6 +44333,7 @@ int ds4_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     return ds4_gpu_hc_weighted_sum_strided(out,
+                                             NULL,
                                              residual_hc,
                                              weights,
                                              0,
@@ -44308,6 +44341,25 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              n_embd,
                                              n_hc,
                                              "HC weighted sum");
+}
+
+int ds4_gpu_hc_weighted_sum_capture_last_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *last_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!last_out) return 0;
+    return ds4_gpu_hc_weighted_sum_strided(out,
+                                             last_out,
+                                             residual_hc,
+                                             weights,
+                                             0,
+                                             (uint64_t)n_hc * sizeof(float),
+                                             n_embd,
+                                             n_hc,
+                                             "HC weighted sum/capture last");
 }
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
@@ -44318,6 +44370,7 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
         uint32_t                n_hc) {
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     return ds4_gpu_hc_weighted_sum_strided(out,
+                                             NULL,
                                              residual_hc,
                                              split,
                                              0,
