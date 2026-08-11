@@ -3073,6 +3073,63 @@ int ds4_mmq_moe_pair_vec_impl(
     return 0;
 }
 
+/* Diagnostic counters are host-dispatch counters.  CUDA graph replays do not
+ * re-enter this wrapper, so they are deliberately not presented as kernel
+ * execution counts.  They are still a fail-closed coverage signal: a GB10
+ * model run must observe at least one candidate and one use before this path
+ * can be promoted from opt-in to default. */
+static uint64_t g_q4_k1024_persistent_candidates;
+static uint64_t g_q4_k1024_persistent_uses;
+static uint64_t g_q4_k1024_persistent_fallbacks;
+static uint64_t g_q4_k1024_persistent_require_failures;
+static uint64_t g_q4_k1024_persistent_oracle_calls;
+static uint64_t g_q4_k1024_persistent_oracle_mismatches;
+static uint64_t g_q4_k1024_persistent_oracle_skips;
+static int g_q4_k1024_persistent_report_registered;
+static int g_q4_k1024_persistent_oracle_mismatch_reported;
+
+static bool q4_k1024_env_flag(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static void q4_k1024_persistent_report(void) {
+    fprintf(stderr,
+            "ds4: CUDA Q4 K1024 persistent: "
+            "candidates=%llu uses=%llu fallbacks=%llu "
+            "require_failures=%llu oracle_calls=%llu "
+            "oracle_mismatches=%llu oracle_skips=%llu "
+            "(host dispatches; graph replays excluded, canonical oracle output retained)\n",
+            (unsigned long long)g_q4_k1024_persistent_candidates,
+            (unsigned long long)g_q4_k1024_persistent_uses,
+            (unsigned long long)g_q4_k1024_persistent_fallbacks,
+            (unsigned long long)g_q4_k1024_persistent_require_failures,
+            (unsigned long long)g_q4_k1024_persistent_oracle_calls,
+            (unsigned long long)g_q4_k1024_persistent_oracle_mismatches,
+            (unsigned long long)g_q4_k1024_persistent_oracle_skips);
+}
+
+static void q4_k1024_persistent_maybe_register_report(void) {
+    if (!g_q4_k1024_persistent_report_registered &&
+        (q4_k1024_env_flag("DS4_CUDA_Q4_K1024_PERSISTENT_STATS") ||
+         q4_k1024_env_flag("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE"))) {
+        g_q4_k1024_persistent_report_registered = 1;
+        (void)atexit(q4_k1024_persistent_report);
+    }
+}
+
+__global__ static void q4_K_k1024_bitwise_compare_kernel(
+        uint32_t    *mismatch,
+        const float *candidate,
+        const float *reference,
+        uint64_t     count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count &&
+        __float_as_uint(candidate[i]) != __float_as_uint(reference[i])) {
+        atomicExch(mismatch, 1u);
+    }
+}
+
 /* GB10 AProjQ4 Q-b decode specialization (M=32768, N=1, K=1024).
  *
  * The canonical MMVQ small-K launch uses four warps to evaluate four rows:
@@ -3205,9 +3262,91 @@ int ds4_mmq_dense_vec_impl(
         return -1;
     }
 
+    /* Resolve the exact-shape admission before allocating pool storage,
+     * quantizing X, clearing output, or launching any kernel.  REQUIRE and
+     * the oracle are coverage gates: an ineligible candidate must therefore
+     * fail without leaving work queued on the caller's stream. */
+    bool q4_k1024_exact = false;
+    bool q4_k1024_eligible = false;
+    bool q4_k1024_oracle = false;
+    unsigned q4_k1024_grid = 0u;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        q4_k1024_persistent_maybe_register_report();
+        q4_k1024_exact = M == 32768 && N == 1 && K == 1024;
+        q4_k1024_oracle = q4_k1024_exact &&
+            q4_k1024_env_flag("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE");
+        const bool enable =
+            getenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT") != nullptr;
+        const bool disable =
+            getenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT") != nullptr ||
+            getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr;
+        if (q4_k1024_exact) {
+            g_q4_k1024_persistent_candidates++;
+        }
+        if (q4_k1024_exact && g_gb10_optimizations &&
+            (enable || q4_k1024_oracle) && !disable &&
+            (((uintptr_t)W & 15u) == 0u)) {
+            const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
+            const int nsm = ggml_cuda_info().devices[dev].nsm;
+            const uint64_t resident_blocks =
+                nsm > 0 ? (uint64_t)(uint32_t)nsm * 4u : 0u;
+            const uint64_t grid64 = row_tiles < resident_blocks
+                ? row_tiles : resident_blocks;
+            if (grid64 > 0u && grid64 <= UINT32_MAX) {
+                q4_k1024_grid = (unsigned)grid64;
+                q4_k1024_eligible = true;
+            }
+        }
+        if (q4_k1024_exact && !q4_k1024_eligible) {
+            g_q4_k1024_persistent_fallbacks++;
+            const bool require =
+                getenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT") != nullptr;
+            if (require || q4_k1024_oracle) {
+                g_q4_k1024_persistent_require_failures++;
+                if (q4_k1024_oracle) {
+                    g_q4_k1024_persistent_oracle_skips++;
+                }
+                fprintf(stderr,
+                        "%s: required Q4_K K1024 persistent path unavailable "
+                        "before enqueue\n",
+                        tag);
+                return -4;
+            }
+        }
+        if (q4_k1024_eligible && q4_k1024_oracle) {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            const cudaError_t capture_err =
+                cudaStreamIsCapturing(stream, &capture);
+            if (capture_err != cudaSuccess ||
+                capture != cudaStreamCaptureStatusNone) {
+                (void)cudaGetLastError();
+                g_q4_k1024_persistent_fallbacks++;
+                g_q4_k1024_persistent_require_failures++;
+                g_q4_k1024_persistent_oracle_skips++;
+                fprintf(stderr,
+                        "%s: Q4_K K1024 persistent oracle refuses CUDA "
+                        "graph capture before enqueue; run the oracle with "
+                        "DS4_CUDA_DECODE_GRAPHS=0\n",
+                        tag);
+                return -5;
+            }
+        }
+    }
+
     // Route the pool's cudaMallocAsync through the caller-supplied stream
     // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
     ds4_pool_set_stream(stream);
+
+    /* Oracle-only storage.  Graph capture was rejected above, so the pool
+     * allocations and the host readback below cannot become graph nodes.
+     * The persistent candidate writes here; canonical MMVQ always owns the
+     * caller-visible output. */
+    ggml_cuda_pool_alloc<float> q4_k1024_candidate;
+    ggml_cuda_pool_alloc<uint32_t> q4_k1024_mismatch;
+    if (q4_k1024_eligible && q4_k1024_oracle) {
+        q4_k1024_candidate.alloc(ctx->pool(), (size_t)M);
+        q4_k1024_mismatch.alloc(ctx->pool(), 1u);
+    }
 
     // Dense: no MoE, ids=null. Layout [K, N, 1, 1] for src1.
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -3260,36 +3399,16 @@ int ds4_mmq_dense_vec_impl(
 
     bool q4_k1024_persistent = false;
     if constexpr (type == GGML_TYPE_Q4_K) {
-        const bool exact_shape = M == 32768 && N == 1 && K == 1024;
-        const bool enable =
-            getenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT") != nullptr;
-        const bool disable =
-            getenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT") != nullptr ||
-            getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr;
-        if (g_gb10_optimizations && enable && !disable && exact_shape &&
-            (((uintptr_t)W & 15u) == 0u)) {
-            const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
-            const int nsm = ggml_cuda_info().devices[dev].nsm;
-            const uint64_t resident_blocks =
-                nsm > 0 ? (uint64_t)(uint32_t)nsm * 4u : 0u;
-            const uint64_t grid64 = row_tiles < resident_blocks
-                ? row_tiles : resident_blocks;
-            if (grid64 > 0u && grid64 <= UINT32_MAX) {
-                q4_K_dense_vec_k1024_persistent_kernel<<<
-                    (unsigned)grid64, 256, 0, stream>>>(
-                        (const block_q4_K *)W,
-                        (const block_q8_1 *)x8,
-                        out_f32, M);
-                q4_k1024_persistent = true;
-            }
-        }
-        if (exact_shape &&
-            getenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT") != nullptr &&
-            !q4_k1024_persistent) {
-            fprintf(stderr,
-                    "%s: required Q4_K K1024 persistent path unavailable\n",
-                    tag);
-            return -4;
+        if (q4_k1024_eligible) {
+            float *candidate_out = q4_k1024_oracle
+                ? q4_k1024_candidate.get() : out_f32;
+            q4_K_dense_vec_k1024_persistent_kernel<<<
+                q4_k1024_grid, 256, 0, stream>>>(
+                    (const block_q4_K *)W,
+                    (const block_q8_1 *)x8,
+                    candidate_out, M);
+            g_q4_k1024_persistent_uses++;
+            q4_k1024_persistent = !q4_k1024_oracle;
         }
     }
 
@@ -3320,7 +3439,53 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    const uint64_t out_count = (uint64_t)M * (uint64_t)N;
+    ds4_mmq_sanitize_f32(out_f32, out_count, stream);
+    if (q4_k1024_oracle) {
+        ds4_mmq_sanitize_f32(q4_k1024_candidate.get(), out_count, stream);
+        if (cudaGetLastError() != cudaSuccess) {
+            fprintf(stderr, "%s: Q4_K K1024 oracle sanitize failed\n", tag);
+            g_q4_k1024_persistent_oracle_skips++;
+            return -6;
+        }
+        cudaError_t oracle_err = cudaMemsetAsync(
+            q4_k1024_mismatch.get(), 0, sizeof(uint32_t), stream);
+        if (oracle_err == cudaSuccess) {
+            q4_K_k1024_bitwise_compare_kernel<<<
+                (unsigned)((out_count + 255u) / 256u), 256, 0, stream>>>(
+                    q4_k1024_mismatch.get(), q4_k1024_candidate.get(),
+                    out_f32, out_count);
+            oracle_err = cudaGetLastError();
+        }
+        uint32_t mismatch_host = 0u;
+        if (oracle_err == cudaSuccess) {
+            oracle_err = cudaMemcpyAsync(
+                &mismatch_host, q4_k1024_mismatch.get(), sizeof(uint32_t),
+                cudaMemcpyDeviceToHost, stream);
+        }
+        if (oracle_err == cudaSuccess) {
+            oracle_err = cudaStreamSynchronize(stream);
+        }
+        if (oracle_err != cudaSuccess) {
+            fprintf(stderr,
+                    "%s: Q4_K K1024 persistent oracle failed: %s\n",
+                    tag, cudaGetErrorString(oracle_err));
+            (void)cudaGetLastError();
+            g_q4_k1024_persistent_oracle_skips++;
+            return -6;
+        }
+        g_q4_k1024_persistent_oracle_calls++;
+        if (mismatch_host != 0u) {
+            g_q4_k1024_persistent_oracle_mismatches++;
+            if (!g_q4_k1024_persistent_oracle_mismatch_reported) {
+                g_q4_k1024_persistent_oracle_mismatch_reported = 1;
+                fprintf(stderr,
+                        "%s: Q4_K K1024 persistent oracle found a bitwise "
+                        "mismatch; retained canonical MMVQ output\n",
+                        tag);
+            }
+        }
+    }
     return 0;
 }
 
@@ -4287,6 +4452,27 @@ static int ds4_mmq_q4_K_dense_pair_vec_impl(
 }
 
 } // anonymous namespace
+
+extern "C" void ds4_mmq_q4_K_k1024_persistent_counters(
+        uint64_t *candidates,
+        uint64_t *uses,
+        uint64_t *fallbacks,
+        uint64_t *require_failures,
+        uint64_t *oracle_calls,
+        uint64_t *oracle_mismatches,
+        uint64_t *oracle_skips) {
+    if (candidates) *candidates = g_q4_k1024_persistent_candidates;
+    if (uses) *uses = g_q4_k1024_persistent_uses;
+    if (fallbacks) *fallbacks = g_q4_k1024_persistent_fallbacks;
+    if (require_failures) {
+        *require_failures = g_q4_k1024_persistent_require_failures;
+    }
+    if (oracle_calls) *oracle_calls = g_q4_k1024_persistent_oracle_calls;
+    if (oracle_mismatches) {
+        *oracle_mismatches = g_q4_k1024_persistent_oracle_mismatches;
+    }
+    if (oracle_skips) *oracle_skips = g_q4_k1024_persistent_oracle_skips;
+}
 
 extern "C" int ds4_mmq_q8_0_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,

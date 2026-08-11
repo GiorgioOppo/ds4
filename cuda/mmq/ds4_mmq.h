@@ -936,9 +936,21 @@ int ds4_mmq_q4_K_grouped_batch_vec(
 // DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1.  The rollback switch
 // DS4_CUDA_NO_Q4_K1024_PERSISTENT=1 is authoritative when both are set.
 // DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1 makes an unavailable exact-shape
-// dispatch fail closed instead of silently running canonical MMVQ.
+// dispatch fail before any CUDA work is enqueued instead of silently running
+// canonical MMVQ. DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE=1 forces a candidate,
+// compares it bit-for-bit with canonical MMVQ, and retains canonical output;
+// run it with DS4_CUDA_DECODE_GRAPHS=0. Set
+// DS4_CUDA_Q4_K1024_PERSISTENT_STATS=1 for the atexit counter summary.
 // DS4_CUDA_NO_Q4_GB10_FAST=1 is the umbrella rollback for this and the
 // GB10 Q4 activation scratch. Other shapes and devices retain canonical MMVQ.
+void ds4_mmq_q4_K_k1024_persistent_counters(
+    uint64_t *candidates,
+    uint64_t *uses,
+    uint64_t *fallbacks,
+    uint64_t *require_failures,
+    uint64_t *oracle_calls,
+    uint64_t *oracle_mismatches,
+    uint64_t *oracle_skips);
 
 // Two independent dense Q4_K projections that share the canonical Q8_1
 // activation quantization.  Each output is dispatched through the same MMVQ

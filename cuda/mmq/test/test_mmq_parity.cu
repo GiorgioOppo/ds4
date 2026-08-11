@@ -1148,17 +1148,32 @@ bool run_q4_K_dense_vec_gb10_parity(
     cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
                     cudaMemcpyHostToDevice, stream);
 
+    uint64_t candidates0 = 0, uses0 = 0, fallbacks0 = 0;
+    uint64_t require_failures0 = 0, oracle_calls0 = 0;
+    uint64_t oracle_mismatches0 = 0, oracle_skips0 = 0;
+    ds4_mmq_q4_K_k1024_persistent_counters(
+        &candidates0, &uses0, &fallbacks0, &require_failures0,
+        &oracle_calls0, &oracle_mismatches0, &oracle_skips0);
+
     unsetenv("DS4_CUDA_NO_Q4_GB10_FAST");
     unsetenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH");
     unsetenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT");
     unsetenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT");
     unsetenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT");
+    unsetenv("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE");
     ds4_mmq_set_gb10_optimizations(persistent_k1024 ? 1 : 0);
     ds4_mmq_set_aligned_q81_scratch(
         persistent_k1024 ? scratch : nullptr,
         persistent_k1024 ? 256u * 1024u : 0u);
+    /* The reference must remain canonical even after a future default-on
+     * promotion.  The authoritative kill switch makes this a real
+     * reference-vs-candidate comparison rather than candidate-vs-candidate. */
+    if (persistent_k1024) {
+        setenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT", "1", 1);
+    }
     const int rc_ref = ds4_mmq_q4_K_dense_vec(
         dW, dX, dRef, M, N, K, stream);
+    unsetenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT");
 
     ds4_mmq_set_gb10_optimizations(1);
     ds4_mmq_set_aligned_q81_scratch(scratch, 256u * 1024u);
@@ -1176,30 +1191,69 @@ bool run_q4_K_dense_vec_gb10_parity(
     cudaMemcpyAsync(got.data(), dGot, got.size() * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
     int rc_required_disabled = 0;
+    int rc_oracle = 0;
+    std::vector<float> oracle((size_t)M * N);
     if (persistent_k1024) {
         setenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT", "1", 1);
         rc_required_disabled = ds4_mmq_q4_K_dense_vec(
             dW, dX, dGot, M, N, K, stream);
         unsetenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT");
+        setenv("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE", "1", 1);
+        rc_oracle = ds4_mmq_q4_K_dense_vec(
+            dW, dX, dGot, M, N, K, stream);
+        unsetenv("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE");
+        cudaMemcpyAsync(oracle.data(), dGot, oracle.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
     }
     const cudaError_t sync_err = cudaStreamSynchronize(stream);
     size_t mismatches = 0;
+    size_t oracle_output_mismatches = 0;
     for (size_t i = 0; i < ref.size(); i++) {
         if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0) mismatches++;
+        if (persistent_k1024 &&
+            std::memcmp(&ref[i], &oracle[i], sizeof(float)) != 0) {
+            oracle_output_mismatches++;
+        }
     }
+
+    uint64_t candidates1 = 0, uses1 = 0, fallbacks1 = 0;
+    uint64_t require_failures1 = 0, oracle_calls1 = 0;
+    uint64_t oracle_mismatches1 = 0, oracle_skips1 = 0;
+    ds4_mmq_q4_K_k1024_persistent_counters(
+        &candidates1, &uses1, &fallbacks1, &require_failures1,
+        &oracle_calls1, &oracle_mismatches1, &oracle_skips1);
+    const bool counter_ok = !persistent_k1024 ||
+        (candidates1 - candidates0 >= 4u &&
+         uses1 - uses0 >= 2u &&
+         fallbacks1 - fallbacks0 >= 2u &&
+         require_failures1 - require_failures0 >= 1u &&
+         oracle_calls1 - oracle_calls0 >= 1u &&
+         oracle_mismatches1 == oracle_mismatches0 &&
+         oracle_skips1 == oracle_skips0);
     ok = rc_ref == 0 && rc_got == 0 &&
          (!persistent_k1024 || rc_required_disabled != 0) &&
+         (!persistent_k1024 || rc_oracle == 0) &&
          sync_err == cudaSuccess &&
-         mismatches == 0;
+         mismatches == 0 && oracle_output_mismatches == 0 && counter_ok;
     fprintf(stderr,
             "rc_ref=%d rc_candidate=%d rc_required_disabled=%d "
-            "mismatches=%zu sync=%s\n%s\n\n",
-            rc_ref, rc_got, rc_required_disabled, mismatches,
+            "rc_oracle=%d mismatches=%zu oracle_output_mismatches=%zu "
+            "counter_delta=%llu/%llu/%llu/%llu/%llu/%llu/%llu sync=%s\n%s\n\n",
+            rc_ref, rc_got, rc_required_disabled, rc_oracle, mismatches,
+            oracle_output_mismatches,
+            (unsigned long long)(candidates1 - candidates0),
+            (unsigned long long)(uses1 - uses0),
+            (unsigned long long)(fallbacks1 - fallbacks0),
+            (unsigned long long)(require_failures1 - require_failures0),
+            (unsigned long long)(oracle_calls1 - oracle_calls0),
+            (unsigned long long)(oracle_mismatches1 - oracle_mismatches0),
+            (unsigned long long)(oracle_skips1 - oracle_skips0),
             cudaGetErrorString(sync_err),
             ok ? "PASS" : "FAIL");
 
     unsetenv("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT");
     unsetenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT");
+    unsetenv("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE");
     ds4_mmq_set_aligned_q81_scratch(nullptr, 0u);
     ds4_mmq_set_gb10_optimizations(0);
     cudaFree(scratch);
