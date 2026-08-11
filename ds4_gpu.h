@@ -189,6 +189,26 @@ int ds4_gpu_test_decode_pipeline_fast_lookup_ext(void);
 /* Strict test oracle for the generated resident-prefill MXFP4 half LUT. */
 int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
                                      uint16_t *lut_bits);
+typedef struct ds4_gpu_iq2_mid_only_oracle_report {
+    uint64_t mid_words;
+    uint64_t mid_mismatches;
+    uint64_t canonical_gate_unwritten;
+    uint64_t canonical_up_unwritten;
+    uint64_t candidate_gate_writes;
+    uint64_t candidate_up_writes;
+    uint64_t masked_mid_mismatches;
+    uint64_t masked_inactive_writes;
+    uint64_t masked_canonical_gate_unwritten;
+    uint64_t masked_canonical_up_unwritten;
+    uint64_t masked_gate_writes;
+    uint64_t masked_up_writes;
+    uint64_t guard_byte_mismatches;
+} ds4_gpu_iq2_mid_only_oracle_report;
+/* Full-shape address-table oracle for the experimental M1 IQ2 mid-only
+ * producer.  Return zero means setup/execution failure; numerical and
+ * sentinel failures are reported explicitly in `report`. */
+int ds4_gpu_test_iq2_addr_mid_only_oracle(
+        ds4_gpu_iq2_mid_only_oracle_report *report);
 enum {
     DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL = 1u << 0,
     DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE = 1u << 1,

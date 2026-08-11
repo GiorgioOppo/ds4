@@ -3247,6 +3247,139 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
     }
 }
 
+// Address-table decode specialization for the DeepSeek Flash IQ2 gate/up
+// shape.  It deliberately keeps the exact dot-product, simd_sum, scale,
+// clamp, exp, and route-weight order of kernel_mul_mv_iq2_xxs_pair_f32_impl
+// followed by the canonical fused SwiGLU epilogue.  The only removed work is
+// the round trip through the gate/up destination buffers: downstream consumes
+// `mid` exclusively on this dispatch.
+template<int nr0>
+void kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl(
+        ds4_metal_args_mul_mv args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_mid,
+        device const char * weights,
+        uint64_t pair_row,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr int ne00 = 4096;
+    constexpr int ne0 = 2048;
+    constexpr int nb = ne00 / QK_K;
+    const short NSG = FC_mul_mv_nsg;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+    const uint64_t offset0 = first_row * args.nb01 +
+        (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+
+    device const block_iq2_xxs *xg =
+        (device const block_iq2_xxs *)(src0_gate + offset0);
+    device const block_iq2_xxs *xu =
+        (device const block_iq2_xxs *)(src0_up + offset0);
+    device const float *y = (device const float *)(src1 + offset1);
+
+    float yl[32];
+    float sumg[nr0] = {0.f};
+    float sumu[nr0] = {0.f};
+    constexpr int nb32 = nb * (QK_K / 32);
+
+    threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
+    threadgroup uint8_t *ssigns = (threadgroup uint8_t *)(svalues + 256);
+    {
+        int nval = 4;
+        int pos = (32 * sgitg + tiisg) * nval;
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        nval = 2;
+        pos = (32 * sgitg + tiisg) * nval;
+        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int ix = tiisg;
+    device const float *y4 = y + 32 * ix;
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = y4[i];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib = ib32 % (QK_K / 32);
+        device const block_iq2_xxs *xgr = xg + ibl;
+        device const block_iq2_xxs *xur = xu + ibl;
+        device const uint16_t *qg = xgr->qs + 4 * ib;
+        device const uint16_t *qu = xur->qs + 4 * ib;
+        device const half *dhg = &xgr->d;
+        device const half *dhu = &xur->d;
+
+        for (short row = 0; row < nr0; ++row) {
+            device const uint8_t *aux8g = (device const uint8_t *)qg;
+            device const uint8_t *aux8u = (device const uint8_t *)qu;
+            const uint32_t aux32g = qg[2] | (qg[3] << 16);
+            const uint32_t aux32u = qu[2] | (qu[3] << 16);
+            const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+            const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+            float sg = 0;
+            float su = 0;
+            for (short l = 0; l < 4; ++l) {
+                const threadgroup uint8_t *gridg =
+                    (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                const threadgroup uint8_t *gridu =
+                    (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
+                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                for (short j = 0; j < 8; ++j) {
+                    const float v = yl[8 * l + j];
+                    sg += v * gridg[j] *
+                        (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    su += v * gridu[j] *
+                        (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+            }
+            sumg[row] += dg * sg;
+            sumu[row] += du * su;
+
+            dhg += args.nb01 / 2;
+            dhu += args.nb01 / 2;
+            qg += args.nb01 / 2;
+            qu += args.nb01 / 2;
+        }
+        y4 += 32 * 32;
+    }
+
+    device float *mid_f32 =
+        (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w =
+        (device const float *)(weights + pair_row * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+    for (int row = 0; row < nr0 && first_row + row < ne0; ++row) {
+        const float sum_gate = simd_sum(sumg[row]);
+        const float sum_up = simd_sum(sumu[row]);
+        if (tiisg == 0) {
+            float g = sum_gate * 0.25f;
+            float u = sum_up * 0.25f;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[first_row + row] = silu * u * route_weight;
+        }
+    }
+}
+
 typedef void (kernel_mul_mv2_disp_t)(
         ds4_metal_args_mul_mv args,
         device const char * src0,
@@ -4296,6 +4429,160 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
         }
     }
 
+    (void)tiitg;
+}
+
+// M1 SSD-streaming candidate for the exact Flash 4096 -> 2048 gate/up shape.
+// `dst_gate` and `dst_up` remain in the ABI so the host can switch pipelines
+// without changing resource bindings; this kernel intentionally never writes
+// either buffer.  Host dispatch is opt-in and falls back to the kernel above
+// for every other shape or execution mode.
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (args.ne00 != 4096 || args.ne01 != 2048 || args.ne0 != 2048 ||
+        args.nr0 != N_R0_IQ2_XXS || args.nei1 != 1) {
+        return;
+    }
+
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx = tgpig.z % args.nei0;
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+        return;
+    }
+    const uint64_t gate_addr = gate_addrs[(uint)i02];
+    const uint64_t up_addr = up_addrs[(uint)i02];
+    if (gate_addr == 0 || up_addr == 0) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addr);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addr);
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+    kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl<N_R0_IQ2_XXS>(
+        args0,
+        act,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_mid,
+        weights,
+        pair_row,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    (void)dst_gate;
+    (void)dst_up;
+    (void)tiitg;
+}
+
+// Same mid-only arithmetic for the ordinary SSD cache split.  Complementary
+// resident/missing masks may execute in separate command buffers; each active
+// slot owns a disjoint mid row, so no gate/up materialization is required.
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant ds4_metal_stream_expert_split_args & split,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (args.ne00 != 4096 || args.ne01 != 2048 || args.ne0 != 2048 ||
+        args.nr0 != N_R0_IQ2_XXS || args.nei1 != 1 ||
+        split.accumulate != 0u || split.active_mask == 0u ||
+        (split.active_mask & ~0x3fu) != 0u) {
+        return;
+    }
+
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx = tgpig.z % args.nei0;
+    if ((split.active_mask & (1u << (uint)idx)) == 0) {
+        return;
+    }
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+        return;
+    }
+    const uint64_t gate_addr = gate_addrs[(uint)i02];
+    const uint64_t up_addr = up_addrs[(uint)i02];
+    if (gate_addr == 0 || up_addr == 0) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addr);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addr);
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+    kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl<N_R0_IQ2_XXS>(
+        args0,
+        act,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_mid,
+        weights,
+        pair_row,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    (void)dst_gate;
+    (void)dst_up;
     (void)tiitg;
 }
 
