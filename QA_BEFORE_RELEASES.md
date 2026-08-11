@@ -407,7 +407,7 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   `DS4_CUDA_DISABLE_HC_NORM_MIX_FUSE=1` versus candidate
   `DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE=1 DS4_CUDA_NO_F16_CUBLAS_ONE=1`; and Q4
   attention-output/HC control `DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` versus
-  MMVQ-safe candidate `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1`. Run a separate
+  the graph-compatible canonical candidate with that variable absent. Run a separate
   non-captured diagnostic with `DS4_CUDA_Q4_ATTN_OUT_HC_ORACLE=1`; require
   the summary to be present with `calls>0`, `skips=0`, and
   `epilogue_mismatches=0`, while `q8k_mismatches` records the expected
@@ -658,6 +658,46 @@ release-ready without this pass.
   vocabulary, compressor, HC split, direct routed-MoE paths, Q4 scratch,
   grouped attention-A, and canonical B+HC epilogue remain relevant, while
   the Q8-only attention-projection consumers are intentionally ineligible.
+- If the umbrella AProjQ4 A/B changes logits, do not attribute that change to
+  "the Q4 fast path" as a unit. Run the fail-closed component matrix from a
+  clean `cuda-spark` build. The output directory is intentionally explicit so
+  the six independent-process arms, two oracle arms, raw logs, and diffs are
+  retained:
+
+  ```sh
+  make clean && make cuda-spark
+  make gguf-tools/quality-testing/score_official CUDA_ARCH=sm_121
+
+  DS4_CUDA_Q4_MATRIX_SSD_STREAMING=1 \
+  DS4_CUDA_Q4_MATRIX_SSD_CACHE=16GB \
+  DS4_CUDA_Q4_MATRIX_DECODE_GRAPHS=1 \
+  tests/cuda_q4_gb10_fast_matrix.sh \
+    /path/to/DeepSeek-V4-Flash-AProjQ4-OutQ8.gguf \
+    gguf-tools/quality-testing/data/flash/manifest.tsv \
+    /tmp/q4-gb10-graphs-on
+
+  DS4_CUDA_Q4_MATRIX_SSD_STREAMING=1 \
+  DS4_CUDA_Q4_MATRIX_SSD_CACHE=16GB \
+  DS4_CUDA_Q4_MATRIX_DECODE_GRAPHS=0 \
+  tests/cuda_q4_gb10_fast_matrix.sh \
+    /path/to/DeepSeek-V4-Flash-AProjQ4-OutQ8.gguf \
+    gguf-tools/quality-testing/data/flash/manifest.tsv \
+    /tmp/q4-gb10-graphs-off
+  ```
+
+  The matrix first proves that the three local rollback switches reproduce
+  `DS4_CUDA_NO_Q4_GB10_FAST=1`; failure of `local_control` means the matrix is
+  incomplete and no component claim is valid. It then enables exactly one of
+  persistent Q8_1 scratch, grouped attention-A, or the graph-compatible B+HC
+  call, with K1024 persistent kept disabled because it is a separate opt-in.
+  The grouped and HC oracle summaries must have `calls>0`, `skips=0`, and zero
+  relevant mismatches. `summary.txt` must say `promotion_gate=pass`. When it
+  is blocked, use the named `*_differences` arms and their `.diff` or
+  `.comparison.txt` files to identify a component; if no single arm differs
+  but `default_fast` does, report an interaction rather than blaming an
+  individual kernel. The tensor oracles and synthetic parity test are the
+  bit-exact component gates; the top-128 smoke dump and every scorer TSV row
+  are complementary end-to-end drift detectors, not a full-logit proof.
 - Exercise CUDA DSpark at verifier/proposer depth 5 with the fast paths enabled
   and disabled.  Require identical final output, zero verifier errors, and
   matching full/partial acceptance histograms.  Test both the generic batch
