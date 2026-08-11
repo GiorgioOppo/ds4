@@ -499,6 +499,27 @@ top-k implementation is now used instead and has no runtime re-enable switch.
 Use a previous binary only as a performance control, and require identical
 selected ids on tie-heavy inputs before comparing timing.
 
+Apple M1 has an opt-in SSD-streaming decode experiment for the exact
+IQ2_XXS/Q2_K routed-MoE shape with 256 experts, top-6 routing, and a
+4096-to-2048 gate/up projection. Set
+`DS4_METAL_ENABLE_M1_IQ2_MID_ONLY=1` to replace the IQ2 address-table
+pair-SwiGLU producer, including complementary resident/missing cache masks.
+It preserves the canonical dot-product,
+reduction, clamp, activation, and route-weight order but writes `mid` directly
+instead of materializing the otherwise unused gate/up rows. Every other
+device, shape, streaming mode, unsupported mask/accumulate mode, or unavailable
+pipeline keeps the canonical producer; `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` takes precedence as
+the kill switch. For fail-closed model coverage,
+`DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` implies the enable gate and rejects an
+ineligible supported address-table dispatch; the kill switch still takes
+precedence. `make test-metal-iq2-midonly` compares all 12,288 top-6
+output words bitwise at full shape for both unmasked and complementary masked
+address tables, verifies that the candidates leave gate/up sentinels untouched,
+and checks output guards. The routed-MoE stage profiler reports
+`iq2_stream_addr_mid_only_4096x2048` or
+`iq2_stream_addr_mask_mid_only_4096x2048` when the model path is actually
+covered.
+
 These gates change dispatch and intermediate-memory traffic, not model
 arithmetic. Compare byte-identical output, exact-union counters, stage timings,
 and generation rate on the same machine; do not infer a speedup from a lower

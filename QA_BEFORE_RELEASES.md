@@ -327,6 +327,22 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   machine. Treat the FlashAttention memo rows as host-dispatch A/B tests: the
   selected specialization and output must remain identical, and any timing
   comparison must use repeated warm runs.
+- For the M1 IQ2 address-table mid-only experiment, first run
+  `make test-metal-iq2-midonly`. It must cover 12,288 full-shape top-6 mid
+  words in both unmasked and complementary masked address-table modes with
+  both mid mismatch counters at zero, no canonical unwritten rows, zero
+  candidate gate/up writes, and zero guard mismatches. Then use the same greedy
+  IQ2_XXS/Q2_K SSD-streaming model, prompt, cache state, and token count for
+  three decode runs: leave both switches unset for the canonical control, set
+  `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` for the fail-closed candidate, and set both enable
+  and `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` for the kill-switch fallback.
+  Enable the routed-MoE stage profiler on one candidate layer and require path
+  `iq2_stream_addr_mid_only_4096x2048` or
+  `iq2_stream_addr_mask_mid_only_4096x2048`; absence of both is failed model
+  coverage. Require byte-identical greedy output and top-logprobs, and report
+  prefill separately from decode: this one-token routed producer is not a
+  prefill optimization. Compare repeated hot-cache medians, then repeat a
+  cold-cache sanity run to exclude a change in SSD cache behavior.
 - For the removed Metal 512-column streaming top-k path, there is no runtime
   candidate gate. Compare the current binary with a build immediately before
   its removal only if historical timing is needed. First require

@@ -147,6 +147,8 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_r
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_mxfp4_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline;
@@ -2499,6 +2501,12 @@ int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
            g_metal_device_name[7] <= '4' &&
+           (g_metal_device_name[8] == '\0' ||
+            g_metal_device_name[8] == ' ');
+}
+
+static int ds4_gpu_device_is_m1_apple_silicon(void) {
+    return strncmp(g_metal_device_name, "Apple M1", 8) == 0 &&
            (g_metal_device_name[8] == '\0' ||
             g_metal_device_name[8] == ' ');
 }
@@ -7521,6 +7529,38 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
+        fn = [library
+            newFunctionWithName:@"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_f32"
+                 constantValues:moe_mv_id_constants
+                          error:&error];
+        if (fn) {
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline =
+                [g_device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline) {
+            fprintf(stderr,
+                    "ds4: optional Metal M1 IQ2 addr mid-only pipeline unavailable: %s\n",
+                    error ? [[error localizedDescription] UTF8String] :
+                            "function not found");
+        }
+
+        error = nil;
+        fn = [library
+            newFunctionWithName:@"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_f32"
+                 constantValues:moe_mv_id_constants
+                          error:&error];
+        if (fn) {
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline =
+                [g_device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline) {
+            fprintf(stderr,
+                    "ds4: optional Metal M1 IQ2 addr masked mid-only pipeline unavailable: %s\n",
+                    error ? [[error localizedDescription] UTF8String] :
+                            "function not found");
+        }
+
+        error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_addr_iq2_xxs_f32"
                            constantValues:moe_mv_id_constants
                                     error:&error];
@@ -8879,6 +8919,366 @@ int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
         }
         memcpy(legacy_bits, [legacy contents], bytes);
         memcpy(lut_bits, [lut contents], bytes);
+    }
+    return 1;
+}
+
+static uint64_t ds4_gpu_test_count_non_sentinel_bytes(
+        const uint8_t *p, size_t n, uint8_t sentinel) {
+    uint64_t count = 0;
+    for (size_t i = 0; i < n; i++) {
+        count += p[i] != sentinel;
+    }
+    return count;
+}
+
+int ds4_gpu_test_iq2_addr_mid_only_oracle(
+        ds4_gpu_iq2_mid_only_oracle_report *report) {
+    enum {
+        N_TOTAL_EXPERT = 256,
+        N_SELECTED = 6,
+        IN_DIM = 4096,
+        MID_DIM = 2048,
+        IQ2_BLOCK = 256,
+        IQ2_BLOCK_BYTES = 66,
+        GUARD_BYTES = 64,
+    };
+    typedef struct {
+        uint16_t d;
+        uint16_t qs[IQ2_BLOCK / 8];
+    } ds4_test_block_iq2_xxs;
+
+    if (!report || sizeof(ds4_test_block_iq2_xxs) != IQ2_BLOCK_BYTES) return 0;
+    memset(report, 0, sizeof(*report));
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline ||
+        !g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline ||
+        !g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline ||
+        !g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline) {
+        fprintf(stderr, "ds4: Metal IQ2 addr mid-only oracle pipelines unavailable\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        const NSUInteger row_bytes =
+            (IN_DIM / IQ2_BLOCK) * sizeof(ds4_test_block_iq2_xxs);
+        const NSUInteger matrix_bytes = (NSUInteger)MID_DIM * row_bytes;
+        const NSUInteger x_bytes = (NSUInteger)IN_DIM * sizeof(float);
+        const NSUInteger payload_bytes =
+            (NSUInteger)N_SELECTED * MID_DIM * sizeof(float);
+        const NSUInteger guarded_bytes = payload_bytes + 2u * GUARD_BYTES;
+        const NSUInteger table_bytes =
+            (NSUInteger)N_TOTAL_EXPERT * sizeof(uint64_t);
+        const NSUInteger ids_bytes = N_SELECTED * sizeof(int32_t);
+        const NSUInteger weights_bytes = N_SELECTED * sizeof(float);
+        const uint8_t sentinel = 0xa5u;
+
+        id<MTLBuffer> gate_weights = [g_device newBufferWithLength:matrix_bytes
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> up_weights = [g_device newBufferWithLength:matrix_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> x = [g_device newBufferWithLength:x_bytes
+                                                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_addrs = [g_device newBufferWithLength:table_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> up_addrs = [g_device newBufferWithLength:table_bytes
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ids = [g_device newBufferWithLength:ids_bytes
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weights = [g_device newBufferWithLength:weights_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> canonical_gate = [g_device newBufferWithLength:guarded_bytes
+                                                             options:MTLResourceStorageModeShared];
+        id<MTLBuffer> canonical_up = [g_device newBufferWithLength:guarded_bytes
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> canonical_mid = [g_device newBufferWithLength:guarded_bytes
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> candidate_gate = [g_device newBufferWithLength:guarded_bytes
+                                                             options:MTLResourceStorageModeShared];
+        id<MTLBuffer> candidate_up = [g_device newBufferWithLength:guarded_bytes
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> candidate_mid = [g_device newBufferWithLength:guarded_bytes
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> masked_canonical_gate = [g_device newBufferWithLength:guarded_bytes
+                                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> masked_canonical_up = [g_device newBufferWithLength:guarded_bytes
+                                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> masked_canonical_mid = [g_device newBufferWithLength:guarded_bytes
+                                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> masked_candidate_gate = [g_device newBufferWithLength:guarded_bytes
+                                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> masked_candidate_up = [g_device newBufferWithLength:guarded_bytes
+                                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> masked_candidate_mid = [g_device newBufferWithLength:guarded_bytes
+                                                                   options:MTLResourceStorageModeShared];
+        if (!gate_weights || !up_weights || !x || !gate_addrs || !up_addrs ||
+            !ids || !weights || !canonical_gate || !canonical_up ||
+            !canonical_mid || !candidate_gate || !candidate_up || !candidate_mid ||
+            !masked_canonical_gate || !masked_canonical_up || !masked_canonical_mid ||
+            !masked_candidate_gate || !masked_candidate_up || !masked_candidate_mid) {
+            fprintf(stderr, "ds4: Metal IQ2 addr mid-only oracle allocation failed\n");
+            return 0;
+        }
+
+        ds4_test_block_iq2_xxs *gate_blocks =
+            (ds4_test_block_iq2_xxs *)[gate_weights contents];
+        ds4_test_block_iq2_xxs *up_blocks =
+            (ds4_test_block_iq2_xxs *)[up_weights contents];
+        const NSUInteger n_blocks = matrix_bytes / sizeof(*gate_blocks);
+        uint32_t gate_state = 0x91e10da5u;
+        uint32_t up_state = 0x6d2b79f5u;
+        for (NSUInteger i = 0; i < n_blocks; i++) {
+            /* Positive, finite half scales in [0.03125, 0.234375]. */
+            gate_blocks[i].d = (uint16_t)(0x2800u + ((i % 7u) << 7u));
+            up_blocks[i].d = (uint16_t)(0x2a00u + ((i % 5u) << 7u));
+            for (NSUInteger q = 0; q < IQ2_BLOCK / 8; q++) {
+                gate_state ^= gate_state << 13;
+                gate_state ^= gate_state >> 17;
+                gate_state ^= gate_state << 5;
+                up_state ^= up_state << 13;
+                up_state ^= up_state >> 17;
+                up_state ^= up_state << 5;
+                gate_blocks[i].qs[q] = (uint16_t)gate_state;
+                up_blocks[i].qs[q] = (uint16_t)up_state;
+            }
+        }
+        float *x_f32 = (float *)[x contents];
+        for (NSUInteger i = 0; i < IN_DIM; i++) {
+            x_f32[i] = ((int)(i % 37u) - 18) * (1.0f / 256.0f);
+        }
+
+        static const int32_t selected_ids[N_SELECTED] = { 3, 17, 41, 89, 137, 251 };
+        static const float route_weights[N_SELECTED] = {
+            1.0f, 0.875f, 0.75f, 0.625f, 0.5f, 0.375f,
+        };
+        memcpy([ids contents], selected_ids, sizeof(selected_ids));
+        memcpy([weights contents], route_weights, sizeof(route_weights));
+        memset([gate_addrs contents], 0, table_bytes);
+        memset([up_addrs contents], 0, table_bytes);
+        uint64_t *gate_table = (uint64_t *)[gate_addrs contents];
+        uint64_t *up_table = (uint64_t *)[up_addrs contents];
+        const uint64_t gate_gpu_addr = (uint64_t)[gate_weights gpuAddress];
+        const uint64_t up_gpu_addr = (uint64_t)[up_weights gpuAddress];
+        if (gate_gpu_addr == 0 || up_gpu_addr == 0) {
+            fprintf(stderr, "ds4: Metal IQ2 addr mid-only oracle has no GPU addresses\n");
+            return 0;
+        }
+        for (NSUInteger i = 0; i < N_SELECTED; i++) {
+            gate_table[(uint32_t)selected_ids[i]] = gate_gpu_addr;
+            up_table[(uint32_t)selected_ids[i]] = up_gpu_addr;
+        }
+
+        memset([canonical_gate contents], sentinel, guarded_bytes);
+        memset([canonical_up contents], sentinel, guarded_bytes);
+        memset([canonical_mid contents], sentinel, guarded_bytes);
+        memset([candidate_gate contents], sentinel, guarded_bytes);
+        memset([candidate_up contents], sentinel, guarded_bytes);
+        memset([candidate_mid contents], sentinel, guarded_bytes);
+        memset([masked_canonical_gate contents], sentinel, guarded_bytes);
+        memset([masked_canonical_up contents], sentinel, guarded_bytes);
+        memset([masked_canonical_mid contents], sentinel, guarded_bytes);
+        memset([masked_candidate_gate contents], sentinel, guarded_bytes);
+        memset([masked_candidate_up contents], sentinel, guarded_bytes);
+        memset([masked_candidate_mid contents], sentinel, guarded_bytes);
+
+        ds4_gpu_mul_mv_id_args args = {
+            .nei0 = N_SELECTED,
+            .nei1 = 1,
+            .nbi1 = N_SELECTED * sizeof(int32_t),
+            .ne00 = IN_DIM,
+            .ne01 = MID_DIM,
+            .ne02 = N_TOTAL_EXPERT,
+            .nb00 = sizeof(ds4_test_block_iq2_xxs),
+            .nb01 = row_bytes,
+            .nb02 = matrix_bytes,
+            .ne10 = IN_DIM,
+            .ne11 = 1,
+            .ne12 = 1,
+            .ne13 = 1,
+            .nb10 = sizeof(float),
+            .nb11 = x_bytes,
+            .nb12 = x_bytes,
+            .ne0 = MID_DIM,
+            .ne1 = N_SELECTED,
+            .nb1 = (uint64_t)MID_DIM * sizeof(float),
+            .nr0 = 4,
+            .tp_world = 1,
+        };
+        ds4_gpu_dsv4_moe_swiglu_weight_args act = {
+            .width = MID_DIM,
+            .rows = N_SELECTED,
+            .gate_row_stride = (uint64_t)MID_DIM * sizeof(float),
+            .up_row_stride = (uint64_t)MID_DIM * sizeof(float),
+            .mid_row_stride = (uint64_t)MID_DIM * sizeof(float),
+            .weight_stride = sizeof(float),
+            .write_clamped = 0,
+            .clamp_value = 6.0f,
+        };
+
+        id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+        if (!cb || !enc) return 0;
+        [enc useResource:gate_weights usage:MTLResourceUsageRead];
+        [enc useResource:up_weights usage:MTLResourceUsageRead];
+        [enc setThreadgroupMemoryLength:256u * sizeof(uint64_t) + 128u * sizeof(uint8_t)
+                                atIndex:0];
+
+#define DS4_ENCODE_IQ2_ADDR_ORACLE(PIPELINE, GATE, UP, MID) do { \
+            [enc setComputePipelineState:(PIPELINE)]; \
+            [enc setBytes:&args length:sizeof(args) atIndex:0]; \
+            [enc setBytes:&act length:sizeof(act) atIndex:1]; \
+            [enc setBuffer:gate_addrs offset:0 atIndex:2]; \
+            [enc setBuffer:up_addrs offset:0 atIndex:3]; \
+            [enc setBuffer:x offset:0 atIndex:4]; \
+            [enc setBuffer:(GATE) offset:GUARD_BYTES atIndex:5]; \
+            [enc setBuffer:(UP) offset:GUARD_BYTES atIndex:6]; \
+            [enc setBuffer:(MID) offset:GUARD_BYTES atIndex:7]; \
+            [enc setBuffer:ids offset:0 atIndex:8]; \
+            [enc setBuffer:weights offset:0 atIndex:9]; \
+            [enc dispatchThreadgroups:MTLSizeMake(MID_DIM / 8u, 1, N_SELECTED) \
+                 threadsPerThreadgroup:MTLSizeMake(32u, 2u, 1u)]; \
+        } while (0)
+        DS4_ENCODE_IQ2_ADDR_ORACLE(
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
+            canonical_gate, canonical_up, canonical_mid);
+        DS4_ENCODE_IQ2_ADDR_ORACLE(
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline,
+            candidate_gate, candidate_up, candidate_mid);
+#undef DS4_ENCODE_IQ2_ADDR_ORACLE
+        const ds4_gpu_stream_expert_split_args split_even = {
+            .active_mask = 0x15u,
+            .accumulate = 0u,
+        };
+        const ds4_gpu_stream_expert_split_args split_odd = {
+            .active_mask = 0x2au,
+            .accumulate = 0u,
+        };
+#define DS4_ENCODE_IQ2_ADDR_MASKED_ORACLE(PIPELINE, SPLIT, GATE, UP, MID) do { \
+            [enc setComputePipelineState:(PIPELINE)]; \
+            [enc setBytes:&args length:sizeof(args) atIndex:0]; \
+            [enc setBytes:&act length:sizeof(act) atIndex:1]; \
+            [enc setBytes:(SPLIT) length:sizeof(*(SPLIT)) atIndex:2]; \
+            [enc setBuffer:gate_addrs offset:0 atIndex:3]; \
+            [enc setBuffer:up_addrs offset:0 atIndex:4]; \
+            [enc setBuffer:x offset:0 atIndex:5]; \
+            [enc setBuffer:(GATE) offset:GUARD_BYTES atIndex:6]; \
+            [enc setBuffer:(UP) offset:GUARD_BYTES atIndex:7]; \
+            [enc setBuffer:(MID) offset:GUARD_BYTES atIndex:8]; \
+            [enc setBuffer:ids offset:0 atIndex:9]; \
+            [enc setBuffer:weights offset:0 atIndex:10]; \
+            [enc dispatchThreadgroups:MTLSizeMake(MID_DIM / 8u, 1, N_SELECTED) \
+                 threadsPerThreadgroup:MTLSizeMake(32u, 2u, 1u)]; \
+        } while (0)
+        DS4_ENCODE_IQ2_ADDR_MASKED_ORACLE(
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+            &split_even, masked_canonical_gate, masked_canonical_up, masked_canonical_mid);
+        DS4_ENCODE_IQ2_ADDR_MASKED_ORACLE(
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline,
+            &split_even, masked_candidate_gate, masked_candidate_up, masked_candidate_mid);
+        [enc endEncoding];
+        [cb commit];
+        if (!ds4_gpu_wait_command_buffer(cb, "IQ2 addr mid-only masked-even oracle")) {
+            return 0;
+        }
+
+        /* Validate active_mask before its complementary leg fills the other
+         * rows.  A final-only comparison after 0x15 + 0x2a cannot detect a
+         * kernel that simply ignores the mask. */
+        const NSUInteger masked_row_bytes = (NSUInteger)MID_DIM * sizeof(float);
+        const uint8_t *masked_even_outputs[] = {
+            (const uint8_t *)[masked_canonical_gate contents] + GUARD_BYTES,
+            (const uint8_t *)[masked_canonical_up contents] + GUARD_BYTES,
+            (const uint8_t *)[masked_canonical_mid contents] + GUARD_BYTES,
+            (const uint8_t *)[masked_candidate_gate contents] + GUARD_BYTES,
+            (const uint8_t *)[masked_candidate_up contents] + GUARD_BYTES,
+            (const uint8_t *)[masked_candidate_mid contents] + GUARD_BYTES,
+        };
+        for (NSUInteger output = 0;
+             output < sizeof(masked_even_outputs) / sizeof(masked_even_outputs[0]);
+             output++) {
+            for (NSUInteger row = 1u; row < N_SELECTED; row += 2u) {
+                report->masked_inactive_writes +=
+                    ds4_gpu_test_count_non_sentinel_bytes(
+                        masked_even_outputs[output] + row * masked_row_bytes,
+                        masked_row_bytes, sentinel);
+            }
+        }
+
+        cb = ds4_gpu_new_command_buffer();
+        enc = cb ? [cb computeCommandEncoder] : nil;
+        if (!cb || !enc) return 0;
+        [enc useResource:gate_weights usage:MTLResourceUsageRead];
+        [enc useResource:up_weights usage:MTLResourceUsageRead];
+        [enc setThreadgroupMemoryLength:256u * sizeof(uint64_t) + 128u * sizeof(uint8_t)
+                                atIndex:0];
+        DS4_ENCODE_IQ2_ADDR_MASKED_ORACLE(
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+            &split_odd, masked_canonical_gate, masked_canonical_up, masked_canonical_mid);
+        DS4_ENCODE_IQ2_ADDR_MASKED_ORACLE(
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline,
+            &split_odd, masked_candidate_gate, masked_candidate_up, masked_candidate_mid);
+#undef DS4_ENCODE_IQ2_ADDR_MASKED_ORACLE
+        [enc endEncoding];
+        [cb commit];
+        if (!ds4_gpu_wait_command_buffer(cb, "IQ2 addr mid-only tensor oracle")) {
+            return 0;
+        }
+
+        const uint8_t *cg = (const uint8_t *)[canonical_gate contents];
+        const uint8_t *cu = (const uint8_t *)[canonical_up contents];
+        const uint8_t *cm = (const uint8_t *)[canonical_mid contents];
+        const uint8_t *ng = (const uint8_t *)[candidate_gate contents];
+        const uint8_t *nu = (const uint8_t *)[candidate_up contents];
+        const uint8_t *nm = (const uint8_t *)[candidate_mid contents];
+        const uint8_t *mcg = (const uint8_t *)[masked_canonical_gate contents];
+        const uint8_t *mcu = (const uint8_t *)[masked_canonical_up contents];
+        const uint8_t *mcm = (const uint8_t *)[masked_canonical_mid contents];
+        const uint8_t *mng = (const uint8_t *)[masked_candidate_gate contents];
+        const uint8_t *mnu = (const uint8_t *)[masked_candidate_up contents];
+        const uint8_t *mnm = (const uint8_t *)[masked_candidate_mid contents];
+        const uint32_t sentinel_word = 0xa5a5a5a5u;
+        const uint32_t *cg_words = (const uint32_t *)(cg + GUARD_BYTES);
+        const uint32_t *cu_words = (const uint32_t *)(cu + GUARD_BYTES);
+        const uint32_t *cm_words = (const uint32_t *)(cm + GUARD_BYTES);
+        const uint32_t *nm_words = (const uint32_t *)(nm + GUARD_BYTES);
+        const uint32_t *mcg_words = (const uint32_t *)(mcg + GUARD_BYTES);
+        const uint32_t *mcu_words = (const uint32_t *)(mcu + GUARD_BYTES);
+        const uint32_t *mcm_words = (const uint32_t *)(mcm + GUARD_BYTES);
+        const uint32_t *mnm_words = (const uint32_t *)(mnm + GUARD_BYTES);
+        report->mid_words = payload_bytes / sizeof(uint32_t);
+        for (uint64_t i = 0; i < report->mid_words; i++) {
+            report->mid_mismatches += cm_words[i] != nm_words[i];
+            report->canonical_gate_unwritten += cg_words[i] == sentinel_word;
+            report->canonical_up_unwritten += cu_words[i] == sentinel_word;
+            report->masked_mid_mismatches += mcm_words[i] != mnm_words[i];
+            report->masked_canonical_gate_unwritten += mcg_words[i] == sentinel_word;
+            report->masked_canonical_up_unwritten += mcu_words[i] == sentinel_word;
+        }
+        report->candidate_gate_writes =
+            ds4_gpu_test_count_non_sentinel_bytes(ng, guarded_bytes, sentinel);
+        report->candidate_up_writes =
+            ds4_gpu_test_count_non_sentinel_bytes(nu, guarded_bytes, sentinel);
+        report->masked_gate_writes =
+            ds4_gpu_test_count_non_sentinel_bytes(mng, guarded_bytes, sentinel);
+        report->masked_up_writes =
+            ds4_gpu_test_count_non_sentinel_bytes(mnu, guarded_bytes, sentinel);
+
+#define DS4_COUNT_GUARDS(P) do { \
+            report->guard_byte_mismatches += \
+                ds4_gpu_test_count_non_sentinel_bytes((P), GUARD_BYTES, sentinel); \
+            report->guard_byte_mismatches += \
+                ds4_gpu_test_count_non_sentinel_bytes( \
+                    (P) + GUARD_BYTES + payload_bytes, GUARD_BYTES, sentinel); \
+        } while (0)
+        DS4_COUNT_GUARDS(cg);
+        DS4_COUNT_GUARDS(cu);
+        DS4_COUNT_GUARDS(cm);
+        DS4_COUNT_GUARDS(nm);
+        DS4_COUNT_GUARDS(mcg);
+        DS4_COUNT_GUARDS(mcu);
+        DS4_COUNT_GUARDS(mcm);
+        DS4_COUNT_GUARDS(mnm);
+#undef DS4_COUNT_GUARDS
     }
     return 1;
 }
@@ -10463,6 +10863,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_slots6_mxfp4_sum6_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = nil;
+        g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline = nil;
+        g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pipeline = nil;
         g_moe_mul_mv_addr_q2_k_sum6_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline = nil;
@@ -13562,6 +13964,13 @@ static void ds4_gpu_stream_expert_cache_note_decode_token(void) {
     ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
 }
 
+static int ds4_gpu_m1_iq2_mid_only_requested(void) {
+    return ds4_gpu_device_is_m1_apple_silicon() &&
+           getenv("DS4_METAL_DISABLE_M1_IQ2_MID_ONLY") == NULL &&
+           (getenv("DS4_METAL_ENABLE_M1_IQ2_MID_ONLY") != NULL ||
+            getenv("DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY") != NULL);
+}
+
 static int ds4_gpu_stream_compact_addr_requested(void) {
     return g_ssd_streaming_mode &&
            getenv("DS4_METAL_ENABLE_STREAMING_COMPACT_ADDR") != NULL &&
@@ -13572,6 +13981,7 @@ static int ds4_gpu_stream_compact_addr_requested(void) {
 static int ds4_gpu_stream_expert_addr_table_requested(void) {
     return g_ssd_streaming_mode &&
            (getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+            ds4_gpu_m1_iq2_mid_only_requested() ||
             getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL ||
             getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_MASKED_ADDR") != NULL ||
             g_stream_prefill_batch_selected_addr_building ||
@@ -13585,6 +13995,7 @@ static int ds4_gpu_stream_expert_addr_table_requested(void) {
 static int ds4_gpu_stream_expert_addr_table_kernel_requested(void) {
     return g_ssd_streaming_mode &&
            (getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+            ds4_gpu_m1_iq2_mid_only_requested() ||
             getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL ||
             getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_MASKED_ADDR") != NULL ||
             ds4_gpu_stream_expert_split_ready()) &&
@@ -39698,6 +40109,12 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
+static bool ds4_gpu_m1_iq2_mid_only_split_supported(
+        const ds4_gpu_stream_expert_split_args *split) {
+    return split && split->accumulate == 0u && split->active_mask != 0u &&
+           (split->active_mask & ~0x3fu) == 0u;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -40035,6 +40452,29 @@ int ds4_gpu_routed_moe_one_tensor(
             (n_expert == 6 || (n_expert == 8 && g_tp_split_world == 2)) &&
             n_tokens == 1 &&
             down_sum6_pipeline != nil;
+        /* Experimental M1 SSD-streaming producer.  The eventual dispatch is
+         * additionally required to be an address-table path supported by the
+         * unmasked or masked mid-only pipeline, where the following Q2 sum
+         * consumes only `mid`.  Presence of the disable switch always wins,
+         * and every failed predicate retains the canonical address-table
+         * kernel. */
+        const bool m1_iq2_mid_only_disabled =
+            getenv("DS4_METAL_DISABLE_M1_IQ2_MID_ONLY") != NULL;
+        const bool m1_iq2_mid_only_required =
+            getenv("DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY") != NULL;
+        const bool m1_iq2_addr_mid_only_candidate =
+            ds4_gpu_m1_iq2_mid_only_requested() &&
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline != nil &&
+            !force_resident && g_ssd_streaming_mode &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            down_type == DS4_METAL_TENSOR_Q2_K &&
+            n_tokens == 1 && n_expert == 6 && n_total_expert == 256 &&
+            expert_in_dim == 4096 && expert_mid_dim == 2048 &&
+            gate_row_bytes == 1056 && gate_expert_bytes == 2162688 &&
+            gate_args.ne00 == 4096 && gate_args.ne01 == 2048 &&
+            gate_args.ne0 == 2048 && gate_args.nr0 == 4 &&
+            g_tp_split_rank == 0 && g_tp_split_world == 1 && add_in == NULL &&
+            fuse_pair_swiglu && direct_down_sum;
 
         if (g_parallel_q8_pending) {
             /* A concurrent encoder invalidates every implicit dependency in
@@ -41352,6 +41792,33 @@ int ds4_gpu_routed_moe_one_tensor(
             [cb useResidencySet:q4_table_layer_residency];
         }
 
+        const bool use_m1_iq2_addr_mid_only =
+            m1_iq2_addr_mid_only_candidate &&
+            use_iq2_selected_slots && use_stream_expert_addr_table &&
+            (!use_stream_expert_masked_addr_table ||
+             g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline != nil);
+        if (m1_iq2_mid_only_required && !m1_iq2_mid_only_disabled &&
+            !use_m1_iq2_addr_mid_only) {
+            fprintf(stderr,
+                    "ds4: required Metal M1 IQ2 address-table mid-only producer was not selected "
+                    "candidate=%d selected_slots=%d addr=%d masked=%d split=%d "
+                    "gate=%u down=%u experts=%u/%u shape=%ux%u ssd=%d resident=%d\n",
+                    m1_iq2_addr_mid_only_candidate ? 1 : 0,
+                    use_iq2_selected_slots ? 1 : 0,
+                    use_stream_expert_addr_table ? 1 : 0,
+                    use_stream_expert_masked_addr_table ? 1 : 0,
+                    use_stream_expert_split_deferred ? 1 : 0,
+                    gate_type,
+                    down_type,
+                    n_expert,
+                    n_total_expert,
+                    expert_in_dim,
+                    expert_mid_dim,
+                    g_ssd_streaming_mode ? 1 : 0,
+                    force_resident ? 1 : 0);
+            return 0;
+        }
+
         const bool moe_one_stage_profile =
             g_batch_cb != nil &&
             ds4_gpu_stage_profile_enabled_for_layer("DS4_METAL_MOE_ONE_STAGE_PROFILE",
@@ -41367,6 +41834,10 @@ int ds4_gpu_routed_moe_one_tensor(
             use_q4_expert_address_table ? "q4_addr_pair_swiglu" :
             use_q4_expert_table ? "q4_table_pair_swiglu" :
             use_q4_gather_slots ? "q4_gather_slots6_pair_swiglu" :
+            use_m1_iq2_addr_mid_only ?
+                (use_stream_expert_masked_addr_table ?
+                    "iq2_stream_addr_mask_mid_only_4096x2048" :
+                    "iq2_stream_addr_mid_only_4096x2048") :
             use_stream_expert_split_deferred ? "iq2_stream_split_pair_swiglu" :
             use_stream_expert_masked_addr_table ? "iq2_stream_addr_mask_pair_swiglu" :
             use_stream_expert_addr_table ? "iq2_stream_addr_pair_swiglu" :
@@ -41736,7 +42207,10 @@ int ds4_gpu_routed_moe_one_tensor(
                             .accumulate = 0u,
                         };
                         ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
-                                                                               g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                                                               use_m1_iq2_addr_mid_only &&
+                                                                               ds4_gpu_m1_iq2_mid_only_split_supported(&resident_pair_args) ?
+                                                                                   g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline :
+                                                                                   g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
                                                                                &gate_args,
                                                                                &act_args,
                                                                                &resident_pair_args,
@@ -41880,7 +42354,10 @@ int ds4_gpu_routed_moe_one_tensor(
                         };
                         if (ok) {
                             ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
-                                                                                   g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                                                                   use_m1_iq2_addr_mid_only &&
+                                                                                   ds4_gpu_m1_iq2_mid_only_split_supported(&missing_pair_args) ?
+                                                                                       g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline :
+                                                                                       g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
                                                                                    &gate_args,
                                                                                    &act_args,
                                                                                    &missing_pair_args,
@@ -41950,7 +42427,10 @@ int ds4_gpu_routed_moe_one_tensor(
                             .accumulate = 0u,
                         };
                         ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
-                                                                               g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                                                               use_m1_iq2_addr_mid_only &&
+                                                                               ds4_gpu_m1_iq2_mid_only_split_supported(&split_args) ?
+                                                                                   g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_pipeline :
+                                                                                   g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
                                                                                &gate_args,
                                                                                &act_args,
                                                                                &split_args,
@@ -41975,7 +42455,9 @@ int ds4_gpu_routed_moe_one_tensor(
                     }
                 } else {
                     ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(cb,
-                                                                    g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
+                                                                    use_m1_iq2_addr_mid_only ?
+                                                                        g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_pipeline :
+                                                                        g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
                                                                     &gate_args,
                                                                     &act_args,
                                                                     stream_addr_resources,
