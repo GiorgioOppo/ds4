@@ -34009,11 +34009,13 @@ __global__ static void matmul_q4_K_hc_expand4_kernel(
     }
 }
 
-/* HC epilogue for the canonical MMVQ/Q8_1 Q4_K path.  MMVQ materializes
- * block_out using its established activation quantizer and reduction order;
- * one thread per embedding row then reuses that value for all four HC
- * destinations.  Each destination retains hc_expand_kernel's exact
- * multiply/add order, while block_out is read once instead of four times. */
+/* Diagnostic row-packed HC epilogue for the canonical MMVQ/Q8_1 Q4_K path.
+ * MMVQ materializes block_out using its established activation quantizer and
+ * reduction order; one thread per embedding row then reuses that value for
+ * all four HC destinations.  Its source-level multiply/add sequence mirrors
+ * hc_expand_kernel, but full unrolling under --use_fast_math is not assumed
+ * bit-exact.  Normal decoding uses hc_expand_kernel; the oracle below is the
+ * only consumer of this candidate until device parity is proven. */
 __global__ static void q4_K_hc_expand4_rows_kernel(
         float *out_hc,
         const float *block_out,
@@ -34364,11 +34366,13 @@ extern "C" int ds4_gpu_matmul_q4_K_hc_expand_available(void) {
          * zero-call summary that makes an ineligible/unused A/B visible. */
         cuda_q4_attn_hc_oracle_register_report();
     }
-    /* On GB10 the default candidate keeps the ordinary Q4_K MMVQ result and
-     * only replaces the four-way HC launch with a row-packed epilogue.  The
-     * existing disable variable (plus DS4_CUDA_NO_Q4_GB10_FAST) is a complete
-     * rollback to the caller's separate B projection + HC expansion.  Legacy
-     * explicit experiment/oracle switches remain usable for diagnostics. */
+    /* On GB10 the default fused call path keeps both the ordinary Q4_K MMVQ
+     * result and the ordinary HC epilogue.  This preserves decode-graph island
+     * B without claiming that the row-packed epilogue is bit-exact.  The
+     * row-packed and Q8_K candidates remain oracle-only diagnostics until
+     * device tests prove their numerical contract.  The existing disable
+     * variable (plus DS4_CUDA_NO_Q4_GB10_FAST) is a complete rollback to the
+     * caller's separate B projection + HC expansion. */
     if (cuda_q4_gb10_fast_path_enabled(
             g_current_logical_tier, NULL)) {
         return 1;
@@ -34447,7 +34451,7 @@ extern "C" int ds4_gpu_matmul_q4_K_hc_expand_tensor(
     if (!q8k_experiment && !oracle) {
         return cuda_q4_K_hc_expand_canonical(
             out_hc, block_out, model_map, model_size, weight_offset,
-            in_dim, out_dim, x, residual_hc, split, 1);
+            in_dim, out_dim, x, residual_hc, split, 0);
     }
 
     /* The oracle is deliberately diagnostic and fail-closed: compute and
@@ -34601,10 +34605,10 @@ extern "C" int ds4_gpu_matmul_q4_K_hc_expand_tensor(
 
     /* Allocation/launch rejection of the optional candidate must not make
      * decoding unavailable.  Re-materialize through the ordinary dispatcher
-     * and finish with the exact row-packed HC epilogue. */
+     * and finish with the ordinary HC epilogue. */
     return cuda_q4_K_hc_expand_canonical(
         out_hc, block_out, model_map, model_size, weight_offset,
-        in_dim, out_dim, x, residual_hc, split, 1);
+        in_dim, out_dim, x, residual_hc, split, 0);
 }
 
 __global__ static void matmul_q4_K_kslice_kernel(

@@ -715,8 +715,9 @@ arithmetic:
   dispatch while keeping `ncols_dst=1`;
   `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1` restores the per-token grouped loop
   and `DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1` restores the per-group loop;
-- attention-output B keeps its canonical MMVQ result and automatically uses
-  the row-packed HC epilogue described below;
+- attention-output B keeps its canonical MMVQ result and the ordinary HC
+  epilogue inside the graph-compatible fused call.  The row-packed epilogue
+  remains oracle-only until a GB10 device run proves it bit-exact;
 - the exact Q-b shape `32768x1024` has an experimental persistent-CTA kernel
   behind `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1`, with
   `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1` taking precedence. Tests can add
@@ -749,11 +750,11 @@ reduction order; with the normal one-token cuBLAS path, also set
 `DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1`. The Q4 attention-output B plus HC
 path is automatic when MMQ is disabled, where the existing one-dispatch Q8_K
 implementation is bit-compatible with its fallback. With the normal
-MMVQ/Q8_1 decode path, `DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE=1` now preserves
-the canonical MMVQ projection and replaces only the following HC expansion
-with a row-packed epilogue that reads each projected row once. It therefore
-does not change activation quantization. The older, truly single-dispatch
-Q8_K experiment is isolated behind
+MMVQ/Q8_1 decode path, the GB10 graph-compatible call preserves both the
+canonical MMVQ projection and the ordinary HC expansion. The specialized
+row-packed epilogue is evaluated only by the oracle below and is never
+consumed by normal decoding. The older, truly single-dispatch Q8_K experiment
+is isolated behind
 `DS4_CUDA_Q4_ATTN_OUT_HC_Q8K_EXPERIMENT=1` and may differ numerically from
 MMVQ/Q8_1.
 
@@ -763,8 +764,9 @@ compares both the row-packed epilogue and the Q8_K compound bit-for-bit, and
 prints `epilogue_mismatches`, `q8k_mismatches`, and `skips` at exit. The
 oracle avoids readback while CUDA graph capture is active; run a separate
 non-captured diagnostic and require `calls>0`, `skips=0`, and
-`epilogue_mismatches=0` before promoting the row-packed path. A zero-call
-summary is therefore an explicit failed coverage gate, not a silent pass.
+`epilogue_mismatches=0` before promoting the row-packed path back into normal
+decoding. A zero-call summary is therefore an explicit failed coverage gate,
+not a silent pass.
 
 An experimental resident-CUDA path can run the existing aligned
 IQ2_XXS/Q2_K vector MoE kernels for two-to-five-draft routed batches,

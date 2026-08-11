@@ -1490,12 +1490,23 @@ int main(int argc, char ** argv) {
         /*M=*/64, /*N=*/1, /*K=*/512, /*groups=*/4, 0xC4FE45);
     all_ok &= run_q4_K_grouped_vec_parity(
         /*M=*/256, /*N=*/2, /*K=*/8192, /*groups=*/4, 0xC4FE42);
-    // DeepSeek-V4 Flash AProjQ4 attention-A production shape at DSpark N=5.
+    // Small synthetic Flash-like case for quick token-aware coverage.
     all_ok &= run_q4_K_grouped_vec_parity(
         /*M=*/128, /*N=*/5, /*K=*/4096, /*groups=*/8, 0xC4FE43);
+    // DeepSeek-V4 Flash AProjQ4 attention-A production shape: each of the
+    // eight output groups owns a [rank=1024, group_dim=4096] Q4_K matrix.
+    // Cover both ordinary one-token decode and the maximum DSpark proposal
+    // width used by the verifier.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/1024, /*N=*/1, /*K=*/4096, /*groups=*/8, 0xC4FE46);
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/1024, /*N=*/5, /*K=*/4096, /*groups=*/8, 0xC4FE47);
     // Pro-style maximum group count and the N=8 API ceiling.
     all_ok &= run_q4_K_grouped_vec_parity(
         /*M=*/64, /*N=*/8, /*K=*/4096, /*groups=*/16, 0xC4FE44);
+    // DeepSeek-V4 Pro has the same rank/group_dim as Flash and 16 groups.
+    all_ok &= run_q4_K_grouped_vec_parity(
+        /*M=*/1024, /*N=*/1, /*K=*/4096, /*groups=*/16, 0xC4FE48);
 
     fprintf(stderr, "===================\n");
     fprintf(stderr, "%s\n", all_ok ? "ALL PASS" : "SOME FAILED");
