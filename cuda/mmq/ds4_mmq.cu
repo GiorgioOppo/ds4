@@ -135,12 +135,135 @@ extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
 // (ne10_padded == K); the registry itself guarantees freshness (slots are
 // reset by the producing entry every layer and pops are one-shot).
 extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
+                                         cudaStream_t stream,
                                          const void **q81);
+
+static uint64_t g_q8_fold_oracle_byte_calls;
+static uint64_t g_q8_fold_oracle_byte_mismatches;
+static uint64_t g_q8_fold_oracle_output_calls;
+static uint64_t g_q8_fold_oracle_output_mismatches;
+static uint64_t g_q8_fold_oracle_raw_moe_calls;
+static uint64_t g_q8_fold_oracle_aligned_q8_calls;
+static uint64_t g_q8_fold_oracle_aligned_iq2_calls;
+static uint64_t g_q8_fold_oracle_skips;
+static int g_q8_fold_oracle_report_registered;
+
+static void ds4_mmq_q8_fold_oracle_report(void) {
+    fprintf(stderr,
+            "ds4: CUDA Q8_1 fold oracle: byte_calls=%llu "
+            "byte_mismatches=%llu output_calls=%llu "
+            "output_mismatches=%llu raw_moe_calls=%llu "
+            "aligned_q8_calls=%llu aligned_iq2_calls=%llu skips=%llu "
+            "(canonical reference retained)\n",
+            (unsigned long long)g_q8_fold_oracle_byte_calls,
+            (unsigned long long)g_q8_fold_oracle_byte_mismatches,
+            (unsigned long long)g_q8_fold_oracle_output_calls,
+            (unsigned long long)g_q8_fold_oracle_output_mismatches,
+            (unsigned long long)g_q8_fold_oracle_raw_moe_calls,
+            (unsigned long long)g_q8_fold_oracle_aligned_q8_calls,
+            (unsigned long long)g_q8_fold_oracle_aligned_iq2_calls,
+            (unsigned long long)g_q8_fold_oracle_skips);
+}
+
+static bool ds4_mmq_q8_fold_oracle_enabled() {
+    const char *env = getenv("DS4_CUDA_Q8_FOLD_ORACLE");
+    const bool enabled = env && strcmp(env, "1") == 0;
+    if (enabled && !g_q8_fold_oracle_report_registered) {
+        g_q8_fold_oracle_report_registered = 1;
+        (void)atexit(ds4_mmq_q8_fold_oracle_report);
+    }
+    return enabled;
+}
+
+__global__ static void q8_fold_output_compare_kernel(
+        uint32_t *mismatch, const float *candidate,
+        const float *reference, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(candidate[i]) !=
+                 __float_as_uint(reference[i])) {
+        atomicExch(mismatch, 1u);
+    }
+}
+
+/* Byte oracle for every consumer.  On mismatch the fresh canonical bytes
+ * overwrite the sidecar before it is consumed.  Any setup/capture failure
+ * rejects the fold entirely so the established prelude quantizes again. */
+static bool ds4_mmq_q8_fold_oracle_bytes(
+        const float *X_f32, int64_t K, int64_t ne10_padded,
+        char *folded, cudaStream_t stream) {
+    if (!ds4_mmq_q8_fold_oracle_enabled()) return true;
+    if (!X_f32 || !folded || K <= 0 || ne10_padded != K ||
+        (K % QK8_1) != 0) {
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    const size_t bytes = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    if (bytes == 0u || bytes > 16384u) {
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    char *fresh = nullptr;
+    char *host = (char *)malloc(bytes * 2u);
+    if (!host || cudaMalloc((void **)&fresh, bytes) != cudaSuccess || !fresh) {
+        free(host);
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, fresh, GGML_TYPE_Q8_0,
+        /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    bool setup_ok = cudaGetLastError() == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess &&
+                    cudaMemcpy(host, folded, bytes,
+                               cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    cudaMemcpy(host + bytes, fresh, bytes,
+                               cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (!setup_ok) {
+        (void)cudaGetLastError();
+        (void)cudaFree(fresh);
+        free(host);
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    const bool match = memcmp(host, host + bytes, bytes) == 0;
+    g_q8_fold_oracle_byte_calls++;
+    if (!match) {
+        g_q8_fold_oracle_byte_mismatches++;
+        if (cudaMemcpyAsync(folded, fresh, bytes,
+                            cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFree(fresh);
+            free(host);
+            g_q8_fold_oracle_skips++;
+            return false;
+        }
+    }
+    (void)cudaFree(fresh);
+    free(host);
+    return true;
+}
+
 static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
-                                int64_t ne10_padded) {
+                                int64_t ne10_padded, cudaStream_t stream) {
     if (n_tokens != 1 || ne10_padded != K) return nullptr;
     const void *p = nullptr;
-    if (!ds4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
+    if (!ds4_cuda_q8_fold_take_q81(
+            (const void *)X_f32, (uint64_t)K, stream, &p)) return nullptr;
+    if (!ds4_mmq_q8_fold_oracle_bytes(
+            X_f32, K, ne10_padded, (char *)(uintptr_t)p, stream)) {
+        return nullptr;
+    }
     static int logged = 0;
     if (!logged) {
         logged = 1;
@@ -4133,7 +4256,9 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
     // M2-Inc2a: the fused HC stage may have emitted this activation's q8_1
     // codes already (ffn_norm) -- take them and skip the quantize prelude.
-    char *src1_q8_1_ptr = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    char *src1_q8_1_ptr = ds4_mmq_folded_q81(
+        X_f32, K, n_tokens, ne10_padded, stream);
+    const bool folded_hit = src1_q8_1_ptr != nullptr;
     cudaError_t err;
     if (!src1_q8_1_ptr) {
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
@@ -4165,6 +4290,98 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
 
     const dim3 block_nums((M + 63) / 64, n_tokens * n_expert_used);
     const dim3 block_dims(256);
+    if (folded_hit && ds4_mmq_q8_fold_oracle_enabled()) {
+        const size_t q8_bytes =
+            (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+        const uint64_t mid_count =
+            (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used;
+        const size_t mid_bytes = (size_t)mid_count * sizeof(float);
+        block_q8_1 *fresh = nullptr;
+        float *reference = nullptr;
+        uint32_t *mismatch_device = nullptr;
+        const bool allocated =
+            cudaMalloc((void **)&fresh, q8_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&reference, mid_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&mismatch_device, sizeof(uint32_t)) == cudaSuccess &&
+            fresh && reference && mismatch_device;
+        if (!allocated) {
+            (void)cudaGetLastError();
+            if (fresh) (void)cudaFree(fresh);
+            if (reference) (void)cudaFree(reference);
+            if (mismatch_device) (void)cudaFree(mismatch_device);
+            g_q8_fold_oracle_skips++;
+        } else {
+            cudaError_t oracle_err = cudaMemsetAsync(
+                mismatch_device, 0, sizeof(uint32_t), stream);
+            if (oracle_err == cudaSuccess) {
+                quantize_row_q8_1_cuda(
+                    X_f32, /*ids=*/nullptr, fresh, type,
+                    /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+                    /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+                    stream);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<
+                    block_nums, block_dims, 0, stream>>>(
+                        W_gate, W_up,
+                        (const block_q8_1 *)src1_q8_1_ptr,
+                        ids, weights, mid_f32,
+                        (uint32_t)K, (uint32_t)M,
+                        (uint32_t)n_tokens, (uint32_t)n_experts,
+                        stride_row_x, stride_col_y, stride_channel_x, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<
+                    block_nums, block_dims, 0, stream>>>(
+                        W_gate, W_up, fresh, ids, weights, reference,
+                        (uint32_t)K, (uint32_t)M,
+                        (uint32_t)n_tokens, (uint32_t)n_experts,
+                        stride_row_x, stride_col_y, stride_channel_x, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                q8_fold_output_compare_kernel<<<
+                    (unsigned)((mid_count + 255u) / 256u), 256, 0, stream>>>(
+                        mismatch_device, mid_f32, reference, mid_count);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    mid_f32, reference, mid_bytes,
+                    cudaMemcpyDeviceToDevice, stream);
+            }
+            uint32_t mismatch_host = 0u;
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    &mismatch_host, mismatch_device, sizeof(mismatch_host),
+                    cudaMemcpyDeviceToHost, stream);
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaStreamSynchronize(stream);
+            }
+            (void)cudaFree(fresh);
+            (void)cudaFree(reference);
+            (void)cudaFree(mismatch_device);
+            if (oracle_err != cudaSuccess) {
+                (void)cudaGetLastError();
+                g_q8_fold_oracle_skips++;
+                fprintf(stderr, "%s: fold consumer oracle failed\n", tag);
+                return -3;
+            }
+            g_q8_fold_oracle_output_calls++;
+            g_q8_fold_oracle_raw_moe_calls++;
+            if (mismatch_host != 0u) {
+                g_q8_fold_oracle_output_mismatches++;
+                fprintf(stderr,
+                        "ds4: CUDA Q8_1 fold oracle found a raw MoE "
+                        "consumer output mismatch; retained canonical "
+                        "output\n");
+            }
+            return 0;
+        }
+    }
     ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
@@ -4496,6 +4713,134 @@ __global__ void q8_0_aligned_dense_vec_nc_kernel(
     }
 }
 
+static cudaError_t q8_0_aligned_dense_vec_launch(
+        float *out, const int4 *qs, const __half *dq,
+        const block_q8_1 *x8, int M, int N, int K,
+        cudaStream_t stream) {
+    switch (N) {
+    case 1:
+        if (g_gb10_optimizations &&
+            getenv("DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT") == NULL &&
+            (K == 1024 || K == 4096) && M >= 32768) {
+            const uint64_t row_blocks = ((uint64_t)(unsigned)M + 7u) / 8u;
+            const unsigned persistent_blocks =
+                row_blocks < 288u ? (unsigned)row_blocks : 288u;
+            if (K == 1024) {
+                q8_0_aligned_dense_vec_k1024_persistent_kernel<<<
+                    persistent_blocks, 256, 0, stream>>>(
+                        out, qs, dq, x8, M);
+            } else {
+                q8_0_aligned_dense_vec_persistent_kernel<<<
+                    persistent_blocks, 256, 0, stream>>>(
+                        out, qs, dq, x8, M, K / 32);
+            }
+        } else {
+            q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
+                out, qs, dq, x8, M, K / 32);
+        }
+        break;
+    case 2: q8_0_aligned_dense_vec_nc_kernel<2><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 3: q8_0_aligned_dense_vec_nc_kernel<3><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 4: q8_0_aligned_dense_vec_nc_kernel<4><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 5: q8_0_aligned_dense_vec_nc_kernel<5><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 6: q8_0_aligned_dense_vec_nc_kernel<6><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 7: q8_0_aligned_dense_vec_nc_kernel<7><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 8: q8_0_aligned_dense_vec_nc_kernel<8><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    default: return cudaErrorInvalidValue;
+    }
+    return cudaGetLastError();
+}
+
+/* Full consumer oracle for the folded single-column Q8_0 aligned entry.
+ * It regenerates canonical Q8_1, runs the exact same consumer twice, compares
+ * output bits, and always leaves the freshly quantized reference output in
+ * the caller buffer.  Return 1 when handled, 0 when diagnostics could not be
+ * set up before enqueue, and -1 after a CUDA failure. */
+static int q8_fold_q8_aligned_output_oracle(
+        const float *X_f32, const block_q8_1 *folded,
+        float *out, const int4 *qs, const __half *dq,
+        int M, int K, cudaStream_t stream) {
+    if (!ds4_mmq_q8_fold_oracle_enabled() || !folded || M <= 0 || K <= 0) {
+        return 0;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return 0;
+    }
+    const size_t q8_bytes = (size_t)K * sizeof(block_q8_1) / QK8_1;
+    const size_t out_bytes = (size_t)M * sizeof(float);
+    block_q8_1 *fresh = nullptr;
+    float *reference = nullptr;
+    uint32_t *mismatch_device = nullptr;
+    if (cudaMalloc((void **)&fresh, q8_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&reference, out_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&mismatch_device, sizeof(uint32_t)) != cudaSuccess ||
+        !fresh || !reference || !mismatch_device) {
+        (void)cudaGetLastError();
+        if (fresh) (void)cudaFree(fresh);
+        if (reference) (void)cudaFree(reference);
+        if (mismatch_device) (void)cudaFree(mismatch_device);
+        g_q8_fold_oracle_skips++;
+        return 0;
+    }
+
+    cudaError_t err = cudaMemsetAsync(
+        mismatch_device, 0, sizeof(uint32_t), stream);
+    if (err == cudaSuccess) {
+        quantize_row_q8_1_cuda(
+            X_f32, /*ids=*/nullptr, fresh, GGML_TYPE_Q8_0,
+            /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+            /*ne0=*/K, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1, stream);
+        err = cudaGetLastError();
+    }
+    if (err == cudaSuccess) {
+        err = q8_0_aligned_dense_vec_launch(
+            out, qs, dq, folded, M, 1, K, stream);
+    }
+    if (err == cudaSuccess) {
+        err = q8_0_aligned_dense_vec_launch(
+            reference, qs, dq, fresh, M, 1, K, stream);
+    }
+    if (err == cudaSuccess) {
+        q8_fold_output_compare_kernel<<<
+            (unsigned)(((uint64_t)M + 255u) / 256u), 256, 0, stream>>>(
+                mismatch_device, out, reference, (uint64_t)M);
+        err = cudaGetLastError();
+    }
+    if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(out, reference, out_bytes,
+                              cudaMemcpyDeviceToDevice, stream);
+    }
+    uint32_t mismatch_host = 0u;
+    if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(&mismatch_host, mismatch_device,
+                              sizeof(mismatch_host),
+                              cudaMemcpyDeviceToHost, stream);
+    }
+    if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+
+    (void)cudaFree(fresh);
+    (void)cudaFree(reference);
+    (void)cudaFree(mismatch_device);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return -1;
+    }
+    g_q8_fold_oracle_output_calls++;
+    g_q8_fold_oracle_aligned_q8_calls++;
+    if (mismatch_host != 0u) {
+        g_q8_fold_oracle_output_mismatches++;
+        fprintf(stderr,
+                "ds4: CUDA Q8_1 fold oracle found a Q8 aligned consumer "
+                "output mismatch; retained canonical output\n");
+    }
+    return 1;
+}
+
 extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
     if (M <= 0 || K <= 0 || K % 1024 != 0) return 0;
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
@@ -4529,7 +4874,10 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
     // kernel) -- take them and skip the quantize prelude.  Single-column
     // producers only; verify widths always quantize.
-    char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
+    char *x8 = N == 1
+        ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded, stream)
+        : NULL;
+    const bool folded_hit = x8 != NULL;
     cudaError_t err;
     if (!x8) {
     if (getenv("DS4_CUDA_NO_Q8_ALIGNED_DENSE_SCRATCH") == NULL &&
@@ -4560,38 +4908,17 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     const int4   *qsp = (const int4 *)((const char *)W_aligned + dq_bytes);
     const __half *dqp = (const __half *)W_aligned;
     const block_q8_1 *x8p = (const block_q8_1 *)x8;
-    switch (N) {
-    case 1:
-        if (g_gb10_optimizations &&
-            getenv("DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT") == NULL &&
-            (K == 1024 || K == 4096) && M >= 32768) {
-            const uint64_t row_blocks = ((uint64_t)(unsigned)M + 7u) / 8u;
-            /* 288 = 48 GB10 SMs x __launch_bounds__(256, 6) resident CTAs. */
-            const unsigned persistent_blocks =
-                row_blocks < 288u ? (unsigned)row_blocks : 288u;
-            if (K == 1024) {
-                q8_0_aligned_dense_vec_k1024_persistent_kernel<<<
-                    persistent_blocks, 256, 0, stream>>>(
-                        out_f32, qsp, dqp, x8p, M);
-            } else {
-                q8_0_aligned_dense_vec_persistent_kernel<<<
-                    persistent_blocks, 256, 0, stream>>>(
-                        out_f32, qsp, dqp, x8p, M, K / 32);
-            }
-        } else {
-            q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
-                out_f32, qsp, dqp, x8p, M, K / 32);
+    if (folded_hit && N == 1 && ds4_mmq_q8_fold_oracle_enabled()) {
+        const int oracle_rc = q8_fold_q8_aligned_output_oracle(
+            X_f32, x8p, out_f32, qsp, dqp, M, K, stream);
+        if (oracle_rc > 0) return 0;
+        if (oracle_rc < 0) {
+            fprintf(stderr, "%s: fold consumer oracle failed\n", tag);
+            return -3;
         }
-        break;
-    case 2: q8_0_aligned_dense_vec_nc_kernel<2><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 3: q8_0_aligned_dense_vec_nc_kernel<3><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 4: q8_0_aligned_dense_vec_nc_kernel<4><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 5: q8_0_aligned_dense_vec_nc_kernel<5><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 6: q8_0_aligned_dense_vec_nc_kernel<6><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 7: q8_0_aligned_dense_vec_nc_kernel<7><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 8: q8_0_aligned_dense_vec_nc_kernel<8><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
     }
-    err = cudaGetLastError();
+    err = q8_0_aligned_dense_vec_launch(
+        out_f32, qsp, dqp, x8p, M, N, K, stream);
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
@@ -4903,7 +5230,9 @@ extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
 // pool otherwise) or nullptr on failure; *pool must outlive the launches.
 static char *iq2_aligned_quantize_xn(
         const char *tag, const float *X_f32, int K, int n_tokens,
-        ggml_cuda_pool_alloc<char> *pool, cudaStream_t stream) {
+        ggml_cuda_pool_alloc<char> *pool, cudaStream_t stream,
+        bool *was_folded) {
+    if (was_folded) *was_folded = false;
     const int dev = ggml_cuda_get_device();
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -4915,8 +5244,10 @@ static char *iq2_aligned_quantize_xn(
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
     // M2-Inc2a: producer-emitted q8_1 codes (ffn_norm from the fused HC
     // stage) -- take them and skip the quantize prelude.
-    char *folded = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    char *folded = ds4_mmq_folded_q81(
+        X_f32, K, n_tokens, ne10_padded, stream);
     if (folded) {
+        if (was_folded) *was_folded = true;
         // C3-Inc4 fold twin selftest (DS4_Q8_FOLD_SELFTEST=<call budget>,
         // eager legs only -- syncs the stream): the taken sidecar must be
         // byte-identical to the fresh quantize this prelude would have run.
@@ -4995,7 +5326,8 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
         return -1;
     }
     ggml_cuda_pool_alloc<char> q8_pool;
-    char *x8 = iq2_aligned_quantize_xn(tag, X_f32, K, n_tokens, &q8_pool, stream);
+    char *x8 = iq2_aligned_quantize_xn(
+        tag, X_f32, K, n_tokens, &q8_pool, stream, nullptr);
     if (!x8) return -2;
 
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
@@ -5032,7 +5364,9 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
         return -1;
     }
     ggml_cuda_pool_alloc<char> q8_pool;
-    char *x8 = iq2_aligned_quantize_xn(tag, X_f32, K, n_tokens, &q8_pool, stream);
+    bool folded_hit = false;
+    char *x8 = iq2_aligned_quantize_xn(
+        tag, X_f32, K, n_tokens, &q8_pool, stream, &folded_hit);
     if (!x8) return -2;
 
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
@@ -5042,6 +5376,91 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     const __half *dq_g = (const __half *)W_gate_aligned;
     const uint2  *qs_u = (const uint2 *)((const char *)W_up_aligned + dq_bytes);
     const __half *dq_u = (const __half *)W_up_aligned;
+    if (folded_hit && n_tokens == 1 &&
+        ds4_mmq_q8_fold_oracle_enabled()) {
+        const size_t q8_bytes = (size_t)K * sizeof(block_q8_1) / QK8_1;
+        const uint64_t mid_count =
+            (uint64_t)M * (uint64_t)n_expert_used;
+        const size_t mid_bytes = (size_t)mid_count * sizeof(float);
+        block_q8_1 *fresh = nullptr;
+        float *reference = nullptr;
+        uint32_t *mismatch_device = nullptr;
+        const bool allocated =
+            cudaMalloc((void **)&fresh, q8_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&reference, mid_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&mismatch_device, sizeof(uint32_t)) == cudaSuccess &&
+            fresh && reference && mismatch_device;
+        if (!allocated) {
+            (void)cudaGetLastError();
+            if (fresh) (void)cudaFree(fresh);
+            if (reference) (void)cudaFree(reference);
+            if (mismatch_device) (void)cudaFree(mismatch_device);
+            g_q8_fold_oracle_skips++;
+        } else {
+            cudaError_t oracle_err = cudaMemsetAsync(
+                mismatch_device, 0, sizeof(uint32_t), stream);
+            if (oracle_err == cudaSuccess) {
+                quantize_row_q8_1_cuda(
+                    X_f32, /*ids=*/nullptr, fresh, GGML_TYPE_IQ2_XXS,
+                    /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+                    /*ne0=*/K, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1, stream);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
+                    mid_f32, qs_g, dq_g, qs_u, dq_u,
+                    (const block_q8_1 *)x8, ids, weights,
+                    M, K / 256, K / 32, n_expert_used, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
+                    reference, qs_g, dq_g, qs_u, dq_u, fresh,
+                    ids, weights, M, K / 256, K / 32,
+                    n_expert_used, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                q8_fold_output_compare_kernel<<<
+                    (unsigned)((mid_count + 255u) / 256u), 256, 0, stream>>>(
+                        mismatch_device, mid_f32, reference, mid_count);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    mid_f32, reference, mid_bytes,
+                    cudaMemcpyDeviceToDevice, stream);
+            }
+            uint32_t mismatch_host = 0u;
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    &mismatch_host, mismatch_device, sizeof(mismatch_host),
+                    cudaMemcpyDeviceToHost, stream);
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaStreamSynchronize(stream);
+            }
+            (void)cudaFree(fresh);
+            (void)cudaFree(reference);
+            (void)cudaFree(mismatch_device);
+            if (oracle_err != cudaSuccess) {
+                (void)cudaGetLastError();
+                g_q8_fold_oracle_skips++;
+                fprintf(stderr, "%s: fold consumer oracle failed\n", tag);
+                return -3;
+            }
+            g_q8_fold_oracle_output_calls++;
+            g_q8_fold_oracle_aligned_iq2_calls++;
+            if (mismatch_host != 0u) {
+                g_q8_fold_oracle_output_mismatches++;
+                fprintf(stderr,
+                        "ds4: CUDA Q8_1 fold oracle found an IQ2 MoE "
+                        "consumer output mismatch; retained canonical "
+                        "output\n");
+            }
+            return 0;
+        }
+    }
     /* v0.4 V6: verify widths dedup expert overlap (see the dedup kernel's
      * header comment).  n_tokens==1 has no cross-token overlap and keeps
      * the per-slot kernel; widths beyond the verify envelope likewise.

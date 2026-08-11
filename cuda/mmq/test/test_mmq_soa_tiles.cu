@@ -35,8 +35,11 @@
 // libds4mmq.a references this ds4_cuda.cu symbol from the q8-fold vec paths
 // (C3 Inc4); the entries under test never reach it, so a "no fold available"
 // stub satisfies the link.
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim, void *out) {
-    (void)src; (void)in_dim; (void)out;
+extern "C" int ds4_cuda_q8_fold_take_q81(
+        const void *src, uint64_t in_dim, cudaStream_t stream,
+        const void **q81) {
+    (void)src; (void)in_dim; (void)stream;
+    if (q81) *q81 = nullptr;
     return 0;
 }
 

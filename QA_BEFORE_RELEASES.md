@@ -666,6 +666,20 @@ release-ready without this pass.
   vocabulary, compressor, HC split, direct routed-MoE paths, Q4 scratch,
   grouped attention-A, and canonical B+HC epilogue remain relevant, while
   the Q8-only attention-projection consumers are intentionally ineligible.
+- Validate the experimental HC-to-consumer Q8_1 producer fold in separate
+  processes. Use `DS4_CUDA_NO_Q8_FOLD=1` for the control and
+  `DS4_CUDA_ENABLE_Q8_FOLD=1` for the candidate, first with the normal graph
+  setting and then with `DS4_CUDA_DECODE_GRAPHS=0`. For the non-captured arm,
+  also set `DS4_CUDA_Q8_FOLD_ORACLE=1` and require `hits>0`, `byte_calls>0`,
+  `output_calls>0`, `byte_mismatches=0`, `output_mismatches=0`, and `skips=0`.
+  The reached consumer must be reported as aligned Q8 or IQ2 MoE rather than
+  inferred from producer counters alone. Require byte-identical greedy stdout
+  and per-token logprobs, then repeat the control/candidate pair under Compute
+  Sanitizer. Keep the oracle off for the graph-on timing arm: capture is an
+  intentional fail-closed miss and is checked for safety, not fold coverage.
+  Run these arms through the ordinary serialized inference dispatcher; the
+  opt-in fold does not support concurrent host-thread submission to one CUDA
+  stream.
 - If the umbrella AProjQ4 A/B changes logits, do not attribute that change to
   "the Q4 fast path" as a unit. Run the fail-closed component matrix from a
   clean `cuda-spark` build. The output directory is intentionally explicit so
