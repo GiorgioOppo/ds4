@@ -654,7 +654,15 @@ release-ready without this pass.
   separate fail-closed arm with both
   `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1` and
   `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1`; its rollback is
-  `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1`.  The persistent OutQ8
+  `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1`. Then run a non-captured oracle process
+  with `DS4_CUDA_DECODE_GRAPHS=0`,
+  `DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE=1`, and
+  `DS4_CUDA_Q4_K1024_PERSISTENT_STATS=1`; require `candidates>0`, `uses>0`,
+  `oracle_calls>0`, `oracle_mismatches=0`, and `oracle_skips=0`. The parity
+  test must also show a nonzero REQUIRE failure with the local kill set,
+  proving admission fails before enqueue, and a canonical reference forced by
+  that same kill. The counters are host dispatches and intentionally exclude
+  CUDA graph replays. The persistent OutQ8
   vocabulary, compressor, HC split, direct routed-MoE paths, Q4 scratch,
   grouped attention-A, and canonical B+HC epilogue remain relevant, while
   the Q8-only attention-projection consumers are intentionally ineligible.

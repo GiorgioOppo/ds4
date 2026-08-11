@@ -571,7 +571,13 @@ arithmetic:
   behind `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1`, with
   `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1` taking precedence. Tests can add
   `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1` to fail instead of silently using
-  canonical MMVQ when the persistent dispatch is unavailable.
+  canonical MMVQ when the persistent dispatch is unavailable; this admission
+  now fails before quantization, output clearing, or any kernel enqueue. Set
+  `DS4_CUDA_Q4_K1024_PERSISTENT_STATS=1` for host-dispatch candidate/use/
+  fallback counters. For a bitwise model-backed check, run with
+  `DS4_CUDA_DECODE_GRAPHS=0 DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE=1`; the oracle
+  forces the candidate, compares it with canonical MMVQ, and always retains
+  canonical output.
 
 `DS4_CUDA_NO_Q4_GB10_FAST=1` is the umbrella rollback for these new GB10
 choices; it does not disable the older cross-CUDA Q-A/KV pair itself. For a
