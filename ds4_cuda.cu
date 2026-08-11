@@ -21,6 +21,8 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -71,6 +73,18 @@ typedef struct {
     int8_t qs[CUDA_QK_K];
     int16_t bsums[CUDA_QK_K / 16];
 } cuda_block_q8_K;
+
+/* Canonical activation layout consumed by the MMVQ entries in
+ * cuda/mmq/.  Keep this private copy byte-for-byte aligned with
+ * block_q8_1 in ggml-common.h: half2(d, sum), then 32 signed codes. */
+typedef struct {
+    __half2 ds;
+    int8_t qs[32];
+} cuda_block_q8_1;
+static_assert(sizeof(cuda_block_q8_1) == 36u,
+              "canonical Q8_1 block layout drift");
+static_assert(offsetof(cuda_block_q8_1, qs) == 4u,
+              "canonical Q8_1 code offset drift");
 
 typedef struct {
     uint16_t d;
@@ -437,6 +451,46 @@ static void *g_aligned_q81_scratch;
  * Q4 grouped attention-A (8 tokens * 16 groups * K=4096 plus ids/alignment). */
 static const size_t CUDA_ALIGNED_Q81_SCRATCH_BYTES =
     96u * 1024u * 1024u;
+
+/* Opt-in producer-fold sidecars.  A slot belongs permanently to one
+ * (physical device, stream) for the lifetime of a CUDA session.  That makes
+ * reuse stream ordered without events, while a one-shot publication prevents
+ * a stale activation pointer from being accepted by a later consumer.
+ *
+ * Host contract: ds4's CUDA inference dispatcher serializes a session on one
+ * host thread.  The mutex protects registry state and cross-stream/device
+ * invalidation, but it does not make prepare -> producer enqueue -> publish or
+ * take -> consumer enqueue atomic when arbitrary host threads share one CUDA
+ * stream.  Such external multi-thread stream submission is unsupported for
+ * this experiment; keep the fold disabled in that embedding. */
+#define CUDA_Q8_FOLD_SLOTS 16u
+#define CUDA_Q8_FOLD_SLOT_BYTES 16384u
+struct cuda_q8_fold_slot {
+    void         *q81;
+    size_t        capacity;
+    const void   *src;
+    const void   *model_map;
+    uint64_t      in_dim;
+    uint64_t      epoch;
+    cudaStream_t  stream;
+    int           device;
+    int           owner_valid;
+    int           ready;
+};
+static cuda_q8_fold_slot g_q8_fold_slots[CUDA_Q8_FOLD_SLOTS];
+static std::mutex g_q8_fold_mutex;
+static uint64_t g_q8_fold_epoch = 1u;
+static int g_q8_fold_last_device = -1;
+static uint64_t g_q8_fold_prepares;
+static uint64_t g_q8_fold_publishes;
+static uint64_t g_q8_fold_hits;
+static uint64_t g_q8_fold_misses;
+static uint64_t g_q8_fold_capture_rejects;
+static uint64_t g_q8_fold_invalidations;
+static int g_q8_fold_report_registered;
+static std::once_flag g_q8_fold_mode_once;
+static int g_q8_fold_mode;
+static std::atomic<int> g_q8_fold_ever_enabled{0};
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
@@ -482,6 +536,234 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
                                             uint64_t bytes,
                                             int      expected_device,
                                             void   **out_device_ptr);
+
+static void cuda_q8_fold_report(void) {
+    fprintf(stderr,
+            "ds4: CUDA Q8_1 producer fold: prepares=%llu publishes=%llu "
+            "hits=%llu misses=%llu capture_rejects=%llu invalidations=%llu\n",
+            (unsigned long long)g_q8_fold_prepares,
+            (unsigned long long)g_q8_fold_publishes,
+            (unsigned long long)g_q8_fold_hits,
+            (unsigned long long)g_q8_fold_misses,
+            (unsigned long long)g_q8_fold_capture_rejects,
+            (unsigned long long)g_q8_fold_invalidations);
+}
+
+/* Experimental until the CUDA matrix has run on GB10/DGX.  The explicit
+ * disable is dominant even when the enable variable is present. */
+static void cuda_q8_fold_init_mode(void) {
+    const char *enable = getenv("DS4_CUDA_ENABLE_Q8_FOLD");
+    const char *disable = getenv("DS4_CUDA_NO_Q8_FOLD");
+    const int disabled = disable && disable[0] &&
+                         strcmp(disable, "0") != 0;
+    const int enabled = enable && strcmp(enable, "1") == 0;
+    g_q8_fold_mode = enabled && !disabled;
+    g_q8_fold_ever_enabled.store(g_q8_fold_mode,
+                                 std::memory_order_release);
+    if (enabled && !disabled && !g_q8_fold_report_registered) {
+        g_q8_fold_report_registered = 1;
+        (void)atexit(cuda_q8_fold_report);
+        fprintf(stderr,
+                "ds4: DS4_CUDA_ENABLE_Q8_FOLD=1 - experimental canonical "
+                "Q8_1 producer fold enabled\n");
+    }
+}
+
+static int cuda_q8_fold_enabled(void) {
+    std::call_once(g_q8_fold_mode_once, cuda_q8_fold_init_mode);
+    return g_q8_fold_mode;
+}
+
+static void cuda_q8_fold_invalidate_locked(void) {
+    g_q8_fold_epoch++;
+    if (g_q8_fold_epoch == 0u) g_q8_fold_epoch = 1u;
+    for (unsigned i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
+        g_q8_fold_slots[i].src = NULL;
+        g_q8_fold_slots[i].model_map = NULL;
+        g_q8_fold_slots[i].in_dim = 0u;
+        g_q8_fold_slots[i].epoch = 0u;
+        g_q8_fold_slots[i].ready = 0;
+    }
+    g_q8_fold_invalidations++;
+}
+
+static void cuda_q8_fold_invalidate_all(void) {
+    if (!g_q8_fold_ever_enabled.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_q8_fold_mutex);
+    cuda_q8_fold_invalidate_locked();
+}
+
+static void cuda_q8_fold_release_all(void) {
+    std::lock_guard<std::mutex> lock(g_q8_fold_mutex);
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    for (unsigned i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
+        cuda_q8_fold_slot *slot = &g_q8_fold_slots[i];
+        if (slot->q81) {
+            if (slot->owner_valid) (void)cudaSetDevice(slot->device);
+            (void)cudaFree(slot->q81);
+        }
+        memset(slot, 0, sizeof(*slot));
+        slot->device = -1;
+    }
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    g_q8_fold_last_device = -1;
+    cuda_q8_fold_invalidate_locked();
+}
+
+static int cuda_q8_fold_stream_is_eager(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    const cudaError_t err = cudaStreamIsCapturing(stream, &status);
+    if (err == cudaSuccess && status == cudaStreamCaptureStatusNone) return 1;
+    (void)cudaGetLastError();
+    std::lock_guard<std::mutex> lock(g_q8_fold_mutex);
+    g_q8_fold_capture_rejects++;
+    cuda_q8_fold_invalidate_locked();
+    return 0;
+}
+
+/* Reserve the stream-owned sidecar before launching a producer.  The
+ * allocation is deliberately forbidden during capture.  New producers on
+ * the same stream may replace an untaken publication: CUDA stream ordering
+ * guarantees that the old consumer, when there was one, has already read it. */
+static cuda_block_q8_1 *cuda_q8_fold_prepare(
+        const void *src, uint64_t in_dim, const void *model_map,
+        cudaStream_t stream) {
+    if (!cuda_q8_fold_enabled() || !src || in_dim != 4096u ||
+        (in_dim & 31u) != 0u || g_n_gpus != 1 ||
+        !model_map || model_map != g_model_host_base) {
+        return NULL;
+    }
+    if (!cuda_q8_fold_stream_is_eager(stream)) return NULL;
+
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cuda_q8_fold_invalidate_all();
+        return NULL;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    if (blocks > SIZE_MAX / sizeof(cuda_block_q8_1)) return NULL;
+    const size_t bytes = (size_t)blocks * sizeof(cuda_block_q8_1);
+    if (bytes > CUDA_Q8_FOLD_SLOT_BYTES) return NULL;
+
+    std::lock_guard<std::mutex> lock(g_q8_fold_mutex);
+    if (g_q8_fold_last_device >= 0 &&
+        g_q8_fold_last_device != device) {
+        cuda_q8_fold_invalidate_locked();
+    }
+    g_q8_fold_last_device = device;
+    cuda_q8_fold_slot *slot = NULL;
+    for (unsigned i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
+        cuda_q8_fold_slot *candidate = &g_q8_fold_slots[i];
+        if (candidate->owner_valid && candidate->device == device &&
+            candidate->stream == stream) {
+            slot = candidate;
+            break;
+        }
+        if (!slot && !candidate->owner_valid) slot = candidate;
+    }
+    if (!slot) return NULL;
+
+    if (!slot->owner_valid) {
+        void *sidecar = NULL;
+        const cudaError_t alloc_err =
+            cudaMalloc(&sidecar, CUDA_Q8_FOLD_SLOT_BYTES);
+        if (alloc_err != cudaSuccess || !sidecar) {
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        slot->q81 = sidecar;
+        slot->capacity = CUDA_Q8_FOLD_SLOT_BYTES;
+        slot->stream = stream;
+        slot->device = device;
+        slot->owner_valid = 1;
+    }
+    if (!slot->q81 || slot->capacity < bytes) return NULL;
+
+    slot->src = src;
+    slot->model_map = model_map;
+    slot->in_dim = in_dim;
+    slot->epoch = g_q8_fold_epoch;
+    slot->ready = 0;
+    g_q8_fold_prepares++;
+    return (cuda_block_q8_1 *)slot->q81;
+}
+
+static void cuda_q8_fold_publish(
+        const void *src, uint64_t in_dim, const void *model_map,
+        cudaStream_t stream, const void *q81) {
+    if (!q81) return;
+    if (!cuda_q8_fold_stream_is_eager(stream)) return;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cuda_q8_fold_invalidate_all();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_q8_fold_mutex);
+    if (g_q8_fold_last_device >= 0 &&
+        g_q8_fold_last_device != device) {
+        cuda_q8_fold_invalidate_locked();
+    }
+    g_q8_fold_last_device = device;
+    for (unsigned i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
+        cuda_q8_fold_slot *slot = &g_q8_fold_slots[i];
+        if (slot->q81 == q81 && slot->device == device &&
+            slot->src == src &&
+            slot->model_map == model_map && slot->in_dim == in_dim &&
+            slot->stream == stream && slot->epoch == g_q8_fold_epoch) {
+            slot->ready = 1;
+            g_q8_fold_publishes++;
+            return;
+        }
+    }
+}
+
+static int cuda_q8_fold_take(
+        const void *src, uint64_t in_dim, cudaStream_t stream,
+        const void **q81) {
+    if (q81) *q81 = NULL;
+    if (!q81 || !cuda_q8_fold_enabled() || !src || in_dim == 0u ||
+        g_n_gpus != 1 || !g_model_host_base) {
+        return 0;
+    }
+    if (!cuda_q8_fold_stream_is_eager(stream)) return 0;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cuda_q8_fold_invalidate_all();
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(g_q8_fold_mutex);
+    if (g_q8_fold_last_device >= 0 &&
+        g_q8_fold_last_device != device) {
+        cuda_q8_fold_invalidate_locked();
+    }
+    g_q8_fold_last_device = device;
+    for (unsigned i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
+        cuda_q8_fold_slot *slot = &g_q8_fold_slots[i];
+        if (slot->ready && slot->src == src && slot->in_dim == in_dim &&
+            slot->stream == stream && slot->device == device &&
+            slot->model_map == g_model_host_base &&
+            slot->epoch == g_q8_fold_epoch) {
+            *q81 = slot->q81;
+            slot->ready = 0;
+            slot->src = NULL;
+            g_q8_fold_hits++;
+            return 1;
+        }
+    }
+    g_q8_fold_misses++;
+    /* A pointer miss is a sequencing mismatch, not merely an absent key.
+     * Tensor scratch addresses can recur after their contents were replaced;
+     * retaining any ready publication across that mismatch could therefore
+     * turn a later address match into a stale hit.  Bump the session epoch
+     * and discard every publication while already holding the registry lock. */
+    cuda_q8_fold_invalidate_locked();
+    return 0;
+}
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -586,6 +868,7 @@ static int cuda_span_fully_replaced(
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+    cuda_q8_fold_invalidate_all();
     if (g_cuda_tmp) {
         if (!cuda_ok(cudaDeviceSynchronize(),
                      "synchronize CUDA scratch growth")) {
@@ -612,6 +895,7 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
 static void *tt_scratch_ensure(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_tt_scratch_bytes >= bytes) return g_tt_scratch;
+    cuda_q8_fold_invalidate_all();
 
     int device = -1;
     if (!cuda_ok(cudaGetDevice(&device), "get device for token-tile scratch")) {
@@ -669,6 +953,7 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
     }
     ds4_gpu_ctx *ctx = &g_gpu[logical_tier];
     if (ctx->scratch_bytes >= bytes) return ctx->scratch;
+    cuda_q8_fold_invalidate_all();
     int prev = -1;
     cudaError_t derr = cudaGetDevice(&prev);
     if (derr != cudaSuccess) {
@@ -1061,6 +1346,9 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
+    /* A captured/replayed island owns its stream schedule.  Never carry an
+     * eager host-side sidecar publication across that boundary. */
+    cuda_q8_fold_invalidate_all();
     cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
     if (!e) {
         g_decode_graph_no_slots++;
@@ -1192,14 +1480,13 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
  * prefill logits drift at ULP scale: validated against the official
  * continuation vectors rather than byte-diffs.  DS4_CUDA_MMQ=0 restores
  * the legacy dispatch. */
-/* Producer-fold registry lookup the vendored ds4_mmq.cu entries probe for
- * pre-quantized q8_1 activations (the fork's flat-pool M2-Inc2a fold).
- * The flat-pool producers are not ported, so nothing is ever registered:
- * always miss, and the entries run their own activation quantize. */
+/* Producer-fold registry lookup used by the vendored MMVQ entries.  Stream
+ * identity is part of the ABI: accepting a sidecar emitted on another stream
+ * without an event would be a data race, so such a lookup must miss. */
 extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
+                                         cudaStream_t stream,
                                          const void **q81) {
-    (void)src; (void)in_dim; (void)q81;
-    return 0;
+    return cuda_q8_fold_take(src, in_dim, stream, q81);
 }
 
 static int cuda_use_mmq(void) {
@@ -2739,6 +3026,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
+    cuda_q8_fold_invalidate_all();
     ds4_mmq_set_gb10_optimizations(0);
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     memset(g_cuda_is_gb10, 0, sizeof(g_cuda_is_gb10));
@@ -2949,6 +3237,7 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     cuda_decode_graphs_shutdown();
+    cuda_q8_fold_release_all();
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -3886,6 +4175,7 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    cuda_q8_fold_invalidate_all();
     cuda_stream_selected_cache_release();
     cuda_f16_pair_chunk32_release_all();
     cuda_model_range_release_all();
@@ -4087,6 +4377,7 @@ extern "C" int ds4_gpu_prepare_support_model(
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    cuda_q8_fold_invalidate_all();
 
     cuda_stream_selected_cache_release();
     cuda_f16_pair_chunk32_release_all();
@@ -12430,6 +12721,26 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     }
 }
 
+/* Emit one canonical block_q8_1 from a warp holding 32 consecutive normalized
+ * values.  This is intentionally the same XOR butterfly, scale, rounding and
+ * half2 conversion as cuda/mmq/quantize.cu::quantize_q8_1. */
+__device__ static __forceinline__ void cuda_q8_fold_store_warp(
+        cuda_block_q8_1 *q81, uint64_t element, float value) {
+    const uint32_t lane = threadIdx.x & 31u;
+    float amax = fabsf(value);
+    float sum = value;
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset, 32));
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+    }
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? (int8_t)0 : (int8_t)roundf(value / d);
+    cuda_block_q8_1 *block = q81 + element / 32u;
+    block->qs[lane] = q;
+    if (lane == 0u) block->ds = __floats2half2_rn(d, sum);
+}
+
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
@@ -12444,7 +12755,8 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         uint32_t n_rows,
         uint32_t sinkhorn_iters,
         float epsv,
-        float norm_eps) {
+        float norm_eps,
+        cuda_block_q8_1 *q81) {
     const uint32_t t = blockIdx.x;
     const uint32_t d = threadIdx.x;
     if (t >= n_rows || n_hc != 4) return;
@@ -12473,7 +12785,10 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         const float v = out[(uint64_t)t * n_embd + col];
-        norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
+        const uint64_t element = (uint64_t)t * n_embd + col;
+        const float normalized = v * norm_scale * norm_w[col];
+        norm_out[element] = normalized;
+        if (q81) cuda_q8_fold_store_warp(q81, element, normalized);
     }
 }
 
@@ -12549,7 +12864,8 @@ __global__ static void hc_split_weighted_sum_norm_fused_store4096_kernel(
         const float *out,
         float *norm_out,
         const float *norm_w,
-        const float *norm_scale) {
+        const float *norm_scale,
+        cuda_block_q8_1 *q81) {
     constexpr uint32_t tile = 256u;
     const uint32_t d = threadIdx.x;
     const uint32_t tile0 = blockIdx.x * tile;
@@ -12557,7 +12873,9 @@ __global__ static void hc_split_weighted_sum_norm_fused_store4096_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < tile / 256u; j++) {
         const uint32_t col = tile0 + j * 256u + d;
-        norm_out[col] = out[col] * scale * norm_w[col];
+        const float normalized = out[col] * scale * norm_w[col];
+        norm_out[col] = normalized;
+        if (q81) cuda_q8_fold_store_warp(q81, col, normalized);
     }
 }
 
@@ -13891,6 +14209,7 @@ static void *indexer_mxf4_scratch_alloc(uint64_t bytes) {
     if (g_indexer_mxf4_scratch_bytes >= bytes) {
         return g_indexer_mxf4_scratch;
     }
+    cuda_q8_fold_invalidate_all();
 
     int device = -1;
     if (!cuda_ok(cudaGetDevice(&device),
@@ -27631,11 +27950,12 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         const float *norm_w = (const float *)cuda_resolve_weight_ptr(model_map, norm_weight_offset,
                 (uint64_t)n_embd * sizeof(float), logical_tier, "hc_norm_weight");
         if (!scale || !base || !norm_w) return 0;
+        const cudaStream_t stream = cuda_decode_stream();
         if (n_embd == 4096u && n_rows == 1u &&
             out->ptr != norm_out->ptr &&
             getenv("DS4_CUDA_NO_HC_SPLIT_NORM_SPLIT4096") == NULL) {
             bool split_ok = true;
-            hc_split_weighted_sum_norm_fused_partial4096_kernel<<<16u, 256, 0, cuda_decode_stream()>>>(
+            hc_split_weighted_sum_norm_fused_partial4096_kernel<<<16u, 256, 0, stream>>>(
                     (float *)out->ptr,
                     (float *)split->ptr,
                     (const float *)mix->ptr,
@@ -27652,26 +27972,38 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                 split_ok = norm_scale != NULL;
             }
             if (split_ok) {
-                hc_split_weighted_sum_norm_fused_reduce4096_kernel<<<1u, 256, 0, cuda_decode_stream()>>>(
+                hc_split_weighted_sum_norm_fused_reduce4096_kernel<<<1u, 256, 0, stream>>>(
                         (const float *)out->ptr,
                         norm_scale,
                         norm_eps);
                 split_ok = cudaGetLastError() == cudaSuccess;
             }
+            cuda_block_q8_1 *fold_q81 = NULL;
             if (split_ok) {
-                hc_split_weighted_sum_norm_fused_store4096_kernel<<<16u, 256, 0, cuda_decode_stream()>>>(
+                fold_q81 = cuda_q8_fold_prepare(
+                        norm_out->ptr, n_embd, model_map, stream);
+                hc_split_weighted_sum_norm_fused_store4096_kernel<<<16u, 256, 0, stream>>>(
                         (const float *)out->ptr,
                         (float *)norm_out->ptr,
                         norm_w,
-                        norm_scale);
+                        norm_scale,
+                        fold_q81);
                 split_ok = cudaGetLastError() == cudaSuccess;
             }
-            if (split_ok) return 1;
+            if (split_ok) {
+                cuda_q8_fold_publish(norm_out->ptr, n_embd, model_map,
+                                     stream, fold_q81);
+                return 1;
+            }
+            if (fold_q81) cuda_q8_fold_invalidate_all();
             /* The split launches are adjacent, so any pre-enqueue failure
              * leaves a valid fused-reference retry: it rewrites out, split,
              * and norm_out without consuming partial state. */
         }
-        hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256, 0, cuda_decode_stream()>>>(
+        cuda_block_q8_1 *fold_q81 = n_rows == 1u
+            ? cuda_q8_fold_prepare(norm_out->ptr, n_embd, model_map, stream)
+            : NULL;
+        hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256, 0, stream>>>(
                 (float *)out->ptr,
                 (float *)norm_out->ptr,
                 (float *)split->ptr,
@@ -27680,8 +28012,16 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                 scale,
                 base,
                 norm_w,
-                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
-        return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
+                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps,
+                norm_eps, fold_q81);
+        const cudaError_t launch_err = cudaGetLastError();
+        if (launch_err == cudaSuccess) {
+            cuda_q8_fold_publish(norm_out->ptr, n_embd, model_map,
+                                 stream, fold_q81);
+        } else if (fold_q81) {
+            cuda_q8_fold_invalidate_all();
+        }
+        return cuda_ok(launch_err, "hc split weighted sum norm launch");
     }
     /* Multi-row fallback: norm EVERY row (rms_norm_weight_tensor is the
      * single-row entry and would leave rows 1..n-1 of norm_out untouched). */

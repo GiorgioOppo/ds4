@@ -22,6 +22,20 @@
 #include <memory>
 #include <mutex>
 
+/* Standalone MMQ tests do not link ds4_cuda.cu.  Full ds4 links its strong,
+ * stream-aware registry implementation over this fail-closed weak miss. */
+#if defined(__GNUC__)
+extern "C" __attribute__((weak)) int ds4_cuda_q8_fold_take_q81(
+        const void *src, uint64_t in_dim, cudaStream_t stream,
+        const void **q81) {
+    (void)src;
+    (void)in_dim;
+    (void)stream;
+    if (q81) *q81 = nullptr;
+    return 0;
+}
+#endif
+
 // ----------------------------------------------------------------------------
 // Device info singleton.
 //

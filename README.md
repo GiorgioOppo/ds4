@@ -701,6 +701,22 @@ standalone projections. The canonical Q4 path submits to the decode stream so
 these projections and the attention-output tail can participate in CUDA
 decode graphs.
 
+Single-token resident CUDA can also experiment with folding the canonical
+Q8_1 activation emitted by the 4096-wide HC split plus RMSNorm stage into its
+next MMVQ consumer. This remains opt-in pending GB10/DGX validation: set
+`DS4_CUDA_ENABLE_Q8_FOLD=1`; `DS4_CUDA_NO_Q8_FOLD=1` is the dominant kill
+switch. The sidecar is one-shot and keyed by model map, physical device,
+stream, source pointer, and session epoch. Capture, scratch growth, a model-map
+or device transition, and every lookup mismatch reject or invalidate it and
+fall back to the established quantizer. For a diagnostic run, disable decode
+graphs and add `DS4_CUDA_Q8_FOLD_ORACLE=1`; the oracle compares canonical Q8_1
+bytes and the reached aligned-Q8 or IQ2 MoE consumer output, then always keeps
+the freshly quantized reference. Require nonzero fold hits, `byte_calls`, and
+`output_calls`, with zero mismatches and skips before considering promotion.
+The experiment supports ds4's serialized, single-inference-host-thread CUDA
+runtime only; embeddings that submit concurrently to the same CUDA stream
+must leave it disabled.
+
 On a single DGX Spark/GB10, the AProjQ4 path also mirrors the safe parts of
 the aligned-Q8 decode work while retaining canonical Q4_K MMVQ/Q8_1
 arithmetic:
