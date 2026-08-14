@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -92,6 +94,10 @@ typedef struct {
     uint16_t d;
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
+static_assert(sizeof(cuda_block_iq2_xxs) == 66u,
+              "canonical IQ2_XXS block layout drift");
+static_assert(sizeof(cuda_block_q2_K) == 84u,
+              "canonical Q2_K block layout drift");
 
 #include "ds4_gpu_mgpu.h"
 #include "ds4_iq2_tables_cuda.inc"
@@ -150,12 +156,17 @@ static int g_ssd_streaming_mode;
 
 typedef struct {
     int valid;
+    int top6_unique;
     int logical_tier;
     const void *model_map;
     uint32_t layer;
     uint32_t n_total_expert;
     uint32_t slot_count;
     uint32_t compact_count;
+    uint32_t slot_base;
+    uint32_t weight_domain;
+    uint64_t generation;
+    uint64_t upload_event_value;
     uint64_t gate_offset;
     uint64_t up_offset;
     uint64_t down_offset;
@@ -174,31 +185,13 @@ typedef struct {
 
 static cuda_stream_selected_cache g_stream_selected_cache;
 static void cuda_stream_selected_upload_drain(void);
+static int cuda_stream_selected_consume_drain(void);
+static void cuda_stream_selected_consume_release(void);
+static void cuda_stream_selected_cache_release(void);
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
-}
-
-static void cuda_stream_selected_cache_release(void) {
-    cuda_stream_selected_upload_drain();
-    const int tier = g_stream_selected_cache.logical_tier;
-    if (tier >= 0 && tier < g_n_gpus) {
-        (void)ds4_gpu_set_current_device(tier);
-    }
-    if (g_stream_selected_cache.gate_ptr) {
-        (void)cudaFree(g_stream_selected_cache.gate_ptr);
-    }
-    if (g_stream_selected_cache.up_ptr) {
-        (void)cudaFree(g_stream_selected_cache.up_ptr);
-    }
-    if (g_stream_selected_cache.down_ptr) {
-        (void)cudaFree(g_stream_selected_cache.down_ptr);
-    }
-    if (g_stream_selected_cache.slot_selected_ptr) {
-        (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
-    }
-    memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
-    g_stream_selected_cache.logical_tier = -1;
+    g_stream_selected_cache.upload_event_value = 0;
 }
 
 typedef struct {
@@ -535,9 +528,19 @@ static uint64_t g_stream_selected_readback_stage_capacity;
 static cudaEvent_t g_stream_selected_compute_ready_event;
 static cudaEvent_t g_stream_selected_readback_done_event;
 static cudaEvent_t g_stream_selected_upload_done_event;
+static cudaEvent_t g_stream_selected_consume_done_event;
 static int g_stream_selected_event_owner_device = -1;
+static int g_stream_selected_consume_owner_device = -1;
 static uint64_t g_stream_selected_compute_event_value;
 static uint64_t g_stream_selected_upload_event_value;
+static uint64_t g_stream_selected_cache_generation;
+static uint64_t g_stream_selected_consume_generation;
+static int g_stream_selected_consume_pending;
+static int g_stream_selected_consume_poisoned;
+static std::mutex g_stream_selected_consume_mutex;
+static std::condition_variable g_stream_selected_consume_cv;
+static uint32_t g_stream_selected_consume_host_readers;
+static int g_stream_selected_writer_active;
 static std::once_flag g_stream_selected_batch_io_once;
 static int g_stream_selected_batch_io_enabled;
 static int g_stream_selected_batch_io_required;
@@ -571,9 +574,28 @@ static std::atomic<uint64_t> g_stream_selected_event_failures{0};
 static std::atomic<uint64_t> g_stream_selected_event_required_failures{0};
 static std::atomic<uint64_t> g_stream_selected_event_oracle_runs{0};
 static std::atomic<uint64_t> g_stream_selected_event_oracle_failures{0};
+static std::once_flag g_iq2_ssd_grouped_once;
+static int g_iq2_ssd_grouped_enabled;
+static int g_iq2_ssd_grouped_required;
+static int g_iq2_ssd_grouped_stats;
+static int g_iq2_ssd_grouped_report_registered;
+static std::atomic<uint64_t> g_iq2_ssd_grouped_candidates{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_eligible{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_attempts{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_completed{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_not_applicable{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_safe_fallbacks{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_failures{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_required_failures{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_upload_waits{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_lease_waits{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_lease_records{0};
+static std::atomic<uint64_t> g_iq2_ssd_grouped_lease_drains{0};
 
 static int cuda_ok(cudaError_t err, const char *what);
 static void cuda_stream_selected_event_pipeline_release(void);
+static int cuda_stream_selected_wait_upload_on(
+        uint64_t event_value, cudaStream_t stream, const char *label);
 extern "C" int ds4_gpu_stream_expert_cache_wait_selected_upload(
         uint64_t event_value, const char *label);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
@@ -2924,6 +2946,174 @@ extern "C" int ds4_cuda_test_stream_selected_event_env_value(
     return cuda_stream_selected_env_value_enabled(value);
 }
 
+struct ds4_cuda_iq2_ssd_grouped_report;
+typedef struct ds4_cuda_iq2_ssd_grouped_report
+    ds4_cuda_iq2_ssd_grouped_report;
+typedef struct {
+    uint64_t candidates;
+    uint64_t eligible;
+    uint64_t attempts;
+    uint64_t completed;
+    uint64_t not_applicable;
+    uint64_t safe_fallbacks;
+    uint64_t failures;
+    uint64_t required_failures;
+    uint64_t upload_waits;
+    uint64_t lease_waits;
+    uint64_t lease_records;
+    uint64_t lease_drains;
+    int enabled;
+    int required;
+    int stats;
+} cuda_iq2_ssd_grouped_report_layout;
+
+static void cuda_iq2_ssd_grouped_resolve_policy(
+        int enable, int disable, int require, int stats,
+        int *enabled_out, int *required_out, int *stats_out) {
+    const int disabled = disable != 0;
+    if (enabled_out) *enabled_out = !disabled && (enable || require);
+    if (required_out) *required_out = !disabled && require;
+    if (stats_out) *stats_out = !disabled && stats;
+}
+
+extern "C" int ds4_cuda_test_iq2_ssd_grouped_policy(
+        int enable, int disable, int require, int stats,
+        int *enabled_out, int *required_out, int *stats_out) {
+    if (!enabled_out || !required_out || !stats_out) return 0;
+    cuda_iq2_ssd_grouped_resolve_policy(
+        enable, disable, require, stats,
+        enabled_out, required_out, stats_out);
+    return 1;
+}
+
+/* Keep the production gate decomposed so host-only policy tests can prove
+ * that every exclusion remains fail-safe without spoofing CUDA properties.
+ * Raw-layout validation itself is checked separately against exact GGUF
+ * strides in routed_moe_launch(). */
+static int cuda_iq2_ssd_grouped_eligible_values(
+        int enabled, int ssd_streaming, int single_gpu, int gb10,
+        int quality, int owned_filtered, int capture, int mmq,
+        uint32_t n_tokens, uint32_t n_expert, int top6_unique,
+        int raw_layout, int binding_valid) {
+    return enabled && ssd_streaming && single_gpu && gb10 && !quality &&
+           !owned_filtered && !capture && mmq && n_tokens >= 32u &&
+           n_expert == 6u && top6_unique && raw_layout && binding_valid;
+}
+
+extern "C" int ds4_cuda_test_iq2_ssd_grouped_eligibility(
+        int enabled, int ssd_streaming, int single_gpu, int gb10,
+        int quality, int owned_filtered, int capture, int mmq,
+        uint32_t n_tokens, uint32_t n_expert, int top6_unique,
+        int raw_layout, int binding_valid) {
+    return cuda_iq2_ssd_grouped_eligible_values(
+        enabled, ssd_streaming, single_gpu, gb10, quality,
+        owned_filtered, capture, mmq, n_tokens, n_expert,
+        top6_unique, raw_layout, binding_valid);
+}
+
+static int cuda_iq2_ssd_grouped_candidate_values(
+        int iq2_path, int ssd_streaming, int allow_streaming,
+        int owned_filtered, uint32_t n_tokens, uint32_t n_expert,
+        int top6_unique, int raw_layout, int binding_valid) {
+    return iq2_path && ssd_streaming && allow_streaming &&
+           !owned_filtered && n_tokens >= 32u && n_expert == 6u &&
+           top6_unique && raw_layout && binding_valid;
+}
+
+extern "C" int ds4_cuda_test_iq2_ssd_grouped_candidate(
+        int iq2_path, int ssd_streaming, int allow_streaming,
+        int owned_filtered, uint32_t n_tokens, uint32_t n_expert,
+        int top6_unique, int raw_layout, int binding_valid) {
+    return cuda_iq2_ssd_grouped_candidate_values(
+        iq2_path, ssd_streaming, allow_streaming, owned_filtered,
+        n_tokens, n_expert, top6_unique, raw_layout, binding_valid);
+}
+
+static void cuda_iq2_ssd_grouped_report_at_exit(void) {
+    fprintf(stderr,
+            "ds4: CUDA IQ2 SSD grouped MMQ: candidates=%llu eligible=%llu "
+            "attempts=%llu completed=%llu not_applicable=%llu "
+            "safe_fallbacks=%llu failures=%llu required_failures=%llu "
+            "upload_waits=%llu lease_waits=%llu lease_records=%llu "
+            "lease_drains=%llu\n",
+            (unsigned long long)g_iq2_ssd_grouped_candidates.load(),
+            (unsigned long long)g_iq2_ssd_grouped_eligible.load(),
+            (unsigned long long)g_iq2_ssd_grouped_attempts.load(),
+            (unsigned long long)g_iq2_ssd_grouped_completed.load(),
+            (unsigned long long)g_iq2_ssd_grouped_not_applicable.load(),
+            (unsigned long long)g_iq2_ssd_grouped_safe_fallbacks.load(),
+            (unsigned long long)g_iq2_ssd_grouped_failures.load(),
+            (unsigned long long)g_iq2_ssd_grouped_required_failures.load(),
+            (unsigned long long)g_iq2_ssd_grouped_upload_waits.load(),
+            (unsigned long long)g_iq2_ssd_grouped_lease_waits.load(),
+            (unsigned long long)g_iq2_ssd_grouped_lease_records.load(),
+            (unsigned long long)g_iq2_ssd_grouped_lease_drains.load());
+}
+
+static void cuda_iq2_ssd_grouped_init(void) {
+    const int enable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_ENABLE_IQ2_XXS_SSD_PREFILL_MMQ");
+    const int disable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_DISABLE_IQ2_XXS_SSD_PREFILL_MMQ") ||
+        cuda_stream_selected_env_flag(
+            "DS4_CUDA_NO_IQ2_XXS_SSD_PREFILL_MMQ");
+    const int require = cuda_stream_selected_env_flag(
+        "DS4_CUDA_REQUIRE_IQ2_XXS_SSD_PREFILL_MMQ");
+    const int stats = cuda_stream_selected_env_flag(
+        "DS4_CUDA_IQ2_XXS_SSD_PREFILL_MMQ_STATS");
+    cuda_iq2_ssd_grouped_resolve_policy(
+        enable, disable, require, stats,
+        &g_iq2_ssd_grouped_enabled,
+        &g_iq2_ssd_grouped_required,
+        &g_iq2_ssd_grouped_stats);
+    if ((enable || require || stats) &&
+        !g_iq2_ssd_grouped_report_registered) {
+        g_iq2_ssd_grouped_report_registered = 1;
+        (void)atexit(cuda_iq2_ssd_grouped_report_at_exit);
+    }
+    if (g_iq2_ssd_grouped_enabled) {
+        fprintf(stderr,
+                "ds4: CUDA IQ2_XXS/Q2_K SSD grouped prefill MMQ enabled%s\n",
+                g_iq2_ssd_grouped_required ? " (required)" : "");
+    } else if (disable && (enable || require)) {
+        fprintf(stderr,
+                "ds4: CUDA IQ2 SSD grouped MMQ disabled by rollback "
+                "override\n");
+    }
+}
+
+static int cuda_iq2_ssd_grouped_enabled(void) {
+    std::call_once(g_iq2_ssd_grouped_once, cuda_iq2_ssd_grouped_init);
+    return g_iq2_ssd_grouped_enabled;
+}
+
+static int cuda_iq2_ssd_grouped_required(void) {
+    std::call_once(g_iq2_ssd_grouped_once, cuda_iq2_ssd_grouped_init);
+    return g_iq2_ssd_grouped_required;
+}
+
+extern "C" void ds4_cuda_iq2_ssd_grouped_get_report(
+        ds4_cuda_iq2_ssd_grouped_report *report) {
+    if (!report) return;
+    cuda_iq2_ssd_grouped_report_layout out = {};
+    out.candidates = g_iq2_ssd_grouped_candidates.load();
+    out.eligible = g_iq2_ssd_grouped_eligible.load();
+    out.attempts = g_iq2_ssd_grouped_attempts.load();
+    out.completed = g_iq2_ssd_grouped_completed.load();
+    out.not_applicable = g_iq2_ssd_grouped_not_applicable.load();
+    out.safe_fallbacks = g_iq2_ssd_grouped_safe_fallbacks.load();
+    out.failures = g_iq2_ssd_grouped_failures.load();
+    out.required_failures = g_iq2_ssd_grouped_required_failures.load();
+    out.upload_waits = g_iq2_ssd_grouped_upload_waits.load();
+    out.lease_waits = g_iq2_ssd_grouped_lease_waits.load();
+    out.lease_records = g_iq2_ssd_grouped_lease_records.load();
+    out.lease_drains = g_iq2_ssd_grouped_lease_drains.load();
+    out.enabled = cuda_iq2_ssd_grouped_enabled();
+    out.required = cuda_iq2_ssd_grouped_required();
+    out.stats = g_iq2_ssd_grouped_stats;
+    memcpy(report, &out, sizeof(out));
+}
+
 static void cuda_stream_selected_batch_io_resolve_policy(
         int enable, int disable, int require, int oracle,
         int *enabled_out, int *required_out, int *oracle_out) {
@@ -3274,6 +3464,288 @@ static int cuda_stream_selected_event_pipeline_ensure(void) {
     return 1;
 }
 
+/* A compact selected cache is a transient binding, not ordinary scratch:
+ * the next SSD load overwrites the same gate/up/down arrays and remap.  The
+ * reusable consume event is recorded after the last grouped-MMQ consumer and
+ * imported into the upload stream before the following H2D epoch.  Allocation
+ * growth and teardown use the host drain because cudaFree cannot be ordered
+ * behind an event in the upload stream. */
+static int cuda_stream_selected_consume_ensure_locked(void) {
+    if (g_n_gpus != 1 || g_stream_selected_consume_poisoned) return 0;
+    const int owner = g_gpu[0].device_id;
+    if (cudaSetDevice(owner) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (g_stream_selected_consume_done_event &&
+        g_stream_selected_consume_owner_device == owner) {
+        return 1;
+    }
+    if (g_stream_selected_consume_pending &&
+        g_stream_selected_consume_done_event) {
+        const cudaError_t sync_err =
+            cudaEventSynchronize(g_stream_selected_consume_done_event);
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA compact-cache consume drain failed while "
+                    "changing owner: %s\n",
+                    cudaGetErrorString(sync_err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_stream_selected_consume_pending = 0;
+        g_iq2_ssd_grouped_lease_drains.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    if (g_stream_selected_consume_done_event) {
+        (void)cudaEventDestroy(g_stream_selected_consume_done_event);
+        g_stream_selected_consume_done_event = NULL;
+    }
+    const cudaError_t err = cudaEventCreateWithFlags(
+        &g_stream_selected_consume_done_event, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA compact-cache consume event creation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        g_stream_selected_consume_owner_device = -1;
+        return 0;
+    }
+    g_stream_selected_consume_owner_device = owner;
+    return 1;
+}
+
+static int cuda_stream_selected_consume_prepare(void) {
+    std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+    return cuda_stream_selected_consume_ensure_locked();
+}
+
+/* Exclusive host-side writer lease for the transient binding.  The flag is
+ * held for the entire load, publication, release or abort transaction, not
+ * just while valid is toggled.  That closes both directions of the TOCTOU:
+ * readers cannot enter after a loader observes zero readers, and a reader
+ * cannot observe partially replaced metadata while a writer is active. */
+class cuda_stream_selected_writer_guard {
+public:
+    explicit cuda_stream_selected_writer_guard(
+            std::atomic<int> *waiting_probe = nullptr) {
+        std::unique_lock<std::mutex> lock(
+            g_stream_selected_consume_mutex);
+        if (waiting_probe) {
+            waiting_probe->store(1, std::memory_order_release);
+        }
+        g_stream_selected_consume_cv.wait(lock, [] {
+            return !g_stream_selected_writer_active &&
+                   g_stream_selected_consume_host_readers == 0u;
+        });
+        g_stream_selected_writer_active = 1;
+        cuda_stream_selected_cache_invalidate();
+        held_ = true;
+    }
+
+    cuda_stream_selected_writer_guard(
+        const cuda_stream_selected_writer_guard &) = delete;
+    cuda_stream_selected_writer_guard &operator=(
+        const cuda_stream_selected_writer_guard &) = delete;
+
+    void publish_valid() {
+        std::lock_guard<std::mutex> lock(
+            g_stream_selected_consume_mutex);
+        if (!held_) return;
+        g_stream_selected_cache.valid = 1;
+        g_stream_selected_writer_active = 0;
+        held_ = false;
+        g_stream_selected_consume_cv.notify_all();
+    }
+
+    ~cuda_stream_selected_writer_guard() {
+        std::lock_guard<std::mutex> lock(
+            g_stream_selected_consume_mutex);
+        if (!held_) return;
+        cuda_stream_selected_cache_invalidate();
+        g_stream_selected_writer_active = 0;
+        held_ = false;
+        g_stream_selected_consume_cv.notify_all();
+    }
+
+private:
+    bool held_ = false;
+};
+
+static int cuda_stream_selected_consume_drain(void) {
+    std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+    if (g_stream_selected_consume_poisoned) {
+        if (g_stream_selected_consume_owner_device < 0 ||
+            cudaSetDevice(g_stream_selected_consume_owner_device) !=
+                cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        const cudaError_t device_err = cudaDeviceSynchronize();
+        if (device_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA compact-cache poisoned drain failed: %s\n",
+                    cudaGetErrorString(device_err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_stream_selected_consume_poisoned = 0;
+        g_stream_selected_consume_pending = 0;
+        g_iq2_ssd_grouped_lease_drains.fetch_add(
+            1, std::memory_order_relaxed);
+        return 1;
+    }
+    if (!g_stream_selected_consume_pending) return 1;
+    if (!g_stream_selected_consume_done_event ||
+        g_stream_selected_consume_owner_device < 0 ||
+        cudaSetDevice(g_stream_selected_consume_owner_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const cudaError_t err =
+        cudaEventSynchronize(g_stream_selected_consume_done_event);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA compact-cache consume drain failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_consume_pending = 0;
+    g_iq2_ssd_grouped_lease_drains.fetch_add(
+        1, std::memory_order_relaxed);
+    return 1;
+}
+
+/* Caller owns cuda_stream_selected_writer_guard, so no reader can acquire
+ * these pointers while they are drained and freed. */
+static int cuda_stream_selected_cache_free_storage_writer(void) {
+    if (!g_stream_selected_writer_active ||
+        !cuda_stream_selected_consume_drain()) {
+        /* Never free a compact binding whose last consumer could not be
+         * drained.  A bounded leak is safer than a cross-stream UAF when the
+         * CUDA context is already reporting an unrecoverable error. */
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
+    cuda_stream_selected_upload_drain();
+    const int has_storage = g_stream_selected_cache.gate_ptr ||
+        g_stream_selected_cache.up_ptr ||
+        g_stream_selected_cache.down_ptr ||
+        g_stream_selected_cache.slot_selected_ptr;
+    if (has_storage &&
+        (g_n_gpus != 1 ||
+         cudaSetDevice(g_gpu[0].device_id) != cudaSuccess)) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (g_stream_selected_cache.gate_ptr) {
+        (void)cudaFree(g_stream_selected_cache.gate_ptr);
+    }
+    if (g_stream_selected_cache.up_ptr) {
+        (void)cudaFree(g_stream_selected_cache.up_ptr);
+    }
+    if (g_stream_selected_cache.down_ptr) {
+        (void)cudaFree(g_stream_selected_cache.down_ptr);
+    }
+    if (g_stream_selected_cache.slot_selected_ptr) {
+        (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
+    }
+    memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
+    g_stream_selected_cache.logical_tier = -1;
+    return 1;
+}
+
+static void cuda_stream_selected_cache_release(void) {
+    cuda_stream_selected_writer_guard writer;
+    (void)cuda_stream_selected_cache_free_storage_writer();
+}
+
+static void cuda_stream_selected_consume_release(void) {
+    std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+    if (g_stream_selected_consume_owner_device >= 0) {
+        (void)cudaSetDevice(g_stream_selected_consume_owner_device);
+    }
+    if (g_stream_selected_consume_pending &&
+        g_stream_selected_consume_done_event) {
+        (void)cudaEventSynchronize(g_stream_selected_consume_done_event);
+    }
+    if (g_stream_selected_consume_done_event) {
+        (void)cudaEventDestroy(g_stream_selected_consume_done_event);
+        g_stream_selected_consume_done_event = NULL;
+    }
+    g_stream_selected_consume_owner_device = -1;
+    g_stream_selected_consume_pending = 0;
+    g_stream_selected_consume_poisoned = 0;
+    g_stream_selected_consume_generation = 0;
+}
+
+static int cuda_stream_selected_consume_wait_on_upload(void) {
+    std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+    if (g_stream_selected_consume_poisoned) return 0;
+    if (!g_stream_selected_consume_pending) return 1;
+    if (!g_stream_selected_consume_done_event ||
+        !g_stream_selected_upload_stream ||
+        g_stream_selected_consume_owner_device < 0 ||
+        g_stream_selected_upload_owner_device !=
+            g_stream_selected_consume_owner_device ||
+        cudaSetDevice(g_stream_selected_consume_owner_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const cudaError_t err = cudaStreamWaitEvent(
+        g_stream_selected_upload_stream,
+        g_stream_selected_consume_done_event, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA compact-cache upload lease wait failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_iq2_ssd_grouped_lease_waits.fetch_add(
+        1, std::memory_order_relaxed);
+    return 1;
+}
+
+static int cuda_stream_selected_consume_record(
+        uint64_t binding_generation, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+    if (!cuda_stream_selected_consume_ensure_locked()) return 0;
+    const cudaError_t err = cudaEventRecord(
+        g_stream_selected_consume_done_event, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA compact-cache consume event record failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        /* A failed record must never expose an unfenced binding to the next
+         * loader.  Draining the exact consumer stream is the safe fallback. */
+        const cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA compact-cache consumer drain failed: %s\n",
+                    cudaGetErrorString(sync_err));
+            (void)cudaGetLastError();
+            const cudaError_t device_err = cudaDeviceSynchronize();
+            if (device_err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA compact-cache device drain failed: %s\n",
+                        cudaGetErrorString(device_err));
+                (void)cudaGetLastError();
+                g_stream_selected_consume_poisoned = 1;
+            }
+        }
+        g_stream_selected_consume_pending = 0;
+        return 0;
+    }
+    g_stream_selected_consume_generation = binding_generation;
+    g_stream_selected_consume_pending = 1;
+    g_iq2_ssd_grouped_lease_records.fetch_add(
+        1, std::memory_order_relaxed);
+    return 1;
+}
+
 static int cuda_stream_selected_readback_stage_ensure(uint64_t bytes) {
     if (bytes == 0 || bytes > SIZE_MAX) return 0;
     if (g_stream_selected_readback_stage &&
@@ -3560,6 +4032,12 @@ static int cuda_model_copy_tasks_to_device_streamed(
     if (!cuda_host_stage_bytes_for_chunk(chunk, g_model_direct_align,
                                          &stage_bytes) ||
         !cuda_stream_selected_stage_pool_alloc(stage_bytes)) {
+        return 0;
+    }
+    if (!cuda_stream_selected_consume_wait_on_upload()) {
+        fprintf(stderr,
+                "ds4: CUDA selected batch refused to overwrite an active "
+                "compact-cache lease\n");
         return 0;
     }
 
@@ -4097,7 +4575,8 @@ static int cuda_model_copy_to_device_streamed(
     uint64_t stage_bytes = 0;
     if (!cuda_host_stage_bytes_for_chunk(chunk, g_model_direct_align,
                                          &stage_bytes) ||
-        !cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+        !cuda_stream_selected_stage_pool_alloc(stage_bytes) ||
+        !cuda_stream_selected_consume_wait_on_upload()) return 0;
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -4748,6 +5227,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_stage_release();
     cuda_stream_selected_event_pipeline_release();
     cuda_stream_selected_cache_release();
+    cuda_stream_selected_consume_release();
     ds4_mmq_set_gb10_optimizations(0);
     g_n_gpus = 0;
     g_cublas_ready = 0;
@@ -27234,6 +27714,135 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+typedef struct {
+    int valid;
+    int top6_unique;
+    const char *gate;
+    const char *up;
+    const char *down;
+    const ds4_gpu_tensor *selected;
+    uint32_t slot_base;
+    uint32_t weight_domain;
+    uint64_t generation;
+    uint64_t upload_event_value;
+} cuda_stream_selected_binding;
+
+static int cuda_stream_selected_binding_acquire(
+        cuda_stream_selected_binding *binding,
+        int logical_tier,
+        const void *model_map,
+        uint32_t layer_index,
+        uint32_t n_total_expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t required_slot_count) {
+    if (!binding) return 0;
+    memset(binding, 0, sizeof(*binding));
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        required_slot_count > UINT64_MAX / sizeof(int32_t) ||
+        !g_stream_selected_cache.valid ||
+        g_stream_selected_cache.logical_tier != logical_tier ||
+        g_stream_selected_cache.model_map != model_map ||
+        g_stream_selected_cache.layer != layer_index ||
+        g_stream_selected_cache.n_total_expert != n_total_expert ||
+        g_stream_selected_cache.slot_count != required_slot_count ||
+        g_stream_selected_cache.gate_offset != gate_offset ||
+        g_stream_selected_cache.up_offset != up_offset ||
+        g_stream_selected_cache.down_offset != down_offset ||
+        g_stream_selected_cache.gate_expert_bytes != gate_expert_bytes ||
+        g_stream_selected_cache.down_expert_bytes != down_expert_bytes ||
+        !g_stream_selected_cache.gate_ptr ||
+        !g_stream_selected_cache.up_ptr ||
+        !g_stream_selected_cache.down_ptr ||
+        !g_stream_selected_cache.slot_selected_tensor.ptr ||
+        g_stream_selected_cache.slot_selected_tensor.bytes <
+            required_slot_count * sizeof(int32_t) ||
+        g_stream_selected_cache.generation == 0 ||
+        g_stream_selected_cache.weight_domain == 0 ||
+        g_stream_selected_cache.slot_base > UINT32_MAX -
+            g_stream_selected_cache.weight_domain) {
+        return 0;
+    }
+    const uint64_t end_slot =
+        (uint64_t)g_stream_selected_cache.slot_base +
+        g_stream_selected_cache.weight_domain;
+    if (end_slot > UINT64_MAX / gate_expert_bytes ||
+        end_slot * gate_expert_bytes >
+            g_stream_selected_cache.gate_capacity ||
+        end_slot * gate_expert_bytes >
+            g_stream_selected_cache.up_capacity ||
+        end_slot > UINT64_MAX / down_expert_bytes ||
+        end_slot * down_expert_bytes >
+            g_stream_selected_cache.down_capacity) {
+        return 0;
+    }
+    binding->valid = 1;
+    binding->top6_unique = g_stream_selected_cache.top6_unique;
+    binding->gate = g_stream_selected_cache.gate_ptr +
+        (uint64_t)g_stream_selected_cache.slot_base * gate_expert_bytes;
+    binding->up = g_stream_selected_cache.up_ptr +
+        (uint64_t)g_stream_selected_cache.slot_base * gate_expert_bytes;
+    binding->down = g_stream_selected_cache.down_ptr +
+        (uint64_t)g_stream_selected_cache.slot_base * down_expert_bytes;
+    binding->selected = &g_stream_selected_cache.slot_selected_tensor;
+    binding->slot_base = g_stream_selected_cache.slot_base;
+    binding->weight_domain = g_stream_selected_cache.weight_domain;
+    binding->generation = g_stream_selected_cache.generation;
+    binding->upload_event_value =
+        g_stream_selected_cache.upload_event_value;
+    return 1;
+}
+
+static int cuda_iq2_ssd_grouped_raw_layout(
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim,
+        uint32_t out_dim) {
+    if (gate_type != 16u || down_type != 10u ||
+        expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u ||
+        (expert_in_dim % CUDA_QK_K) != 0u ||
+        (expert_mid_dim % CUDA_QK_K) != 0u) {
+        return 0;
+    }
+    const uint64_t iq2_blocks = expert_in_dim / CUDA_QK_K;
+    const uint64_t q2_blocks = expert_mid_dim / CUDA_QK_K;
+    if (iq2_blocks > UINT64_MAX / sizeof(cuda_block_iq2_xxs) ||
+        q2_blocks > UINT64_MAX / sizeof(cuda_block_q2_K)) {
+        return 0;
+    }
+    const uint64_t canonical_gate_row =
+        iq2_blocks * sizeof(cuda_block_iq2_xxs);
+    const uint64_t canonical_down_row =
+        q2_blocks * sizeof(cuda_block_q2_K);
+    if ((uint64_t)expert_mid_dim >
+            UINT64_MAX / canonical_gate_row ||
+        (uint64_t)out_dim > UINT64_MAX / canonical_down_row) {
+        return 0;
+    }
+    return gate_row_bytes == canonical_gate_row &&
+           gate_expert_bytes ==
+               (uint64_t)expert_mid_dim * canonical_gate_row &&
+           down_row_bytes == canonical_down_row &&
+           down_expert_bytes ==
+               (uint64_t)out_dim * canonical_down_row;
+}
+
+extern "C" int ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim,
+        uint32_t out_dim) {
+    return cuda_iq2_ssd_grouped_raw_layout(
+        gate_type, down_type, gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim);
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -27446,6 +28055,59 @@ static int routed_moe_launch(
         }
     }
 
+    /* Resolve one immutable raw-weight binding before choosing MXFP4, the
+     * IQ2 grouped tier, or the established scratch pipeline.  SSD loads
+     * publish compact weights plus an ID remap; resident models retain their
+     * full domain.  The public routed wrapper holds the matching reader lease
+     * for every return below. */
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        (uint64_t)n_total_expert >
+            UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert >
+            UINT64_MAX / down_expert_bytes) {
+        return 0;
+    }
+    const uint64_t gate_bytes =
+        (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_bytes =
+        (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_bytes > model_size - gate_offset ||
+        gate_bytes > model_size - up_offset ||
+        down_bytes > model_size - down_offset) {
+        return 0;
+    }
+    const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    cuda_stream_selected_binding stream_binding = {};
+    const int use_stream_selected_cache =
+        allow_streaming && g_ssd_streaming_mode &&
+        cuda_stream_selected_binding_acquire(
+            &stream_binding, logical_tier, model_map, layer_index,
+            n_total_expert, gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes, required_slot_count);
+    if (g_ssd_streaming_mode && allow_streaming &&
+        !use_stream_selected_cache) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected experts are unavailable for "
+                "layer %u\n",
+                layer_index);
+        return 0;
+    }
+    if (use_stream_selected_cache) selected = stream_binding.selected;
+    const char *gate_w = use_stream_selected_cache
+        ? stream_binding.gate
+        : cuda_resolve_weight_ptr(model_map, gate_offset, gate_bytes,
+                                  logical_tier, "moe_gate");
+    const char *up_w = use_stream_selected_cache
+        ? stream_binding.up
+        : cuda_resolve_weight_ptr(model_map, up_offset, gate_bytes,
+                                  logical_tier, "moe_up");
+    const char *down_w = use_stream_selected_cache
+        ? stream_binding.down
+        : cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
+                                  logical_tier, "moe_down");
+    if (!gate_w || !up_w || !down_w) return 0;
+
     /* Native MXFP4 routed experts use the vendored MMVQ decode kernels and
      * MMQ matrix kernels. On Blackwell the latter dispatch to FP4 MMA; older
      * CUDA devices use the mathematically equivalent DP4A implementation.
@@ -27456,63 +28118,18 @@ static int routed_moe_launch(
             fprintf(stderr, "ds4: CUDA MXFP4 requires the MMQ backend\n");
             return 0;
         }
-        const uint64_t gate_total =
-            (uint64_t)n_total_expert * gate_expert_bytes;
-        const uint64_t down_total =
-            (uint64_t)n_total_expert * down_expert_bytes;
-        if (gate_total > model_size - gate_offset ||
-            gate_total > model_size - up_offset ||
-            down_total > model_size - down_offset) {
+        /* MMQ lazy initialization may leave this host thread current on a
+         * different physical device.  Do not trust the logical-device cache
+         * after it; select the owner explicitly before any launch. */
+        if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+            cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) {
+            (void)cudaGetLastError();
             return 0;
         }
-
-        const uint64_t slot_count = (uint64_t)n_tokens * n_expert;
-        const int logical_tier = ds4_tensor_device_idx(out);
-        const int use_stream_selected_cache =
-            allow_streaming &&
-            g_ssd_streaming_mode &&
-            g_stream_selected_cache.valid &&
-            g_stream_selected_cache.logical_tier == logical_tier &&
-            g_stream_selected_cache.model_map == model_map &&
-            g_stream_selected_cache.layer == layer_index &&
-            g_stream_selected_cache.n_total_expert == n_total_expert &&
-            g_stream_selected_cache.slot_count >= slot_count &&
-            g_stream_selected_cache.gate_offset == gate_offset &&
-            g_stream_selected_cache.up_offset == up_offset &&
-            g_stream_selected_cache.down_offset == down_offset &&
-            g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
-            g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-            g_stream_selected_cache.gate_ptr &&
-            g_stream_selected_cache.up_ptr &&
-            g_stream_selected_cache.down_ptr &&
-            g_stream_selected_cache.slot_selected_tensor.ptr &&
-            g_stream_selected_cache.slot_selected_tensor.bytes >=
-                slot_count * sizeof(int32_t);
-        if (g_ssd_streaming_mode && allow_streaming &&
-            !use_stream_selected_cache) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming MXFP4 experts are unavailable for layer %u\n",
-                    layer_index);
-            return 0;
-        }
-
-        const ds4_gpu_tensor *mx_selected = use_stream_selected_cache ?
-            &g_stream_selected_cache.slot_selected_tensor : selected;
+        const ds4_gpu_tensor *mx_selected = selected;
         const uint32_t weight_experts = use_stream_selected_cache ?
-            g_stream_selected_cache.compact_count : n_total_expert;
-        const char *gate_w = use_stream_selected_cache ?
-            g_stream_selected_cache.gate_ptr :
-            cuda_resolve_weight_ptr(model_map, gate_offset, gate_total,
-                                    logical_tier, "mxfp4 moe gate");
-        const char *up_w = use_stream_selected_cache ?
-            g_stream_selected_cache.up_ptr :
-            cuda_resolve_weight_ptr(model_map, up_offset, gate_total,
-                                    logical_tier, "mxfp4 moe up");
-        const char *down_w = use_stream_selected_cache ?
-            g_stream_selected_cache.down_ptr :
-            cuda_resolve_weight_ptr(model_map, down_offset, down_total,
-                                    logical_tier, "mxfp4 moe down");
-        if (!gate_w || !up_w || !down_w || weight_experts == 0u) return 0;
+            stream_binding.weight_domain : n_total_expert;
+        if (weight_experts == 0u) return 0;
 
         const cudaStream_t stream =
             n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
@@ -27543,7 +28160,7 @@ static int routed_moe_launch(
                 stream);
             if (rc == 0) {
                 const uint64_t mid_floats =
-                    slot_count * expert_mid_dim;
+                    required_slot_count * expert_mid_dim;
                 moe_mmq_swiglu_weighted_clamp_kernel<<<
                     (uint32_t)((mid_floats + 255u) / 256u), 256, 0, stream>>>(
                     (float *)mid->ptr,
@@ -27559,7 +28176,7 @@ static int routed_moe_launch(
                     (const int32_t *)mx_selected->ptr,
                     (float *)down->ptr,
                     (int)out_dim, (int)expert_mid_dim,
-                    (int)slot_count, (int)weight_experts,
+                    (int)required_slot_count, (int)weight_experts,
                     /*n_expert_used=*/1, stream);
             }
             if (rc == 0) {
@@ -27582,6 +28199,187 @@ static int routed_moe_launch(
                 rc, layer_index, n_tokens);
         return 0;
     }
+
+    /* Opt-in GB10 grouped SSD prefill.  The raw fused entry builds routing
+     * once for gate/up/down over the compact weight domain.  Only its explicit
+     * pre-enqueue NOT_APPLICABLE result may enter the legacy scratch path;
+     * every other error is fenced and fails closed. */
+    const int grouped_enabled = cuda_iq2_ssd_grouped_enabled();
+    const int grouped_required = cuda_iq2_ssd_grouped_required();
+    const int grouped_raw_layout = cuda_iq2_ssd_grouped_raw_layout(
+        gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim);
+    const int grouped_candidate_domain =
+        cuda_iq2_ssd_grouped_candidate_values(
+            iq2_path, g_ssd_streaming_mode, allow_streaming,
+            owned_filtered, n_tokens, n_expert,
+            stream_binding.top6_unique, grouped_raw_layout,
+            use_stream_selected_cache);
+    if (grouped_candidate_domain &&
+        (grouped_enabled || grouped_required)) {
+        g_iq2_ssd_grouped_candidates.fetch_add(
+            1, std::memory_order_relaxed);
+        const cudaStream_t grouped_stream = (cudaStream_t)0;
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        const cudaError_t capture_err =
+            cudaStreamIsCapturing(grouped_stream, &capture);
+        const int capture_active = capture_err != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone;
+        if (capture_err != cudaSuccess) (void)cudaGetLastError();
+        const int tensor_devices_ok = logical_tier == 0 &&
+            ds4_tensor_device_idx(gate) == logical_tier &&
+            ds4_tensor_device_idx(up) == logical_tier &&
+            ds4_tensor_device_idx(mid) == logical_tier &&
+            ds4_tensor_device_idx(down) == logical_tier &&
+            ds4_tensor_device_idx(x) == logical_tier &&
+            ds4_tensor_device_idx(weights) == logical_tier &&
+            stream_binding.selected &&
+            ds4_tensor_device_idx(stream_binding.selected) == logical_tier;
+        /* ds4_mmq_init() may change the thread's physical CUDA device.  It is
+         * part of preflight, and the owner is selected again before waiting
+         * on the upload token or enqueueing the fused pipeline. */
+        const int mmq_ready = cuda_use_mmq();
+        const int eligible = cuda_iq2_ssd_grouped_eligible_values(
+            grouped_enabled,
+            g_ssd_streaming_mode,
+            g_n_gpus == 1 && logical_tier == 0,
+            logical_tier >= 0 && logical_tier < DS4_MAX_GPUS &&
+                g_cuda_is_gb10[logical_tier],
+            g_quality_mode,
+            owned_filtered,
+            capture_active,
+            mmq_ready,
+            n_tokens,
+            n_expert,
+            stream_binding.top6_unique,
+            grouped_raw_layout,
+            use_stream_selected_cache && tensor_devices_ok &&
+                stream_binding.slot_base == 0u &&
+                stream_binding.weight_domain > 0u &&
+                stream_binding.weight_domain <= INT_MAX &&
+                n_tokens <= INT_MAX && n_expert <= INT_MAX &&
+                expert_in_dim <= INT_MAX && expert_mid_dim <= INT_MAX &&
+                out_dim <= INT_MAX &&
+                ((uint64_t)n_tokens * out_dim + 255u) / 256u <=
+                    UINT32_MAX);
+        if (!eligible) {
+            if (grouped_required) {
+                g_iq2_ssd_grouped_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+                g_iq2_ssd_grouped_required_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+                fprintf(stderr,
+                        "ds4: required CUDA IQ2 SSD grouped MMQ is not "
+                        "eligible at layer %u (n_tokens=%u)\n",
+                        layer_index, n_tokens);
+                return 0;
+            }
+            g_iq2_ssd_grouped_safe_fallbacks.fetch_add(
+                1, std::memory_order_relaxed);
+        } else {
+            g_iq2_ssd_grouped_eligible.fetch_add(
+                1, std::memory_order_relaxed);
+            if (cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
+                (void)cudaGetLastError();
+                g_iq2_ssd_grouped_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (grouped_required) {
+                    g_iq2_ssd_grouped_required_failures.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                return 0;
+            }
+            if (stream_binding.upload_event_value != 0) {
+                if (!cuda_stream_selected_wait_upload_on(
+                        stream_binding.upload_event_value,
+                        grouped_stream,
+                        "IQ2 SSD grouped-MMQ upload wait")) {
+                    g_iq2_ssd_grouped_failures.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (grouped_required) {
+                        g_iq2_ssd_grouped_required_failures.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    return 0;
+                }
+                g_iq2_ssd_grouped_upload_waits.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            if (!g_stream_selected_cache.valid ||
+                g_stream_selected_cache.generation !=
+                    stream_binding.generation ||
+                g_stream_selected_cache.upload_event_value !=
+                    stream_binding.upload_event_value) {
+                g_iq2_ssd_grouped_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (grouped_required) {
+                    g_iq2_ssd_grouped_required_failures.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                return 0;
+            }
+            g_iq2_ssd_grouped_attempts.fetch_add(
+                1, std::memory_order_relaxed);
+            int rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+                gate_w, up_w, down_w,
+                (const float *)x->ptr,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                (float *)gate->ptr, (float *)up->ptr,
+                (float *)mid->ptr, (float *)down->ptr,
+                (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
+                (int)n_tokens, (int)stream_binding.weight_domain,
+                (int)n_expert, clamp, grouped_stream);
+            if (rc == DS4_MMQ_NOT_APPLICABLE) {
+                g_iq2_ssd_grouped_not_applicable.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (grouped_required) {
+                    g_iq2_ssd_grouped_failures.fetch_add(
+                        1, std::memory_order_relaxed);
+                    g_iq2_ssd_grouped_required_failures.fetch_add(
+                        1, std::memory_order_relaxed);
+                    fprintf(stderr,
+                            "ds4: required CUDA IQ2 SSD grouped MMQ was "
+                            "not applicable at layer %u\n",
+                            layer_index);
+                    return 0;
+                }
+                g_iq2_ssd_grouped_safe_fallbacks.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                if (rc == 0) {
+                    const uint64_t n = (uint64_t)n_tokens * out_dim;
+                    moe_mmq_sum_kernel<<<
+                        (uint32_t)((n + 255u) / 256u), 256, 0,
+                        grouped_stream>>>(
+                        (float *)out->ptr, (const float *)down->ptr,
+                        NULL, out_dim, n_expert, n_tokens,
+                        /*guard_nonfinite=*/1);
+                    rc = cuda_ok(cudaGetLastError(),
+                                 "IQ2 SSD grouped moe sum launch") ? 0 : -1;
+                }
+                if (rc != 0) {
+                    g_iq2_ssd_grouped_failures.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (grouped_required) {
+                        g_iq2_ssd_grouped_required_failures.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    fprintf(stderr,
+                            "ds4: CUDA IQ2 SSD grouped MMQ failed closed "
+                            "with rc=%d at layer %u\n",
+                            rc, layer_index);
+                    return 0;
+                }
+                g_iq2_ssd_grouped_completed.fetch_add(
+                    1, std::memory_order_relaxed);
+                return 1;
+            }
+        }
+    }
+
     /* mmq routed-MoE prefill tier (ported from the Entrpi/ds4 fork).
      * IQ2_XXS gate/up pair (one shared activation quantize + routing
      * pass) -> SwiGLU + clamp + router weight -> Q2_K down, treating
@@ -27592,12 +28390,11 @@ static int routed_moe_launch(
      * buffers are scratch there too). */
     if (iq2_path && n_tokens > 1u && !owned_filtered && cuda_use_mmq() &&
         !(g_ssd_streaming_mode && allow_streaming)) {
-        const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
-        const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
-        const int mmq_tier = ds4_tensor_device_idx(out);
-        const char *gate_w = cuda_resolve_weight_ptr(model_map, gate_offset, gate_total, mmq_tier, "moe gate mmq");
-        const char *up_w = gate_w ? cuda_resolve_weight_ptr(model_map, up_offset, gate_total, mmq_tier, "moe up mmq") : NULL;
-        const char *down_w = up_w ? cuda_resolve_weight_ptr(model_map, down_offset, down_total, mmq_tier, "moe down mmq") : NULL;
+        if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+            cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
         if (down_w) {
             const uint64_t n_assignments = (uint64_t)n_tokens * n_expert;
             int rc = ds4_mmq_iq2_xxs_moe_pair(
@@ -27654,59 +28451,6 @@ static int routed_moe_launch(
      *                  pairs by expert and uses Q4_K tile8 gate/up + down kernels
      *                  (`DS4_CUDA_MOE_NO_Q4_SORTED=1` restores the older
      *                  token-indexed decode-style prefill kernels). */
-    const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
-    const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
-    if (gate_bytes > model_size - gate_offset ||
-        gate_bytes > model_size - up_offset ||
-        down_bytes > model_size - down_offset) {
-        return 0;
-    }
-    const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
-    const int logical_tier = ds4_tensor_device_idx(out);
-    const int use_stream_selected_cache =
-        allow_streaming &&
-        g_ssd_streaming_mode &&
-        g_stream_selected_cache.valid &&
-        g_stream_selected_cache.logical_tier == logical_tier &&
-        g_stream_selected_cache.model_map == model_map &&
-        g_stream_selected_cache.layer == layer_index &&
-        g_stream_selected_cache.n_total_expert == n_total_expert &&
-        g_stream_selected_cache.slot_count >= required_slot_count &&
-        g_stream_selected_cache.gate_offset == gate_offset &&
-        g_stream_selected_cache.up_offset == up_offset &&
-        g_stream_selected_cache.down_offset == down_offset &&
-        g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
-        g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-        g_stream_selected_cache.gate_ptr &&
-        g_stream_selected_cache.up_ptr &&
-        g_stream_selected_cache.down_ptr &&
-        g_stream_selected_cache.slot_selected_tensor.ptr &&
-        g_stream_selected_cache.slot_selected_tensor.bytes >=
-            required_slot_count * sizeof(int32_t);
-    if (g_ssd_streaming_mode && allow_streaming &&
-        !use_stream_selected_cache) {
-        fprintf(stderr,
-                "ds4: CUDA streaming selected experts are unavailable for layer %u\n",
-                layer_index);
-        return 0;
-    }
-    if (use_stream_selected_cache) {
-        selected = &g_stream_selected_cache.slot_selected_tensor;
-    }
-    const char *gate_w = use_stream_selected_cache ?
-        g_stream_selected_cache.gate_ptr :
-        cuda_resolve_weight_ptr(model_map, gate_offset, gate_bytes,
-                                logical_tier, "moe_gate");
-    const char *up_w = use_stream_selected_cache ?
-        g_stream_selected_cache.up_ptr :
-        cuda_resolve_weight_ptr(model_map, up_offset, gate_bytes,
-                                logical_tier, "moe_up");
-    const char *down_w = use_stream_selected_cache ?
-        g_stream_selected_cache.down_ptr :
-        cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
-                                logical_tier, "moe_down");
-    if (!gate_w || !up_w || !down_w) return 0;
-
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
@@ -29152,6 +29896,85 @@ extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
                    "owned routed_moe packed combine launch");
 }
 
+/* Central lifetime guard for every transient SSD binding consumer.  It is
+ * deliberately outside routed_moe_launch(): all of that function's early
+ * success and error returns then pass through one consume-event publication,
+ * including Q4, MXFP4, grouped IQ2 and the legacy IQ2 fallback. */
+static int cuda_stream_selected_consumer_begin(
+        int allow_streaming, cudaStream_t stream,
+        uint64_t *generation_out) {
+    if (generation_out) *generation_out = 0;
+    if (!allow_streaming || !g_ssd_streaming_mode) {
+        return 1;
+    }
+    if (!generation_out || g_n_gpus != 1 ||
+        cudaSetDevice(g_gpu[0].device_id) != cudaSuccess ||
+        !cuda_stream_selected_consume_prepare()) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    uint64_t generation = 0;
+    uint64_t upload_event = 0;
+    {
+        std::unique_lock<std::mutex> lock(g_stream_selected_consume_mutex);
+        /* A single reusable event represents the whole consume frontier.
+         * Serialize host acquisitions, then chain this consumer behind the
+         * previous record before the event is reused on its stream. */
+        g_stream_selected_consume_cv.wait(lock, [] {
+            return !g_stream_selected_writer_active &&
+                   g_stream_selected_consume_host_readers == 0u;
+        });
+        if (!g_stream_selected_cache.valid ||
+            g_stream_selected_cache.generation == 0) {
+            return 0;
+        }
+        if (g_stream_selected_consume_pending) {
+            if (!g_stream_selected_consume_done_event ||
+                g_stream_selected_consume_owner_device !=
+                    g_gpu[0].device_id) {
+                return 0;
+            }
+            const cudaError_t consume_wait = cudaStreamWaitEvent(
+                stream, g_stream_selected_consume_done_event, 0);
+            if (consume_wait != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA compact-cache consumer-chain wait "
+                        "failed: %s\n",
+                        cudaGetErrorString(consume_wait));
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        generation = g_stream_selected_cache.generation;
+        upload_event = g_stream_selected_cache.upload_event_value;
+        g_stream_selected_consume_host_readers++;
+    }
+    if (!cuda_stream_selected_wait_upload_on(
+            upload_event, stream, "selected-cache consumer upload wait")) {
+        std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+        g_stream_selected_consume_host_readers--;
+        g_stream_selected_consume_cv.notify_all();
+        return 0;
+    }
+    *generation_out = generation;
+    return 1;
+}
+
+static int cuda_stream_selected_consumer_end(
+        uint64_t generation, cudaStream_t stream) {
+    if (generation == 0) return 1;
+    const int recorded =
+        cuda_stream_selected_consume_record(generation, stream);
+    {
+        std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+        if (g_stream_selected_consume_host_readers != 0u) {
+            g_stream_selected_consume_host_readers--;
+        }
+        g_stream_selected_consume_cv.notify_all();
+    }
+    return recorded;
+}
+
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t layer_index,
@@ -29160,25 +29983,46 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
         if (!ds4_gpu_add_tensor(out, out, add_in,
                                 (uint32_t)(out->bytes / sizeof(float)))) return 0;
     }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1, force_resident ? 0 : 1, 0);
+    const int allow_streaming = force_resident ? 0 : 1;
+    const cudaStream_t stream = cuda_decode_stream();
+    uint64_t consume_generation = 0;
+    if (!cuda_stream_selected_consumer_begin(
+            allow_streaming, stream, &consume_generation)) return 0;
+    const int rc = routed_moe_launch(
+        out, gate, up, mid, down, model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim,
+        selected, weights, n_total_expert, n_expert, clamp, x,
+        layer_index, 1, allow_streaming, 0);
+    if (!cuda_stream_selected_consumer_end(consume_generation, stream)) {
+        return 0;
+    }
+    return rc;
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     if (mid_is_f16) *mid_is_f16 = false;
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens, force_resident ? 0 : 1, 0);
+    const int allow_streaming = force_resident ? 0 : 1;
+    const cudaStream_t stream = n_tokens == 1u
+        ? cuda_decode_stream() : (cudaStream_t)0;
+    uint64_t consume_generation = 0;
+    if (!cuda_stream_selected_consumer_begin(
+            allow_streaming, stream, &consume_generation)) return 0;
+    const int rc = routed_moe_launch(
+        out, gate, up, mid, down, model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim,
+        selected, weights, n_total_expert, n_expert, clamp, x,
+        layer_index, n_tokens, allow_streaming, 0);
+    if (!cuda_stream_selected_consumer_end(consume_generation, stream)) {
+        return 0;
+    }
+    return rc;
 }
 
 extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
@@ -29934,7 +30778,7 @@ static int cuda_stream_selected_cache_begin_load_impl(
         int *submitted_any_out) {
     if (upload_event_out) *upload_event_out = 0;
     if (submitted_any_out) *submitted_any_out = 0;
-    cuda_stream_selected_cache_invalidate();
+    cuda_stream_selected_writer_guard writer;
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
         slot_count == 0) {
@@ -29984,6 +30828,17 @@ static int cuda_stream_selected_cache_begin_load_impl(
         }
         slot_ids[i] = compact;
     }
+    int top6_unique = (slot_count % 6u) == 0u;
+    for (uint32_t base = 0; top6_unique && base < slot_count; base += 6u) {
+        for (uint32_t i = 0; top6_unique && i < 6u; i++) {
+            for (uint32_t j = i + 1u; j < 6u; j++) {
+                if (selected_ids[base + i] == selected_ids[base + j]) {
+                    top6_unique = 0;
+                    break;
+                }
+            }
+        }
+    }
     if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
     const uint64_t compact_count = compact_ids.size();
     if (compact_count > UINT64_MAX / table->gate_expert_bytes ||
@@ -29998,8 +30853,23 @@ static int cuda_stream_selected_cache_begin_load_impl(
          g_stream_selected_cache.up_ptr ||
          g_stream_selected_cache.down_ptr ||
          g_stream_selected_cache.slot_selected_ptr)) {
-        cuda_stream_selected_cache_release();
+        if (!cuda_stream_selected_cache_free_storage_writer()) return 0;
     }
+    const uint64_t remap_bytes = (uint64_t)slot_count * sizeof(int32_t);
+    const int resize_binding =
+        (g_stream_selected_cache.gate_ptr &&
+         g_stream_selected_cache.gate_capacity < gate_bytes) ||
+        (g_stream_selected_cache.up_ptr &&
+         g_stream_selected_cache.up_capacity < gate_bytes) ||
+        (g_stream_selected_cache.down_ptr &&
+         g_stream_selected_cache.down_capacity < down_bytes) ||
+        (g_stream_selected_cache.slot_selected_ptr &&
+         g_stream_selected_cache.slot_selected_capacity < remap_bytes);
+    if (resize_binding && !cuda_stream_selected_consume_drain()) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
+    if (resize_binding) cuda_stream_selected_upload_drain();
     if (ds4_gpu_set_current_device(logical_tier) != 0 ||
         !cuda_stream_selected_ensure_bytes(
                 &g_stream_selected_cache.gate_ptr,
@@ -30117,6 +30987,13 @@ static int cuda_stream_selected_cache_begin_load_impl(
         return 0;
     }
     if (!copied) {
+        /* The legacy copy path may use blocking cudaMemcpy before an upload
+         * stream exists.  It therefore needs the host-side lease boundary;
+         * the batched path imports the same event directly into its stream. */
+        if (!cuda_stream_selected_consume_drain()) {
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
         g_stream_selected_batch_io_legacy++;
         for (uint32_t i = 0; i < compact_ids.size(); i++) {
             const uint64_t expert = (uint32_t)compact_ids[i];
@@ -30165,6 +31042,14 @@ static int cuda_stream_selected_cache_begin_load_impl(
     g_stream_selected_cache.n_total_expert = table->n_total_expert;
     g_stream_selected_cache.slot_count = slot_count;
     g_stream_selected_cache.compact_count = (uint32_t)compact_count;
+    g_stream_selected_cache.slot_base = 0;
+    g_stream_selected_cache.weight_domain = (uint32_t)compact_count;
+    g_stream_selected_cache.top6_unique = top6_unique;
+    uint64_t generation = ++g_stream_selected_cache_generation;
+    if (generation == 0) generation = ++g_stream_selected_cache_generation;
+    g_stream_selected_cache.generation = generation;
+    g_stream_selected_cache.upload_event_value =
+        upload_event_out ? *upload_event_out : 0;
     g_stream_selected_cache.gate_offset = table->gate_offset;
     g_stream_selected_cache.up_offset = table->up_offset;
     g_stream_selected_cache.down_offset = table->down_offset;
@@ -30176,7 +31061,10 @@ static int cuda_stream_selected_cache_begin_load_impl(
         (uint64_t)slot_count * sizeof(int32_t);
     g_stream_selected_cache.slot_selected_tensor.owner = 0;
     g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
-    g_stream_selected_cache.valid = 1;
+    /* Publish all binding metadata atomically with respect to consumer
+     * acquisition.  The upload itself may still be in flight; its exact
+     * completion token is part of the metadata guarded by this release. */
+    writer.publish_valid();
     return 1;
 }
 
@@ -37225,6 +38113,12 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 
 extern "C" int ds4_gpu_stream_expert_cache_wait_selected_upload(
         uint64_t event_value, const char *label) {
+    return cuda_stream_selected_wait_upload_on(
+        event_value, cuda_decode_stream(), label);
+}
+
+static int cuda_stream_selected_wait_upload_on(
+        uint64_t event_value, cudaStream_t stream, const char *label) {
     if (event_value == 0) return 1;
     if (event_value != g_stream_selected_upload_event_value ||
         !g_stream_selected_upload_done_event ||
@@ -37238,7 +38132,7 @@ extern "C" int ds4_gpu_stream_expert_cache_wait_selected_upload(
         return 0;
     }
     const cudaError_t err = cudaStreamWaitEvent(
-        cuda_decode_stream(), g_stream_selected_upload_done_event, 0);
+        stream, g_stream_selected_upload_done_event, 0);
     if (err != cudaSuccess) {
         fprintf(stderr,
                 "ds4: CUDA %s failed: %s\n",
@@ -37253,15 +38147,16 @@ extern "C" int ds4_gpu_stream_expert_cache_wait_selected_upload(
 }
 
 extern "C" int ds4_gpu_cuda_stream_selected_event_abort(void) {
+    /* Stop new consumers and wait until every routed caller has published
+     * its consume frontier before the device-wide abort drain. */
+    cuda_stream_selected_writer_guard writer;
     int device = g_stream_selected_event_owner_device;
     if (device < 0 && g_n_gpus == 1) device = g_gpu[0].device_id;
     if (device >= 0 && cudaSetDevice(device) != cudaSuccess) {
         (void)cudaGetLastError();
-        cuda_stream_selected_cache_invalidate();
         return 0;
     }
     const cudaError_t err = cudaDeviceSynchronize();
-    cuda_stream_selected_cache_invalidate();
     uint64_t compute_value = ++g_stream_selected_compute_event_value;
     if (compute_value == 0) ++g_stream_selected_compute_event_value;
     uint64_t upload_value = ++g_stream_selected_upload_event_value;
@@ -37274,6 +38169,286 @@ extern "C" int ds4_gpu_cuda_stream_selected_event_abort(void) {
         return 0;
     }
     return 1;
+}
+
+__global__ static void cuda_stream_selected_lease_delay_store_kernel(
+        int32_t *dst, int32_t value, uint64_t delay_clocks) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint64_t begin = clock64();
+    while (clock64() - begin < delay_clocks) {
+        __nanosleep(64u);
+    }
+    *dst = value;
+}
+
+/* End-to-end compact-binding protocol oracle.  It publishes generation A
+ * through the real begin_load_impl call site, acquires it through the real
+ * consumer and binding helpers, then starts a second writer.  A probe inside
+ * guard proves that writer B is waiting while reader A is held.  Once A
+ * records consume_done, B imports that event into the nonblocking upload
+ * stream, overwrites the remap, and publishes generation B before upload
+ * completion.  A second consumer validates both generation and upload token.
+ * fails if writer exclusion, publish_valid(), consume record/wait, generation
+ * matching, or upload completion are bypassed. */
+extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
+    if (g_n_gpus != 1 ||
+        cudaSetDevice(g_gpu[0].device_id) != cudaSuccess ||
+        !cuda_stream_selected_consume_drain() ||
+        !cuda_stream_selected_consume_prepare()) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const int saved_ssd_streaming_mode = g_ssd_streaming_mode;
+    const int saved_model_fd = g_model_fd;
+    const void *saved_model_fd_host_base = g_model_fd_host_base;
+    const int saved_model_direct_fd = g_model_direct_fd;
+    const uint64_t saved_model_direct_align = g_model_direct_align;
+    const uint64_t saved_model_file_size = g_model_file_size;
+    cuda_stream_selected_cache_release();
+    {
+        cuda_stream_selected_writer_guard writer;
+        g_ssd_streaming_mode = 1;
+    }
+    /* Force begin_load_impl through its host-map copy contract regardless of
+     * any model fd configured by a surrounding process.  No saved descriptor
+     * is closed; the exact globals are restored at the single cleanup exit. */
+    g_model_fd = -1;
+    g_model_fd_host_base = NULL;
+    g_model_direct_fd = -1;
+    g_model_direct_align = 1;
+
+    unsigned char *test_model = NULL;
+    int32_t *host_words = NULL;
+    const uint64_t expert_bytes = 16u;
+    const uint32_t weight_domain = 6u;
+    const uint32_t test_total_expert = 8u;
+    const uint64_t full_table_bytes =
+        expert_bytes * test_total_expert;
+    const uint64_t test_gate_offset = 0u;
+    const uint64_t test_up_offset = full_table_bytes;
+    const uint64_t test_down_offset = 2u * full_table_bytes;
+    const uint64_t test_model_bytes = 3u * full_table_bytes;
+    g_model_file_size = test_model_bytes;
+    int ok = cuda_stream_selected_stage_pool_alloc(4096u) &&
+             cuda_stream_selected_event_pipeline_ensure() &&
+             cudaMallocHost((void **)&test_model,
+                            (size_t)test_model_bytes) == cudaSuccess &&
+             cudaMallocHost((void **)&host_words,
+                            3u * sizeof(*host_words)) == cudaSuccess;
+    if (!ok) (void)cudaGetLastError();
+    if (ok) {
+        for (uint64_t i = 0; i < test_model_bytes; i++) {
+            test_model[i] = (unsigned char)(i * 29u + 7u);
+        }
+        host_words[0] = 0x13572468;
+        host_words[1] = 0x24681357;
+        host_words[2] = 0;
+    }
+
+    const void *test_model_map = test_model;
+    const uint32_t test_layer = 0x7f00u;
+    const int32_t selected_ids[6] = {0, 1, 2, 3, 4, 5};
+    ds4_gpu_stream_expert_table table = {};
+    table.model_map = test_model_map;
+    table.model_size = test_model_bytes;
+    table.layer = test_layer;
+    table.n_total_expert = test_total_expert;
+    table.gate_offset = test_gate_offset;
+    table.up_offset = test_up_offset;
+    table.down_offset = test_down_offset;
+    table.gate_expert_bytes = expert_bytes;
+    table.down_expert_bytes = expert_bytes;
+    if (ok) {
+        ok = cuda_stream_selected_cache_begin_load_impl(
+            &table, selected_ids, weight_domain,
+            /*upload_event_out=*/NULL,
+            /*submitted_any_out=*/NULL);
+    }
+    const uint64_t generation_a = ok
+        ? g_stream_selected_cache.generation : 0;
+    if (ok && (!g_stream_selected_cache.valid || generation_a == 0 ||
+               g_stream_selected_cache.upload_event_value != 0 ||
+               g_stream_selected_cache.weight_domain != weight_domain)) {
+        ok = 0;
+    }
+
+    uint64_t reader_generation = 0;
+    int reader_held = 0;
+    cuda_stream_selected_binding binding_a = {};
+    if (ok) {
+        ok = cuda_stream_selected_consumer_begin(
+                 /*allow_streaming=*/1, (cudaStream_t)0,
+                 &reader_generation) &&
+             reader_generation == generation_a;
+        reader_held = reader_generation != 0;
+    }
+    if (ok) {
+        ok = cuda_stream_selected_binding_acquire(
+                 &binding_a, 0, test_model_map, test_layer,
+                 test_total_expert,
+                 test_gate_offset, test_up_offset, test_down_offset,
+                 expert_bytes, expert_bytes, weight_domain) &&
+             binding_a.generation == generation_a &&
+             binding_a.weight_domain == weight_domain &&
+             binding_a.selected &&
+             binding_a.selected->ptr ==
+                 g_stream_selected_cache.slot_selected_ptr;
+    }
+    if (ok) {
+        /* A is deliberately longer than writer B's 1M-clock store.  If B
+         * omits the consume fence it writes first and A restores sentinel A;
+         * with the fence B cannot start until A has completed. */
+        cuda_stream_selected_lease_delay_store_kernel<<<1, 1, 0, 0>>>(
+            (int32_t *)binding_a.selected->ptr,
+            host_words[0], 50000000u);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+
+    uint64_t generation_b = ++g_stream_selected_cache_generation;
+    if (generation_b == 0) {
+        generation_b = ++g_stream_selected_cache_generation;
+    }
+    std::atomic<int> writer_waiting{0};
+    std::atomic<int> writer_acquired{0};
+    std::atomic<int> writer_published{0};
+    std::atomic<int> writer_ok{1};
+    std::thread writer_thread;
+    if (reader_held) {
+        try {
+            writer_thread = std::thread([&] {
+                cuda_stream_selected_writer_guard writer(&writer_waiting);
+                writer_acquired.store(1, std::memory_order_release);
+                int local_ok =
+                    cudaSetDevice(g_gpu[0].device_id) == cudaSuccess &&
+                    cuda_stream_selected_consume_wait_on_upload();
+                if (local_ok) {
+                    /* Keep publication observably ahead of upload completion.
+                     * Without consumer B's upload-token wait, its default-
+                     * stream read runs after consume A but during this delay
+                     * and deterministically observes sentinel A. */
+                    cuda_stream_selected_lease_delay_store_kernel<<<
+                        1, 1, 0, g_stream_selected_upload_stream>>>(
+                        g_stream_selected_cache.slot_selected_ptr,
+                        host_words[1], 1000000u);
+                    local_ok = cudaGetLastError() == cudaSuccess;
+                }
+                if (local_ok) {
+                    local_ok = cudaEventRecord(
+                        g_stream_selected_upload_done_event,
+                        g_stream_selected_upload_stream) == cudaSuccess;
+                }
+                if (local_ok) {
+                    uint64_t upload_value =
+                        ++g_stream_selected_upload_event_value;
+                    if (upload_value == 0) {
+                        upload_value =
+                            ++g_stream_selected_upload_event_value;
+                    }
+                    g_stream_selected_cache.generation = generation_b;
+                    g_stream_selected_cache.upload_event_value =
+                        upload_value;
+                    writer.publish_valid();
+                    writer_published.store(1, std::memory_order_release);
+                } else {
+                    (void)cudaGetLastError();
+                }
+                writer_ok.store(local_ok, std::memory_order_release);
+            });
+        } catch (...) {
+            ok = 0;
+        }
+    }
+
+    if (writer_thread.joinable()) {
+        uint32_t yields = 0;
+        while (!writer_waiting.load(std::memory_order_acquire) &&
+               yields++ < 1000000u) {
+            std::this_thread::yield();
+        }
+        /* waiting is set while the writer owns the protocol mutex, before
+         * its predicate wait.  With reader A held, acquired must still be 0
+         * and generation A must remain the published binding. */
+        if (!writer_waiting.load(std::memory_order_acquire) ||
+            writer_acquired.load(std::memory_order_acquire) ||
+            !g_stream_selected_cache.valid ||
+            g_stream_selected_cache.generation != generation_a) {
+            ok = 0;
+        }
+    }
+
+    if (reader_held) {
+        if (!cuda_stream_selected_consumer_end(
+                reader_generation, (cudaStream_t)0)) {
+            ok = 0;
+        }
+        reader_held = 0;
+    }
+    if (writer_thread.joinable()) writer_thread.join();
+    if (!writer_ok.load(std::memory_order_acquire) ||
+        !writer_acquired.load(std::memory_order_acquire) ||
+        !writer_published.load(std::memory_order_acquire) ||
+        !g_stream_selected_cache.valid ||
+        g_stream_selected_cache.generation != generation_b) {
+        ok = 0;
+    }
+
+    uint64_t reader_generation_b = 0;
+    cuda_stream_selected_binding binding_b = {};
+    int reader_b_held = 0;
+    if (writer_published.load(std::memory_order_acquire)) {
+        const int began = cuda_stream_selected_consumer_begin(
+            /*allow_streaming=*/1, (cudaStream_t)0,
+            &reader_generation_b);
+        reader_b_held = reader_generation_b != 0;
+        if (!began || reader_generation_b != generation_b ||
+            !cuda_stream_selected_binding_acquire(
+                &binding_b, 0, test_model_map, test_layer,
+                test_total_expert,
+                test_gate_offset, test_up_offset, test_down_offset,
+                expert_bytes, expert_bytes, weight_domain) ||
+            binding_b.generation != generation_b ||
+            binding_b.upload_event_value == 0) {
+            ok = 0;
+        } else if (cudaMemcpyAsync(
+                       &host_words[2], binding_b.selected->ptr,
+                       sizeof(host_words[2]), cudaMemcpyDeviceToHost,
+                       (cudaStream_t)0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            ok = 0;
+        }
+    }
+    if (reader_b_held) {
+        if (!cuda_stream_selected_consumer_end(
+                reader_generation_b, (cudaStream_t)0)) {
+            ok = 0;
+        }
+        reader_b_held = 0;
+    }
+    if (cudaStreamSynchronize((cudaStream_t)0) != cudaSuccess ||
+        !host_words || host_words[2] != host_words[1]) {
+        (void)cudaGetLastError();
+        ok = 0;
+    }
+
+    if (!ok) {
+        (void)cudaGetLastError();
+        (void)cudaDeviceSynchronize();
+    }
+    cuda_stream_selected_cache_release();
+    if (test_model) (void)cudaFreeHost(test_model);
+    if (host_words) (void)cudaFreeHost(host_words);
+    cuda_stream_selected_stage_release();
+    {
+        cuda_stream_selected_writer_guard writer;
+        g_ssd_streaming_mode = saved_ssd_streaming_mode;
+    }
+    g_model_fd = saved_model_fd;
+    g_model_fd_host_base = saved_model_fd_host_base;
+    g_model_direct_fd = saved_model_direct_fd;
+    g_model_direct_align = saved_model_direct_align;
+    g_model_file_size = saved_model_file_size;
+    return ok;
 }
 
 /* Device-backed ordering oracle for CI/DGX bring-up.  It exercises the same
@@ -37417,9 +38592,11 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+    cuda_stream_selected_writer_guard writer;
     g_ssd_streaming_mode = enabled ? 1 : 0;
-    cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+    if (!g_ssd_streaming_mode) {
+        (void)cuda_stream_selected_cache_free_storage_writer();
+    }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -37435,8 +38612,10 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
-        g_stream_selected_cache.compact_count : 0;
+    std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+    return !g_stream_selected_writer_active &&
+           g_stream_selected_cache.valid
+        ? g_stream_selected_cache.compact_count : 0;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {

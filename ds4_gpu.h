@@ -320,6 +320,23 @@ typedef struct ds4_cuda_stream_selected_event_pipeline_report {
     int required;
     int oracle;
 } ds4_cuda_stream_selected_event_pipeline_report;
+typedef struct ds4_cuda_iq2_ssd_grouped_report {
+    uint64_t candidates;
+    uint64_t eligible;
+    uint64_t attempts;
+    uint64_t completed;
+    uint64_t not_applicable;
+    uint64_t safe_fallbacks;
+    uint64_t failures;
+    uint64_t required_failures;
+    uint64_t upload_waits;
+    uint64_t lease_waits;
+    uint64_t lease_records;
+    uint64_t lease_drains;
+    int enabled;
+    int required;
+    int stats;
+} ds4_cuda_iq2_ssd_grouped_report;
 /* CUDA-only policy/planner/scatter hooks.  The policy hook takes explicit
  * values so tests do not need to mutate process environment around once_flag
  * initialization. */
@@ -339,6 +356,27 @@ int ds4_cuda_test_stream_selected_event_pipeline(void);
 int ds4_cuda_test_stream_selected_owner_device(void);
 void ds4_cuda_stream_selected_event_pipeline_get_report(
         ds4_cuda_stream_selected_event_pipeline_report *report);
+int ds4_cuda_test_iq2_ssd_grouped_policy(
+        int enable, int disable, int require, int stats,
+        int *enabled_out, int *required_out, int *stats_out);
+int ds4_cuda_test_iq2_ssd_grouped_eligibility(
+        int enabled, int ssd_streaming, int single_gpu, int gb10,
+        int quality, int owned_filtered, int capture, int mmq,
+        uint32_t n_tokens, uint32_t n_expert, int top6_unique,
+        int raw_layout, int binding_valid);
+int ds4_cuda_test_iq2_ssd_grouped_candidate(
+        int iq2_path, int ssd_streaming, int allow_streaming,
+        int owned_filtered, uint32_t n_tokens, uint32_t n_expert,
+        int top6_unique, int raw_layout, int binding_valid);
+int ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim,
+        uint32_t out_dim);
+int ds4_cuda_test_iq2_ssd_grouped_lease(void);
+void ds4_cuda_iq2_ssd_grouped_get_report(
+        ds4_cuda_iq2_ssd_grouped_report *report);
 int ds4_gpu_cuda_stream_selected_event_pipeline_enabled(void);
 int ds4_gpu_cuda_stream_selected_event_pipeline_required(void);
 int ds4_gpu_cuda_stream_selected_set_owner_device(void);
