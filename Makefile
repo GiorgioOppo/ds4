@@ -63,7 +63,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-metal-q4-streams test-metal-exactn-oracle test-metal-dspark-capture test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-cuda test-mmq-parity-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-exactn-oracle test-metal-dspark-capture test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-cuda test-mmq-parity-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -75,6 +75,7 @@ help:
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
+	@echo "  make test-metal-session-batch-ssd  Exact-logit Metal SSD union control/candidate oracle"
 	@echo "  make test-metal-q4-streams  Check resident Q4 Metal stream overlap"
 	@echo "  make test-metal-exactn-oracle  Compare Metal exact-N state with sequential decode"
 	@echo "  make test-metal-dspark-capture  Check fused DSpark HC capture bitwise"
@@ -114,6 +115,32 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
+
+test-metal-session-batch-ssd: tests/test_metal_session_batch
+	env -u DS4_METAL_ENABLE_Q4_SSD_SESSION_UNION \
+		-u DS4_METAL_REQUIRE_EXACT_ROWS_PERSISTENT_CACHE \
+		-u DS4_TEST_SSD_UNION_POLICY_SWITCH \
+		DS4_METAL_DISABLE_Q4_SSD_SESSION_UNION=1 \
+		DS4_METAL_REQUIRE_Q4_SSD_SESSION_UNION=1 \
+		DS4_METAL_DISABLE_EXACT_ROWS_PERSISTENT_CACHE=1 \
+		DS4_TEST_SSD_STREAMING=1 DS4_TEST_SESSION_COUNT=5 \
+		DS4_TEST_SSD_CACHE_EXPERTS="$(DS4_TEST_SSD_CACHE_EXPERTS)" \
+		DS4_TEST_SESSION_BATCH_TIMING=1 \
+		DS4_TEST_SESSION_BATCH_ARM=control \
+		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" \
+		./tests/test_metal_session_batch
+	env -u DS4_METAL_DISABLE_Q4_SSD_SESSION_UNION \
+		-u DS4_METAL_ENABLE_Q4_SSD_SESSION_UNION \
+		-u DS4_METAL_DISABLE_EXACT_ROWS_PERSISTENT_CACHE \
+		DS4_METAL_REQUIRE_Q4_SSD_SESSION_UNION=1 \
+		DS4_METAL_REQUIRE_EXACT_ROWS_PERSISTENT_CACHE=1 \
+		DS4_TEST_SSD_STREAMING=1 DS4_TEST_SESSION_COUNT=5 \
+		DS4_TEST_SSD_UNION_POLICY_SWITCH=1 \
+		DS4_TEST_SSD_CACHE_EXPERTS="$(DS4_TEST_SSD_CACHE_EXPERTS)" \
+		DS4_TEST_SESSION_BATCH_TIMING=1 \
+		DS4_TEST_SESSION_BATCH_ARM=candidate \
+		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" \
+		./tests/test_metal_session_batch
 
 tests/test_metal_q4_streams.o: tests/test_metal_q4_streams.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ $<

@@ -5,6 +5,7 @@
  */
 
 #include "ds4.h"
+#include "ds4_gpu.h"
 #include "ds4_tp.h"
 
 #include <float.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_SESSION_COUNT 16
@@ -29,6 +31,17 @@ static const char *prompts[MAX_SESSION_COUNT] = {
     "Give a compact example of hexadecimal notation.",
     "Describe one invariant of a binary search tree.",
 };
+
+static bool env_flag(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static double monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
 
 static void fail(const char *what, int session, int step) {
     fprintf(stderr, "FAIL: %s session=%d step=%d\n", what, session, step);
@@ -69,6 +82,22 @@ static int session_count_from_env(void) {
         exit(1);
     }
     return (int)count;
+}
+
+static uint32_t ssd_cache_experts_from_env(void) {
+    const char *value = getenv("DS4_TEST_SSD_CACHE_EXPERTS");
+    if (!value || !value[0]) return 30u;
+    char *end = NULL;
+    unsigned long count = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || count < 30ul ||
+        count > (unsigned long)UINT32_MAX) {
+        fprintf(stderr,
+                "FAIL: invalid DS4_TEST_SSD_CACHE_EXPERTS=%s "
+                "(expected 30..%u)\n",
+                value, UINT32_MAX);
+        exit(1);
+    }
+    return (uint32_t)count;
 }
 
 static void archive_logits(ds4_session *session, float *dst, int vocab,
@@ -115,6 +144,26 @@ int main(void) {
     }
     setenv("DS4_METAL_SESSION_BATCH_LOG", "1", 1);
     const int session_count = session_count_from_env();
+    const bool ssd_streaming = env_flag("DS4_TEST_SSD_STREAMING");
+    const uint32_t ssd_cache_experts =
+        ssd_streaming ? ssd_cache_experts_from_env() : 0u;
+    const bool batch_timing = env_flag("DS4_TEST_SESSION_BATCH_TIMING");
+    const bool ssd_union_policy_switch =
+        env_flag("DS4_TEST_SSD_UNION_POLICY_SWITCH");
+    const char *batch_arm = getenv("DS4_TEST_SESSION_BATCH_ARM");
+    if (!batch_arm || !batch_arm[0]) batch_arm = "unspecified";
+    if (ssd_streaming && session_count < 5) {
+        fprintf(stderr,
+                "FAIL: DS4_TEST_SSD_STREAMING needs "
+                "DS4_TEST_SESSION_COUNT=5 to cover N=2..5\n");
+        return 1;
+    }
+    if (ssd_union_policy_switch && !ssd_streaming) {
+        fprintf(stderr,
+                "FAIL: DS4_TEST_SSD_UNION_POLICY_SWITCH requires "
+                "DS4_TEST_SSD_STREAMING=1\n");
+        return 1;
+    }
 
     const char *tp_mode = getenv("DS4_TEST_TP_MODE");
     const bool tp_leader = tp_mode && strcmp(tp_mode, "leader") == 0;
@@ -123,13 +172,33 @@ int main(void) {
         fprintf(stderr, "FAIL: invalid DS4_TEST_TP_MODE=%s\n", tp_mode);
         return 1;
     }
+    if (ssd_streaming && (tp_leader || tp_worker)) {
+        fprintf(stderr,
+                "FAIL: DS4_TEST_SSD_STREAMING does not support TP mode\n");
+        return 1;
+    }
     const int tp_port = tp_port_from_env();
     ds4_engine_options opt = {
         .model_path = model,
         .backend = DS4_BACKEND_METAL,
         .n_threads = 1,
         .context_size = TEST_CTX,
+        .prefill_chunk = ssd_streaming ? 128u : 0u,
+        .ssd_streaming_cache_experts = ssd_cache_experts,
+        .ssd_streaming = ssd_streaming,
+        .ssd_streaming_cold = ssd_streaming,
+        .placement_session_count_hint = ssd_streaming ? session_count : 0,
+        .share_session_prefill_workspace = ssd_streaming,
     };
+    fprintf(stderr,
+            "test_metal_session_batch setup mode=%s arm=%s sessions=%d "
+            "cache_experts=%u cold=%d shared_workspace=%d\n",
+            ssd_streaming ? "ssd" : "resident",
+            batch_arm,
+            session_count,
+            opt.ssd_streaming_cache_experts,
+            opt.ssd_streaming_cold ? 1 : 0,
+            opt.share_session_prefill_workspace ? 1 : 0);
     if (tp_leader) {
         opt.tp.role = DS4_TP_LEADER;
         opt.tp.listen_host = getenv("DS4_TEST_TP_LISTEN_HOST");
@@ -232,7 +301,13 @@ int main(void) {
     float *actual = malloc((size_t)vocab * sizeof(float));
     int *argmax = malloc(frontier_count * sizeof(int));
     int generated[MAX_SESSION_COUNT][DECODE_STEPS];
+    int final_pos[MAX_SESSION_COUNT] = {0};
     if (!expected || !actual || !argmax) fail("oracle allocation", -1, -1);
+    for (int i = 0; i < MAX_SESSION_COUNT; i++) {
+        for (int step = 0; step < DECODE_STEPS; step++) {
+            generated[i][step] = -1;
+        }
+    }
 
 #define FRONTIER(step_, session_) \
     ((size_t)(step_) * (size_t)session_count + (size_t)(session_))
@@ -243,20 +318,43 @@ int main(void) {
         argmax[f] = ds4_session_argmax(batched[i]);
     }
 
+    double batch_ms = 0.0;
+    uint64_t batch_rows_total = 0;
+    uint32_t ssd_rows_coverage = 0;
+    ds4_gpu_exact_rows_persistent_report exact_before = {0};
+    ds4_gpu_exact_rows_persistent_report exact_after = {0};
+    if (ssd_streaming) {
+        ds4_gpu_test_exact_rows_persistent_report(&exact_before);
+    }
     for (int step = 0; step < DECODE_STEPS; step++) {
+        if (ssd_union_policy_switch && step == DECODE_STEPS / 2) {
+            if (unsetenv("DS4_METAL_REQUIRE_Q4_SSD_SESSION_UNION") != 0 ||
+                setenv("DS4_METAL_ENABLE_Q4_SSD_SESSION_UNION", "1", 1) != 0) {
+                fail("SSD union policy switch", -1, step);
+            }
+            fprintf(stderr,
+                    "test_metal_session_batch policy-switch step=%d "
+                    "REQUIRE=unset ENABLE=1\n",
+                    step);
+        }
+        const int batch_rows = ssd_streaming ? 2 + step % 4 : session_count;
         ds4_decode_item items[MAX_SESSION_COUNT];
-        for (int row = 0; row < session_count; row++) {
-            int i = (step & 1) ? session_count - 1 - row : row;
+        for (int row = 0; row < batch_rows; row++) {
+            int i = (step & 1) ? batch_rows - 1 - row : row;
             int token = ds4_session_argmax(batched[i]);
             generated[i][step] = token;
             items[row].session = batched[i];
             items[row].token = token;
         }
-        if (ds4_sessions_eval_batch(items, session_count,
+        const double batch_t0 = batch_timing ? monotonic_ms() : 0.0;
+        if (ds4_sessions_eval_batch(items, batch_rows,
                                     err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: batch step=%d: %s\n", step, err);
             return 1;
         }
+        if (batch_timing) batch_ms += monotonic_ms() - batch_t0;
+        batch_rows_total += (uint64_t)batch_rows;
+        if (ssd_streaming) ssd_rows_coverage |= 1u << (uint32_t)batch_rows;
         for (int i = 0; i < session_count; i++) {
             size_t f = FRONTIER(step + 1, i);
             archive_logits(batched[i], expected + f * (size_t)vocab,
@@ -264,10 +362,59 @@ int main(void) {
             argmax[f] = ds4_session_argmax(batched[i]);
         }
     }
+    if (ssd_streaming &&
+        (ssd_rows_coverage & ((1u << 2) | (1u << 3) |
+                              (1u << 4) | (1u << 5))) !=
+            ((1u << 2) | (1u << 3) | (1u << 4) | (1u << 5))) {
+        fail("SSD batch coverage N=2..5", -1, -1);
+    }
+    if (ssd_streaming) {
+        ds4_gpu_test_exact_rows_persistent_report(&exact_after);
+        const uint64_t persistent =
+            exact_after.persistent_calls - exact_before.persistent_calls;
+        const uint64_t transient =
+            exact_after.transient_calls - exact_before.transient_calls;
+        const uint64_t fallbacks =
+            exact_after.persistent_fallbacks -
+            exact_before.persistent_fallbacks;
+        const uint64_t failures =
+            exact_after.persistent_failures - exact_before.persistent_failures;
+        const uint64_t mapped_views =
+            exact_after.mapped_view_calls - exact_before.mapped_view_calls;
+        const int layer_count = ds4_engine_layer_count(engine);
+        const uint64_t expected_persistent = layer_count > 0
+            ? (uint64_t)DECODE_STEPS * (uint64_t)(uint32_t)layer_count
+            : 0u;
+        fprintf(stderr,
+                "test_metal_session_batch exact-cache persistent=%llu "
+                "expected_persistent=%llu "
+                "transient=%llu fallbacks=%llu failures=%llu "
+                "mapped_views=%llu max_unique=%u\n",
+                (unsigned long long)persistent,
+                (unsigned long long)expected_persistent,
+                (unsigned long long)transient,
+                (unsigned long long)fallbacks,
+                (unsigned long long)failures,
+                (unsigned long long)mapped_views,
+                exact_after.max_unique);
+        if (env_flag("DS4_METAL_REQUIRE_EXACT_ROWS_PERSISTENT_CACHE") &&
+            (persistent != expected_persistent || transient != 0u ||
+             fallbacks != 0u || failures != 0u || mapped_views != 0u)) {
+            fail("SSD exact persistent cache coverage", -1, -1);
+        }
+        if (env_flag("DS4_METAL_DISABLE_Q4_SSD_SESSION_UNION") &&
+            env_flag("DS4_METAL_REQUIRE_Q4_SSD_SESSION_UNION") &&
+            (persistent != 0u || transient != 0u || fallbacks != 0u ||
+             failures != 0u || mapped_views != 0u)) {
+            fail("SSD control did not serialize", -1, -1);
+        }
+    }
     for (int i = 0; i < session_count; i++) {
+        final_pos[i] = ds4_session_pos(batched[i]);
         ds4_session_free(batched[i]);
     }
 
+    if (!ssd_streaming) {
     ds4_tokens mixed_prompt = {0};
     ds4_tokens suffix = {0};
     ds4_tokens_copy(&mixed_prompt, &prompt[0]);
@@ -365,6 +512,7 @@ int main(void) {
     free(mixed_expected);
     ds4_tokens_free(&suffix);
     ds4_tokens_free(&mixed_prompt);
+    }
 
     for (int i = 0; i < session_count; i++) {
         ds4_session *control = NULL;
@@ -379,7 +527,7 @@ int main(void) {
             size_t f = FRONTIER(step, i);
             compare_logits(control, expected + f * (size_t)vocab,
                            actual, vocab, argmax[f], i, step);
-            if (step < DECODE_STEPS &&
+            if (step < DECODE_STEPS && generated[i][step] >= 0 &&
                 ds4_session_eval(control, generated[i][step],
                                  err, sizeof(err)) != 0) {
                 fprintf(stderr,
@@ -387,6 +535,9 @@ int main(void) {
                         i, step, err);
                 return 1;
             }
+        }
+        if (ds4_session_pos(control) != final_pos[i]) {
+            fail("final checkpoint", i, DECODE_STEPS);
         }
         ds4_session_free(control);
         ds4_tokens_free(&prompt[i]);
@@ -398,9 +549,30 @@ int main(void) {
     if (tp) (void)ds4_tp_send_stop(tp);
     ds4_engine_close(engine);
     ds4_tp_free(tp);
+    if (batch_timing) {
+        const double rows_per_sec = batch_ms > 0.0
+            ? (double)batch_rows_total * 1000.0 / batch_ms : 0.0;
+        fprintf(stderr,
+                "test_metal_session_batch timing arm=%s batch_ms=%.3f "
+                "rows=%llu steps=%d rows_per_sec=%.3f\n",
+                batch_arm,
+                batch_ms,
+                (unsigned long long)batch_rows_total,
+                DECODE_STEPS,
+                rows_per_sec);
+    }
     fprintf(stderr,
-            "test_metal_session_batch PASS sessions=%d steps=%d mixed_suffix=%d exact_logits=1\n",
-            session_count, DECODE_STEPS, MIXED_SUFFIX_TOKENS);
+            "test_metal_session_batch PASS sessions=%d steps=%d "
+            "mixed_suffix=%d exact_logits=1 mode=%s arm=%s "
+            "ssd_rows=%s batch_rows=%llu batch_ms=%s\n",
+            session_count,
+            DECODE_STEPS,
+            ssd_streaming ? 0 : MIXED_SUFFIX_TOKENS,
+            ssd_streaming ? "ssd" : "resident",
+            batch_arm,
+            ssd_streaming ? "2,3,4,5" : "fixed",
+            (unsigned long long)batch_rows_total,
+            batch_timing ? "reported-above" : "disabled");
     return 0;
 #undef FRONTIER
 }
