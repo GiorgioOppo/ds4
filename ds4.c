@@ -20835,6 +20835,25 @@ static bool metal_graph_use_iq2_selected_async_load(const ds4_gpu_graph *g) {
 
 static bool metal_graph_use_iq2_selected_async_early_commit(
         const ds4_gpu_graph *g) {
+    /* The selected-id event already lets the service thread start the IQ2
+     * expert load while router and shared-expert work remain in one command
+     * buffer.  Keep the historical extra frontier as an explicit rollback
+     * for isolated A/Bs instead of paying it by default. */
+    return g &&
+           g->ssd_streaming &&
+#ifndef DS4_ROCM_BUILD
+           getenv("DS4_METAL_ENABLE_IQ2_SELECTED_ASYNC_EARLY_COMMIT") != NULL &&
+           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
+#else
+           false;
+#endif
+}
+
+static bool metal_graph_use_selected_async_early_commit_legacy(
+        const ds4_gpu_graph *g) {
+    /* MXFP4 and native CUDA were not part of the IQ2 Metal scheduling A/B.
+     * Preserve their established default while the IQ2-only rollback above
+     * selects the merged Metal boundary. */
     return g &&
            g->ssd_streaming &&
 #ifndef DS4_ROCM_BUILD
@@ -25208,11 +25227,19 @@ static bool metal_graph_encode_decode_layer_phase(
         if (ok) ok = ds4_gpu_signal_selected_readback_ready(&selected_event) != 0;
         metal_graph_selected_async_load async_load = {0};
         bool async_load_started = false;
+        const bool iq2_metal_merged_boundary =
+            iq2_selected_shared_overlap &&
+            !cuda_selected_shared_overlap;
         const bool async_early_commit =
             async_selected_load &&
-            metal_graph_use_iq2_selected_async_early_commit(g);
+            (iq2_metal_merged_boundary ?
+                 metal_graph_use_iq2_selected_async_early_commit(g) :
+                 metal_graph_use_selected_async_early_commit_legacy(g));
         if (ok && async_selected_load) {
-            ok = metal_graph_selected_async_load_start(&async_load,
+            /* Failure to acquire the optional worker retains the established
+             * synchronous selected-id/load fallback below. */
+            async_load_started =
+                metal_graph_selected_async_load_start(&async_load,
                                                        g,
                                                        model,
                                                        layer,
@@ -25220,9 +25247,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                        selected_event,
                                                        gate_expert_bytes,
                                                        down_expert_bytes);
-            async_load_started = ok;
         }
-        if (ok && async_early_commit) {
+        if (ok && async_early_commit && async_load_started) {
             ok = ds4_gpu_flush_commands() != 0;
         }
         if (ok && fuse_shared_gate_up) {
