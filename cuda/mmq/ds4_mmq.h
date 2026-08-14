@@ -34,6 +34,23 @@ extern "C" {
 int ds4_mmq_init(int device);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
+// Opt-in grouped-MMQ Q8_1 arena controlled by
+// DS4_CUDA_MMQ_Q81_PERSISTENT. Unset and =0 keep the stream-pool path.
+// cleanup drains the owner device before freeing and is safe across reinit;
+// report/counters expose host-dispatch coverage (graph replays excluded).
+int  ds4_mmq_q81_persistent_cleanup(void);
+int  ds4_mmq_q81_persistent_preflight_for_test(int device, size_t required);
+void ds4_mmq_q81_persistent_report(void);
+void ds4_mmq_q81_persistent_counters(
+    uint64_t *candidates,
+    uint64_t *uses,
+    uint64_t *hits,
+    uint64_t *pool_fallbacks,
+    uint64_t *allocations,
+    uint64_t *resizes,
+    size_t   *arena_bytes,
+    size_t   *high_water);
+
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
 //   1 if mmq is faster than dequant+cublas for this shape on this device,
 //   0 otherwise (caller should fall back to its existing dequant+cublas path).

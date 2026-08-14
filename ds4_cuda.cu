@@ -1701,8 +1701,9 @@ static int cuda_use_mmq(void) {
 /* MXFP4 has no dequant+cublas fallback, so it must retain MMQ on multi-GPU
  * placements where the optional Q8/IQ2 prefill tier stays disabled. MMQ
  * resolves the active CUDA device on every call; initialization only warms
- * its device-info singleton. The experimental global persistent scratch is
- * intentionally rejected because one pointer cannot span CUDA devices. */
+ * its device-info singleton. The grouped persistent Q8_1 arena is device-bound
+ * and is never consumed by the MXFP4 wrappers, so it does not constrain this
+ * multi-GPU path. */
 static int cuda_use_mxfp4_mmq(void) {
     static int init = 0;
     static int use = 0;
@@ -1712,10 +1713,6 @@ static int cuda_use_mxfp4_mmq(void) {
         if (s && s[0] == '0') {
             fprintf(stderr,
                     "ds4: DS4_CUDA_MMQ=0 - MXFP4 MMQ disabled\n");
-        } else if (g_n_gpus > 1 &&
-                   getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") != NULL) {
-            fprintf(stderr,
-                    "ds4: persistent MMQ Q8_1 scratch is unavailable with multi-GPU MXFP4\n");
         } else {
             int device = 0;
             if (cudaGetDevice(&device) == cudaSuccess &&

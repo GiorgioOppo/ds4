@@ -831,7 +831,8 @@ __global__ void test_swiglu_weighted_f32(
 // Every token has six distinct experts.  Flattening ids to [assignments, 1]
 // for the reference down leg produces the same stable expert ordering as the
 // single routing map reused by the fused candidate.
-bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
+bool run_iq2_xxs_q2_K_fused_raw_parity(
+        int n_tokens, uint32_t seed, bool persistent_q81 = false) {
     constexpr int global_experts = 13;
     constexpr int compact_experts = 8;
     constexpr int n_expert_used = 6;
@@ -843,11 +844,48 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
     constexpr int out_dim = 768;
     constexpr float clamp = 6.0f;
     const int compact_to_global[compact_experts] = {11, 2, 9, 0, 7, 12, 4, 6};
+    int persistent_device = 0;
+
+    if (persistent_q81) {
+        cudaDeviceProp prop = {};
+        if (cudaGetDevice(&persistent_device) != cudaSuccess ||
+            cudaGetDeviceProperties(&prop, persistent_device) != cudaSuccess ||
+            !prop.integrated || prop.major != 12 || prop.minor != 1) {
+            (void)cudaGetLastError();
+            fprintf(stderr,
+                    "=== IQ2_XXS+Q2_K/FUSED_RAW persistent Q8_1: "
+                    "SKIP (requires integrated sm_121) ===\n\n");
+            return true;
+        }
+    }
 
     fprintf(stderr,
-            "=== IQ2_XXS+Q2_K/FUSED_RAW compact-remap ntok=%d "
+            "=== IQ2_XXS+Q2_K/FUSED_RAW%s compact-remap ntok=%d "
             "nexp=%d nused=%d seed=%u ===\n",
+            persistent_q81 ? "/PERSISTENT_Q81" : "",
             n_tokens, compact_experts, n_expert_used, seed);
+
+    int initial_arena_cleanup = 0;
+    int q81_lazy_init_rc = 0;
+    uint64_t q81_init_allocations0 = 0, q81_init_resizes0 = 0;
+    uint64_t q81_init_allocations1 = 0, q81_init_resizes1 = 0;
+    size_t q81_init_arena0 = 0, q81_init_arena1 = 0;
+    if (persistent_q81) {
+        initial_arena_cleanup = ds4_mmq_q81_persistent_cleanup();
+        ds4_mmq_set_gb10_optimizations(1);
+        ds4_mmq_q81_persistent_counters(
+            nullptr, nullptr, nullptr, nullptr,
+            &q81_init_allocations0, &q81_init_resizes0,
+            &q81_init_arena0, nullptr);
+        setenv("DS4_CUDA_MMQ_Q81_PERSISTENT", "1", 1);
+        q81_lazy_init_rc = ds4_mmq_init(persistent_device);
+        ds4_mmq_q81_persistent_counters(
+            nullptr, nullptr, nullptr, nullptr,
+            &q81_init_allocations1, &q81_init_resizes1,
+            &q81_init_arena1, nullptr);
+        // A real `=0` dispatch below is the value-aware opt-out oracle.
+        setenv("DS4_CUDA_MMQ_Q81_PERSISTENT", "0", 1);
+    }
 
     std::mt19937 rng(seed);
     std::normal_distribution<float> activation(0.0f, 0.05f);
@@ -938,7 +976,8 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
     float *d_gate_global = nullptr, *d_up_global = nullptr,
           *d_mid_global = nullptr, *d_down_global = nullptr;
 
-    bool allocated = cudaStreamCreate(&stream) == cudaSuccess &&
+    bool allocated = (persistent_q81 ||
+                      cudaStreamCreate(&stream) == cudaSuccess) &&
         cudaMalloc(&d_gate_w, gate_compact.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
         cudaMalloc(&d_up_w, up_compact.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
         cudaMalloc(&d_down_w, down_compact.size() * sizeof(block_q2_K)) == cudaSuccess &&
@@ -986,6 +1025,10 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
         if (d_up_w) cudaFree(d_up_w);
         if (d_gate_w) cudaFree(d_gate_w);
         if (stream) cudaStreamDestroy(stream);
+        if (persistent_q81) {
+            unsetenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
+            ds4_mmq_set_gb10_optimizations(0);
+        }
     };
     if (!allocated) {
         fprintf(stderr, "fused raw parity allocation failed\nFAIL\n\n");
@@ -1082,11 +1125,31 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
         d_down_w, d_mid_ref, d_ids, d_down_ref,
         out_dim, expert_mid_dim, (int)assignments, compact_experts,
         /*n_expert_used=*/1, stream);
+    uint64_t q81_candidates0 = 0, q81_uses0 = 0, q81_hits0 = 0;
+    uint64_t q81_fallbacks0 = 0, q81_allocations0 = 0, q81_resizes0 = 0;
+    size_t q81_arena0 = 0, q81_high_water0 = 0;
+    uint64_t q81_candidates_off = 0, q81_uses_off = 0, q81_hits_off = 0;
+    uint64_t q81_fallbacks_off = 0, q81_allocations_off = 0;
+    uint64_t q81_resizes_off = 0;
+    size_t q81_arena_off = 0, q81_high_water_off = 0;
+    if (persistent_q81) {
+        ds4_mmq_q81_persistent_counters(
+            &q81_candidates0, &q81_uses0, &q81_hits0,
+            &q81_fallbacks0, &q81_allocations0, &q81_resizes0,
+            &q81_arena0, &q81_high_water0);
+    }
     const int rc_fused = ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
         d_gate_w, d_up_w, d_down_w, d_x, d_ids, d_router,
         d_gate_got, d_up_got, d_mid_got, d_down_got,
         expert_mid_dim, expert_in_dim, out_dim,
         n_tokens, compact_experts, n_expert_used, clamp, stream);
+    if (persistent_q81) {
+        ds4_mmq_q81_persistent_counters(
+            &q81_candidates_off, &q81_uses_off, &q81_hits_off,
+            &q81_fallbacks_off, &q81_allocations_off, &q81_resizes_off,
+            &q81_arena_off, &q81_high_water_off);
+        setenv("DS4_CUDA_MMQ_Q81_PERSISTENT", "1", 1);
+    }
     // Run the same fused path against the original global expert table and
     // unremapped ids.  Bitwise equality with the compact result validates the
     // full-expert copies and, with the multi-block shape above, both raw
@@ -1097,6 +1160,25 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
         d_gate_global, d_up_global, d_mid_global, d_down_global,
         expert_mid_dim, expert_in_dim, out_dim,
         n_tokens, global_experts, n_expert_used, clamp, stream);
+    // Traverse the real acquire/grow path with a deterministic requirement
+    // just above the lazy minimum.  This drains the first dispatch before
+    // retiring its arena without making the parity fixture itself enormous.
+    constexpr size_t q81_growth_required =
+        4u * 1024u * 1024u + 257u;
+    const int rc_q81_grow = persistent_q81
+        ? ds4_mmq_q81_persistent_preflight_for_test(
+              persistent_device, q81_growth_required)
+        : 0;
+    // The second identical dispatch must reuse the same owned arena and raises
+    // the hit counter; default-stream order makes overwriting its Q8 input safe.
+    const int rc_global_reuse = persistent_q81
+        ? ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+              d_gate_global_w, d_up_global_w, d_down_global_w,
+              d_x, d_global_ids, d_router,
+              d_gate_global, d_up_global, d_mid_global, d_down_global,
+              expert_mid_dim, expert_in_dim, out_dim,
+              n_tokens, global_experts, n_expert_used, clamp, stream)
+        : 0;
 
     std::vector<float> gate_ref(mid_count), up_ref(mid_count),
                        mid_ref(mid_count), down_ref(down_count);
@@ -1130,6 +1212,71 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
                     down_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
     sync_err = cudaStreamSynchronize(stream);
 
+    uint64_t q81_candidates1 = 0, q81_uses1 = 0, q81_hits1 = 0;
+    uint64_t q81_fallbacks1 = 0, q81_allocations1 = 0, q81_resizes1 = 0;
+    size_t q81_arena1 = 0, q81_high_water1 = 0;
+    if (persistent_q81) {
+        ds4_mmq_q81_persistent_counters(
+            &q81_candidates1, &q81_uses1, &q81_hits1,
+            &q81_fallbacks1, &q81_allocations1, &q81_resizes1,
+            &q81_arena1, &q81_high_water1);
+        ds4_mmq_q81_persistent_report();
+    }
+    const size_t q81_growth_aligned =
+        (q81_growth_required + 255u) & ~(size_t)255u;
+    const bool q81_counters_ok = !persistent_q81 ||
+        (q81_lazy_init_rc == 0 &&
+         q81_init_allocations1 == q81_init_allocations0 &&
+         q81_init_resizes1 == q81_init_resizes0 &&
+         q81_init_arena0 == 0 && q81_init_arena1 == 0 &&
+         q81_candidates_off == q81_candidates0 &&
+         q81_uses_off == q81_uses0 && q81_hits_off == q81_hits0 &&
+         q81_fallbacks_off == q81_fallbacks0 &&
+         q81_allocations_off == q81_allocations0 &&
+         q81_resizes_off == q81_resizes0 &&
+         q81_arena_off == 0 &&
+         q81_candidates1 - q81_candidates_off == 3u &&
+         q81_uses1 - q81_uses_off == 3u &&
+         q81_hits1 - q81_hits_off == 1u &&
+         q81_fallbacks1 == q81_fallbacks_off &&
+         q81_allocations1 - q81_allocations_off == 2u &&
+         q81_resizes1 - q81_resizes_off == 1u &&
+         q81_arena1 == q81_growth_aligned &&
+         q81_high_water1 >= q81_growth_required &&
+         q81_high_water1 >= q81_high_water0);
+    if (persistent_q81) {
+        fprintf(stderr,
+                "q81 persistent lazy_init=%d arena=%zu->%zu alloc=%llu->%llu "
+                "resize=%llu->%llu "
+                "delta(off c/u/h/f/a/r)=%llu/%llu/%llu/%llu/%llu/%llu "
+                "delta(on c/u/h/f/a/r)=%llu/%llu/%llu/%llu/%llu/%llu "
+                "arena=%zu high=%zu\n",
+                q81_lazy_init_rc, q81_init_arena0, q81_init_arena1,
+                (unsigned long long)q81_init_allocations0,
+                (unsigned long long)q81_init_allocations1,
+                (unsigned long long)q81_init_resizes0,
+                (unsigned long long)q81_init_resizes1,
+                (unsigned long long)(q81_candidates_off - q81_candidates0),
+                (unsigned long long)(q81_uses_off - q81_uses0),
+                (unsigned long long)(q81_hits_off - q81_hits0),
+                (unsigned long long)(q81_fallbacks_off - q81_fallbacks0),
+                (unsigned long long)(q81_allocations_off - q81_allocations0),
+                (unsigned long long)(q81_resizes_off - q81_resizes0),
+                (unsigned long long)(q81_candidates1 - q81_candidates_off),
+                (unsigned long long)(q81_uses1 - q81_uses_off),
+                (unsigned long long)(q81_hits1 - q81_hits_off),
+                (unsigned long long)(q81_fallbacks1 - q81_fallbacks_off),
+                (unsigned long long)(q81_allocations1 - q81_allocations_off),
+                (unsigned long long)(q81_resizes1 - q81_resizes_off),
+                q81_arena1, q81_high_water1);
+    }
+    int final_arena_cleanup = 0;
+    if (persistent_q81) {
+        unsetenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
+        final_arena_cleanup = ds4_mmq_q81_persistent_cleanup();
+        ds4_mmq_set_gb10_optimizations(0);
+    }
+
     const auto mismatches = [](const std::vector<float> & a,
                                const std::vector<float> & b) {
         size_t bad = 0;
@@ -1148,15 +1295,20 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
     const size_t down_remap_bad = mismatches(down_got, down_global_out);
     const bool ok = na_ok && rc_pair == 0 && swiglu_err == cudaSuccess &&
         rc_down == 0 && rc_fused == 0 && rc_global == 0 &&
+        rc_global_reuse == 0 && rc_q81_grow == 0 &&
+        initial_arena_cleanup == 0 &&
+        final_arena_cleanup == 0 && q81_counters_ok &&
         sync_err == cudaSuccess && gate_bad == 0 && up_bad == 0 &&
         mid_bad == 0 && down_bad == 0 && gate_remap_bad == 0 &&
         up_remap_bad == 0 && mid_remap_bad == 0 && down_remap_bad == 0;
     fprintf(stderr,
             "rc_na=%d canary=%s rc_pair=%d swiglu=%s rc_down=%d "
-            "rc_fused=%d rc_global=%d mismatches(g/u/m/d)=%zu/%zu/%zu/%zu "
+            "rc_fused=%d rc_global=%d rc_grow=%d rc_reuse=%d "
+            "mismatches(g/u/m/d)=%zu/%zu/%zu/%zu "
             "remap_mismatches(g/u/m/d)=%zu/%zu/%zu/%zu sync=%s\n%s\n\n",
-            rc_na, na_ok ? "intact" : "FAILED", rc_pair,
+        rc_na, na_ok ? "intact" : "FAILED", rc_pair,
             cudaGetErrorString(swiglu_err), rc_down, rc_fused, rc_global,
+            rc_q81_grow, rc_global_reuse,
             gate_bad, up_bad, mid_bad, down_bad,
             gate_remap_bad, up_remap_bad, mid_remap_bad, down_remap_bad,
             cudaGetErrorString(sync_err), ok ? "PASS" : "FAIL");
@@ -1863,6 +2015,8 @@ int main(int argc, char ** argv) {
     all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/8,   0xC2F008);
     all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/32,  0xC2F020);
     all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/128, 0xC2F080);
+    all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(
+        /*nt=*/32, 0xC2F021, /*persistent_q81=*/true);
 
     // Step 6 - mmvq vector matmul tests.
     //

@@ -29,7 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstring>
+#include <mutex>
 
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
@@ -100,19 +100,38 @@ private:
 // Init
 // ----------------------------------------------------------------------------
 
-// Step 7 task #29: experimental persistent Q8_1 scratch buffer. CUDA graph
-// memory nodes already preserve the allocation's virtual address for the
-// lifetime of the graph, so the ordinary same-stream pool path is correct.
-// This startup allocation is instead an optimization experiment: it removes
-// captured alloc/free nodes and their allocator/instantiation overhead. When
-// DS4_CUDA_MMQ_Q81_PERSISTENT=1 is set, ds4_mmq_moe_vec_impl uses this buffer
-// instead of pool_alloc.
-//
-// Sized for V4 Flash decode shapes: gate Q8_1 ~8 KB, down Q8_1 ~14 KB.
-// 256 KB allocation gives generous headroom for short prefill batches.
+// Experimental persistent Q8_1 scratch.  The grouped raw prefill path below
+// aliases its input and down-Q8 staging in this arena: both ranges have the
+// same layout but disjoint lifetimes on the default stream.  The feature stays
+// opt-in because a process-global address is only safe for the single-owner
+// GB10 dispatch covered by q81_grouped_persistent_acquire().
 static void *g_q81_scratch_ptr   = nullptr;
 static size_t g_q81_scratch_bytes = 0;
-static bool   g_q81_scratch_enabled = false;
+// A failed resize retirement can leave both allocations live.  Keep the
+// unpublished replacement owned here so cleanup/reinit can retry its free.
+static void *g_q81_unpublished_replacement_ptr = nullptr;
+// Older vector wrappers still contain a generic persistent branch.  Keep that
+// branch disabled: unlike grouped fused_raw it has no default-stream lease or
+// capture exclusion and therefore cannot safely share the owned arena.
+static constexpr bool g_q81_scratch_enabled = false;
+static bool   g_q81_grouped_enabled = false;
+static bool   g_q81_scratch_poisoned = false;
+static int    g_q81_scratch_device = -1;
+static std::mutex g_q81_scratch_mutex;
+
+static uint64_t g_q81_grouped_candidates;
+static uint64_t g_q81_grouped_uses;
+static uint64_t g_q81_grouped_hits;
+static uint64_t g_q81_grouped_pool_fallbacks;
+static uint64_t g_q81_grouped_allocations;
+static uint64_t g_q81_grouped_resizes;
+static uint64_t g_q81_grouped_owner_rejects;
+static uint64_t g_q81_grouped_stream_rejects;
+static uint64_t g_q81_grouped_capture_rejects;
+static uint64_t g_q81_grouped_device_rejects;
+static uint64_t g_q81_grouped_size_rejects;
+static size_t   g_q81_grouped_high_water;
+
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_aligned_q81_scratch_device = -1;
@@ -135,6 +154,162 @@ struct mmq_pair_map_scratch {
 static mmq_pair_map_scratch g_mmq_pair_maps[GGML_CUDA_MAX_DEVICES] = {};
 static int    g_gb10_optimizations = 0;
 
+static constexpr size_t DS4_MMQ_Q81_ARENA_MIN_BYTES = 4u * 1024u * 1024u;
+
+enum q81_arena_result {
+    Q81_ARENA_REJECTED = 0,
+    Q81_ARENA_HIT,
+    Q81_ARENA_ALLOCATED,
+    Q81_ARENA_RESIZED,
+};
+
+static bool q81_persistent_requested() {
+    const char *value = getenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
+    if (!value || value[0] == '\0' || strcmp(value, "0") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+        strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+    return strcmp(value, "1") == 0 ||
+           strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+           strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+           strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0;
+}
+
+static bool q81_is_gb10_owner(int device) {
+    if (!g_gb10_optimizations || device < 0 ||
+        device >= ggml_cuda_info().device_count) {
+        return false;
+    }
+    const auto &info = ggml_cuda_info().devices[device];
+    return info.integrated && info.cc == GGML_CUDA_CC_DGX_SPARK;
+}
+
+static q81_arena_result q81_arena_ensure_locked(int device, size_t required) {
+    if (g_q81_scratch_poisoned || required > SIZE_MAX - 255u ||
+        (g_q81_scratch_ptr && g_q81_scratch_device != device)) {
+        return Q81_ARENA_REJECTED;
+    }
+    if (g_q81_scratch_ptr && required <= g_q81_scratch_bytes) {
+        g_q81_grouped_enabled = true;
+        return Q81_ARENA_HIT;
+    }
+
+    const size_t aligned = (required + 255u) & ~(size_t)255u;
+    const size_t bytes = aligned > DS4_MMQ_Q81_ARENA_MIN_BYTES
+        ? aligned : DS4_MMQ_Q81_ARENA_MIN_BYTES;
+    void *replacement = nullptr;
+    cudaError_t err = cudaMalloc(&replacement, bytes);
+    if (err != cudaSuccess || !replacement) {
+        fprintf(stderr,
+                "ds4_mmq: cudaMalloc(persistent Q8_1 arena %zu B) failed: %s; "
+                "using stream pool\n",
+                bytes, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return Q81_ARENA_REJECTED;
+    }
+
+    if (g_q81_scratch_ptr) {
+        /* The lease excludes another host submission and the persistent path
+         * only accepts the legacy default stream.  Drain the device before
+         * retiring the old address: allocation succeeds before any state is
+         * changed, so OOM leaves the previous arena usable.  A drain/free
+         * failure is different -- pointer liveness is ambiguous and the
+         * feature stays poisoned until explicit cleanup. */
+        err = cudaDeviceSynchronize();
+        if (err == cudaSuccess) {
+            err = cudaFree(g_q81_scratch_ptr);
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4_mmq: persistent Q8_1 arena resize from %zu B to "
+                    "%zu B failed while retiring the old arena: %s; "
+                    "persistent reuse poisoned\n",
+                    g_q81_scratch_bytes, bytes, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            const cudaError_t replacement_free_err = cudaFree(replacement);
+            if (replacement_free_err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4_mmq: freeing unpublished Q8_1 replacement "
+                        "failed: %s\n",
+                        cudaGetErrorString(replacement_free_err));
+                (void)cudaGetLastError();
+                g_q81_unpublished_replacement_ptr = replacement;
+            }
+            g_q81_grouped_enabled = false;
+            g_q81_scratch_poisoned = true;
+            return Q81_ARENA_REJECTED;
+        }
+    }
+
+    const bool resized = g_q81_scratch_ptr != nullptr;
+    g_q81_scratch_ptr = replacement;
+    g_q81_scratch_bytes = bytes;
+    g_q81_scratch_device = device;
+    g_q81_grouped_enabled = true;
+    g_q81_grouped_allocations++;
+    if (resized) g_q81_grouped_resizes++;
+    fprintf(stderr,
+            "ds4_mmq: persistent Q8_1 arena %s (%zu B at %p, device %d)\n",
+            resized ? "resized" : "enabled", bytes,
+            g_q81_scratch_ptr, device);
+    return resized ? Q81_ARENA_RESIZED : Q81_ARENA_ALLOCATED;
+}
+
+// On success, lease remains locked until the complete host dispatch has been
+// submitted.  A following dispatch therefore cannot interleave its writes;
+// default-stream ordering protects the device-side lifetime after unlock.
+static char *q81_grouped_persistent_acquire(
+        int device, cudaStream_t stream, size_t required,
+        std::unique_lock<std::mutex> *lease) {
+    if (!lease || !q81_persistent_requested()) return nullptr;
+    lease->lock();
+    g_q81_grouped_candidates++;
+    if (required > g_q81_grouped_high_water) {
+        g_q81_grouped_high_water = required;
+    }
+    if (!q81_is_gb10_owner(device)) {
+        g_q81_grouped_device_rejects++;
+    } else if (stream != (cudaStream_t)0) {
+        g_q81_grouped_stream_rejects++;
+    } else {
+        int active_device = -1;
+        const cudaError_t device_err = cudaGetDevice(&active_device);
+        if (device_err != cudaSuccess || active_device != device ||
+            (g_q81_scratch_device >= 0 &&
+             g_q81_scratch_device != device)) {
+            (void)cudaGetLastError();
+            g_q81_grouped_owner_rejects++;
+        } else {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            const cudaError_t capture_err =
+                cudaStreamIsCapturing(stream, &capture);
+            if (capture_err != cudaSuccess ||
+                capture != cudaStreamCaptureStatusNone) {
+                (void)cudaGetLastError();
+                g_q81_grouped_capture_rejects++;
+            } else {
+                const q81_arena_result arena =
+                    q81_arena_ensure_locked(device, required);
+                if (arena != Q81_ARENA_REJECTED &&
+                    g_q81_grouped_enabled && !g_q81_scratch_poisoned &&
+                    required <= g_q81_scratch_bytes) {
+                    g_q81_grouped_uses++;
+                    if (arena == Q81_ARENA_HIT) g_q81_grouped_hits++;
+                    return (char *)g_q81_scratch_ptr;
+                }
+                if (g_q81_scratch_ptr && required > g_q81_scratch_bytes) {
+                    g_q81_grouped_size_rejects++;
+                }
+            }
+        }
+    }
+    g_q81_grouped_pool_fallbacks++;
+    lease->unlock();
+    return nullptr;
+}
+
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
     g_aligned_q81_scratch_bytes = ptr ? bytes : 0;
@@ -149,15 +324,41 @@ static void *ds4_mmq_aligned_q81_scratch(int device, size_t bytes) {
         ? g_aligned_q81_scratch_ptr : nullptr;
 }
 
-// Read by ds4_mmq_moe_vec_impl; non-zero means use the persistent buffer.
-// Set by ds4_mmq_init once based on env.  (Single-threaded GPU work; no
-// atomicity needed.)
+// Legacy generic-scratch ABI.  It must stay false: the grouped arena has a
+// stricter lease contract and callers should inspect its counters/report API.
 extern "C" int ds4_mmq_q81_persistent_enabled(void) {
-    return g_q81_scratch_enabled ? 1 : 0;
+    return 0;
 }
 
 extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
     return g_q81_scratch_ptr;
+}
+
+/* Test-only preflight hook.  It deliberately traverses the production
+ * acquire path (including owner/default-stream/capture checks and resize
+ * retirement) without enqueueing a synthetic large MMQ fixture. */
+extern "C" int ds4_mmq_q81_persistent_preflight_for_test(
+        int device, size_t required) {
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess ||
+        cudaSetDevice(device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    char *arena = nullptr;
+    {
+        std::unique_lock<std::mutex> lease(
+            g_q81_scratch_mutex, std::defer_lock);
+        arena = q81_grouped_persistent_acquire(
+            device, (cudaStream_t)0, required, &lease);
+    }
+    const cudaError_t restore_err = previous != device
+        ? cudaSetDevice(previous) : cudaSuccess;
+    if (restore_err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -2;
+    }
+    return arena ? 0 : -3;
 }
 
 // M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
@@ -467,28 +668,126 @@ extern "C" int ds4_mmq_init(int device) {
         maps.expert_bounds = base + 2u * MMQ_GFX1151_PAIR_MAP_ROWS;
     }
 
-    // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
-    // This happens before layer-graph capture to keep allocator nodes and
-    // their instantiation overhead out of the graph. The ordinary same-stream
-    // cudaMallocAsync path remains correct: CUDA graph memory nodes preserve
-    // their virtual address for the lifetime of the graph.
-    if (getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
-        const size_t bytes = 256 * 1024;
-        cudaError_t err = cudaMalloc(&g_q81_scratch_ptr, bytes);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4_mmq_init: cudaMalloc(q81_scratch %zu B) failed: %s; "
-                            "falling back to pool_alloc\n",
-                    bytes, cudaGetErrorString(err));
-            g_q81_scratch_ptr = nullptr;
-            g_q81_scratch_enabled = false;
-        } else {
-            g_q81_scratch_bytes = bytes;
-            g_q81_scratch_enabled = true;
-            fprintf(stderr, "ds4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
-                    bytes, g_q81_scratch_ptr);
-        }
+    // Allocation is intentionally lazy.  The first eligible grouped dispatch
+    // knows its exact maximum input/down staging requirement and resolves the
+    // arena during preflight, before it submits any device operation.
+    {
+        std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+        const bool requested = q81_persistent_requested();
+        g_q81_grouped_enabled = requested && q81_is_gb10_owner(device) &&
+            g_q81_scratch_ptr && !g_q81_scratch_poisoned &&
+            g_q81_scratch_device == device;
     }
     return 0;
+}
+
+extern "C" int ds4_mmq_q81_persistent_cleanup(void) {
+    std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+    g_q81_grouped_enabled = false;
+    if (!g_q81_scratch_ptr && !g_q81_unpublished_replacement_ptr) {
+        g_q81_scratch_bytes = 0;
+        g_q81_scratch_device = -1;
+        g_q81_scratch_poisoned = false;
+        return 0;
+    }
+
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess ||
+        g_q81_scratch_device < 0 ||
+        cudaSetDevice(g_q81_scratch_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_q81_scratch_poisoned = true;
+        return -1;
+    }
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    cudaError_t arena_free_err = cudaSuccess;
+    cudaError_t replacement_free_err = cudaSuccess;
+    if (sync_err == cudaSuccess) {
+        if (g_q81_scratch_ptr) {
+            arena_free_err = cudaFree(g_q81_scratch_ptr);
+            if (arena_free_err == cudaSuccess) {
+                g_q81_scratch_ptr = nullptr;
+                g_q81_scratch_bytes = 0;
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+        if (g_q81_unpublished_replacement_ptr) {
+            replacement_free_err = cudaFree(
+                g_q81_unpublished_replacement_ptr);
+            if (replacement_free_err == cudaSuccess) {
+                g_q81_unpublished_replacement_ptr = nullptr;
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+    } else {
+        (void)cudaGetLastError();
+    }
+    const cudaError_t restore_err = previous != g_q81_scratch_device
+        ? cudaSetDevice(previous) : cudaSuccess;
+    if (sync_err != cudaSuccess || arena_free_err != cudaSuccess ||
+        replacement_free_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4_mmq: persistent Q8_1 arena cleanup failed: "
+                "sync=%s arena_free=%s replacement_free=%s\n",
+                cudaGetErrorString(sync_err),
+                cudaGetErrorString(arena_free_err),
+                cudaGetErrorString(replacement_free_err));
+        g_q81_scratch_poisoned = true;
+        return -1;
+    }
+    // Both owned allocations are now retired; only now may reinit clear the
+    // poison and admit a new lazy allocation.
+    g_q81_scratch_device = -1;
+    g_q81_scratch_poisoned = false;
+    if (restore_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4_mmq: persistent Q8_1 arena freed, but restoring CUDA "
+                "device %d failed: %s\n",
+                previous, cudaGetErrorString(restore_err));
+        (void)cudaGetLastError();
+        return -2;
+    }
+    return 0;
+}
+
+extern "C" void ds4_mmq_q81_persistent_counters(
+        uint64_t *candidates, uint64_t *uses, uint64_t *hits,
+        uint64_t *pool_fallbacks, uint64_t *allocations, uint64_t *resizes,
+        size_t *arena_bytes, size_t *high_water) {
+    std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+    if (candidates) *candidates = g_q81_grouped_candidates;
+    if (uses) *uses = g_q81_grouped_uses;
+    if (hits) *hits = g_q81_grouped_hits;
+    if (pool_fallbacks) *pool_fallbacks = g_q81_grouped_pool_fallbacks;
+    if (allocations) *allocations = g_q81_grouped_allocations;
+    if (resizes) *resizes = g_q81_grouped_resizes;
+    if (arena_bytes) *arena_bytes = g_q81_scratch_bytes;
+    if (high_water) *high_water = g_q81_grouped_high_water;
+}
+
+extern "C" void ds4_mmq_q81_persistent_report(void) {
+    std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+    fprintf(stderr,
+            "ds4: CUDA MMQ grouped Q8_1 persistent: candidates=%llu "
+            "uses=%llu hits=%llu pool_fallbacks=%llu allocations=%llu "
+            "resizes=%llu "
+            "arena=%zu high_water=%zu rejects(device/owner/stream/capture/size)="
+            "%llu/%llu/%llu/%llu/%llu poisoned=%d\n",
+            (unsigned long long)g_q81_grouped_candidates,
+            (unsigned long long)g_q81_grouped_uses,
+            (unsigned long long)g_q81_grouped_hits,
+            (unsigned long long)g_q81_grouped_pool_fallbacks,
+            (unsigned long long)g_q81_grouped_allocations,
+            (unsigned long long)g_q81_grouped_resizes,
+            g_q81_scratch_bytes, g_q81_grouped_high_water,
+            (unsigned long long)g_q81_grouped_device_rejects,
+            (unsigned long long)g_q81_grouped_owner_rejects,
+            (unsigned long long)g_q81_grouped_stream_rejects,
+            (unsigned long long)g_q81_grouped_capture_rejects,
+            (unsigned long long)g_q81_grouped_size_rejects,
+            g_q81_scratch_poisoned ? 1 : 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -1455,6 +1754,16 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
+    // Past the shared-memory cap the launcher takes the bit-identical global
+    // variant unless the authoritative large-map kill switch rejects it.
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo &&
+        !ds4_mmid_large_enabled()) {
+        fprintf(stderr,
+                "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; "
+                "falling back\n", tag, n_tokens);
+        return -1;
+    }
+
     ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
     ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
@@ -1527,12 +1836,52 @@ int ds4_mmq_moe_pair_impl(
         ids_src1 = (int32_t *)ids_src1_raw;
         ids_dst = (int32_t *)ids_dst_raw;
         expert_bounds = (int32_t *)expert_bounds_raw;
-    } else if (persistent_pair_maps) {
+    }
+
+    /* `fused_raw` is the only grouped path that owns neither aligned weights
+     * nor caller scratch.  Its input Q8 is dead after gate/up, before down Q8
+     * is produced, so one max-sized range can back both phases.  Resolve the
+     * opt-in arena (or allocate its one-block pool fallback) before the first
+     * expert-map enqueue; no mid-pipeline allocation failure can strand a
+     * partially submitted candidate. */
+    const bool grouped_raw_q81 = profile_fused_prefill &&
+        type == GGML_TYPE_IQ2_XXS && fused_down != nullptr &&
+        !direct_gateup_q8 && xa_soa == nullptr && xb_soa == nullptr &&
+        fused_down->W_soa == nullptr;
+    size_t grouped_down_q8_bytes = 0;
+    size_t grouped_q81_required = 0;
+    std::unique_lock<std::mutex> grouped_q81_lease(
+        g_q81_scratch_mutex, std::defer_lock);
+    ggml_cuda_pool_alloc<char> grouped_q81_pool;
+    char *grouped_q81_scratch = nullptr;
+    if (grouped_raw_q81 && q81_persistent_requested()) {
+        const int64_t down_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
+        const size_t tail =
+            (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+        if ((size_t)ne_get_rows > SIZE_MAX / (size_t)down_padded ||
+            (size_t)ne_get_rows * (size_t)down_padded >
+                (SIZE_MAX - tail) / sizeof(block_q8_1)) {
+            return -98;
+        }
+        grouped_down_q8_bytes =
+            (size_t)ne_get_rows * (size_t)down_padded *
+                sizeof(block_q8_1) / QK8_1 + tail;
+        grouped_q81_required = nbytes_src1_q8_1 > grouped_down_q8_bytes
+            ? nbytes_src1_q8_1 : grouped_down_q8_bytes;
+        grouped_q81_scratch = q81_grouped_persistent_acquire(
+            dev, stream, grouped_q81_required, &grouped_q81_lease);
+        if (!grouped_q81_scratch) {
+            grouped_q81_scratch = grouped_q81_pool.alloc(
+                ctx->pool(), grouped_q81_required);
+        }
+    }
+
+    if (persistent_pair_maps) {
         const auto & maps = g_mmq_pair_maps[dev];
         ids_src1 = maps.ids_src1;
         ids_dst = maps.ids_dst;
         expert_bounds = maps.expert_bounds;
-    } else {
+    } else if (!direct_gateup_q8) {
         ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
         ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
         expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
@@ -1540,15 +1889,6 @@ int ds4_mmq_moe_pair_impl(
 
     const int si1  = n_expert_used;
     const int sis1 = 1;
-
-    // Same cap guard as ds4_mmq_moe_impl (see comment there): past the smem
-    // cap the launcher takes the bit-identical global variant (P5); only
-    // refuse with DS4_MMID_LARGE=0.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
-        fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
-                tag, n_tokens);
-        return -1;
-    }
 
     cudaError_t err = cudaSuccess;
     {
@@ -1597,7 +1937,9 @@ int ds4_mmq_moe_pair_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
     char *src1_q8_1 = direct_gateup_q8
         ? (char *)fused_down->input_q8_scratch
-        : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+        : (grouped_q81_scratch
+            ? grouped_q81_scratch
+            : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1));
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -1879,8 +2221,11 @@ int ds4_mmq_moe_pair_impl(
             (size_t)ne_get_rows * (size_t)down_ne10_padded * sizeof(block_q8_1) / QK8_1;
         const size_t tail_q8_bytes =
             (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> down_q8_1(
-            ctx->pool(), logical_q8_bytes + tail_q8_bytes);
+        const size_t down_q8_bytes = logical_q8_bytes + tail_q8_bytes;
+        ggml_cuda_pool_alloc<char> down_q8_1_pool;
+        char *down_q8_1 = grouped_q81_scratch
+            ? grouped_q81_scratch
+            : down_q8_1_pool.alloc(ctx->pool(), down_q8_bytes);
 
         const uint64_t mid_values = (uint64_t)ne_get_rows * (uint64_t)M;
         {
@@ -1888,7 +2233,7 @@ int ds4_mmq_moe_pair_impl(
                     "ds4/prefill/moe/swiglu_down_quant",
                     ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                     nvtx_prefill);
-            ybuf_memset(down_q8_1.get(), logical_q8_bytes + tail_q8_bytes, stream);
+            ybuf_memset(down_q8_1, down_q8_bytes, stream);
             ds4_swiglu_weighted_f32<<<
                 (uint32_t)((mid_values + 255u) / 256u), 256, 0, stream>>>(
                     out_a, out_b, fused_down->router_weights,
@@ -1901,7 +2246,7 @@ int ds4_mmq_moe_pair_impl(
             }
 
             quantize_mmq_q8_1_cuda(
-                fused_down->mid_f32, ids_dst, (void *)down_q8_1.get(),
+                fused_down->mid_f32, ids_dst, (void *)down_q8_1,
                 GGML_TYPE_Q2_K, /*ne00=*/M, /*s01=*/M,
                 /*s02=*/(int64_t)M, /*s03=*/(int64_t)M * ne_get_rows,
                 /*ne0=*/down_ne10_padded, /*ne1=*/ne_get_rows,
@@ -1926,7 +2271,7 @@ int ds4_mmq_moe_pair_impl(
         const mmq_args down_args = {
             /*x=*/(const char *)fused_down->W,
             /*type_x=*/GGML_TYPE_Q2_K,
-            /*y=*/(const int *)down_q8_1.get(),
+            /*y=*/(const int *)down_q8_1,
             /*ids_dst=*/ids_dst,
             /*expert_bounds=*/expert_bounds,
             /*dst=*/fused_down->out,
@@ -1967,7 +2312,7 @@ int ds4_mmq_moe_pair_impl(
                 down_done = ds4_mmq_q2_K_moe_d2r_launch(
                         fused_down->W_soa,
                         fused_down->soa_blocks,
-                        down_q8_1.get(),
+                        down_q8_1,
                         ids_dst,
                         expert_bounds,
                         fused_down->out,
@@ -4883,7 +5228,15 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
 }
 
 extern "C" void ds4_mmq_set_gb10_optimizations(int enabled) {
-    g_gb10_optimizations = enabled != 0;
+    {
+        std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+        g_gb10_optimizations = enabled != 0;
+    }
+    if (!enabled) {
+        // Backend teardown/reinit already funnels through this setter.  Keep
+        // MMQ's owned arena lifecycle local to this translation unit.
+        (void)ds4_mmq_q81_persistent_cleanup();
+    }
 }
 
 // ---------------------------------------------------------------------------
