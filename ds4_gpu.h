@@ -350,6 +350,12 @@ typedef struct ds4_cuda_stream_expert_persistent_report {
     uint64_t overflow_rejects;
     uint64_t oracle_runs;
     uint64_t oracle_failures;
+    uint64_t arena_allocations;
+    uint64_t arena_reuses;
+    uint64_t arena_releases;
+    uint64_t arena_failures;
+    uint64_t arena_oracle_runs;
+    uint64_t arena_oracle_failures;
     int enabled;
     int required;
     int stats;
@@ -401,6 +407,7 @@ int ds4_cuda_test_stream_expert_persistent_policy(
         int *oracle_out);
 int ds4_cuda_test_stream_expert_persistent_env_value(const char *value);
 int ds4_cuda_test_stream_expert_persistent_planner(void);
+int ds4_cuda_test_stream_expert_persistent_arena(void);
 void ds4_cuda_stream_expert_persistent_get_report(
         ds4_cuda_stream_expert_persistent_report *report);
 int ds4_gpu_cuda_stream_selected_event_pipeline_enabled(void);

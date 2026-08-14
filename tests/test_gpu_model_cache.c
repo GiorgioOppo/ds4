@@ -221,6 +221,30 @@ int main(void) {
     }
 
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
+    ds4_gpu_set_streaming_expert_cache_budget(3u);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(40u);
+    CHECK(ds4_gpu_stream_expert_cache_configured_count() == 0u &&
+          ds4_gpu_stream_expert_cache_budget_for_expert_size(16u, 8u) == 0u &&
+          ds4_gpu_stream_expert_cache_current_count() == 0u,
+          "persistent expert arena remains runtime-inert before loader wiring");
+    ds4_cuda_stream_expert_persistent_report arena_before;
+    memset(&arena_before, 0, sizeof(arena_before));
+    ds4_cuda_stream_expert_persistent_get_report(&arena_before);
+    CHECK(ds4_cuda_test_stream_expert_persistent_arena(),
+          "persistent expert device arena allocation/reuse/reinit oracle");
+    ds4_cuda_stream_expert_persistent_report arena_after;
+    memset(&arena_after, 0, sizeof(arena_after));
+    ds4_cuda_stream_expert_persistent_get_report(&arena_after);
+    CHECK(arena_after.arena_allocations >=
+              arena_before.arena_allocations + 2u &&
+          arena_after.arena_reuses > arena_before.arena_reuses &&
+          arena_after.arena_releases >= arena_before.arena_releases + 2u &&
+          arena_after.arena_failures == arena_before.arena_failures &&
+          arena_after.arena_oracle_runs ==
+              arena_before.arena_oracle_runs + 1u &&
+          arena_after.arena_oracle_failures ==
+              arena_before.arena_oracle_failures,
+          "persistent expert device arena coverage counters");
     ds4_cuda_iq2_ssd_grouped_report lease_before;
     memset(&lease_before, 0, sizeof(lease_before));
     ds4_cuda_iq2_ssd_grouped_get_report(&lease_before);
