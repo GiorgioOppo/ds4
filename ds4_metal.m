@@ -504,6 +504,17 @@ typedef struct {
 static ds4_gpu_stream_expert_timing_snapshot g_stream_expert_timing_last_report;
 static int g_stream_prefill_batch_selected_addr_building;
 static int g_glm_stream_expert_addr_table_building;
+/* Coverage-only counters for the IQ2_XXS/Q2_K SSD grouped address-MM path.
+ * They are updated on the host after an otherwise successful routed batch
+ * and never add a command-buffer boundary or GPU synchronization. */
+static int g_iq2_stream_addr_mm_stats_enabled;
+static uint64_t g_iq2_stream_addr_mm_candidate_calls;
+static uint64_t g_iq2_stream_addr_mm_calls;
+static uint64_t g_iq2_stream_addr_mm_tokens;
+static uint64_t g_iq2_stream_addr_mm_rows;
+static uint64_t g_iq2_stream_addr_mm_require_failures;
+static uint32_t g_iq2_stream_addr_mm_min_tokens;
+static uint32_t g_iq2_stream_addr_mm_max_tokens;
 static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
 static int g_glm_model_mode;
@@ -2435,6 +2446,81 @@ static int ds4_gpu_env_bool(const char *name) {
                 name, (int)n, v);
         g_mpp_invalid_env_reported = 1;
     }
+    return 1;
+}
+
+static void ds4_gpu_iq2_stream_addr_mm_stats_reset(void) {
+    g_iq2_stream_addr_mm_candidate_calls = 0;
+    g_iq2_stream_addr_mm_calls = 0;
+    g_iq2_stream_addr_mm_tokens = 0;
+    g_iq2_stream_addr_mm_rows = 0;
+    g_iq2_stream_addr_mm_require_failures = 0;
+    g_iq2_stream_addr_mm_min_tokens = 0;
+    g_iq2_stream_addr_mm_max_tokens = 0;
+}
+
+static void ds4_gpu_iq2_stream_addr_mm_stats_note_candidate(void) {
+    if (g_iq2_stream_addr_mm_stats_enabled) {
+        g_iq2_stream_addr_mm_candidate_calls++;
+    }
+}
+
+static void ds4_gpu_iq2_stream_addr_mm_stats_note_selected(
+        uint32_t n_tokens,
+        uint32_t n_expert) {
+    if (!g_iq2_stream_addr_mm_stats_enabled) return;
+
+    if (g_iq2_stream_addr_mm_calls == 0 ||
+        n_tokens < g_iq2_stream_addr_mm_min_tokens) {
+        g_iq2_stream_addr_mm_min_tokens = n_tokens;
+    }
+    if (n_tokens > g_iq2_stream_addr_mm_max_tokens) {
+        g_iq2_stream_addr_mm_max_tokens = n_tokens;
+    }
+    g_iq2_stream_addr_mm_calls++;
+    g_iq2_stream_addr_mm_tokens += n_tokens;
+    g_iq2_stream_addr_mm_rows += (uint64_t)n_tokens * n_expert;
+}
+
+static void ds4_gpu_iq2_stream_addr_mm_stats_note_require_failure(void) {
+    if (g_iq2_stream_addr_mm_stats_enabled) {
+        g_iq2_stream_addr_mm_require_failures++;
+    }
+}
+
+static void ds4_gpu_iq2_stream_addr_mm_stats_print(void) {
+    if (!g_iq2_stream_addr_mm_stats_enabled) return;
+
+    fprintf(stderr,
+            "ds4: Metal IQ2_XXS SSD prefill MM stats candidates=%llu "
+            "calls=%llu tokens=%llu rows=%llu min_tokens=%u max_tokens=%u "
+            "require_failures=%llu\n",
+            (unsigned long long)g_iq2_stream_addr_mm_candidate_calls,
+            (unsigned long long)g_iq2_stream_addr_mm_calls,
+            (unsigned long long)g_iq2_stream_addr_mm_tokens,
+            (unsigned long long)g_iq2_stream_addr_mm_rows,
+            g_iq2_stream_addr_mm_min_tokens,
+            g_iq2_stream_addr_mm_max_tokens,
+            (unsigned long long)g_iq2_stream_addr_mm_require_failures);
+}
+
+/* Standalone Metal oracle hook. Production code only updates the counters;
+ * the dedicated test reads them without changing path selection. */
+int ds4_gpu_test_iq2_stream_addr_mm_stats(
+        uint64_t *candidate_calls,
+        uint64_t *calls,
+        uint64_t *tokens,
+        uint64_t *rows,
+        uint64_t *require_failures,
+        uint32_t *min_tokens,
+        uint32_t *max_tokens) {
+    if (candidate_calls) *candidate_calls = g_iq2_stream_addr_mm_candidate_calls;
+    if (calls) *calls = g_iq2_stream_addr_mm_calls;
+    if (tokens) *tokens = g_iq2_stream_addr_mm_tokens;
+    if (rows) *rows = g_iq2_stream_addr_mm_rows;
+    if (require_failures) *require_failures = g_iq2_stream_addr_mm_require_failures;
+    if (min_tokens) *min_tokens = g_iq2_stream_addr_mm_min_tokens;
+    if (max_tokens) *max_tokens = g_iq2_stream_addr_mm_max_tokens;
     return 1;
 }
 
@@ -6567,6 +6653,10 @@ typedef struct {
  * while long-context prefill and decode can still pick specialized variants. */
 int ds4_gpu_init(void) {
     if (g_initialized) return 1;
+
+    ds4_gpu_iq2_stream_addr_mm_stats_reset();
+    g_iq2_stream_addr_mm_stats_enabled =
+        ds4_gpu_env_bool("DS4_METAL_IQ2_XXS_SSD_PREFILL_MM_STATS") > 0;
 
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
@@ -10779,7 +10869,11 @@ int ds4_gpu_synchronize(void) {
 }
 
 void ds4_gpu_cleanup(void) {
-    if (!g_initialized) return;
+    if (!g_initialized) {
+        g_iq2_stream_addr_mm_stats_enabled = 0;
+        ds4_gpu_iq2_stream_addr_mm_stats_reset();
+        return;
+    }
 
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
@@ -10795,6 +10889,7 @@ void ds4_gpu_cleanup(void) {
             g_stream_expert_cache_batch_seq = 0;
         }
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
+        ds4_gpu_iq2_stream_addr_mm_stats_print();
         if (ds4_gpu_stream_expert_timing_summary_enabled() &&
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
@@ -11129,6 +11224,8 @@ void ds4_gpu_cleanup(void) {
         g_library = nil;
         g_queue = nil;
         g_device = nil;
+        g_iq2_stream_addr_mm_stats_enabled = 0;
+        ds4_gpu_iq2_stream_addr_mm_stats_reset();
         g_initialized = 0;
     }
 }
@@ -32609,6 +32706,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
 
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_addr_pipeline(uint32_t type) {
     switch (type) {
+    case DS4_METAL_TENSOR_IQ2_XXS:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_addr_iq2_xxs_f32", false);
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_addr_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
@@ -44046,6 +44145,67 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
             g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
 
+        /* IQ2 grouped-MM controls are value-aware. The sparse address-MM
+         * path is the default for eligible IQ2_XXS/Q2_K SSD prefill;
+         * ENABLE=0 is the legacy-MV control, REQUIRE forces coverage, and
+         * the dedicated disable always wins. */
+        const bool require_iq2_batch_addr_mm =
+            ds4_gpu_env_bool("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM") == 1;
+        const int enable_iq2_batch_addr_mm =
+            ds4_gpu_env_bool("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
+        const bool disable_iq2_batch_addr_mm =
+            ds4_gpu_env_bool("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM") == 1;
+        const bool request_iq2_batch_addr_mm =
+            (enable_iq2_batch_addr_mm != 0 || require_iq2_batch_addr_mm) &&
+            !disable_iq2_batch_addr_mm;
+        const bool iq2_batch_addr_mm_candidate =
+            !force_resident && g_ssd_streaming_mode &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            down_type == DS4_METAL_TENSOR_Q2_K &&
+            n_tokens >= 32u && n_expert == 6 &&
+            n_total_expert != 0 &&
+            n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+            g_tp_split_world == 1 &&
+            !g_quality_mode &&
+            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+            !ds4_gpu_stage_profile_enabled_for_layer(
+                "DS4_METAL_MOE_STAGE_PROFILE",
+                "DS4_METAL_MOE_STAGE_PROFILE_LAYER",
+                layer_index) &&
+            getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+        if (iq2_batch_addr_mm_candidate) {
+            ds4_gpu_iq2_stream_addr_mm_stats_note_candidate();
+        }
+        const bool iq2_batch_addr_mm_policy =
+            request_iq2_batch_addr_mm &&
+            iq2_batch_addr_mm_candidate &&
+            use_iq2_batch_selected_addr;
+        id<MTLComputePipelineState> iq2_gate_addr_mm_pipeline =
+            iq2_batch_addr_mm_policy ?
+                ds4_gpu_routed_mm_addr_pipeline(gate_type) : nil;
+        id<MTLComputePipelineState> iq2_down_addr_mm_pipeline =
+            iq2_batch_addr_mm_policy ?
+                ds4_gpu_routed_mm_addr_pipeline(down_type) : nil;
+        const bool use_iq2_batch_addr_mm =
+            iq2_batch_addr_mm_policy &&
+            iq2_gate_addr_mm_pipeline != nil &&
+            iq2_down_addr_mm_pipeline != nil;
+
+        /* REQUIRE only asserts calls that satisfy the specialization's
+         * candidate contract; short final chunks keep the established path. */
+        if (require_iq2_batch_addr_mm &&
+            !disable_iq2_batch_addr_mm &&
+            iq2_batch_addr_mm_candidate &&
+            !use_iq2_batch_addr_mm) {
+            ds4_gpu_iq2_stream_addr_mm_stats_note_require_failure();
+            fprintf(stderr,
+                    "ds4: required Metal IQ2_XXS SSD grouped address-MM path "
+                    "was not selected tokens=%u gate=%u down=%u\n",
+                    n_tokens, gate_type, down_type);
+            return 0;
+        }
+
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
                                           gate_row_bytes, gate_expert_bytes,
@@ -44259,7 +44419,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_down_half_lut_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT) != 0u);
-        if (use_mm_id) {
+        if (use_mm_id || use_iq2_batch_addr_mm) {
             gate_map_args =
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_total_expert, 1, n_expert, n_tokens);
             gate_mm_args =
@@ -44282,9 +44442,13 @@ int ds4_gpu_routed_moe_batch_tensor(
                 use_mxfp4_mm_id_map_scatter ?
                     "kernel_mul_mm_id_map_scatter_work_ne20_6" :
                     ds4_gpu_mul_mm_id_map0_name(n_expert));
-            gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
-            up_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
-            down_mm_pipeline = use_mxfp4_mm_id_down_half_lut ?
+            gate_mm_pipeline = use_iq2_batch_addr_mm ?
+                iq2_gate_addr_mm_pipeline :
+                ds4_gpu_routed_mm_pipeline(gate_type);
+            up_mm_pipeline = gate_mm_pipeline;
+            down_mm_pipeline = use_iq2_batch_addr_mm ?
+                iq2_down_addr_mm_pipeline :
+                use_mxfp4_mm_id_down_half_lut ?
                 ds4_gpu_get_mul_mm_id_pipeline(
                     use_mxfp4_mm_id_down_tail_simdgroup_cull ?
                         "kernel_mul_mm_id_mxfp4_f16_half_lut_tail_cull" :
@@ -44297,7 +44461,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                     ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) :
                     ds4_gpu_routed_mm_pipeline(down_type);
             const int mpp_mask = ds4_gpu_routed_mm_mpp_mask();
-            if (mpp_mask && gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
+            if (!use_iq2_batch_addr_mm &&
+                mpp_mask && gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
                 id<MTLComputePipelineState> mpp =
                     ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32_mpp", false);
                 if (mpp) {
@@ -44305,7 +44470,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                     if (mpp_mask & 2) up_mm_pipeline = mpp;
                 }
             }
-            if ((mpp_mask & 4) && request_mid_f16 &&
+            if (!use_iq2_batch_addr_mm &&
+                (mpp_mask & 4) && request_mid_f16 &&
                 (down_type == DS4_METAL_TENSOR_Q2_K || down_type == DS4_METAL_TENSOR_IQ2_XXS)) {
                 id<MTLComputePipelineState> mpp = ds4_gpu_get_mul_mm_id_pipeline(
                     down_type == DS4_METAL_TENSOR_Q2_K ?
@@ -44522,6 +44688,14 @@ int ds4_gpu_routed_moe_batch_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
+        if (use_iq2_batch_addr_mm && stream_resource_count != 0 &&
+            !ds4_gpu_stream_expert_cache_mark_entries_inflight(
+                stream_resources, stream_resource_count, 0)) {
+            fprintf(stderr,
+                    "ds4: Metal IQ2_XXS SSD grouped address-MM could not pin "
+                    "expert resources for the command buffer\n");
+            return 0;
+        }
         if (use_q4_batch_expert_table && !ds4_gpu_use_model_residency_set(cb)) {
             return 0;
         }
@@ -44538,6 +44712,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const char *moe_stage_filter = getenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
         const char *moe_path =
             use_q4_batch_expert_table ? "q4_table_pair_swiglu" :
+            use_iq2_batch_addr_mm ? "iq2_batch_stream_addr_mm" :
             use_iq2_batch_selected_addr ? "iq2_batch_stream_addr" :
             use_mm_id_pair_swiglu ? "mm_id_pair_swiglu" :
             use_mm_id ? "mm_id" :
@@ -44606,7 +44781,31 @@ int ds4_gpu_routed_moe_batch_tensor(
             n_tokens <= 4u &&
             down_sum6_pipeline != nil;
         int ok = 0;
-        if (use_iq2_batch_selected_addr) {
+        if (use_iq2_batch_addr_mm) {
+            ok = ds4_gpu_encode_mul_mm_id_map(cb,
+                                               map_pipeline,
+                                               &gate_map_args,
+                                               &gate_mm_args,
+                                               selectedbuf,
+                                               ds4_gpu_tensor_offset(selected));
+            DS4_METAL_PROFILE_MOE_STAGE("map");
+            if (ok) {
+                ok = ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
+                        cb, gate_mm_pipeline, &gate_mm_args,
+                        stream_gate_addr_buf,
+                        xbuf, ds4_gpu_tensor_offset(x),
+                        gatebuf, ds4_gpu_tensor_offset(gate),
+                        8192u, stream_resources, stream_resource_count,
+                        0u, stream_overflow_gate) &&
+                     ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
+                        cb, up_mm_pipeline, &gate_mm_args,
+                        stream_up_addr_buf,
+                        xbuf, ds4_gpu_tensor_offset(x),
+                        upbuf, ds4_gpu_tensor_offset(up),
+                        8192u, stream_resources, stream_resource_count,
+                        1u, stream_overflow_up);
+            }
+        } else if (use_iq2_batch_selected_addr) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
                 .rows = pair_rows,
@@ -44844,7 +45043,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_fused_activation &&
             request_mid_f16;
         if (mid_is_f16) *mid_is_f16 = use_mid_f16;
-        if (ok && use_iq2_batch_selected_addr) {
+        if (ok && use_iq2_batch_selected_addr && !use_iq2_batch_addr_mm) {
             /* The address-table pair kernel already wrote weighted SwiGLU rows into mid. */
         } else if (ok && use_q4_batch_expert_table) {
             /* The table pair kernel already wrote weighted SwiGLU rows into mid. */
@@ -44946,7 +45145,22 @@ int ds4_gpu_routed_moe_batch_tensor(
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) :
             (expertsbuf ? ds4_gpu_tensor_offset(experts) : 0);
         if (ok) {
-            if (use_iq2_batch_selected_addr) {
+            if (use_iq2_batch_addr_mm) {
+                ok = ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
+                        cb,
+                        down_mm_pipeline,
+                        &down_mm_args,
+                        stream_down_addr_buf,
+                        midbuf,
+                        ds4_gpu_tensor_offset(mid),
+                        down_dst,
+                        down_dst_off,
+                        8192u,
+                        stream_resources,
+                        stream_resource_count,
+                        2u,
+                        stream_overflow_down);
+            } else if (use_iq2_batch_selected_addr) {
                 ok = ds4_gpu_encode_mul_mv_addr_q2_sum6(
                         cb,
                         g_moe_mul_mv_addr_q2_k_sum6_pipeline,
@@ -45034,7 +45248,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             n_expert > 1 &&
             !direct_down_sum &&
             !use_q4_batch_expert_table &&
-            !use_iq2_batch_selected_addr) {
+            (!use_iq2_batch_selected_addr || use_iq2_batch_addr_mm)) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
                                                        down_dst,
                                                        down_dst_off,
@@ -45077,6 +45291,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                     return 0;
                 }
             }
+        }
+        if (use_iq2_batch_addr_mm) {
+            ds4_gpu_iq2_stream_addr_mm_stats_note_selected(n_tokens, n_expert);
         }
         if (q4_batch_table_boundary) {
             if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
