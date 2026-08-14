@@ -30,6 +30,50 @@ int main(void) {
     int enabled = -1;
     int required = -1;
     int oracle = -1;
+    int fused = -1;
+    int owned_forced = -1;
+    int multi_gpu_forced = -1;
+    int capture = -1;
+    CHECK(!ds4_cuda_test_q8_hc_expand_env_value(NULL) &&
+          !ds4_cuda_test_q8_hc_expand_env_value("") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("0") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("false") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("NO") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("off") &&
+          ds4_cuda_test_q8_hc_expand_env_value("1") &&
+          ds4_cuda_test_q8_hc_expand_env_value("true"),
+          "Q8 HC value-aware environment parser");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 0, 1, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 0 && multi_gpu_forced == 0 &&
+          capture == 0,
+          "Q8 HC defaults to fused");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 1, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 0 && owned_forced == 0 && multi_gpu_forced == 0,
+          "Q8 HC split opt-in on single GPU");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              1, 1, 1, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 0 && multi_gpu_forced == 0,
+          "Q8 HC force-fused dominates conflicting split request");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 2, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 0 && multi_gpu_forced == 1,
+          "Q8 HC multi-GPU remains fused");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 1, 1, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 1 && multi_gpu_forced == 0,
+          "Q8 HC owned dispatch remains fused");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 1, 0, 1, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 0 && capture == 1,
+          "Q8 HC split graph-capture policy matches eager policy");
     CHECK(!ds4_cuda_test_stream_selected_batch_env_value(NULL) &&
           !ds4_cuda_test_stream_selected_batch_env_value("") &&
           !ds4_cuda_test_stream_selected_batch_env_value("0") &&
@@ -221,6 +265,17 @@ int main(void) {
     }
 
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
+    ds4_cuda_q8_hc_expand_report q8_hc_before;
+    memset(&q8_hc_before, 0, sizeof(q8_hc_before));
+    ds4_cuda_q8_hc_expand_get_report(&q8_hc_before);
+    CHECK(ds4_cuda_test_q8_hc_expand_oracle(),
+          "Q8 HC fused/split graph-capture parity oracle");
+    ds4_cuda_q8_hc_expand_report q8_hc_after;
+    memset(&q8_hc_after, 0, sizeof(q8_hc_after));
+    ds4_cuda_q8_hc_expand_get_report(&q8_hc_after);
+    CHECK(q8_hc_after.oracle_runs == q8_hc_before.oracle_runs + 1u &&
+          q8_hc_after.oracle_failures == q8_hc_before.oracle_failures,
+          "Q8 HC oracle coverage counters");
     ds4_gpu_set_streaming_expert_cache_budget(3u);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(40u);
     CHECK(ds4_gpu_stream_expert_cache_configured_count() == 0u &&
