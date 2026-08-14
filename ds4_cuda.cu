@@ -172,12 +172,14 @@ typedef struct {
 } cuda_stream_selected_cache;
 
 static cuda_stream_selected_cache g_stream_selected_cache;
+static void cuda_stream_selected_upload_drain(void);
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
 
 static void cuda_stream_selected_cache_release(void) {
+    cuda_stream_selected_upload_drain();
     const int tier = g_stream_selected_cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
@@ -536,6 +538,18 @@ static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static uint64_t g_stream_selected_stage_align = 1;
 static cudaStream_t g_stream_selected_upload_stream;
+static int g_stream_selected_upload_owner_device = -1;
+static int32_t *g_stream_selected_remap_stage;
+static uint64_t g_stream_selected_remap_stage_capacity;
+static cudaStream_t g_stream_selected_readback_stream;
+static void *g_stream_selected_readback_stage;
+static uint64_t g_stream_selected_readback_stage_capacity;
+static cudaEvent_t g_stream_selected_compute_ready_event;
+static cudaEvent_t g_stream_selected_readback_done_event;
+static cudaEvent_t g_stream_selected_upload_done_event;
+static int g_stream_selected_event_owner_device = -1;
+static uint64_t g_stream_selected_compute_event_value;
+static uint64_t g_stream_selected_upload_event_value;
 static std::once_flag g_stream_selected_batch_io_once;
 static int g_stream_selected_batch_io_enabled;
 static int g_stream_selected_batch_io_required;
@@ -554,8 +568,26 @@ static uint64_t g_stream_selected_batch_io_tasks;
 static uint64_t g_stream_selected_batch_io_segments;
 static uint64_t g_stream_selected_batch_io_reads;
 static uint64_t g_stream_selected_batch_io_bytes;
+static std::once_flag g_stream_selected_event_pipeline_once;
+static int g_stream_selected_event_pipeline_enabled;
+static int g_stream_selected_event_pipeline_required;
+static int g_stream_selected_event_pipeline_oracle;
+static int g_stream_selected_event_pipeline_report_registered;
+static std::atomic<uint64_t> g_stream_selected_event_candidates{0};
+static std::atomic<uint64_t> g_stream_selected_event_signals{0};
+static std::atomic<uint64_t> g_stream_selected_event_readbacks{0};
+static std::atomic<uint64_t> g_stream_selected_event_uploads{0};
+static std::atomic<uint64_t> g_stream_selected_event_compute_waits{0};
+static std::atomic<uint64_t> g_stream_selected_event_safe_fallbacks{0};
+static std::atomic<uint64_t> g_stream_selected_event_failures{0};
+static std::atomic<uint64_t> g_stream_selected_event_required_failures{0};
+static std::atomic<uint64_t> g_stream_selected_event_oracle_runs{0};
+static std::atomic<uint64_t> g_stream_selected_event_oracle_failures{0};
 
 static int cuda_ok(cudaError_t err, const char *what);
+static void cuda_stream_selected_event_pipeline_release(void);
+extern "C" int ds4_gpu_stream_expert_cache_wait_selected_upload(
+        uint64_t event_value, const char *label);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
 static void cuda_decode_graphs_shutdown(void);
 static const char *cuda_model_range_ptr_from_fd(
@@ -2685,7 +2717,30 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
+static void cuda_stream_selected_upload_drain(void) {
+    if (!g_stream_selected_upload_stream) return;
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    if (g_stream_selected_upload_owner_device >= 0) {
+        (void)cudaSetDevice(g_stream_selected_upload_owner_device);
+    }
+    (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+}
+
 static void cuda_stream_selected_stage_release(void) {
+    const int had_upload_stream = g_stream_selected_upload_stream != NULL;
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    if (g_stream_selected_upload_owner_device >= 0) {
+        (void)cudaSetDevice(g_stream_selected_upload_owner_device);
+    }
+    /* Once event publication is enabled, resize/teardown may arrive while
+     * the last H2D epoch is still in flight.  Drain before destroying the
+     * ring events or freeing their pinned payloads. */
+    if (g_stream_selected_upload_stream) {
+        (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+    }
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
             (void)cudaEventDestroy(g_stream_selected_stage_event[i]);
@@ -2699,10 +2754,21 @@ static void cuda_stream_selected_stage_release(void) {
     }
     g_stream_selected_stage_bytes = 0;
     g_stream_selected_stage_align = 1;
+    if (g_stream_selected_remap_stage) {
+        (void)cudaFreeHost(g_stream_selected_remap_stage);
+        g_stream_selected_remap_stage = NULL;
+    }
+    g_stream_selected_remap_stage_capacity = 0;
     if (g_stream_selected_upload_stream) {
         (void)cudaStreamDestroy(g_stream_selected_upload_stream);
         g_stream_selected_upload_stream = NULL;
     }
+    g_stream_selected_upload_owner_device = -1;
+    if (had_upload_stream) {
+        uint64_t value = ++g_stream_selected_upload_event_value;
+        if (value == 0) ++g_stream_selected_upload_event_value;
+    }
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
 }
 
 static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
@@ -2723,6 +2789,11 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
                 "ds4: CUDA streaming selected upload stream creation failed: %s\n",
                 cudaGetErrorString(err));
         (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaGetDevice(&g_stream_selected_upload_owner_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cuda_stream_selected_stage_release();
         return 0;
     }
     for (size_t i = 0; i < 4; i++) {
@@ -2757,6 +2828,39 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
     }
     g_stream_selected_stage_bytes = bytes;
     g_stream_selected_stage_align = align;
+    return 1;
+}
+
+static int cuda_stream_selected_remap_stage_ensure(uint64_t count) {
+    if (count == 0 || count > SIZE_MAX / sizeof(int32_t)) return 0;
+    if (g_stream_selected_remap_stage &&
+        g_stream_selected_remap_stage_capacity >= count) {
+        return 1;
+    }
+    /* The caller invokes this before submitting the new epoch.  The pool
+     * release drains an older epoch before replacing its pinned storage. */
+    if (g_stream_selected_remap_stage) {
+        if (g_stream_selected_upload_stream &&
+            cudaStreamSynchronize(g_stream_selected_upload_stream) !=
+                cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        (void)cudaFreeHost(g_stream_selected_remap_stage);
+        g_stream_selected_remap_stage = NULL;
+        g_stream_selected_remap_stage_capacity = 0;
+    }
+    const size_t bytes = (size_t)count * sizeof(int32_t);
+    cudaError_t err = cudaMallocHost(
+            (void **)&g_stream_selected_remap_stage, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected remap staging allocation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_remap_stage_capacity = count;
     return 1;
 }
 
@@ -2818,6 +2922,11 @@ static int cuda_stream_selected_env_flag(const char *name) {
 }
 
 extern "C" int ds4_cuda_test_stream_selected_batch_env_value(
+        const char *value) {
+    return cuda_stream_selected_env_value_enabled(value);
+}
+
+extern "C" int ds4_cuda_test_stream_selected_event_env_value(
         const char *value) {
     return cuda_stream_selected_env_value_enabled(value);
 }
@@ -2939,6 +3048,267 @@ extern "C" void ds4_cuda_stream_selected_batch_io_get_report(
     out.required = cuda_stream_selected_batch_io_require_requested();
     out.oracle = cuda_stream_selected_batch_io_oracle_requested();
     memcpy(report, &out, sizeof(out));
+}
+
+struct ds4_cuda_stream_selected_event_pipeline_report;
+typedef struct ds4_cuda_stream_selected_event_pipeline_report
+    ds4_cuda_stream_selected_event_pipeline_report;
+typedef struct {
+    uint64_t candidates;
+    uint64_t signals;
+    uint64_t readbacks;
+    uint64_t uploads;
+    uint64_t compute_waits;
+    uint64_t safe_fallbacks;
+    uint64_t failures;
+    uint64_t required_failures;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    int enabled;
+    int required;
+    int oracle;
+} cuda_stream_selected_event_pipeline_report_layout;
+
+static void cuda_stream_selected_event_pipeline_resolve_policy(
+        int enable, int disable, int require, int oracle,
+        int *enabled_out, int *required_out, int *oracle_out) {
+    const int disabled = disable != 0;
+    if (enabled_out) *enabled_out = !disabled && (enable || require || oracle);
+    if (required_out) *required_out = !disabled && require;
+    if (oracle_out) *oracle_out = !disabled && oracle;
+}
+
+extern "C" int ds4_cuda_test_stream_selected_event_pipeline_policy(
+        int enable, int disable, int require, int oracle,
+        int *enabled_out, int *required_out, int *oracle_out) {
+    if (!enabled_out || !required_out || !oracle_out) return 0;
+    cuda_stream_selected_event_pipeline_resolve_policy(
+        enable, disable, require, oracle,
+        enabled_out, required_out, oracle_out);
+    return 1;
+}
+
+static void cuda_stream_selected_event_pipeline_report_at_exit(void) {
+    fprintf(stderr,
+            "ds4: CUDA selected-expert event pipeline: candidates=%llu "
+            "signals=%llu readbacks=%llu uploads=%llu compute_waits=%llu "
+            "safe_fallbacks=%llu failures=%llu required_failures=%llu "
+            "oracle_runs=%llu oracle_failures=%llu\n",
+            (unsigned long long)g_stream_selected_event_candidates.load(),
+            (unsigned long long)g_stream_selected_event_signals.load(),
+            (unsigned long long)g_stream_selected_event_readbacks.load(),
+            (unsigned long long)g_stream_selected_event_uploads.load(),
+            (unsigned long long)g_stream_selected_event_compute_waits.load(),
+            (unsigned long long)g_stream_selected_event_safe_fallbacks.load(),
+            (unsigned long long)g_stream_selected_event_failures.load(),
+            (unsigned long long)g_stream_selected_event_required_failures.load(),
+            (unsigned long long)g_stream_selected_event_oracle_runs.load(),
+            (unsigned long long)g_stream_selected_event_oracle_failures.load());
+}
+
+static void cuda_stream_selected_event_pipeline_init(void) {
+    const int enable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_ENABLE_STREAMING_SELECTED_EVENT_PIPELINE");
+    const int disable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_DISABLE_STREAMING_SELECTED_EVENT_PIPELINE") ||
+        cuda_stream_selected_env_flag(
+            "DS4_CUDA_NO_STREAMING_SELECTED_EVENT_PIPELINE");
+    const int require = cuda_stream_selected_env_flag(
+        "DS4_CUDA_REQUIRE_STREAMING_SELECTED_EVENT_PIPELINE");
+    const int oracle = cuda_stream_selected_env_flag(
+        "DS4_CUDA_STREAMING_SELECTED_EVENT_PIPELINE_ORACLE");
+    const int stats = cuda_stream_selected_env_flag(
+        "DS4_CUDA_STREAMING_SELECTED_EVENT_PIPELINE_STATS");
+    cuda_stream_selected_event_pipeline_resolve_policy(
+        enable, disable, require, oracle,
+        &g_stream_selected_event_pipeline_enabled,
+        &g_stream_selected_event_pipeline_required,
+        &g_stream_selected_event_pipeline_oracle);
+    if ((enable || require || oracle || stats) &&
+        !g_stream_selected_event_pipeline_report_registered) {
+        g_stream_selected_event_pipeline_report_registered = 1;
+        (void)atexit(cuda_stream_selected_event_pipeline_report_at_exit);
+    }
+    if (g_stream_selected_event_pipeline_enabled) {
+        fprintf(stderr,
+                "ds4: CUDA selected-expert event pipeline enabled%s%s\n",
+                g_stream_selected_event_pipeline_required ? " (required)" : "",
+                g_stream_selected_event_pipeline_oracle ?
+                    " with synchronous oracle" : "");
+    } else if (disable && (enable || require || oracle)) {
+        fprintf(stderr,
+                "ds4: CUDA selected-expert event pipeline disabled by "
+                "rollback override\n");
+    }
+}
+
+extern "C" int ds4_gpu_cuda_stream_selected_event_pipeline_enabled(void) {
+    std::call_once(g_stream_selected_event_pipeline_once,
+                   cuda_stream_selected_event_pipeline_init);
+    return g_stream_selected_event_pipeline_enabled;
+}
+
+extern "C" int ds4_gpu_cuda_stream_selected_event_pipeline_required(void) {
+    std::call_once(g_stream_selected_event_pipeline_once,
+                   cuda_stream_selected_event_pipeline_init);
+    return g_stream_selected_event_pipeline_required;
+}
+
+static int cuda_stream_selected_event_pipeline_oracle_requested(void) {
+    std::call_once(g_stream_selected_event_pipeline_once,
+                   cuda_stream_selected_event_pipeline_init);
+    return g_stream_selected_event_pipeline_oracle;
+}
+
+extern "C" void ds4_gpu_cuda_stream_selected_event_note_candidate(void) {
+    g_stream_selected_event_candidates.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void ds4_gpu_cuda_stream_selected_event_note_fallback(void) {
+    g_stream_selected_event_safe_fallbacks.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+extern "C" void ds4_gpu_cuda_stream_selected_event_note_failure(
+        int required) {
+    g_stream_selected_event_failures.fetch_add(1, std::memory_order_relaxed);
+    if (required) {
+        g_stream_selected_event_required_failures.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" void ds4_cuda_stream_selected_event_pipeline_get_report(
+        ds4_cuda_stream_selected_event_pipeline_report *report) {
+    if (!report) return;
+    cuda_stream_selected_event_pipeline_report_layout out = {};
+    out.candidates = g_stream_selected_event_candidates.load();
+    out.signals = g_stream_selected_event_signals.load();
+    out.readbacks = g_stream_selected_event_readbacks.load();
+    out.uploads = g_stream_selected_event_uploads.load();
+    out.compute_waits = g_stream_selected_event_compute_waits.load();
+    out.safe_fallbacks = g_stream_selected_event_safe_fallbacks.load();
+    out.failures = g_stream_selected_event_failures.load();
+    out.required_failures = g_stream_selected_event_required_failures.load();
+    out.oracle_runs = g_stream_selected_event_oracle_runs.load();
+    out.oracle_failures = g_stream_selected_event_oracle_failures.load();
+    out.enabled = ds4_gpu_cuda_stream_selected_event_pipeline_enabled();
+    out.required = ds4_gpu_cuda_stream_selected_event_pipeline_required();
+    out.oracle = cuda_stream_selected_event_pipeline_oracle_requested();
+    memcpy(report, &out, sizeof(out));
+}
+
+static void cuda_stream_selected_event_pipeline_release(void) {
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    if (g_stream_selected_event_owner_device >= 0) {
+        (void)cudaSetDevice(g_stream_selected_event_owner_device);
+    }
+    if (g_stream_selected_upload_stream) {
+        (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+    }
+    if (g_stream_selected_readback_stream) {
+        (void)cudaStreamSynchronize(g_stream_selected_readback_stream);
+        (void)cudaStreamDestroy(g_stream_selected_readback_stream);
+        g_stream_selected_readback_stream = NULL;
+    }
+    if (g_stream_selected_readback_stage) {
+        (void)cudaFreeHost(g_stream_selected_readback_stage);
+        g_stream_selected_readback_stage = NULL;
+    }
+    g_stream_selected_readback_stage_capacity = 0;
+    if (g_stream_selected_compute_ready_event) {
+        (void)cudaEventDestroy(g_stream_selected_compute_ready_event);
+        g_stream_selected_compute_ready_event = NULL;
+    }
+    if (g_stream_selected_readback_done_event) {
+        (void)cudaEventDestroy(g_stream_selected_readback_done_event);
+        g_stream_selected_readback_done_event = NULL;
+    }
+    if (g_stream_selected_upload_done_event) {
+        (void)cudaEventDestroy(g_stream_selected_upload_done_event);
+        g_stream_selected_upload_done_event = NULL;
+    }
+    g_stream_selected_event_owner_device = -1;
+    uint64_t compute_value = ++g_stream_selected_compute_event_value;
+    if (compute_value == 0) ++g_stream_selected_compute_event_value;
+    uint64_t upload_value = ++g_stream_selected_upload_event_value;
+    if (upload_value == 0) ++g_stream_selected_upload_event_value;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+}
+
+static int cuda_stream_selected_event_pipeline_ensure(void) {
+    if (g_n_gpus != 1) return 0;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (g_stream_selected_event_owner_device >= 0 &&
+        g_stream_selected_event_owner_device != device) {
+        cuda_stream_selected_event_pipeline_release();
+    }
+    if (g_stream_selected_readback_stream &&
+        g_stream_selected_compute_ready_event &&
+        g_stream_selected_readback_done_event &&
+        g_stream_selected_upload_done_event) {
+        return 1;
+    }
+    cuda_stream_selected_event_pipeline_release();
+    g_stream_selected_event_owner_device = device;
+    cudaError_t err = cudaStreamCreateWithFlags(
+        &g_stream_selected_readback_stream, cudaStreamNonBlocking);
+    if (err == cudaSuccess) {
+        err = cudaEventCreateWithFlags(
+            &g_stream_selected_compute_ready_event, cudaEventDisableTiming);
+    }
+    if (err == cudaSuccess) {
+        err = cudaEventCreateWithFlags(
+            &g_stream_selected_readback_done_event, cudaEventDisableTiming);
+    }
+    if (err == cudaSuccess) {
+        err = cudaEventCreateWithFlags(
+            &g_stream_selected_upload_done_event, cudaEventDisableTiming);
+    }
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected event resource creation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        cuda_stream_selected_event_pipeline_release();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_selected_readback_stage_ensure(uint64_t bytes) {
+    if (bytes == 0 || bytes > SIZE_MAX) return 0;
+    if (g_stream_selected_readback_stage &&
+        g_stream_selected_readback_stage_capacity >= bytes) {
+        return 1;
+    }
+    if (g_stream_selected_readback_stream &&
+        cudaStreamSynchronize(g_stream_selected_readback_stream) !=
+            cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (g_stream_selected_readback_stage) {
+        (void)cudaFreeHost(g_stream_selected_readback_stage);
+        g_stream_selected_readback_stage = NULL;
+        g_stream_selected_readback_stage_capacity = 0;
+    }
+    cudaError_t err = cudaMallocHost(
+        &g_stream_selected_readback_stage, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected readback staging allocation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_readback_stage_capacity = bytes;
+    return 1;
 }
 
 /* Build a deterministic source-ordered plan without changing compact-slot
@@ -3151,10 +3521,11 @@ static int cuda_stream_selected_copy_oracle(
 }
 
 /* Queue every unique gate/up/down span plus the selected-id remap into one
- * upload epoch.  The ring events protect staging reuse; the sole final stream
- * synchronization publishes the complete compact table atomically to the
- * caller.  submitted_out distinguishes safe pre-enqueue fallback from a
- * partial upload, which must always fail closed. */
+ * upload epoch.  The ring events protect staging reuse.  Ordinary callers
+ * retain the final stream synchronization; the decode worker may instead
+ * request an upload-done event which the compute stream consumes before the
+ * routed kernels.  submitted_out distinguishes safe pre-enqueue fallback
+ * from a partial upload, which must always fail closed. */
 static int cuda_model_copy_tasks_to_device_streamed(
         const std::vector<cuda_stream_selected_copy_task> &tasks,
         const void *model_map,
@@ -3165,8 +3536,10 @@ static int cuda_model_copy_tasks_to_device_streamed(
         int run_oracle,
         uint64_t chunk_override,
         int *submitted_out,
+        uint64_t *upload_event_out,
         const char *what) {
     if (submitted_out) *submitted_out = 0;
+    if (upload_event_out) *upload_event_out = 0;
     if (!model_map || tasks.empty() || !remap_dst || !remap_src ||
         remap_count == 0 || remap_count > SIZE_MAX / sizeof(int32_t)) {
         return 0;
@@ -3185,11 +3558,31 @@ static int cuda_model_copy_tasks_to_device_streamed(
         return 0;
     }
 
+    /* Both diagnostic oracles deliberately retain a synchronous publication
+     * boundary.  This keeps their reference observation deterministic and
+     * makes the ordinary event path the only mode which returns a token. */
+    const int async_publish = upload_event_out != NULL && !run_oracle &&
+        !cuda_stream_selected_event_pipeline_oracle_requested();
     uint64_t stage_bytes = 0;
     if (!cuda_host_stage_bytes_for_chunk(chunk, g_model_direct_align,
                                          &stage_bytes) ||
         !cuda_stream_selected_stage_pool_alloc(stage_bytes)) {
         return 0;
+    }
+
+    /* Pool allocation is first: its cold-start/re-size path releases every
+     * selected-upload staging allocation, including the persistent remap.
+     * Only publish/copy the remap after that destructive boundary. */
+    if (async_publish &&
+        (!cuda_stream_selected_event_pipeline_ensure() ||
+         !cuda_stream_selected_remap_stage_ensure(remap_count))) {
+        return 0;
+    }
+    const int32_t *remap_upload_src = remap_src;
+    if (async_publish) {
+        memcpy(g_stream_selected_remap_stage, remap_src,
+               (size_t)remap_count * sizeof(remap_src[0]));
+        remap_upload_src = g_stream_selected_remap_stage;
     }
 
     const bool profile = cuda_stream_selected_env_flag(
@@ -3303,9 +3696,9 @@ static int cuda_model_copy_tasks_to_device_streamed(
     }
 
     const size_t remap_bytes =
-        (size_t)remap_count * sizeof(remap_src[0]);
+        (size_t)remap_count * sizeof(remap_upload_src[0]);
     cudaError_t err = cudaMemcpyAsync(
-        remap_dst, remap_src, remap_bytes,
+        remap_dst, remap_upload_src, remap_bytes,
         cudaMemcpyHostToDevice, g_stream_selected_upload_stream);
     if (err != cudaSuccess) {
         fprintf(stderr,
@@ -3316,16 +3709,30 @@ static int cuda_model_copy_tasks_to_device_streamed(
     }
     if (submitted_out) *submitted_out = 1;
 
-    /* Async handoff seam: a future boundary-only change can replace this
-     * wait with an upload-done event recorded here and waited by the compute
-     * stream.  All weight scatters and the remap are ordered before it. */
-    err = cudaStreamSynchronize(g_stream_selected_upload_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA selected batched I/O final sync failed for %s: %s\n",
-                what ? what : "expert batch", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
+    if (async_publish) {
+        err = cudaEventRecord(g_stream_selected_upload_done_event,
+                              g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA selected upload event record failed for %s: %s\n",
+                    what ? what : "expert batch", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return cuda_stream_selected_upload_fail(what);
+        }
+        uint64_t value = ++g_stream_selected_upload_event_value;
+        if (value == 0) value = ++g_stream_selected_upload_event_value;
+        *upload_event_out = value;
+        g_stream_selected_event_uploads.fetch_add(
+            1, std::memory_order_relaxed);
+    } else {
+        err = cudaStreamSynchronize(g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA selected batched I/O final sync failed for %s: %s\n",
+                    what ? what : "expert batch", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
     }
 
     if (run_oracle) {
@@ -3558,13 +3965,36 @@ extern "C" int ds4_cuda_test_stream_selected_batch_copy(void) {
                 { dst[1],    0u, 4096u, 1u },
                 { dst[2], 4096u, 4096u, 2u },
             };
+            /* Force the production cold-start order.  stage_pool_alloc()
+             * must run before the persistent remap is allocated/copied; the
+             * inverse order used to free the remap and enqueue from a stale
+             * host pointer on the first async batch. */
+            cuda_stream_selected_stage_release();
             int submitted = 0;
+            uint64_t cold_upload_event = 0;
             ok = cuda_model_copy_tasks_to_device_streamed(
+                tasks, map, model_bytes,
+                remap_dst, remap_src, 6u,
+                /*run_oracle=*/0,
+                /*chunk_override=*/12288u,
+                &submitted, &cold_upload_event,
+                "selected batch cold-start event selftest") &&
+                submitted &&
+                ds4_gpu_stream_expert_cache_wait_selected_upload(
+                    cold_upload_event,
+                    "selected batch cold-start event selftest") &&
+                cudaStreamSynchronize(cuda_decode_stream()) == cudaSuccess &&
+                cuda_stream_selected_copy_oracle(
+                    tasks, map, model_bytes,
+                    remap_src, remap_dst, 6u, /*report=*/1);
+            submitted = 0;
+            ok = ok && cuda_model_copy_tasks_to_device_streamed(
                 tasks, map, model_bytes,
                 remap_dst, remap_src, 6u,
                 /*run_oracle=*/1,
                 /*chunk_override=*/12288u,
-                &submitted, "selected batch selftest") && submitted;
+                &submitted, /*upload_event_out=*/NULL,
+                "selected batch selftest") && submitted;
             if (ok) {
                 size_t selected_allocation = 0;
                 ok = cuda_host_stage_allocation_bytes(
@@ -3606,6 +4036,7 @@ extern "C" int ds4_cuda_test_stream_selected_batch_copy(void) {
                          /*run_oracle=*/1,
                          /*chunk_override=*/4096u,
                          &submitted,
+                         /*upload_event_out=*/NULL,
                          "selected batch ring-wrap selftest") &&
                      submitted;
                 for (uint32_t i = 0; ok && i < 4u; i++) {
@@ -4318,8 +4749,12 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
-    cuda_stream_selected_cache_release();
+    /* The selected cache may still be the destination of an event-published
+     * upload.  Drain and retire its auxiliary streams before freeing device
+     * storage or invalidating the owner-device context. */
     cuda_stream_selected_stage_release();
+    cuda_stream_selected_event_pipeline_release();
+    cuda_stream_selected_cache_release();
     ds4_mmq_set_gb10_optimizations(0);
     g_n_gpus = 0;
     g_cublas_ready = 0;
@@ -29275,10 +29710,14 @@ static int cuda_stream_selected_ranges_valid(
            down_bytes <= table->model_size - table->down_offset;
 }
 
-static int cuda_stream_selected_cache_begin_load(
+static int cuda_stream_selected_cache_begin_load_impl(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
-        uint32_t slot_count) {
+        uint32_t slot_count,
+        uint64_t *upload_event_out,
+        int *submitted_any_out) {
+    if (upload_event_out) *upload_event_out = 0;
+    if (submitted_any_out) *submitted_any_out = 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
@@ -29288,6 +29727,17 @@ static int cuda_stream_selected_cache_begin_load(
     if (g_n_gpus != 1) {
         fprintf(stderr,
                 "ds4: CUDA SSD streaming requires single-GPU placement\n");
+        return 0;
+    }
+    /* This function also runs on the selected-load service thread.  CUDA's
+     * current device is thread-local, while g_current_logical_tier is a
+     * process-global launch cache and may already say tier 0 from the main
+     * thread.  Always select the physical owner explicitly here. */
+    if (cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected cache could not select owner device %d\n",
+                g_gpu[0].device_id);
+        (void)cudaGetLastError();
         return 0;
     }
 
@@ -29357,6 +29807,12 @@ static int cuda_stream_selected_cache_begin_load(
     const int batch_io_required =
         cuda_stream_selected_batch_io_require_requested();
     int copied = 0;
+    if (upload_event_out && !batch_io) {
+        /* The explicit async contract never falls into the per-expert
+         * synchronous loader.  Its caller may retry through the legacy API
+         * only after learning that no upload was submitted. */
+        return 0;
+    }
     if (batch_io) {
         std::vector<cuda_stream_selected_copy_task> tasks;
         int task_plan_ready = 1;
@@ -29406,7 +29862,9 @@ static int cuda_stream_selected_cache_begin_load(
                 slot_ids.data(), slot_count,
                 cuda_stream_selected_batch_io_oracle_requested(),
                 /*chunk_override=*/0, &submitted,
+                upload_event_out,
                 "selected expert batch");
+            if (submitted_any_out) *submitted_any_out = submitted;
             if (copied) {
                 g_stream_selected_batch_io_completed++;
             } else {
@@ -29414,7 +29872,7 @@ static int cuda_stream_selected_cache_begin_load(
                 if (batch_io_required) {
                     g_stream_selected_batch_io_required_failures++;
                 }
-                if (submitted || batch_io_required) {
+                if (submitted || batch_io_required || upload_event_out) {
                     cuda_stream_selected_cache_invalidate();
                     return 0;
                 }
@@ -29424,9 +29882,13 @@ static int cuda_stream_selected_cache_begin_load(
             g_stream_selected_batch_io_failures++;
             if (batch_io_required) {
                 g_stream_selected_batch_io_required_failures++;
-                fprintf(stderr,
-                        "ds4: required CUDA selected batched I/O could not "
-                        "allocate its copy plan\n");
+            }
+            if (batch_io_required || upload_event_out) {
+                if (batch_io_required) {
+                    fprintf(stderr,
+                            "ds4: required CUDA selected batched I/O could "
+                            "not allocate its copy plan\n");
+                }
                 cuda_stream_selected_cache_invalidate();
                 return 0;
             }
@@ -29434,6 +29896,10 @@ static int cuda_stream_selected_cache_begin_load(
         }
     }
 
+    if (!copied && upload_event_out) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
     if (!copied) {
         g_stream_selected_batch_io_legacy++;
         for (uint32_t i = 0; i < compact_ids.size(); i++) {
@@ -29496,6 +29962,14 @@ static int cuda_stream_selected_cache_begin_load(
     g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
     g_stream_selected_cache.valid = 1;
     return 1;
+}
+
+static int cuda_stream_selected_cache_begin_load(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected_ids,
+        uint32_t slot_count) {
+    return cuda_stream_selected_cache_begin_load_impl(
+        table, selected_ids, slot_count, NULL, NULL);
 }
 
 __device__ __forceinline__ static float glm_rope_yarn_corr_factor_dev(
@@ -34459,12 +34933,121 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     return cuda_ok(cudaDeviceSynchronize(), "selected readback signal");
 }
 
+extern "C" int ds4_gpu_cuda_stream_selected_set_owner_device(void) {
+    if (g_n_gpus != 1) return 0;
+    const int owner = g_stream_selected_event_owner_device >= 0 ?
+        g_stream_selected_event_owner_device : g_gpu[0].device_id;
+    if (owner != g_gpu[0].device_id) return 0;
+    const cudaError_t err = cudaSetDevice(owner);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected event owner-device switch to %d failed: %s\n",
+                owner, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_cuda_test_stream_selected_owner_device(void) {
+    if (g_n_gpus != 1) return 0;
+    int saved_device = -1;
+    int device_count = 0;
+    if (cudaGetDevice(&saved_device) != cudaSuccess ||
+        cudaGetDeviceCount(&device_count) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const int saved_logical_tier = g_current_logical_tier;
+    const int owner = g_gpu[0].device_id;
+    int wrong_device = owner;
+    for (int device = 0; device < device_count; device++) {
+        if (device != owner) {
+            wrong_device = device;
+            break;
+        }
+    }
+    /* Reproduce the service-thread hazard: the process-global logical cache
+     * claims tier 0 even though this thread is current on another physical
+     * device.  The owner setter must still issue cudaSetDevice(owner). */
+    g_current_logical_tier = 0;
+    int ok = cudaSetDevice(wrong_device) == cudaSuccess &&
+             ds4_gpu_cuda_stream_selected_set_owner_device() != 0;
+    int got_device = -1;
+    if (ok) ok = cudaGetDevice(&got_device) == cudaSuccess &&
+                 got_device == owner;
+    if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+    g_current_logical_tier = saved_logical_tier;
+    if (!ok) (void)cudaGetLastError();
+    return ok;
+}
+
+/* Event-only boundary used by the DeepSeek SSD selected-expert worker.  It is
+ * intentionally separate from the compatibility API above: callers which do
+ * not opt in retain its full-device synchronization semantics. */
+extern "C" int ds4_gpu_signal_selected_readback_ready_async(
+        uint64_t *event_value) {
+    if (event_value) *event_value = 0;
+    if (!event_value ||
+        !ds4_gpu_cuda_stream_selected_event_pipeline_enabled() ||
+        g_n_gpus != 1 ||
+        !ds4_gpu_cuda_stream_selected_set_owner_device() ||
+        !cuda_stream_selected_event_pipeline_ensure()) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const cudaStream_t stream = cuda_decode_stream();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    cudaError_t err = cudaStreamIsCapturing(stream, &capture_status);
+    if (err != cudaSuccess || capture_status != cudaStreamCaptureStatusNone) {
+        if (err != cudaSuccess) (void)cudaGetLastError();
+        return 0;
+    }
+    err = cudaEventRecord(g_stream_selected_compute_ready_event, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected compute-ready event record failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    uint64_t value = ++g_stream_selected_compute_event_value;
+    if (value == 0) value = ++g_stream_selected_compute_event_value;
+    *event_value = value;
+    g_stream_selected_event_signals.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
                                                  n_selected);
+}
+
+/* Tri-state result: 1 published (event_value may be zero for an oracle),
+ * 0 failed before enqueue and is safe for the caller's legacy retry, -1
+ * failed after enqueue and must fail closed. */
+extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load_async(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected,
+        uint64_t                          *upload_event_value) {
+    if (upload_event_value) *upload_event_value = 0;
+    if (!upload_event_value ||
+        !ds4_gpu_cuda_stream_selected_event_pipeline_enabled() ||
+        g_n_gpus != 1 ||
+        !ds4_gpu_cuda_stream_selected_set_owner_device()) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    int submitted = 0;
+    const int ok = cuda_stream_selected_cache_begin_load_impl(
+        table, selected_ids, n_selected, upload_event_value, &submitted);
+    if (ok) return 1;
+    return submitted ? -1 : 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
@@ -34508,18 +35091,88 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *te
                                              uint64_t bytes,
                                              uint64_t event_value,
                                              const char *label) {
-    (void)event_value;
     if (!tensor || !data || offset > tensor->bytes ||
-        bytes > tensor->bytes - offset) {
+        bytes > tensor->bytes - offset || bytes > SIZE_MAX) {
         return 0;
     }
-    if (!cuda_ok(cudaDeviceSynchronize(),
-                 label ? label : "selected readback wait")) {
+    const int tier = ds4_tensor_device_idx(tensor);
+    if (event_value == 0 ||
+        event_value != g_stream_selected_compute_event_value ||
+        tier < 0 || tier >= g_n_gpus ||
+        g_stream_selected_event_owner_device != g_gpu[tier].device_id ||
+        !g_stream_selected_readback_stream ||
+        !g_stream_selected_compute_ready_event ||
+        !g_stream_selected_readback_done_event ||
+        cudaSetDevice(g_stream_selected_event_owner_device) != cudaSuccess ||
+        (bytes != 0 && !cuda_stream_selected_readback_stage_ensure(bytes))) {
+        (void)cudaGetLastError();
         return 0;
     }
-    return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset,
-                              (size_t)bytes, cudaMemcpyDeviceToHost),
-                   "selected tensor read");
+
+    cudaError_t err = cudaStreamWaitEvent(
+        g_stream_selected_readback_stream,
+        g_stream_selected_compute_ready_event, 0);
+    if (err == cudaSuccess && bytes != 0) {
+        err = cudaMemcpyAsync(
+            g_stream_selected_readback_stage,
+            (const char *)tensor->ptr + offset,
+            (size_t)bytes,
+            cudaMemcpyDeviceToHost,
+            g_stream_selected_readback_stream);
+    }
+    if (err == cudaSuccess) {
+        err = cudaEventRecord(g_stream_selected_readback_done_event,
+                              g_stream_selected_readback_stream);
+    }
+    if (err == cudaSuccess) {
+        err = cudaEventSynchronize(g_stream_selected_readback_done_event);
+    }
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA %s failed: %s\n",
+                label ? label : "selected event readback",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (bytes != 0) {
+        memcpy(data, g_stream_selected_readback_stage, (size_t)bytes);
+    }
+    g_stream_selected_event_readbacks.fetch_add(
+        1, std::memory_order_relaxed);
+
+    if (cuda_stream_selected_event_pipeline_oracle_requested()) {
+        g_stream_selected_event_oracle_runs.fetch_add(
+            1, std::memory_order_relaxed);
+        std::vector<unsigned char> reference;
+        try {
+            reference.resize((size_t)bytes);
+        } catch (...) {
+            g_stream_selected_event_oracle_failures.fetch_add(
+                1, std::memory_order_relaxed);
+            return 0;
+        }
+        err = cudaDeviceSynchronize();
+        if (err == cudaSuccess && bytes != 0) {
+            err = cudaMemcpy(reference.data(),
+                             (const char *)tensor->ptr + offset,
+                             (size_t)bytes,
+                             cudaMemcpyDeviceToHost);
+        }
+        if (err != cudaSuccess ||
+            (bytes != 0 && memcmp(reference.data(), data,
+                                  (size_t)bytes) != 0)) {
+            fprintf(stderr,
+                    "ds4: CUDA selected event readback oracle %s\n",
+                    err == cudaSuccess ? "mismatch" :
+                    cudaGetErrorString(err));
+            if (err != cudaSuccess) (void)cudaGetLastError();
+            g_stream_selected_event_oracle_failures.fetch_add(
+                1, std::memory_order_relaxed);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
@@ -34543,6 +35196,163 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
     (void)event_value;
     return cuda_ok(cudaDeviceSynchronize(),
                    label ? label : "selected readback wait");
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_wait_selected_upload(
+        uint64_t event_value, const char *label) {
+    if (event_value == 0) return 1;
+    if (event_value != g_stream_selected_upload_event_value ||
+        !g_stream_selected_upload_done_event ||
+        g_stream_selected_event_owner_device < 0 ||
+        g_n_gpus != 1 ||
+        g_stream_selected_event_owner_device != g_gpu[0].device_id ||
+        g_stream_selected_upload_owner_device !=
+            g_stream_selected_event_owner_device ||
+        cudaSetDevice(g_stream_selected_event_owner_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const cudaError_t err = cudaStreamWaitEvent(
+        cuda_decode_stream(), g_stream_selected_upload_done_event, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA %s failed: %s\n",
+                label ? label : "selected upload wait",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_event_compute_waits.fetch_add(
+        1, std::memory_order_relaxed);
+    return 1;
+}
+
+extern "C" int ds4_gpu_cuda_stream_selected_event_abort(void) {
+    int device = g_stream_selected_event_owner_device;
+    if (device < 0 && g_n_gpus == 1) device = g_gpu[0].device_id;
+    if (device >= 0 && cudaSetDevice(device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
+    const cudaError_t err = cudaDeviceSynchronize();
+    cuda_stream_selected_cache_invalidate();
+    uint64_t compute_value = ++g_stream_selected_compute_event_value;
+    if (compute_value == 0) ++g_stream_selected_compute_event_value;
+    uint64_t upload_value = ++g_stream_selected_upload_event_value;
+    if (upload_value == 0) ++g_stream_selected_upload_event_value;
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected event abort sync failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+/* Device-backed ordering oracle for CI/DGX bring-up.  It exercises the same
+ * event objects and streams as decode without requiring a GGUF or mutating
+ * process-environment policy after its once_flag has resolved. */
+extern "C" int ds4_cuda_test_stream_selected_event_pipeline(void) {
+    if (g_n_gpus != 1 ||
+        cudaSetDevice(g_gpu[0].device_id) != cudaSuccess ||
+        !cuda_stream_selected_event_pipeline_ensure() ||
+        !cuda_stream_selected_stage_pool_alloc(4096u) ||
+        !cuda_stream_selected_remap_stage_ensure(1u)) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    int32_t *source = NULL;
+    int32_t *uploaded = NULL;
+    int32_t *consumed = NULL;
+    int32_t *host = NULL;
+    int ok = cudaMalloc((void **)&source, sizeof(*source)) == cudaSuccess &&
+             cudaMalloc((void **)&uploaded, sizeof(*uploaded)) == cudaSuccess &&
+             cudaMalloc((void **)&consumed, sizeof(*consumed)) == cudaSuccess &&
+             cudaMallocHost((void **)&host, 2u * sizeof(*host)) == cudaSuccess;
+    if (!ok) (void)cudaGetLastError();
+
+    ds4_gpu_tensor tensor = {};
+    tensor.ptr = source;
+    tensor.bytes = sizeof(*source);
+    tensor.owner = 0;
+    tensor.device_id = 0;
+    if (ok) {
+        host[0] = 0x13572468;
+        host[1] = 0x24681357;
+        ok = cudaMemcpyAsync(source, &host[0], sizeof(host[0]),
+                             cudaMemcpyHostToDevice,
+                             cuda_decode_stream()) == cudaSuccess &&
+             cudaEventRecord(g_stream_selected_compute_ready_event,
+                             cuda_decode_stream()) == cudaSuccess;
+    }
+    uint64_t compute_value = 0;
+    if (ok) {
+        compute_value = ++g_stream_selected_compute_event_value;
+        if (compute_value == 0) {
+            compute_value = ++g_stream_selected_compute_event_value;
+        }
+        g_stream_selected_event_candidates.fetch_add(
+            1, std::memory_order_relaxed);
+        g_stream_selected_event_signals.fetch_add(
+            1, std::memory_order_relaxed);
+        int32_t got = 0;
+        ok = ds4_gpu_tensor_read_after_selected_event(
+                 &tensor, 0, &got, sizeof(got), compute_value,
+                 "selected event selftest readback") != 0 &&
+             got == host[0];
+    }
+
+    uint64_t upload_value = 0;
+    if (ok) {
+        g_stream_selected_remap_stage[0] = host[1];
+        ok = cudaMemcpyAsync(uploaded,
+                             g_stream_selected_remap_stage,
+                             sizeof(g_stream_selected_remap_stage[0]),
+                             cudaMemcpyHostToDevice,
+                             g_stream_selected_upload_stream) == cudaSuccess &&
+             cudaEventRecord(g_stream_selected_upload_done_event,
+                             g_stream_selected_upload_stream) == cudaSuccess;
+    }
+    if (ok) {
+        upload_value = ++g_stream_selected_upload_event_value;
+        if (upload_value == 0) {
+            upload_value = ++g_stream_selected_upload_event_value;
+        }
+        g_stream_selected_event_uploads.fetch_add(
+            1, std::memory_order_relaxed);
+        ok = ds4_gpu_stream_expert_cache_wait_selected_upload(
+                 upload_value, "selected event selftest upload") != 0 &&
+             cudaMemcpyAsync(consumed, uploaded, sizeof(*consumed),
+                             cudaMemcpyDeviceToDevice,
+                             cuda_decode_stream()) == cudaSuccess &&
+             cudaStreamSynchronize(cuda_decode_stream()) == cudaSuccess;
+    }
+    if (ok) {
+        int32_t got = 0;
+        ok = cudaMemcpy(&got, consumed, sizeof(got),
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             got == host[1];
+    }
+    g_stream_selected_event_oracle_runs.fetch_add(
+        1, std::memory_order_relaxed);
+    if (!ok) {
+        (void)cudaGetLastError();
+        g_stream_selected_event_oracle_failures.fetch_add(
+            1, std::memory_order_relaxed);
+        (void)cudaDeviceSynchronize();
+    }
+    if (source) (void)cudaFree(source);
+    if (uploaded) (void)cudaFree(uploaded);
+    if (consumed) (void)cudaFree(consumed);
+    if (host) (void)cudaFreeHost(host);
+    /* Keep the compute/readback/upload-done event resources for the report,
+     * but restore the selected-upload pool to the same cold state expected by
+     * the production batch-copy selftest which runs next. */
+    cuda_stream_selected_stage_release();
+    return ok;
 }
 
 /* Compatibility surface shared with the canonical Metal/ROCm graph. CUDA

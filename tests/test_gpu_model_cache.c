@@ -52,6 +52,31 @@ int main(void) {
               1, 1, 1, 1, &enabled, &required, &oracle) &&
           enabled == 0 && required == 0 && oracle == 0,
           "selected-expert batched-I/O disable-dominant policy");
+    CHECK(!ds4_cuda_test_stream_selected_event_env_value(NULL) &&
+          !ds4_cuda_test_stream_selected_event_env_value("") &&
+          !ds4_cuda_test_stream_selected_event_env_value("0") &&
+          !ds4_cuda_test_stream_selected_event_env_value("false") &&
+          !ds4_cuda_test_stream_selected_event_env_value("NO") &&
+          !ds4_cuda_test_stream_selected_event_env_value("off") &&
+          ds4_cuda_test_stream_selected_event_env_value("1") &&
+          ds4_cuda_test_stream_selected_event_env_value("true"),
+          "selected-expert event-pipeline value-aware environment parser");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              1, 0, 0, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 0 && oracle == 0,
+          "selected-expert event-pipeline enable policy");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              0, 0, 1, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 1 && oracle == 0,
+          "selected-expert event-pipeline require policy");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              0, 0, 0, 1, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 0 && oracle == 1,
+          "selected-expert event-pipeline oracle policy");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              1, 1, 1, 1, &enabled, &required, &oracle) &&
+          enabled == 0 && required == 0 && oracle == 0,
+          "selected-expert event-pipeline disable-dominant policy");
     CHECK(ds4_cuda_test_stream_selected_batch_plan(),
           "selected-expert batched-I/O planner");
 
@@ -65,6 +90,19 @@ int main(void) {
     }
 
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline(),
+          "selected-expert compute/readback/upload event ordering oracle");
+    ds4_cuda_stream_selected_event_pipeline_report event_report;
+    memset(&event_report, 0, sizeof(event_report));
+    ds4_cuda_stream_selected_event_pipeline_get_report(&event_report);
+    CHECK(event_report.candidates >= 1 &&
+          event_report.signals >= 1 &&
+          event_report.readbacks >= 1 &&
+          event_report.uploads >= 1 &&
+          event_report.compute_waits >= 1 &&
+          event_report.oracle_runs >= 1 &&
+          event_report.oracle_failures == 0,
+          "selected-expert event-pipeline coverage counters");
     CHECK(ds4_cuda_test_stream_selected_batch_copy(),
           "selected-expert batched-I/O scatter + byte oracle");
     ds4_cuda_stream_selected_batch_io_report batch_report;
