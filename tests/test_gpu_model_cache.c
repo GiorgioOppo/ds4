@@ -6,6 +6,7 @@
  *   - ds4_gpu_lookup_cache at range bases and at interior offsets
  *     (proves the subrange pointer offset arithmetic is right)
  *   - device-id resolution
+ *   - selected-expert batched-I/O policy, planner, scatter and byte oracle
  *   - on multi-GPU boxes: caching on device 1 and active-device
  *     preference in lookup */
 
@@ -26,6 +27,34 @@
     } while (0)
 
 int main(void) {
+    int enabled = -1;
+    int required = -1;
+    int oracle = -1;
+    CHECK(!ds4_cuda_test_stream_selected_batch_env_value(NULL) &&
+          !ds4_cuda_test_stream_selected_batch_env_value("") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("0") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("false") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("FALSE") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("no") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("off") &&
+          ds4_cuda_test_stream_selected_batch_env_value("1") &&
+          ds4_cuda_test_stream_selected_batch_env_value("true"),
+          "selected-expert batched-I/O value-aware environment parser");
+    CHECK(ds4_cuda_test_stream_selected_batch_policy(
+              1, 0, 0, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 0 && oracle == 0,
+          "selected-expert batched-I/O enable policy");
+    CHECK(ds4_cuda_test_stream_selected_batch_policy(
+              0, 0, 1, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 1 && oracle == 0,
+          "selected-expert batched-I/O require policy");
+    CHECK(ds4_cuda_test_stream_selected_batch_policy(
+              1, 1, 1, 1, &enabled, &required, &oracle) &&
+          enabled == 0 && required == 0 && oracle == 0,
+          "selected-expert batched-I/O disable-dominant policy");
+    CHECK(ds4_cuda_test_stream_selected_batch_plan(),
+          "selected-expert batched-I/O planner");
+
     int dev_count = 0;
     (void)cudaGetDeviceCount(&dev_count);
     fprintf(stderr, "test_gpu_model_cache: %d CUDA devices visible\n",
@@ -36,6 +65,17 @@ int main(void) {
     }
 
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
+    CHECK(ds4_cuda_test_stream_selected_batch_copy(),
+          "selected-expert batched-I/O scatter + byte oracle");
+    ds4_cuda_stream_selected_batch_io_report batch_report;
+    memset(&batch_report, 0, sizeof(batch_report));
+    ds4_cuda_stream_selected_batch_io_get_report(&batch_report);
+    CHECK(batch_report.oracle_runs >= 2 &&
+          batch_report.oracle_failures == 0 &&
+          batch_report.tasks >= 9 &&
+          batch_report.segments >= batch_report.tasks &&
+          batch_report.reads >= 7 && batch_report.bytes >= 18u * 1024u,
+          "selected-expert batched-I/O coverage counters");
 
     /* Build a synthetic 1-MiB "model" in host memory. */
     const size_t total = 1024 * 1024;
