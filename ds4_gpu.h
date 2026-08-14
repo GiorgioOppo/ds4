@@ -114,6 +114,14 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+#ifdef __APPLE__
+/* Metal-only asynchronous command streams. Command encoding remains
+ * serialized; at most eight committed streams may execute concurrently. */
+void ds4_gpu_set_stream(int idx);
+int ds4_gpu_current_stream(void);
+int ds4_gpu_end_commands_async(void);
+int ds4_gpu_wait_stream(int idx);
+#endif
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
@@ -228,6 +236,34 @@ int ds4_gpu_test_stream_expert_live_index_policy(
         int disable);
 void ds4_gpu_test_stream_expert_live_index_report(
         ds4_gpu_stream_expert_live_index_report *report);
+typedef struct ds4_gpu_exact_rows_persistent_report {
+    uint64_t persistent_calls;
+    uint64_t transient_calls;
+    uint64_t persistent_fallbacks;
+    uint64_t persistent_failures;
+    uint64_t mapped_view_calls;
+    uint32_t max_unique;
+} ds4_gpu_exact_rows_persistent_report;
+/* Test-only policy and counters for exact-row private cache snapshots. */
+int ds4_gpu_test_exact_rows_persistent_policy(
+        uint32_t configured_count,
+        uint32_t unique_count,
+        int      size_class_ok);
+void ds4_gpu_test_exact_rows_persistent_report(
+        ds4_gpu_exact_rows_persistent_report *report);
+typedef struct ds4_gpu_stream_test_stats {
+    uint64_t tensor_live_bytes;
+    uint64_t transient_references;
+    uint32_t tensor_live_count;
+    uint32_t pending_command_buffers;
+    uint32_t last_command_buffers;
+    uint32_t active_queue_mask;
+    uint32_t model_residency_queue_mask;
+    uint32_t q4_residency_queue_mask;
+} ds4_gpu_stream_test_stats;
+/* Test-only observability and lifetime injection for Metal stream oracles. */
+void ds4_gpu_test_stream_stats(ds4_gpu_stream_test_stats *stats);
+int ds4_gpu_test_hold_stream_transient(uint64_t bytes);
 enum {
     DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL = 1u << 0,
     DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE = 1u << 1,
