@@ -78,6 +78,67 @@ int main(void) {
           enabled == 0 && required == 0 && oracle == 0,
           "selected-expert event-pipeline disable-dominant policy");
     int stats = -1;
+    CHECK(!ds4_cuda_test_stream_expert_persistent_env_value(NULL) &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("0") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("false") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("NO") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("off") &&
+          ds4_cuda_test_stream_expert_persistent_env_value("1") &&
+          ds4_cuda_test_stream_expert_persistent_env_value("true"),
+          "persistent expert planner value-aware environment parser");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              1, 0, 0, 0, 0,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 1 && required == 0 && stats == 0 && oracle == 0,
+          "persistent expert planner enable policy");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              0, 0, 1, 1, 1,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 1 && required == 1 && stats == 1 && oracle == 1,
+          "persistent expert planner require/stats/oracle policy");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              0, 0, 0, 1, 0,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 0 && required == 0 && stats == 1 && oracle == 0,
+          "persistent expert planner stats-only policy");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              1, 1, 1, 1, 1,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 0 && required == 0 && stats == 0 && oracle == 0,
+          "persistent expert planner disable-dominant policy");
+    ds4_cuda_stream_expert_persistent_report persistent_before;
+    memset(&persistent_before, 0, sizeof(persistent_before));
+    ds4_cuda_stream_expert_persistent_get_report(&persistent_before);
+    CHECK(ds4_cuda_test_stream_expert_persistent_planner(),
+          "persistent expert LRU/free-list transaction planner oracle");
+    ds4_cuda_stream_expert_persistent_report persistent_after;
+    memset(&persistent_after, 0, sizeof(persistent_after));
+    ds4_cuda_stream_expert_persistent_get_report(&persistent_after);
+    CHECK(persistent_after.oracle_runs == persistent_before.oracle_runs + 1u &&
+          persistent_after.oracle_failures ==
+              persistent_before.oracle_failures &&
+          persistent_after.plan_attempts > persistent_before.plan_attempts &&
+          persistent_after.plans_built > persistent_before.plans_built &&
+          persistent_after.commits > persistent_before.commits &&
+          persistent_after.rollbacks > persistent_before.rollbacks &&
+          persistent_after.hits > persistent_before.hits &&
+          persistent_after.misses > persistent_before.misses &&
+          persistent_after.duplicates > persistent_before.duplicates &&
+          persistent_after.free_assignments >
+              persistent_before.free_assignments &&
+          persistent_after.evictions > persistent_before.evictions &&
+          persistent_after.rejects > persistent_before.rejects &&
+          persistent_after.budget_rejects >
+              persistent_before.budget_rejects &&
+          persistent_after.class_rejects >
+              persistent_before.class_rejects &&
+          persistent_after.protected_rejects >
+              persistent_before.protected_rejects &&
+          persistent_after.key_misses > persistent_before.key_misses &&
+          persistent_after.overflow_rejects >
+              persistent_before.overflow_rejects,
+          "persistent expert planner invariant coverage counters");
     CHECK(ds4_cuda_test_iq2_ssd_grouped_policy(
               1, 0, 0, 0, &enabled, &required, &stats) &&
           enabled == 1 && required == 0 && stats == 0,

@@ -27,6 +27,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <utility>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -591,6 +592,29 @@ static std::atomic<uint64_t> g_iq2_ssd_grouped_upload_waits{0};
 static std::atomic<uint64_t> g_iq2_ssd_grouped_lease_waits{0};
 static std::atomic<uint64_t> g_iq2_ssd_grouped_lease_records{0};
 static std::atomic<uint64_t> g_iq2_ssd_grouped_lease_drains{0};
+static std::once_flag g_stream_expert_persistent_once;
+static int g_stream_expert_persistent_enabled;
+static int g_stream_expert_persistent_required;
+static int g_stream_expert_persistent_stats;
+static int g_stream_expert_persistent_oracle;
+static int g_stream_expert_persistent_report_registered;
+static std::atomic<uint64_t> g_stream_expert_persistent_plan_attempts{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_plans_built{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_commits{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_rollbacks{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_hits{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_misses{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_duplicates{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_free_assignments{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_evictions{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_rejects{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_budget_rejects{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_class_rejects{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_protected_rejects{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_key_misses{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_overflow_rejects{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_oracle_runs{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_oracle_failures{0};
 
 static int cuda_ok(cudaError_t err, const char *what);
 static void cuda_stream_selected_event_pipeline_release(void);
@@ -2944,6 +2968,1093 @@ extern "C" int ds4_cuda_test_stream_selected_batch_env_value(
 extern "C" int ds4_cuda_test_stream_selected_event_env_value(
         const char *value) {
     return cuda_stream_selected_env_value_enabled(value);
+}
+
+/* This tagged compatibility type is normally declared beside the CUDA
+ * streaming implementation below.  The phase-one host planner lives here so
+ * its value semantics and policy hooks can be tested before any CUDA arena is
+ * introduced. */
+typedef struct ds4_gpu_stream_expert_table {
+    const void *model_map;
+    uint64_t    model_size;
+    uint32_t    layer;
+    uint32_t    n_total_expert;
+    uint64_t    gate_offset;
+    uint64_t    up_offset;
+    uint64_t    down_offset;
+    uint64_t    gate_expert_bytes;
+    uint64_t    down_expert_bytes;
+} ds4_gpu_stream_expert_table;
+
+struct ds4_cuda_stream_expert_persistent_report;
+typedef struct ds4_cuda_stream_expert_persistent_report
+    ds4_cuda_stream_expert_persistent_report;
+typedef struct {
+    uint64_t plan_attempts;
+    uint64_t plans_built;
+    uint64_t commits;
+    uint64_t rollbacks;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t duplicates;
+    uint64_t free_assignments;
+    uint64_t evictions;
+    uint64_t rejects;
+    uint64_t budget_rejects;
+    uint64_t class_rejects;
+    uint64_t protected_rejects;
+    uint64_t key_misses;
+    uint64_t overflow_rejects;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    int enabled;
+    int required;
+    int stats;
+    int oracle;
+} cuda_stream_expert_persistent_report_layout;
+
+/* Phase one of the CUDA resident-expert cache is deliberately host-only.
+ * It defines and tests the transaction which a later device arena will
+ * execute, without allocating storage or changing the transient cache path.
+ * An arena has one immutable byte-size class.  Full entry keys prevent a
+ * layer, model, or table-layout change from being mistaken for a hit. */
+typedef struct {
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t bytes_per_slot;
+    uint64_t arena_bytes;
+    uint32_t capacity;
+} cuda_stream_expert_persistent_class;
+
+typedef struct {
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint32_t layer;
+    uint32_t n_total_expert;
+    uint32_t expert_id;
+} cuda_stream_expert_persistent_key;
+
+typedef struct {
+    cuda_stream_expert_persistent_key key;
+    uint64_t last_use;
+    uint32_t pin_count;
+    int valid;
+} cuda_stream_expert_persistent_entry;
+
+typedef struct {
+    cuda_stream_expert_persistent_class size_class;
+    std::vector<cuda_stream_expert_persistent_entry> slots;
+    /* Stored in reverse order so pop_back() deterministically yields the
+     * lowest free slot. */
+    std::vector<uint32_t> free_slots;
+    uint64_t lru_clock;
+} cuda_stream_expert_persistent_state;
+
+typedef struct {
+    cuda_stream_expert_persistent_key key;
+    cuda_stream_expert_persistent_key victim;
+    uint32_t slot;
+    int had_victim;
+} cuda_stream_expert_persistent_load;
+
+typedef struct {
+    cuda_stream_expert_persistent_state next;
+    std::vector<uint32_t> remap;
+    std::vector<cuda_stream_expert_persistent_load> loads;
+    uint32_t slot_base;
+    uint32_t weight_domain;
+    uint32_t unique_count;
+    uint32_t hit_count;
+    uint32_t miss_count;
+    uint32_t duplicate_count;
+    int built;
+} cuda_stream_expert_persistent_plan;
+
+static int cuda_stream_expert_persistent_add_u64(
+        uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || a > UINT64_MAX - b) return 0;
+    *out = a + b;
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_mul_u64(
+        uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || (a != 0 && b > UINT64_MAX / a)) return 0;
+    *out = a * b;
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_class_make(
+        cuda_stream_expert_persistent_class *out,
+        uint32_t capacity,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!out || capacity == 0 || gate_expert_bytes == 0 ||
+        down_expert_bytes == 0) {
+        return 0;
+    }
+    uint64_t two_gate = 0;
+    uint64_t bytes_per_slot = 0;
+    uint64_t arena_bytes = 0;
+    if (!cuda_stream_expert_persistent_mul_u64(
+            gate_expert_bytes, 2u, &two_gate) ||
+        !cuda_stream_expert_persistent_add_u64(
+            two_gate, down_expert_bytes, &bytes_per_slot) ||
+        !cuda_stream_expert_persistent_mul_u64(
+            bytes_per_slot, capacity, &arena_bytes) ||
+        arena_bytes > SIZE_MAX) {
+        return 0;
+    }
+    out->gate_expert_bytes = gate_expert_bytes;
+    out->down_expert_bytes = down_expert_bytes;
+    out->bytes_per_slot = bytes_per_slot;
+    out->arena_bytes = arena_bytes;
+    out->capacity = capacity;
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_class_equal(
+        const cuda_stream_expert_persistent_class *a,
+        const cuda_stream_expert_persistent_class *b) {
+    return a && b &&
+           a->gate_expert_bytes == b->gate_expert_bytes &&
+           a->down_expert_bytes == b->down_expert_bytes &&
+           a->bytes_per_slot == b->bytes_per_slot &&
+           a->arena_bytes == b->arena_bytes &&
+           a->capacity == b->capacity;
+}
+
+static int cuda_stream_expert_persistent_key_equal(
+        const cuda_stream_expert_persistent_key *a,
+        const cuda_stream_expert_persistent_key *b) {
+    return a && b && a->model_map == b->model_map &&
+           a->model_size == b->model_size &&
+           a->gate_offset == b->gate_offset &&
+           a->up_offset == b->up_offset &&
+           a->down_offset == b->down_offset &&
+           a->gate_expert_bytes == b->gate_expert_bytes &&
+           a->down_expert_bytes == b->down_expert_bytes &&
+           a->layer == b->layer &&
+           a->n_total_expert == b->n_total_expert &&
+           a->expert_id == b->expert_id;
+}
+
+static int cuda_stream_expert_persistent_table_range_ok(
+        uint64_t offset, uint64_t expert_bytes,
+        uint32_t n_total_expert, uint64_t model_size) {
+    uint64_t table_bytes = 0;
+    return cuda_stream_expert_persistent_mul_u64(
+               expert_bytes, n_total_expert, &table_bytes) &&
+           offset <= model_size && table_bytes <= model_size - offset;
+}
+
+static int cuda_stream_expert_persistent_key_make(
+        cuda_stream_expert_persistent_key *out,
+        const ds4_gpu_stream_expert_table *table,
+        int32_t expert_id) {
+    if (!out || !table || !table->model_map || table->model_size == 0 ||
+        table->n_total_expert == 0 || table->gate_expert_bytes == 0 ||
+        table->down_expert_bytes == 0 || expert_id < 0 ||
+        (uint32_t)expert_id >= table->n_total_expert ||
+        !cuda_stream_expert_persistent_table_range_ok(
+            table->gate_offset, table->gate_expert_bytes,
+            table->n_total_expert, table->model_size) ||
+        !cuda_stream_expert_persistent_table_range_ok(
+            table->up_offset, table->gate_expert_bytes,
+            table->n_total_expert, table->model_size) ||
+        !cuda_stream_expert_persistent_table_range_ok(
+            table->down_offset, table->down_expert_bytes,
+            table->n_total_expert, table->model_size)) {
+        return 0;
+    }
+    out->model_map = table->model_map;
+    out->model_size = table->model_size;
+    out->gate_offset = table->gate_offset;
+    out->up_offset = table->up_offset;
+    out->down_offset = table->down_offset;
+    out->gate_expert_bytes = table->gate_expert_bytes;
+    out->down_expert_bytes = table->down_expert_bytes;
+    out->layer = table->layer;
+    out->n_total_expert = table->n_total_expert;
+    out->expert_id = (uint32_t)expert_id;
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_state_init(
+        cuda_stream_expert_persistent_state *state,
+        uint32_t capacity,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!state || !cuda_stream_expert_persistent_class_make(
+            &state->size_class, capacity,
+            gate_expert_bytes, down_expert_bytes)) {
+        return 0;
+    }
+    try {
+        state->slots.assign(capacity, {});
+        state->free_slots.clear();
+        state->free_slots.reserve(capacity);
+        for (uint32_t slot = capacity; slot != 0; slot--) {
+            state->free_slots.push_back(slot - 1u);
+        }
+    } catch (...) {
+        state->slots.clear();
+        state->free_slots.clear();
+        memset(&state->size_class, 0, sizeof(state->size_class));
+        return 0;
+    }
+    state->lru_clock = 0;
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_state_valid(
+        const cuda_stream_expert_persistent_state *state) {
+    if (!state || state->size_class.capacity == 0 ||
+        state->slots.size() != state->size_class.capacity ||
+        state->free_slots.size() > state->slots.size()) {
+        return 0;
+    }
+    std::vector<uint8_t> free_seen;
+    try {
+        free_seen.assign(state->slots.size(), 0u);
+    } catch (...) {
+        return 0;
+    }
+    for (uint32_t slot : state->free_slots) {
+        if (slot >= state->slots.size() || free_seen[slot] ||
+            state->slots[slot].valid || state->slots[slot].pin_count != 0) {
+            return 0;
+        }
+        free_seen[slot] = 1u;
+    }
+    for (size_t slot = 0; slot < state->slots.size(); slot++) {
+        const cuda_stream_expert_persistent_entry *entry =
+            &state->slots[slot];
+        if (entry->valid) {
+            if (free_seen[slot] || entry->last_use == 0 ||
+                entry->last_use > state->lru_clock) {
+                return 0;
+            }
+        } else if (!free_seen[slot] || entry->last_use != 0 ||
+                   entry->pin_count != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_state_equal(
+        const cuda_stream_expert_persistent_state *a,
+        const cuda_stream_expert_persistent_state *b) {
+    if (!a || !b ||
+        !cuda_stream_expert_persistent_class_equal(
+            &a->size_class, &b->size_class) ||
+        a->lru_clock != b->lru_clock ||
+        a->free_slots != b->free_slots ||
+        a->slots.size() != b->slots.size()) {
+        return 0;
+    }
+    for (size_t i = 0; i < a->slots.size(); i++) {
+        const cuda_stream_expert_persistent_entry *ea = &a->slots[i];
+        const cuda_stream_expert_persistent_entry *eb = &b->slots[i];
+        if (ea->valid != eb->valid || ea->last_use != eb->last_use ||
+            ea->pin_count != eb->pin_count ||
+            (ea->valid && !cuda_stream_expert_persistent_key_equal(
+                              &ea->key, &eb->key))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_state_copy(
+        cuda_stream_expert_persistent_state *dst,
+        const cuda_stream_expert_persistent_state *src) {
+    if (!dst || !src) return 0;
+    try {
+        *dst = *src;
+    } catch (...) {
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_find_key(
+        const cuda_stream_expert_persistent_state *state,
+        const cuda_stream_expert_persistent_key *key,
+        uint32_t *slot_out) {
+    if (!state || !key) return 0;
+    for (uint32_t slot = 0; slot < state->slots.size(); slot++) {
+        const cuda_stream_expert_persistent_entry *entry =
+            &state->slots[slot];
+        if (entry->valid && cuda_stream_expert_persistent_key_equal(
+                                &entry->key, key)) {
+            if (slot_out) *slot_out = slot;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int cuda_stream_expert_persistent_touch(
+        cuda_stream_expert_persistent_state *state, uint32_t slot) {
+    if (!state || slot >= state->slots.size() ||
+        !state->slots[slot].valid || state->lru_clock == UINT64_MAX) {
+        return 0;
+    }
+    state->slots[slot].last_use = ++state->lru_clock;
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_pin_key(
+        cuda_stream_expert_persistent_state *state,
+        const cuda_stream_expert_persistent_key *key,
+        int pin) {
+    uint32_t slot = 0;
+    if (!state || !cuda_stream_expert_persistent_find_key(
+            state, key, &slot)) {
+        return 0;
+    }
+    if (pin) {
+        if (state->slots[slot].pin_count == UINT32_MAX) return 0;
+        state->slots[slot].pin_count++;
+    } else {
+        if (state->slots[slot].pin_count == 0) return 0;
+        state->slots[slot].pin_count--;
+    }
+    return 1;
+}
+
+static void cuda_stream_expert_persistent_note_reject(
+        std::atomic<uint64_t> *specific) {
+    g_stream_expert_persistent_rejects.fetch_add(
+        1, std::memory_order_relaxed);
+    if (specific) specific->fetch_add(1, std::memory_order_relaxed);
+}
+
+/* Build against a private state copy.  Until commit(), both LRU touches and
+ * victim selection are invisible to the live cache, so every rejection and
+ * every abandoned upload plan is a true rollback. */
+static int cuda_stream_expert_persistent_plan_build(
+        const cuda_stream_expert_persistent_state *state,
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected_ids,
+        uint32_t n_selected,
+        cuda_stream_expert_persistent_plan *plan) {
+    g_stream_expert_persistent_plan_attempts.fetch_add(
+        1, std::memory_order_relaxed);
+    if (!state || !table || !selected_ids || n_selected == 0 || !plan ||
+        !cuda_stream_expert_persistent_state_valid(state)) {
+        cuda_stream_expert_persistent_note_reject(NULL);
+        return 0;
+    }
+
+    cuda_stream_expert_persistent_class request_class = {};
+    if (!cuda_stream_expert_persistent_class_make(
+            &request_class, state->size_class.capacity,
+            table->gate_expert_bytes, table->down_expert_bytes)) {
+        cuda_stream_expert_persistent_note_reject(
+            &g_stream_expert_persistent_overflow_rejects);
+        return 0;
+    }
+    if (!cuda_stream_expert_persistent_class_equal(
+            &state->size_class, &request_class)) {
+        cuda_stream_expert_persistent_note_reject(
+            &g_stream_expert_persistent_class_rejects);
+        return 0;
+    }
+
+    std::vector<cuda_stream_expert_persistent_key> unique_keys;
+    std::vector<uint32_t> input_unique;
+    uint32_t duplicate_count = 0;
+    try {
+        unique_keys.reserve(n_selected);
+        input_unique.reserve(n_selected);
+        for (uint32_t i = 0; i < n_selected; i++) {
+            cuda_stream_expert_persistent_key key = {};
+            if (!cuda_stream_expert_persistent_key_make(
+                    &key, table, selected_ids[i])) {
+                cuda_stream_expert_persistent_note_reject(
+                    &g_stream_expert_persistent_overflow_rejects);
+                return 0;
+            }
+            uint32_t unique_index = UINT32_MAX;
+            for (uint32_t u = 0; u < unique_keys.size(); u++) {
+                if (cuda_stream_expert_persistent_key_equal(
+                        &unique_keys[u], &key)) {
+                    unique_index = u;
+                    break;
+                }
+            }
+            if (unique_index == UINT32_MAX) {
+                if (unique_keys.size() >= UINT32_MAX) {
+                    cuda_stream_expert_persistent_note_reject(
+                        &g_stream_expert_persistent_overflow_rejects);
+                    return 0;
+                }
+                unique_index = (uint32_t)unique_keys.size();
+                unique_keys.push_back(key);
+            } else {
+                duplicate_count++;
+            }
+            input_unique.push_back(unique_index);
+        }
+    } catch (...) {
+        cuda_stream_expert_persistent_note_reject(NULL);
+        return 0;
+    }
+    if (unique_keys.size() > state->size_class.capacity) {
+        cuda_stream_expert_persistent_note_reject(
+            &g_stream_expert_persistent_budget_rejects);
+        return 0;
+    }
+
+    cuda_stream_expert_persistent_plan candidate = {};
+    if (!cuda_stream_expert_persistent_state_copy(
+            &candidate.next, state)) {
+        cuda_stream_expert_persistent_note_reject(NULL);
+        return 0;
+    }
+    std::vector<uint8_t> protected_slots;
+    std::vector<uint32_t> unique_slots;
+    try {
+        protected_slots.assign(candidate.next.slots.size(), 0u);
+        unique_slots.assign(unique_keys.size(), UINT32_MAX);
+        candidate.remap.resize(n_selected);
+        candidate.loads.reserve(unique_keys.size());
+    } catch (...) {
+        cuda_stream_expert_persistent_note_reject(NULL);
+        return 0;
+    }
+    for (uint32_t slot = 0; slot < candidate.next.slots.size(); slot++) {
+        if (candidate.next.slots[slot].pin_count != 0) {
+            protected_slots[slot] = 1u;
+        }
+    }
+
+    uint32_t hit_count = 0;
+    uint32_t miss_count = 0;
+    uint32_t key_miss_count = 0;
+    uint32_t free_assignment_count = 0;
+    uint32_t eviction_count = 0;
+    /* Resolve every hit before considering a victim.  A request may put a
+     * cold miss before a resident key; a one-pass planner would otherwise be
+     * able to evict that later requested resident slot. */
+    for (uint32_t u = 0; u < unique_keys.size(); u++) {
+        uint32_t slot = 0;
+        if (cuda_stream_expert_persistent_find_key(
+                &candidate.next, &unique_keys[u], &slot)) {
+            protected_slots[slot] = 1u;
+            if (!cuda_stream_expert_persistent_touch(
+                    &candidate.next, slot)) {
+                cuda_stream_expert_persistent_note_reject(
+                    &g_stream_expert_persistent_overflow_rejects);
+                return 0;
+            }
+            unique_slots[u] = slot;
+            hit_count++;
+            continue;
+        }
+        miss_count++;
+        for (const cuda_stream_expert_persistent_entry &entry :
+             candidate.next.slots) {
+            if (entry.valid &&
+                entry.key.expert_id == unique_keys[u].expert_id &&
+                !cuda_stream_expert_persistent_key_equal(
+                    &entry.key, &unique_keys[u])) {
+                key_miss_count++;
+                break;
+            }
+        }
+    }
+
+    /* Only slots outside the complete request hit-set and outside active
+     * leases are eligible LRU victims.  Newly assigned miss slots are also
+     * protected so later misses in the transaction cannot replace them. */
+    for (uint32_t u = 0; u < unique_keys.size(); u++) {
+        if (unique_slots[u] != UINT32_MAX) continue;
+        uint32_t slot = 0;
+        int had_victim = 0;
+        cuda_stream_expert_persistent_key victim = {};
+        if (!candidate.next.free_slots.empty()) {
+            slot = candidate.next.free_slots.back();
+            candidate.next.free_slots.pop_back();
+            if (slot >= candidate.next.slots.size() ||
+                candidate.next.slots[slot].valid ||
+                candidate.next.slots[slot].pin_count != 0) {
+                cuda_stream_expert_persistent_note_reject(NULL);
+                return 0;
+            }
+            free_assignment_count++;
+        } else {
+            uint64_t oldest = UINT64_MAX;
+            slot = UINT32_MAX;
+            for (uint32_t s = 0; s < candidate.next.slots.size(); s++) {
+                const cuda_stream_expert_persistent_entry *entry =
+                    &candidate.next.slots[s];
+                if (!entry->valid || protected_slots[s] ||
+                    entry->pin_count != 0) {
+                    continue;
+                }
+                if (slot == UINT32_MAX || entry->last_use < oldest ||
+                    (entry->last_use == oldest && s < slot)) {
+                    oldest = entry->last_use;
+                    slot = s;
+                }
+            }
+            if (slot == UINT32_MAX) {
+                cuda_stream_expert_persistent_note_reject(
+                    &g_stream_expert_persistent_protected_rejects);
+                return 0;
+            }
+            victim = candidate.next.slots[slot].key;
+            had_victim = 1;
+            eviction_count++;
+        }
+        cuda_stream_expert_persistent_entry *entry =
+            &candidate.next.slots[slot];
+        entry->key = unique_keys[u];
+        entry->valid = 1;
+        entry->pin_count = 0;
+        if (!cuda_stream_expert_persistent_touch(&candidate.next, slot)) {
+            cuda_stream_expert_persistent_note_reject(
+                &g_stream_expert_persistent_overflow_rejects);
+            return 0;
+        }
+        protected_slots[slot] = 1u;
+        unique_slots[u] = slot;
+        cuda_stream_expert_persistent_load load = {};
+        load.key = unique_keys[u];
+        load.victim = victim;
+        load.slot = slot;
+        load.had_victim = had_victim;
+        try {
+            candidate.loads.push_back(load);
+        } catch (...) {
+            cuda_stream_expert_persistent_note_reject(NULL);
+            return 0;
+        }
+    }
+
+    uint32_t min_slot = UINT32_MAX;
+    uint32_t max_slot = 0;
+    for (uint32_t slot : unique_slots) {
+        if (slot == UINT32_MAX || slot >= candidate.next.slots.size()) {
+            cuda_stream_expert_persistent_note_reject(NULL);
+            return 0;
+        }
+        min_slot = std::min(min_slot, slot);
+        max_slot = std::max(max_slot, slot);
+    }
+    if (min_slot == UINT32_MAX || max_slot < min_slot) {
+        cuda_stream_expert_persistent_note_reject(NULL);
+        return 0;
+    }
+    const uint64_t domain64 =
+        (uint64_t)max_slot - min_slot + 1u;
+    if (domain64 == 0 || domain64 > UINT32_MAX) {
+        cuda_stream_expert_persistent_note_reject(
+            &g_stream_expert_persistent_overflow_rejects);
+        return 0;
+    }
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const uint32_t unique_index = input_unique[i];
+        if (unique_index >= unique_slots.size() ||
+            unique_slots[unique_index] < min_slot) {
+            cuda_stream_expert_persistent_note_reject(NULL);
+            return 0;
+        }
+        candidate.remap[i] = unique_slots[unique_index] - min_slot;
+        if (candidate.remap[i] >= domain64) {
+            cuda_stream_expert_persistent_note_reject(NULL);
+            return 0;
+        }
+    }
+    if (!cuda_stream_expert_persistent_state_valid(&candidate.next)) {
+        cuda_stream_expert_persistent_note_reject(NULL);
+        return 0;
+    }
+    candidate.slot_base = min_slot;
+    candidate.weight_domain = (uint32_t)domain64;
+    candidate.unique_count = (uint32_t)unique_keys.size();
+    candidate.hit_count = hit_count;
+    candidate.miss_count = miss_count;
+    candidate.duplicate_count = duplicate_count;
+    candidate.built = 1;
+    try {
+        *plan = std::move(candidate);
+    } catch (...) {
+        cuda_stream_expert_persistent_note_reject(NULL);
+        return 0;
+    }
+
+    g_stream_expert_persistent_plans_built.fetch_add(
+        1, std::memory_order_relaxed);
+    g_stream_expert_persistent_hits.fetch_add(
+        hit_count, std::memory_order_relaxed);
+    g_stream_expert_persistent_misses.fetch_add(
+        miss_count, std::memory_order_relaxed);
+    g_stream_expert_persistent_duplicates.fetch_add(
+        duplicate_count, std::memory_order_relaxed);
+    g_stream_expert_persistent_free_assignments.fetch_add(
+        free_assignment_count, std::memory_order_relaxed);
+    g_stream_expert_persistent_evictions.fetch_add(
+        eviction_count, std::memory_order_relaxed);
+    g_stream_expert_persistent_key_misses.fetch_add(
+        key_miss_count, std::memory_order_relaxed);
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_plan_commit(
+        cuda_stream_expert_persistent_state *state,
+        cuda_stream_expert_persistent_plan *plan) {
+    if (!state || !plan || !plan->built ||
+        !cuda_stream_expert_persistent_state_valid(&plan->next)) {
+        return 0;
+    }
+    state->size_class = plan->next.size_class;
+    state->slots.swap(plan->next.slots);
+    state->free_slots.swap(plan->next.free_slots);
+    state->lru_clock = plan->next.lru_clock;
+    plan->built = 0;
+    g_stream_expert_persistent_commits.fetch_add(
+        1, std::memory_order_relaxed);
+    return 1;
+}
+
+static void cuda_stream_expert_persistent_plan_rollback(
+        cuda_stream_expert_persistent_plan *plan) {
+    if (!plan || !plan->built) return;
+    plan->built = 0;
+    plan->next.slots.clear();
+    plan->next.free_slots.clear();
+    plan->remap.clear();
+    plan->loads.clear();
+    g_stream_expert_persistent_rollbacks.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+static void cuda_stream_expert_persistent_resolve_policy(
+        int enable, int disable, int require, int stats, int oracle,
+        int *enabled_out, int *required_out, int *stats_out,
+        int *oracle_out) {
+    const int disabled = disable != 0;
+    if (enabled_out) {
+        *enabled_out = !disabled && (enable || require || oracle);
+    }
+    if (required_out) *required_out = !disabled && require;
+    if (stats_out) *stats_out = !disabled && stats;
+    if (oracle_out) *oracle_out = !disabled && oracle;
+}
+
+extern "C" int ds4_cuda_test_stream_expert_persistent_env_value(
+        const char *value) {
+    return cuda_stream_selected_env_value_enabled(value);
+}
+
+extern "C" int ds4_cuda_test_stream_expert_persistent_policy(
+        int enable, int disable, int require, int stats, int oracle,
+        int *enabled_out, int *required_out, int *stats_out,
+        int *oracle_out) {
+    if (!enabled_out || !required_out || !stats_out || !oracle_out) return 0;
+    cuda_stream_expert_persistent_resolve_policy(
+        enable, disable, require, stats, oracle,
+        enabled_out, required_out, stats_out, oracle_out);
+    return 1;
+}
+
+static void cuda_stream_expert_persistent_report_at_exit(void) {
+    fprintf(stderr,
+            "ds4: CUDA persistent expert planner: attempts=%llu built=%llu "
+            "commits=%llu rollbacks=%llu hits=%llu misses=%llu "
+            "duplicates=%llu free=%llu evictions=%llu rejects=%llu "
+            "budget_rejects=%llu class_rejects=%llu protected_rejects=%llu "
+            "key_misses=%llu overflow_rejects=%llu oracle=%llu/%llu\n",
+            (unsigned long long)g_stream_expert_persistent_plan_attempts.load(),
+            (unsigned long long)g_stream_expert_persistent_plans_built.load(),
+            (unsigned long long)g_stream_expert_persistent_commits.load(),
+            (unsigned long long)g_stream_expert_persistent_rollbacks.load(),
+            (unsigned long long)g_stream_expert_persistent_hits.load(),
+            (unsigned long long)g_stream_expert_persistent_misses.load(),
+            (unsigned long long)g_stream_expert_persistent_duplicates.load(),
+            (unsigned long long)g_stream_expert_persistent_free_assignments.load(),
+            (unsigned long long)g_stream_expert_persistent_evictions.load(),
+            (unsigned long long)g_stream_expert_persistent_rejects.load(),
+            (unsigned long long)g_stream_expert_persistent_budget_rejects.load(),
+            (unsigned long long)g_stream_expert_persistent_class_rejects.load(),
+            (unsigned long long)g_stream_expert_persistent_protected_rejects.load(),
+            (unsigned long long)g_stream_expert_persistent_key_misses.load(),
+            (unsigned long long)g_stream_expert_persistent_overflow_rejects.load(),
+            (unsigned long long)g_stream_expert_persistent_oracle_runs.load(),
+            (unsigned long long)g_stream_expert_persistent_oracle_failures.load());
+}
+
+static void cuda_stream_expert_persistent_init(void) {
+    const int enable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_ENABLE_STREAMING_EXPERT_PERSISTENT_CACHE");
+    const int disable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_DISABLE_STREAMING_EXPERT_PERSISTENT_CACHE") ||
+        cuda_stream_selected_env_flag(
+            "DS4_CUDA_NO_STREAMING_EXPERT_PERSISTENT_CACHE");
+    const int require = cuda_stream_selected_env_flag(
+        "DS4_CUDA_REQUIRE_STREAMING_EXPERT_PERSISTENT_CACHE");
+    const int stats = cuda_stream_selected_env_flag(
+        "DS4_CUDA_STREAMING_EXPERT_PERSISTENT_CACHE_STATS");
+    const int oracle = cuda_stream_selected_env_flag(
+        "DS4_CUDA_STREAMING_EXPERT_PERSISTENT_CACHE_ORACLE");
+    cuda_stream_expert_persistent_resolve_policy(
+        enable, disable, require, stats, oracle,
+        &g_stream_expert_persistent_enabled,
+        &g_stream_expert_persistent_required,
+        &g_stream_expert_persistent_stats,
+        &g_stream_expert_persistent_oracle);
+    if ((enable || require || stats || oracle) &&
+        !g_stream_expert_persistent_report_registered) {
+        g_stream_expert_persistent_report_registered = 1;
+        (void)atexit(cuda_stream_expert_persistent_report_at_exit);
+    }
+    if (g_stream_expert_persistent_enabled) {
+        fprintf(stderr,
+                "ds4: CUDA persistent expert planner enabled%s%s\n",
+                g_stream_expert_persistent_required ? " (required)" : "",
+                g_stream_expert_persistent_oracle ? " with oracle" : "");
+    } else if (disable && (enable || require || oracle)) {
+        fprintf(stderr,
+                "ds4: CUDA persistent expert planner disabled by rollback "
+                "override\n");
+    }
+}
+
+extern "C" void ds4_cuda_stream_expert_persistent_get_report(
+        ds4_cuda_stream_expert_persistent_report *report) {
+    if (!report) return;
+    std::call_once(g_stream_expert_persistent_once,
+                   cuda_stream_expert_persistent_init);
+    cuda_stream_expert_persistent_report_layout out = {};
+    out.plan_attempts = g_stream_expert_persistent_plan_attempts.load();
+    out.plans_built = g_stream_expert_persistent_plans_built.load();
+    out.commits = g_stream_expert_persistent_commits.load();
+    out.rollbacks = g_stream_expert_persistent_rollbacks.load();
+    out.hits = g_stream_expert_persistent_hits.load();
+    out.misses = g_stream_expert_persistent_misses.load();
+    out.duplicates = g_stream_expert_persistent_duplicates.load();
+    out.free_assignments =
+        g_stream_expert_persistent_free_assignments.load();
+    out.evictions = g_stream_expert_persistent_evictions.load();
+    out.rejects = g_stream_expert_persistent_rejects.load();
+    out.budget_rejects =
+        g_stream_expert_persistent_budget_rejects.load();
+    out.class_rejects = g_stream_expert_persistent_class_rejects.load();
+    out.protected_rejects =
+        g_stream_expert_persistent_protected_rejects.load();
+    out.key_misses = g_stream_expert_persistent_key_misses.load();
+    out.overflow_rejects =
+        g_stream_expert_persistent_overflow_rejects.load();
+    out.oracle_runs = g_stream_expert_persistent_oracle_runs.load();
+    out.oracle_failures =
+        g_stream_expert_persistent_oracle_failures.load();
+    out.enabled = g_stream_expert_persistent_enabled;
+    out.required = g_stream_expert_persistent_required;
+    out.stats = g_stream_expert_persistent_stats;
+    out.oracle = g_stream_expert_persistent_oracle;
+    memcpy(report, &out, sizeof(out));
+}
+
+static int cuda_stream_expert_persistent_test_table_make(
+        ds4_gpu_stream_expert_table *table,
+        const void *model_map,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!table || !model_map || n_total_expert == 0) return 0;
+    uint64_t gate_table_bytes = 0;
+    uint64_t down_table_bytes = 0;
+    uint64_t down_offset = 0;
+    uint64_t model_size = 0;
+    if (!cuda_stream_expert_persistent_mul_u64(
+            gate_expert_bytes, n_total_expert, &gate_table_bytes) ||
+        !cuda_stream_expert_persistent_mul_u64(
+            down_expert_bytes, n_total_expert, &down_table_bytes) ||
+        !cuda_stream_expert_persistent_mul_u64(
+            gate_table_bytes, 2u, &down_offset) ||
+        !cuda_stream_expert_persistent_add_u64(
+            down_offset, down_table_bytes, &model_size)) {
+        return 0;
+    }
+    memset(table, 0, sizeof(*table));
+    table->model_map = model_map;
+    table->model_size = model_size;
+    table->layer = layer;
+    table->n_total_expert = n_total_expert;
+    table->gate_offset = 0;
+    table->up_offset = gate_table_bytes;
+    table->down_offset = down_offset;
+    table->gate_expert_bytes = gate_expert_bytes;
+    table->down_expert_bytes = down_expert_bytes;
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_test_basic(void) {
+    unsigned char model_marker = 0;
+    ds4_gpu_stream_expert_table table = {};
+    cuda_stream_expert_persistent_state state = {};
+    cuda_stream_expert_persistent_state before = {};
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &table, &model_marker, 7u, 8u, 16u, 8u) ||
+        !cuda_stream_expert_persistent_state_init(&state, 4u, 16u, 8u) ||
+        !cuda_stream_expert_persistent_state_copy(&before, &state)) {
+        return 0;
+    }
+
+    const int32_t cold_ids[3] = {2, 3, 2};
+    cuda_stream_expert_persistent_plan cold = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, cold_ids, 3u, &cold) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before) ||
+        cold.unique_count != 2u || cold.hit_count != 0u ||
+        cold.miss_count != 2u || cold.duplicate_count != 1u ||
+        cold.loads.size() != 2u || cold.loads[0].slot != 0u ||
+        cold.loads[1].slot != 1u || cold.slot_base != 0u ||
+        cold.weight_domain != 2u || cold.remap.size() != 3u ||
+        cold.remap[0] != 0u || cold.remap[1] != 1u ||
+        cold.remap[2] != 0u ||
+        !cuda_stream_expert_persistent_plan_commit(&state, &cold) ||
+        !cuda_stream_expert_persistent_state_valid(&state)) {
+        return 0;
+    }
+
+    const int32_t fill_ids[2] = {4, 5};
+    cuda_stream_expert_persistent_plan fill = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, fill_ids, 2u, &fill) ||
+        fill.loads.size() != 2u || fill.loads[0].slot != 2u ||
+        fill.loads[1].slot != 3u ||
+        !cuda_stream_expert_persistent_plan_commit(&state, &fill)) {
+        return 0;
+    }
+
+    if (!cuda_stream_expert_persistent_state_copy(&before, &state)) return 0;
+    const int32_t sparse_ids[3] = {3, 5, 3};
+    cuda_stream_expert_persistent_plan sparse = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, sparse_ids, 3u, &sparse) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before) ||
+        sparse.unique_count != 2u || sparse.hit_count != 2u ||
+        sparse.miss_count != 0u || sparse.duplicate_count != 1u ||
+        !sparse.loads.empty() || sparse.slot_base != 1u ||
+        sparse.weight_domain != 3u || sparse.remap.size() != 3u ||
+        sparse.remap[0] != 0u || sparse.remap[1] != 2u ||
+        sparse.remap[2] != 0u ||
+        !cuda_stream_expert_persistent_plan_commit(&state, &sparse) ||
+        !cuda_stream_expert_persistent_state_valid(&state)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_test_protection(void) {
+    unsigned char model_marker = 0;
+    ds4_gpu_stream_expert_table table = {};
+    cuda_stream_expert_persistent_state state = {};
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &table, &model_marker, 11u, 8u, 16u, 8u) ||
+        !cuda_stream_expert_persistent_state_init(&state, 3u, 16u, 8u)) {
+        return 0;
+    }
+    const int32_t initial_ids[3] = {0, 1, 2};
+    cuda_stream_expert_persistent_plan initial = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, initial_ids, 3u, &initial) ||
+        !cuda_stream_expert_persistent_plan_commit(&state, &initial)) {
+        return 0;
+    }
+
+    cuda_stream_expert_persistent_key key0 = {};
+    cuda_stream_expert_persistent_key key1 = {};
+    cuda_stream_expert_persistent_key key2 = {};
+    if (!cuda_stream_expert_persistent_key_make(&key0, &table, 0) ||
+        !cuda_stream_expert_persistent_key_make(&key1, &table, 1) ||
+        !cuda_stream_expert_persistent_key_make(&key2, &table, 2)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_state before = {};
+    if (!cuda_stream_expert_persistent_state_copy(&before, &state)) return 0;
+
+    /* The hit is deliberately ordered after the miss.  Planning all hits
+     * first must protect resident slot zero before the miss selects a victim. */
+    const int32_t miss_then_hit[2] = {3, 0};
+    cuda_stream_expert_persistent_plan requested = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, miss_then_hit, 2u, &requested) ||
+        requested.hit_count != 1u || requested.miss_count != 1u ||
+        requested.loads.size() != 1u || requested.loads[0].slot != 1u ||
+        !requested.loads[0].had_victim ||
+        requested.loads[0].victim.expert_id != 1u ||
+        requested.slot_base != 0u || requested.weight_domain != 2u ||
+        requested.remap.size() != 2u || requested.remap[0] != 1u ||
+        requested.remap[1] != 0u ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_plan_rollback(&requested);
+    if (!cuda_stream_expert_persistent_state_equal(&state, &before) ||
+        !cuda_stream_expert_persistent_pin_key(&state, &key0, 1) ||
+        !cuda_stream_expert_persistent_state_copy(&before, &state)) {
+        return 0;
+    }
+
+    /* Slot zero is the LRU, but its active lease protects it.  The planner
+     * must choose the next-oldest unpinned slot, then rollback without an LRU
+     * or free-list mutation. */
+    const int32_t miss_id[1] = {3};
+    cuda_stream_expert_persistent_plan replacement = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, miss_id, 1u, &replacement) ||
+        replacement.loads.size() != 1u ||
+        replacement.loads[0].slot != 1u ||
+        !replacement.loads[0].had_victim ||
+        replacement.loads[0].victim.expert_id != 1u ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_plan_rollback(&replacement);
+    if (!cuda_stream_expert_persistent_state_equal(&state, &before)) return 0;
+
+    if (!cuda_stream_expert_persistent_pin_key(&state, &key1, 1) ||
+        !cuda_stream_expert_persistent_pin_key(&state, &key2, 1) ||
+        !cuda_stream_expert_persistent_state_copy(&before, &state)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_plan blocked = {};
+    if (cuda_stream_expert_persistent_plan_build(
+            &state, &table, miss_id, 1u, &blocked) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_test_rejections(void) {
+    unsigned char model_a = 0;
+    unsigned char model_b = 0;
+    ds4_gpu_stream_expert_table table = {};
+    cuda_stream_expert_persistent_state state = {};
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &table, &model_a, 3u, 8u, 16u, 8u) ||
+        !cuda_stream_expert_persistent_state_init(&state, 2u, 16u, 8u)) {
+        return 0;
+    }
+    const int32_t initial_ids[2] = {0, 1};
+    cuda_stream_expert_persistent_plan initial = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, initial_ids, 2u, &initial) ||
+        !cuda_stream_expert_persistent_plan_commit(&state, &initial)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_state before = {};
+    if (!cuda_stream_expert_persistent_state_copy(&before, &state)) return 0;
+
+    ds4_gpu_stream_expert_table wrong_class = {};
+    const int32_t one_id[1] = {0};
+    cuda_stream_expert_persistent_plan rejected = {};
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &wrong_class, &model_a, 3u, 8u, 32u, 8u) ||
+        cuda_stream_expert_persistent_plan_build(
+            &state, &wrong_class, one_id, 1u, &rejected) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    /* Exact class identity matters even when 2*gate+down has the same total
+     * bytes per slot (16/8 and 12/16 are both 40 bytes). */
+    ds4_gpu_stream_expert_table same_total_wrong_class = {};
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &same_total_wrong_class, &model_a, 3u, 8u, 12u, 16u) ||
+        cuda_stream_expert_persistent_plan_build(
+            &state, &same_total_wrong_class, one_id, 1u, &rejected) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+
+    const int32_t over_budget[3] = {0, 1, 2};
+    if (cuda_stream_expert_persistent_plan_build(
+            &state, &table, over_budget, 3u, &rejected) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+
+    /* Same expert number in another model/layer/table is a miss, never an
+     * aliasing hit.  The discarded transaction must preserve the old key. */
+    ds4_gpu_stream_expert_table other_key = {};
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &other_key, &model_b, 4u, 8u, 16u, 8u)) {
+        return 0;
+    }
+    const uint64_t key_misses_before =
+        g_stream_expert_persistent_key_misses.load();
+    cuda_stream_expert_persistent_plan key_plan = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &other_key, one_id, 1u, &key_plan) ||
+        key_plan.hit_count != 0u || key_plan.miss_count != 1u ||
+        key_plan.loads.size() != 1u || !key_plan.loads[0].had_victim ||
+        key_plan.loads[0].key.model_map != &model_b ||
+        key_plan.loads[0].victim.model_map != &model_a ||
+        g_stream_expert_persistent_key_misses.load() !=
+            key_misses_before + 1u ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_plan_rollback(&key_plan);
+    if (!cuda_stream_expert_persistent_state_equal(&state, &before)) return 0;
+
+    ds4_gpu_stream_expert_table bad_range = table;
+    bad_range.gate_offset = UINT64_MAX - 7u;
+    if (cuda_stream_expert_persistent_plan_build(
+            &state, &bad_range, one_id, 1u, &rejected) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+
+    cuda_stream_expert_persistent_class impossible = {};
+    if (cuda_stream_expert_persistent_class_make(
+            &impossible, 2u, UINT64_MAX, 1u)) {
+        return 0;
+    }
+
+    /* A wrapped LRU clock is fail-closed on the private transaction. */
+    cuda_stream_expert_persistent_state wrapped = {};
+    cuda_stream_expert_persistent_state wrapped_before = {};
+    if (!cuda_stream_expert_persistent_state_copy(&wrapped, &state)) return 0;
+    wrapped.lru_clock = UINT64_MAX;
+    if (!cuda_stream_expert_persistent_state_copy(
+            &wrapped_before, &wrapped)) {
+        return 0;
+    }
+    if (cuda_stream_expert_persistent_plan_build(
+            &wrapped, &table, one_id, 1u, &rejected) ||
+        !cuda_stream_expert_persistent_state_equal(
+            &wrapped, &wrapped_before)) {
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_cuda_test_stream_expert_persistent_planner(void) {
+    g_stream_expert_persistent_oracle_runs.fetch_add(
+        1, std::memory_order_relaxed);
+    const int ok = cuda_stream_expert_persistent_test_basic() &&
+                   cuda_stream_expert_persistent_test_protection() &&
+                   cuda_stream_expert_persistent_test_rejections();
+    if (!ok) {
+        g_stream_expert_persistent_oracle_failures.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 struct ds4_cuda_iq2_ssd_grouped_report;
@@ -30702,18 +31813,6 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
     }
     return 0;
 }
-
-typedef struct ds4_gpu_stream_expert_table {
-    const void *model_map;
-    uint64_t    model_size;
-    uint32_t    layer;
-    uint32_t    n_total_expert;
-    uint64_t    gate_offset;
-    uint64_t    up_offset;
-    uint64_t    down_offset;
-    uint64_t    gate_expert_bytes;
-    uint64_t    down_expert_bytes;
-} ds4_gpu_stream_expert_table;
 
 static int cuda_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
