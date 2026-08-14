@@ -105,7 +105,8 @@ int ds4_gpu_parallel_ffn_start(
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || \
+    (!defined(__APPLE__) && !defined(DS4_NO_GPU))
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,
@@ -304,6 +305,21 @@ typedef struct ds4_cuda_stream_selected_batch_io_report {
     int required;
     int oracle;
 } ds4_cuda_stream_selected_batch_io_report;
+typedef struct ds4_cuda_stream_selected_event_pipeline_report {
+    uint64_t candidates;
+    uint64_t signals;
+    uint64_t readbacks;
+    uint64_t uploads;
+    uint64_t compute_waits;
+    uint64_t safe_fallbacks;
+    uint64_t failures;
+    uint64_t required_failures;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    int enabled;
+    int required;
+    int oracle;
+} ds4_cuda_stream_selected_event_pipeline_report;
 /* CUDA-only policy/planner/scatter hooks.  The policy hook takes explicit
  * values so tests do not need to mutate process environment around once_flag
  * initialization. */
@@ -315,6 +331,24 @@ int ds4_cuda_test_stream_selected_batch_plan(void);
 int ds4_cuda_test_stream_selected_batch_copy(void);
 void ds4_cuda_stream_selected_batch_io_get_report(
         ds4_cuda_stream_selected_batch_io_report *report);
+int ds4_cuda_test_stream_selected_event_pipeline_policy(
+        int enable, int disable, int require, int oracle,
+        int *enabled_out, int *required_out, int *oracle_out);
+int ds4_cuda_test_stream_selected_event_env_value(const char *value);
+int ds4_cuda_test_stream_selected_event_pipeline(void);
+int ds4_cuda_test_stream_selected_owner_device(void);
+void ds4_cuda_stream_selected_event_pipeline_get_report(
+        ds4_cuda_stream_selected_event_pipeline_report *report);
+int ds4_gpu_cuda_stream_selected_event_pipeline_enabled(void);
+int ds4_gpu_cuda_stream_selected_event_pipeline_required(void);
+int ds4_gpu_cuda_stream_selected_set_owner_device(void);
+void ds4_gpu_cuda_stream_selected_event_note_candidate(void);
+void ds4_gpu_cuda_stream_selected_event_note_fallback(void);
+void ds4_gpu_cuda_stream_selected_event_note_failure(int required);
+int ds4_gpu_signal_selected_readback_ready_async(uint64_t *event_value);
+int ds4_gpu_stream_expert_cache_wait_selected_upload(
+        uint64_t event_value, const char *label);
+int ds4_gpu_cuda_stream_selected_event_abort(void);
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
@@ -347,6 +381,15 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* Returns 1 on publication, 0 on a safe pre-enqueue rejection, and -1 on
+ * a post-enqueue failure which callers must not retry. */
+int ds4_gpu_stream_expert_cache_begin_selected_load_async(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected,
+        uint64_t                          *upload_event_value);
+#endif
 int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,

@@ -22408,11 +22408,15 @@ typedef struct metal_graph_selected_async_load {
     /* Selected ids remain usable for a synchronous retry if the service
      * thread cannot stage the cache load without waiting on GPU work. */
     bool                      ids_ok;
+    bool                      cuda_event_pipeline;
+    bool                      cuda_event_required;
+    bool                      fail_closed;
     ds4_gpu_tensor           *router_selected;
     const ds4_model          *model;
     const ds4_layer_weights  *layer;
     uint32_t                  il;
     uint64_t                  event_value;
+    uint64_t                  upload_event_value;
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
@@ -22439,8 +22443,54 @@ static void metal_graph_selected_async_load_run(
         DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
         return;
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (job->cuda_event_pipeline &&
+        ds4_gpu_cuda_stream_selected_set_owner_device() == 0) {
+        job->fail_closed = job->cuda_event_required;
+        return;
+    }
+#endif
     if (job->event_value != 0) {
-#ifdef DS4_ROCM_BUILD
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        if (job->cuda_event_pipeline) {
+            if (ds4_gpu_tensor_read_after_selected_event(
+                        job->router_selected,
+                        0,
+                        job->selected_ids,
+                        (uint64_t)DS4_N_EXPERT_USED *
+                            sizeof(job->selected_ids[0]),
+                        job->event_value,
+                        "selected-id async expert load") == 0) {
+                if (job->cuda_event_required) {
+                    job->fail_closed = true;
+                    return;
+                }
+                ds4_gpu_cuda_stream_selected_event_note_fallback();
+                if (ds4_gpu_synchronize() == 0 ||
+                    ds4_gpu_tensor_read(
+                        job->router_selected,
+                        0,
+                        job->selected_ids,
+                        (uint64_t)DS4_N_EXPERT_USED *
+                            sizeof(job->selected_ids[0])) == 0) {
+                    return;
+                }
+                job->cuda_event_pipeline = false;
+            }
+        } else {
+            if (ds4_gpu_wait_selected_readback_ready(
+                        job->event_value,
+                        "selected-id async expert load") == 0 ||
+                ds4_gpu_tensor_read(
+                        job->router_selected,
+                        0,
+                        job->selected_ids,
+                        (uint64_t)DS4_N_EXPERT_USED *
+                            sizeof(job->selected_ids[0])) == 0) {
+                return;
+            }
+        }
+#elif defined(DS4_ROCM_BUILD)
         if (ds4_gpu_tensor_read_after_selected_event(
                     job->router_selected,
                     0,
@@ -22452,15 +22502,15 @@ static void metal_graph_selected_async_load_run(
             return;
         }
 #else
-        if (ds4_gpu_wait_selected_readback_ready(job->event_value,
-                                                 "selected-id async expert load") == 0) {
-            return;
-        }
-        if (ds4_gpu_tensor_read(job->router_selected,
-                                0,
-                                job->selected_ids,
-                                (uint64_t)DS4_N_EXPERT_USED *
-                                    sizeof(job->selected_ids[0])) == 0) {
+        if (ds4_gpu_wait_selected_readback_ready(
+                    job->event_value,
+                    "selected-id async expert load") == 0 ||
+            ds4_gpu_tensor_read(
+                    job->router_selected,
+                    0,
+                    job->selected_ids,
+                    (uint64_t)DS4_N_EXPERT_USED *
+                        sizeof(job->selected_ids[0])) == 0) {
             return;
         }
 #endif
@@ -22483,6 +22533,32 @@ static void metal_graph_selected_async_load_run(
                                        job->il,
                                        job->gate_expert_bytes,
                                        job->down_expert_bytes);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (job->cuda_event_pipeline) {
+        const int load_rc =
+            ds4_gpu_stream_expert_cache_begin_selected_load_async(
+                &table,
+                job->selected_ids,
+                DS4_N_EXPERT_USED,
+                &job->upload_event_value);
+        if (load_rc <= 0) {
+            if (load_rc < 0 || job->cuda_event_required) {
+                job->fail_closed = true;
+                return;
+            }
+            /* A zero result guarantees that no H2D operation was submitted,
+             * so the established synchronous loader is a safe rollback. */
+            ds4_gpu_cuda_stream_selected_event_note_fallback();
+            job->cuda_event_pipeline = false;
+            if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                        &table,
+                        job->selected_ids,
+                        DS4_N_EXPERT_USED) == 0) {
+                return;
+            }
+        }
+    } else
+#endif
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
                 &table,
                 job->selected_ids,
@@ -22552,6 +22628,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
         const ds4_layer_weights         *layer,
         uint32_t                         il,
         uint64_t                         event_value,
+        bool                             cuda_event_pipeline,
+        bool                             cuda_event_required,
         uint64_t                         gate_expert_bytes,
         uint64_t                         down_expert_bytes) {
     if (!job || !router_selected || event_value == 0) return false;
@@ -22562,6 +22640,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     job->layer = layer;
     job->il = il;
     job->event_value = event_value;
+    job->cuda_event_pipeline = cuda_event_pipeline;
+    job->cuda_event_required = cuda_event_required;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
@@ -22586,6 +22666,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
         const ds4_layer_weights         *layer,
         uint32_t                         il,
         uint64_t                         event_value,
+        bool                             cuda_event_pipeline,
+        bool                             cuda_event_required,
         uint64_t                         gate_expert_bytes,
         uint64_t                         down_expert_bytes) {
     return metal_graph_selected_async_load_start_tensor(
@@ -22595,6 +22677,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
             layer,
             il,
             event_value,
+            cuda_event_pipeline,
+            cuda_event_required,
             gate_expert_bytes,
             down_expert_bytes);
 }
@@ -25772,6 +25856,27 @@ static bool metal_graph_encode_decode_layer_phase(
          (mxfp4_selected_shared_overlap &&
           metal_graph_use_iq2_selected_async_load(g)) ||
          cuda_selected_shared_overlap);
+    bool cuda_selected_event_pipeline = false;
+    bool cuda_selected_event_required = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    cuda_selected_event_required =
+        ds4_gpu_cuda_stream_selected_event_pipeline_required() != 0;
+    cuda_selected_event_pipeline =
+        ds4_gpu_cuda_stream_selected_event_pipeline_enabled() != 0 &&
+        cuda_selected_shared_overlap &&
+        async_selected_load;
+    if (cuda_selected_event_required &&
+        !cuda_selected_event_pipeline) {
+        ds4_gpu_cuda_stream_selected_event_note_candidate();
+        ds4_gpu_cuda_stream_selected_event_note_failure(1);
+        fprintf(stderr,
+                "ds4: required CUDA selected-expert event pipeline is not "
+                "eligible at layer %u\n",
+                il);
+        (void)ds4_gpu_cuda_stream_selected_event_abort();
+        return false;
+    }
+#endif
     const bool selected_readahead_shared_delay =
         ok &&
         !external_routed &&
@@ -25936,7 +26041,29 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (overlap_selected_shared) {
         uint64_t selected_event = 0;
-        if (ok) ok = ds4_gpu_signal_selected_readback_ready(&selected_event) != 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        if (ok && cuda_selected_event_pipeline) {
+            ds4_gpu_cuda_stream_selected_event_note_candidate();
+            if (ds4_gpu_signal_selected_readback_ready_async(
+                        &selected_event) == 0) {
+                ds4_gpu_cuda_stream_selected_event_note_failure(
+                    cuda_selected_event_required ? 1 : 0);
+                if (cuda_selected_event_required) {
+                    fprintf(stderr,
+                            "ds4: required CUDA selected compute-ready "
+                            "event failed at layer %u\n",
+                            il);
+                    (void)ds4_gpu_cuda_stream_selected_event_abort();
+                    return false;
+                }
+                ds4_gpu_cuda_stream_selected_event_note_fallback();
+                cuda_selected_event_pipeline = false;
+            }
+        }
+#endif
+        if (ok && !cuda_selected_event_pipeline) {
+            ok = ds4_gpu_signal_selected_readback_ready(&selected_event) != 0;
+        }
         metal_graph_selected_async_load async_load = {0};
         bool async_load_started = false;
         const bool iq2_metal_merged_boundary =
@@ -25944,6 +26071,7 @@ static bool metal_graph_encode_decode_layer_phase(
             !cuda_selected_shared_overlap;
         const bool async_early_commit =
             async_selected_load &&
+            !cuda_selected_event_pipeline &&
             (iq2_metal_merged_boundary ?
                  metal_graph_use_iq2_selected_async_early_commit(g) :
                  metal_graph_use_selected_async_early_commit_legacy(g));
@@ -25957,8 +26085,26 @@ static bool metal_graph_encode_decode_layer_phase(
                                                        layer,
                                                        il,
                                                        selected_event,
+                                                       cuda_selected_event_pipeline,
+                                                       cuda_selected_event_required,
                                                        gate_expert_bytes,
                                                        down_expert_bytes);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+            if (!async_load_started && cuda_selected_event_pipeline) {
+                ds4_gpu_cuda_stream_selected_event_note_failure(
+                    cuda_selected_event_required ? 1 : 0);
+                if (cuda_selected_event_required) {
+                    fprintf(stderr,
+                            "ds4: required CUDA selected-expert worker "
+                            "could not start at layer %u\n",
+                            il);
+                    (void)ds4_gpu_cuda_stream_selected_event_abort();
+                    return false;
+                }
+                ds4_gpu_cuda_stream_selected_event_note_fallback();
+                cuda_selected_event_pipeline = false;
+            }
+#endif
         }
         if (ok && async_early_commit && async_load_started) {
             ok = ds4_gpu_flush_commands() != 0;
@@ -26005,13 +26151,22 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
         if (async_load_started) {
-            const bool flush_ok = ds4_gpu_flush_commands() != 0;
+            const bool flush_ok = cuda_selected_event_pipeline ||
+                ds4_gpu_flush_commands() != 0;
             bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
-            if (!finish_ok && async_load.ids_ok) {
+            if (!finish_ok && async_load.ids_ok &&
+                !async_load.fail_closed &&
+                !cuda_selected_event_required &&
+                async_load.upload_event_value == 0) {
                 /* The worker read valid ids but could not stage the load
                  * (it is not allowed to wait on in-flight cache entries).
                  * This thread is, so retry the same load synchronously. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+                if (cuda_selected_event_pipeline) {
+                    ds4_gpu_cuda_stream_selected_event_note_fallback();
+                }
+#endif
                 const ds4_gpu_stream_expert_table retry_table =
                     graph_stream_expert_table_make(model,
                                                    layer,
@@ -26027,6 +26182,29 @@ static bool metal_graph_encode_decode_layer_phase(
                             async_load.selected_ids,
                             DS4_N_EXPERT_USED) != 0;
             }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+            if (cuda_selected_event_pipeline && !finish_ok) {
+                ds4_gpu_cuda_stream_selected_event_note_failure(
+                    cuda_selected_event_required ? 1 : 0);
+            }
+            if (cuda_selected_event_pipeline && finish_ok &&
+                async_load.upload_event_value != 0 &&
+                ds4_gpu_stream_expert_cache_wait_selected_upload(
+                    async_load.upload_event_value,
+                    "selected expert upload") == 0) {
+                ds4_gpu_cuda_stream_selected_event_note_failure(
+                    cuda_selected_event_required ? 1 : 0);
+                if (cuda_selected_event_required) {
+                    finish_ok = false;
+                } else {
+                    ds4_gpu_cuda_stream_selected_event_note_fallback();
+                    finish_ok = ds4_gpu_synchronize() != 0;
+                }
+            }
+            if (cuda_selected_event_pipeline && !finish_ok) {
+                (void)ds4_gpu_cuda_stream_selected_event_abort();
+            }
+#endif
             ok = ok && flush_ok && finish_ok;
         } else if (ok) {
             ok = ds4_gpu_commit_and_wait_selected_readback(selected_event,
@@ -26053,6 +26231,11 @@ static bool metal_graph_encode_decode_layer_phase(
                             DS4_N_EXPERT_USED) != 0;
             }
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        if (!ok && cuda_selected_event_pipeline) {
+            (void)ds4_gpu_cuda_stream_selected_event_abort();
+        }
+#endif
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                      metal_graph_routed_gate(g),
                                                      metal_graph_routed_up(g),
@@ -46798,6 +46981,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                         l,
                         il,
                         selected_event,
+                        false,
+                        false,
                         gate_out * gate_row_bytes,
                         down_out * down_row_bytes);
                 async_path_profiled = async_profile && async_load_started;
