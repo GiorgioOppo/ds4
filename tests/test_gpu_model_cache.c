@@ -245,6 +245,38 @@ int main(void) {
           arena_after.arena_oracle_failures ==
               arena_before.arena_oracle_failures,
           "persistent expert device arena coverage counters");
+    ds4_cuda_stream_expert_persistent_report runtime_before;
+    memset(&runtime_before, 0, sizeof(runtime_before));
+    ds4_cuda_stream_expert_persistent_get_report(&runtime_before);
+    CHECK(ds4_cuda_test_stream_expert_persistent_runtime(),
+          "persistent expert cold/hit/mixed/eviction/fault runtime oracle");
+    ds4_cuda_stream_expert_persistent_report runtime_after;
+    memset(&runtime_after, 0, sizeof(runtime_after));
+    ds4_cuda_stream_expert_persistent_get_report(&runtime_after);
+    CHECK(runtime_after.runtime_oracle_runs ==
+              runtime_before.runtime_oracle_runs + 1u &&
+          runtime_after.runtime_oracle_failures ==
+              runtime_before.runtime_oracle_failures &&
+          runtime_after.epochs_attempted >=
+              runtime_before.epochs_attempted + 7u &&
+          runtime_after.epochs_published ==
+              runtime_before.epochs_published + 5u &&
+          runtime_after.all_hit_epochs ==
+              runtime_before.all_hit_epochs + 2u &&
+          runtime_after.miss_epochs == runtime_before.miss_epochs + 3u &&
+          runtime_after.miss_experts >= runtime_before.miss_experts + 5u &&
+          runtime_after.weight_bytes_uploaded >=
+              runtime_before.weight_bytes_uploaded + 200u &&
+          runtime_after.remap_bytes_uploaded >=
+              runtime_before.remap_bytes_uploaded + 44u &&
+          runtime_after.upload_failures ==
+              runtime_before.upload_failures + 1u &&
+          runtime_after.slot_invalidations >=
+              runtime_before.slot_invalidations + 2u &&
+          runtime_after.poisons >= runtime_before.poisons + 1u &&
+          runtime_after.persistent_dispatches >=
+              runtime_before.persistent_dispatches + 5u,
+          "persistent expert runtime coverage counters");
     ds4_cuda_iq2_ssd_grouped_report lease_before;
     memset(&lease_before, 0, sizeof(lease_before));
     ds4_cuda_iq2_ssd_grouped_get_report(&lease_before);

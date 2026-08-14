@@ -361,6 +361,21 @@ typedef struct ds4_cuda_stream_expert_persistent_report {
     uint64_t arena_failures;
     uint64_t arena_oracle_runs;
     uint64_t arena_oracle_failures;
+    uint64_t epochs_attempted;
+    uint64_t epochs_published;
+    uint64_t all_hit_epochs;
+    uint64_t miss_epochs;
+    uint64_t miss_experts;
+    uint64_t weight_bytes_uploaded;
+    uint64_t remap_bytes_uploaded;
+    uint64_t upload_failures;
+    uint64_t fallbacks;
+    uint64_t slot_invalidations;
+    uint64_t poisons;
+    uint64_t persistent_dispatches;
+    uint64_t transient_dispatches;
+    uint64_t runtime_oracle_runs;
+    uint64_t runtime_oracle_failures;
     int enabled;
     int required;
     int stats;
@@ -413,6 +428,7 @@ int ds4_cuda_test_stream_expert_persistent_policy(
 int ds4_cuda_test_stream_expert_persistent_env_value(const char *value);
 int ds4_cuda_test_stream_expert_persistent_planner(void);
 int ds4_cuda_test_stream_expert_persistent_arena(void);
+int ds4_cuda_test_stream_expert_persistent_runtime(void);
 void ds4_cuda_stream_expert_persistent_get_report(
         ds4_cuda_stream_expert_persistent_report *report);
 int ds4_gpu_cuda_stream_selected_event_pipeline_enabled(void);
