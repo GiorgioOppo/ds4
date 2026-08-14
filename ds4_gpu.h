@@ -332,6 +332,29 @@ typedef struct ds4_cuda_iq2_ssd_grouped_report {
     int required;
     int stats;
 } ds4_cuda_iq2_ssd_grouped_report;
+typedef struct ds4_cuda_stream_expert_persistent_report {
+    uint64_t plan_attempts;
+    uint64_t plans_built;
+    uint64_t commits;
+    uint64_t rollbacks;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t duplicates;
+    uint64_t free_assignments;
+    uint64_t evictions;
+    uint64_t rejects;
+    uint64_t budget_rejects;
+    uint64_t class_rejects;
+    uint64_t protected_rejects;
+    uint64_t key_misses;
+    uint64_t overflow_rejects;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    int enabled;
+    int required;
+    int stats;
+    int oracle;
+} ds4_cuda_stream_expert_persistent_report;
 /* CUDA-only policy/planner/scatter hooks.  The policy hook takes explicit
  * values so tests do not need to mutate process environment around once_flag
  * initialization. */
@@ -372,6 +395,14 @@ int ds4_cuda_test_iq2_ssd_grouped_raw_layout(
 int ds4_cuda_test_iq2_ssd_grouped_lease(void);
 void ds4_cuda_iq2_ssd_grouped_get_report(
         ds4_cuda_iq2_ssd_grouped_report *report);
+int ds4_cuda_test_stream_expert_persistent_policy(
+        int enable, int disable, int require, int stats, int oracle,
+        int *enabled_out, int *required_out, int *stats_out,
+        int *oracle_out);
+int ds4_cuda_test_stream_expert_persistent_env_value(const char *value);
+int ds4_cuda_test_stream_expert_persistent_planner(void);
+void ds4_cuda_stream_expert_persistent_get_report(
+        ds4_cuda_stream_expert_persistent_report *report);
 int ds4_gpu_cuda_stream_selected_event_pipeline_enabled(void);
 int ds4_gpu_cuda_stream_selected_event_pipeline_required(void);
 int ds4_gpu_cuda_stream_selected_set_owner_device(void);
