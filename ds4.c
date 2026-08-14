@@ -51830,6 +51830,8 @@ struct ds4_session {
     bool greedy_splitkv_anchor_valid;
 };
 
+enum { DS4_METAL_SESSION_STREAMS = 8 };
+
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
 
@@ -64685,6 +64687,92 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+#ifndef DS4_NO_GPU
+/* Small fail-closed policy shared by runtime admission and its test hook.
+ * Detailed graph/layout checks remain below; this layer owns the externally
+ * controllable arm and the state classes that must never reach multi-queue
+ * execution. */
+static bool ds4_q4_stream_overlap_policy(
+        int  count,
+        bool resident,
+        bool ssd_streaming,
+        bool quality) {
+    const bool enabled = metal_graph_tp_env_flag(
+            "DS4_METAL_ENABLE_Q4_STREAM_OVERLAP", false);
+    const bool disabled = metal_graph_tp_env_flag(
+            "DS4_METAL_DISABLE_Q4_STREAM_OVERLAP", false);
+    return enabled && !disabled &&
+           count >= 2 && count <= DS4_METAL_SESSION_STREAMS &&
+           resident && !ssd_streaming && !quality;
+}
+
+#ifdef DS4_TEST_HOOKS
+int ds4_test_q4_stream_overlap_policy(
+        int  count,
+        bool resident,
+        bool ssd_streaming,
+        bool quality) {
+    return ds4_q4_stream_overlap_policy(count,
+                                        resident,
+                                        ssd_streaming,
+                                        quality) ? 1 : 0;
+}
+#endif
+#endif
+
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+static bool ds4_engine_has_q4_stream_overlap_weights(const ds4_engine *e) {
+    if (!e) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        const bool aproj_q4 =
+            layer->attn_q_a && layer->attn_kv &&
+            layer->attn_q_a->type == DS4_TENSOR_Q4_K &&
+            layer->attn_kv->type == DS4_TENSOR_Q4_K;
+        const bool routed_q4 =
+            layer->ffn_gate_exps && layer->ffn_up_exps &&
+            layer->ffn_down_exps &&
+            layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+            layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+            layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+        if (aproj_q4 || routed_q4) return true;
+    }
+    return false;
+}
+
+static bool ds4_session_q4_stream_overlap_eligible(ds4_session *s) {
+    if (!s || !s->engine) return false;
+    const ds4_engine *e = s->engine;
+    const ds4_gpu_graph *g = &s->graph;
+    return e->backend == DS4_BACKEND_METAL &&
+           e->support_kind == DS4_SUPPORT_NONE &&
+           !e->tp.active && !e->multi_tier && !e->ssd_streaming &&
+           !s->distributed && !ds4_session_is_cpu(s) &&
+           !ds4_session_is_glm(s) && !ds4_session_cancelled(s) &&
+           s->checkpoint_valid &&
+           !g->ssd_streaming && !g->placement && !g->quality &&
+           g->tp_world < 2 && !g->materialize_ffn_out &&
+           !g->decode_stage_profile &&
+           !g->decode_index_stage_profile &&
+           !g->output_stage_profile && !g_expert_profile.active &&
+           !metal_graph_hc_norm_fusion_check_enabled() &&
+           !metal_graph_use_reference_shared_down_hc() &&
+           !metal_graph_use_pro_q4_cpu_router() &&
+           !metal_graph_use_q4_selected_shared_overlap(g) &&
+           !metal_graph_q4_non_streaming_opt_in_enabled() &&
+           !metal_graph_directional_steering_attn_enabled(g) &&
+           !metal_graph_directional_steering_ffn_enabled(g) &&
+           getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL &&
+           getenv("DS4_METAL_DECODE_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_LAYER_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_ATTN_OUT_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_MOE_STAGE_PROFILE") == NULL &&
+           ds4_engine_has_q4_stream_overlap_weights(e);
+}
+#endif
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
@@ -64726,6 +64814,42 @@ static bool ds4_sessions_eval_batch_metal_supported(
         }
     }
     return true;
+}
+
+static bool ds4_sessions_q4_stream_overlap_supported(
+        ds4_decode_item *items,
+        int count,
+        ds4_engine *e) {
+#if !defined(__APPLE__)
+    (void)items;
+    (void)count;
+    (void)e;
+    return false;
+#else
+    if (!items || count <= 0 || !e || !items[0].session) {
+        return false;
+    }
+    const ds4_gpu_graph *first = &items[0].session->graph;
+    const bool resident =
+        e->backend == DS4_BACKEND_METAL &&
+        !e->multi_tier && !first->placement;
+    const bool ssd_streaming = e->ssd_streaming || first->ssd_streaming;
+    if (!ds4_q4_stream_overlap_policy(count,
+                                      resident,
+                                      ssd_streaming,
+                                      first->quality) ||
+        !ds4_engine_has_q4_stream_overlap_weights(e)) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s || s->engine != e ||
+            !ds4_session_q4_stream_overlap_eligible(s)) {
+            return false;
+        }
+    }
+    return true;
+#endif
 }
 
 static bool metal_graph_native_session_batch_shared_supported(
@@ -65112,10 +65236,42 @@ static int ds4_sessions_eval_batch_metal(
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
-    bool ok = ds4_gpu_begin_commands() != 0;
-    const bool native_shared = ok &&
+    bool native_shared = false;
+    bool native_qkv = false;
+    const bool stream_overlap =
+        ds4_sessions_q4_stream_overlap_supported(items, count, e);
+    bool ok = true;
+#if defined(__APPLE__)
+    if (stream_overlap) {
+        int started = 0;
+        for (int i = 0; ok && i < count; i++) {
+            ds4_session *s = items[i].session;
+            ds4_gpu_set_stream(i);
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_token_raw_swa(&s->graph,
+                                                          &e->model,
+                                                          &e->weights,
+                                                          items[i].token,
+                                                          (uint32_t)s->checkpoint.len,
+                                                          true,
+                                                          false);
+            if (ok) ok = ds4_gpu_end_commands_async() != 0;
+            if (ok) started = i + 1;
+        }
+        if (!ok && ds4_gpu_commands_active()) {
+            (void)ds4_gpu_synchronize();
+        }
+        for (int i = 0; i < started; i++) {
+            if (ds4_gpu_wait_stream(i) == 0) ok = false;
+        }
+        ds4_gpu_set_stream(0);
+        if (!ok) (void)ds4_gpu_synchronize();
+    } else {
+#endif
+    ok = ds4_gpu_begin_commands() != 0;
+    native_shared = ok &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
-    const bool native_qkv = native_shared &&
+    native_qkv = native_shared &&
         metal_graph_native_session_batch_qkv_supported(items, count, e);
     if (native_shared) {
         ok = metal_graph_encode_native_session_batch_shared(
@@ -65147,6 +65303,9 @@ static int ds4_sessions_eval_batch_metal(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+#if defined(__APPLE__)
+    }
+#endif
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
     if (ok && e->tp.active && ds4_gpu_tp_failed()) {
@@ -65198,11 +65357,14 @@ static int ds4_sessions_eval_batch_metal(
     if (getenv("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
         fprintf(stderr,
                 "ds4: Metal session batch rows=%d family=%s "
-                "native_shared=%d native_qkv=%d\n",
+                "native_shared=%d native_qkv=%d stream_overlap=%d "
+                "streams=%d\n",
                 count,
                 ds4_session_is_glm(items[0].session) ? "glm" : "deepseek",
                 native_shared ? 1 : 0,
-                native_qkv ? 1 : 0);
+                native_qkv ? 1 : 0,
+                stream_overlap ? 1 : 0,
+                stream_overlap ? count : 1);
     }
     return 0;
 }
