@@ -158,6 +158,7 @@ static int g_ssd_streaming_mode;
 typedef struct {
     int valid;
     int top6_unique;
+    int storage_kind;
     int logical_tier;
     const void *model_map;
     uint32_t layer;
@@ -185,22 +186,51 @@ typedef struct {
 } cuda_stream_selected_cache;
 
 static cuda_stream_selected_cache g_stream_selected_cache;
-static void cuda_stream_selected_upload_drain(void);
+
+enum {
+    CUDA_STREAM_SELECTED_STORAGE_NONE = 0,
+    CUDA_STREAM_SELECTED_STORAGE_TRANSIENT = 1,
+    CUDA_STREAM_SELECTED_STORAGE_PERSISTENT = 2,
+};
+
+/* Sole owner of allocations used by the transient selected-expert binding.
+ * g_stream_selected_cache only publishes non-owning views into this storage. */
+typedef struct {
+    char *gate;
+    char *up;
+    char *down;
+    int32_t *remap;
+    uint64_t gate_capacity;
+    uint64_t up_capacity;
+    uint64_t down_capacity;
+    uint64_t remap_capacity;
+    int owner_device;
+    int poisoned;
+} cuda_stream_selected_transient_storage;
+
+static cuda_stream_selected_transient_storage
+    g_stream_selected_transient_storage = {
+        NULL, NULL, NULL, NULL, 0, 0, 0, 0, -1, 0,
+    };
+static int cuda_stream_selected_upload_drain_checked(void);
 static int cuda_stream_selected_consume_drain(void);
 static void cuda_stream_selected_consume_release(void);
 static void cuda_stream_selected_cache_release(void);
+static void cuda_stream_expert_storage_release(int reset_class);
 
 typedef struct {
     void *base;
     char *gate;
     char *up;
     char *down;
+    int32_t *remap;
     uint64_t bytes;
     uint64_t up_offset;
     uint64_t down_offset;
     uint64_t gate_expert_bytes;
     uint64_t down_expert_bytes;
     uint64_t configured_expert_bytes;
+    uint64_t remap_capacity;
     uint32_t capacity;
     uint32_t valid_count;
     uint32_t configured_budget;
@@ -214,7 +244,19 @@ static void cuda_stream_expert_persistent_arena_release(int reset_class);
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
+    g_stream_selected_cache.storage_kind =
+        CUDA_STREAM_SELECTED_STORAGE_NONE;
     g_stream_selected_cache.upload_event_value = 0;
+    g_stream_selected_cache.gate_ptr = NULL;
+    g_stream_selected_cache.up_ptr = NULL;
+    g_stream_selected_cache.down_ptr = NULL;
+    g_stream_selected_cache.gate_capacity = 0;
+    g_stream_selected_cache.up_capacity = 0;
+    g_stream_selected_cache.down_capacity = 0;
+    g_stream_selected_cache.slot_selected_ptr = NULL;
+    g_stream_selected_cache.slot_selected_capacity = 0;
+    memset(&g_stream_selected_cache.slot_selected_tensor, 0,
+           sizeof(g_stream_selected_cache.slot_selected_tensor));
 }
 
 typedef struct {
@@ -2785,15 +2827,27 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
-static void cuda_stream_selected_upload_drain(void) {
-    if (!g_stream_selected_upload_stream) return;
+static int cuda_stream_selected_upload_drain_checked(void) {
+    if (!g_stream_selected_upload_stream) return 1;
     int previous_device = -1;
     (void)cudaGetDevice(&previous_device);
-    if (g_stream_selected_upload_owner_device >= 0) {
-        (void)cudaSetDevice(g_stream_selected_upload_owner_device);
+    if (g_stream_selected_upload_owner_device < 0 ||
+        cudaSetDevice(g_stream_selected_upload_owner_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
     }
-    (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+    const cudaError_t err =
+        cudaStreamSynchronize(g_stream_selected_upload_stream);
     if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA compact-cache upload drain failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -4781,37 +4835,70 @@ static int cuda_stream_selected_consume_drain(void) {
 /* Caller owns cuda_stream_selected_writer_guard, so no reader can acquire
  * these pointers while they are drained and freed. */
 static int cuda_stream_selected_cache_free_storage_writer(void) {
+    cuda_stream_selected_transient_storage *storage =
+        &g_stream_selected_transient_storage;
     if (!g_stream_selected_writer_active ||
-        !cuda_stream_selected_consume_drain()) {
+        !cuda_stream_selected_consume_drain() ||
+        !cuda_stream_selected_upload_drain_checked()) {
         /* Never free a compact binding whose last consumer could not be
          * drained.  A bounded leak is safer than a cross-stream UAF when the
          * CUDA context is already reporting an unrecoverable error. */
         cuda_stream_selected_cache_invalidate();
+        storage->poisoned = 1;
         return 0;
     }
-    cuda_stream_selected_upload_drain();
-    const int has_storage = g_stream_selected_cache.gate_ptr ||
-        g_stream_selected_cache.up_ptr ||
-        g_stream_selected_cache.down_ptr ||
-        g_stream_selected_cache.slot_selected_ptr;
+    const int has_storage = storage->gate || storage->up ||
+        storage->down || storage->remap;
+    int previous_device = -1;
+    if (has_storage) (void)cudaGetDevice(&previous_device);
     if (has_storage &&
-        (g_n_gpus != 1 ||
-         cudaSetDevice(g_gpu[0].device_id) != cudaSuccess)) {
+        (storage->owner_device < 0 ||
+         cudaSetDevice(storage->owner_device) != cudaSuccess)) {
         (void)cudaGetLastError();
+        cuda_stream_selected_cache_invalidate();
+        storage->poisoned = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
         return 0;
     }
-    if (g_stream_selected_cache.gate_ptr) {
-        (void)cudaFree(g_stream_selected_cache.gate_ptr);
+    if (storage->gate && cudaFree(storage->gate) != cudaSuccess) {
+        (void)cudaGetLastError();
+        storage->poisoned = 1;
+        cuda_stream_selected_cache_invalidate();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
     }
-    if (g_stream_selected_cache.up_ptr) {
-        (void)cudaFree(g_stream_selected_cache.up_ptr);
+    storage->gate = NULL;
+    storage->gate_capacity = 0;
+    if (storage->up && cudaFree(storage->up) != cudaSuccess) {
+        (void)cudaGetLastError();
+        storage->poisoned = 1;
+        cuda_stream_selected_cache_invalidate();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
     }
-    if (g_stream_selected_cache.down_ptr) {
-        (void)cudaFree(g_stream_selected_cache.down_ptr);
+    storage->up = NULL;
+    storage->up_capacity = 0;
+    if (storage->down && cudaFree(storage->down) != cudaSuccess) {
+        (void)cudaGetLastError();
+        storage->poisoned = 1;
+        cuda_stream_selected_cache_invalidate();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
     }
-    if (g_stream_selected_cache.slot_selected_ptr) {
-        (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
+    storage->down = NULL;
+    storage->down_capacity = 0;
+    if (storage->remap && cudaFree(storage->remap) != cudaSuccess) {
+        (void)cudaGetLastError();
+        storage->poisoned = 1;
+        cuda_stream_selected_cache_invalidate();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
     }
+    storage->remap = NULL;
+    storage->remap_capacity = 0;
+    storage->owner_device = -1;
+    storage->poisoned = 0;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
     g_stream_selected_cache.logical_tier = -1;
     return 1;
@@ -4820,6 +4907,55 @@ static int cuda_stream_selected_cache_free_storage_writer(void) {
 static void cuda_stream_selected_cache_release(void) {
     cuda_stream_selected_writer_guard writer;
     (void)cuda_stream_selected_cache_free_storage_writer();
+}
+
+static int cuda_stream_selected_cache_bind_transient_storage(
+        int logical_tier,
+        uint64_t gate_bytes,
+        uint64_t down_bytes,
+        uint64_t remap_bytes) {
+    const cuda_stream_selected_transient_storage *storage =
+        &g_stream_selected_transient_storage;
+    if (storage->poisoned || !storage->gate || !storage->up ||
+        !storage->down || !storage->remap ||
+        storage->gate_capacity < gate_bytes ||
+        storage->up_capacity < gate_bytes ||
+        storage->down_capacity < down_bytes ||
+        storage->remap_capacity < remap_bytes) {
+        return 0;
+    }
+    g_stream_selected_cache.storage_kind =
+        CUDA_STREAM_SELECTED_STORAGE_TRANSIENT;
+    g_stream_selected_cache.gate_ptr = storage->gate;
+    g_stream_selected_cache.up_ptr = storage->up;
+    g_stream_selected_cache.down_ptr = storage->down;
+    g_stream_selected_cache.gate_capacity = storage->gate_capacity;
+    g_stream_selected_cache.up_capacity = storage->up_capacity;
+    g_stream_selected_cache.down_capacity = storage->down_capacity;
+    g_stream_selected_cache.slot_selected_ptr = storage->remap;
+    g_stream_selected_cache.slot_selected_capacity =
+        storage->remap_capacity;
+    g_stream_selected_cache.slot_selected_tensor.ptr = storage->remap;
+    g_stream_selected_cache.slot_selected_tensor.bytes = remap_bytes;
+    g_stream_selected_cache.slot_selected_tensor.owner = 0;
+    g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
+    return 1;
+}
+
+/* Invalidate the public binding under one writer epoch, retire its transient
+ * owner, and only then retire the persistent owner it may alias in phase 3. */
+static int cuda_stream_expert_storage_release_writer(int reset_class) {
+    if (!g_stream_selected_writer_active ||
+        !cuda_stream_selected_cache_free_storage_writer()) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_arena_release(reset_class);
+    return 1;
+}
+
+static void cuda_stream_expert_storage_release(int reset_class) {
+    cuda_stream_selected_writer_guard writer;
+    (void)cuda_stream_expert_storage_release_writer(reset_class);
 }
 
 static void cuda_stream_selected_consume_release(void) {
@@ -6385,10 +6521,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     /* The selected cache may still be the destination of an event-published
      * upload.  Drain and retire its auxiliary streams before freeing device
      * storage or invalidating the owner-device context. */
-    cuda_stream_expert_persistent_arena_release(1);
+    cuda_stream_expert_storage_release(1);
     cuda_stream_selected_stage_release();
     cuda_stream_selected_event_pipeline_release();
-    cuda_stream_selected_cache_release();
     cuda_stream_selected_consume_release();
     ds4_mmq_set_gb10_optimizations(0);
     g_n_gpus = 0;
@@ -7263,8 +7398,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_q8_fold_invalidate_all();
-    cuda_stream_selected_cache_release();
-    cuda_stream_expert_persistent_arena_release(1);
+    cuda_stream_expert_storage_release(1);
     cuda_f16_pair_chunk32_release_all();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -7467,8 +7601,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_q8_fold_invalidate_all();
 
-    cuda_stream_selected_cache_release();
-    cuda_stream_expert_persistent_arena_release(1);
+    cuda_stream_expert_storage_release(1);
     cuda_f16_pair_chunk32_release_all();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -28881,6 +29014,7 @@ __global__ static void moe_down_f32_kernel(
 typedef struct {
     int valid;
     int top6_unique;
+    int storage_kind;
     const char *gate;
     const char *up;
     const char *down;
@@ -28908,6 +29042,8 @@ static int cuda_stream_selected_binding_acquire(
     if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
         required_slot_count > UINT64_MAX / sizeof(int32_t) ||
         !g_stream_selected_cache.valid ||
+        g_stream_selected_cache.storage_kind !=
+            CUDA_STREAM_SELECTED_STORAGE_TRANSIENT ||
         g_stream_selected_cache.logical_tier != logical_tier ||
         g_stream_selected_cache.model_map != model_map ||
         g_stream_selected_cache.layer != layer_index ||
@@ -28945,6 +29081,7 @@ static int cuda_stream_selected_binding_acquire(
     }
     binding->valid = 1;
     binding->top6_unique = g_stream_selected_cache.top6_unique;
+    binding->storage_kind = g_stream_selected_cache.storage_kind;
     binding->gate = g_stream_selected_cache.gate_ptr +
         (uint64_t)g_stream_selected_cache.slot_base * gate_expert_bytes;
     binding->up = g_stream_selected_cache.up_ptr +
@@ -31871,7 +32008,14 @@ static int cuda_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
     if (*ptr && *capacity >= bytes) return 1;
     if (*ptr) {
-        (void)cudaFree(*ptr);
+        const cudaError_t free_err = cudaFree(*ptr);
+        if (free_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming %s resize free failed: %s\n",
+                    label, cudaGetErrorString(free_err));
+            (void)cudaGetLastError();
+            return 0;
+        }
         *ptr = NULL;
         *capacity = 0;
     }
@@ -31887,12 +32031,15 @@ static int cuda_stream_selected_ensure_bytes(
     return 1;
 }
 
-static int cuda_stream_selected_ensure_i32(uint64_t count) {
+static int cuda_stream_selected_ensure_i32(
+        cuda_stream_selected_transient_storage *storage,
+        uint64_t count) {
+    if (!storage) return 0;
     if (count == 0 || count > UINT64_MAX / sizeof(int32_t)) return 0;
     const uint64_t bytes = count * sizeof(int32_t);
     return cuda_stream_selected_ensure_bytes(
-            (char **)&g_stream_selected_cache.slot_selected_ptr,
-            &g_stream_selected_cache.slot_selected_capacity,
+            (char **)&storage->remap,
+            &storage->remap_capacity,
             bytes,
             "selected-id remap");
 }
@@ -31931,6 +32078,8 @@ static int cuda_stream_selected_cache_begin_load_impl(
     if (upload_event_out) *upload_event_out = 0;
     if (submitted_any_out) *submitted_any_out = 0;
     cuda_stream_selected_writer_guard writer;
+    cuda_stream_selected_transient_storage *storage =
+        &g_stream_selected_transient_storage;
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
         slot_count == 0) {
@@ -31950,6 +32099,10 @@ static int cuda_stream_selected_cache_begin_load_impl(
                 "ds4: CUDA selected cache could not select owner device %d\n",
                 g_gpu[0].device_id);
         (void)cudaGetLastError();
+        return 0;
+    }
+    if (storage->poisoned &&
+        !cuda_stream_selected_cache_free_storage_writer()) {
         return 0;
     }
 
@@ -32000,42 +32153,40 @@ static int cuda_stream_selected_cache_begin_load_impl(
     const uint64_t gate_bytes = compact_count * table->gate_expert_bytes;
     const uint64_t down_bytes = compact_count * table->down_expert_bytes;
     const int logical_tier = 0;
-    if (g_stream_selected_cache.logical_tier != logical_tier &&
-        (g_stream_selected_cache.gate_ptr ||
-         g_stream_selected_cache.up_ptr ||
-         g_stream_selected_cache.down_ptr ||
-         g_stream_selected_cache.slot_selected_ptr)) {
+    if ((storage->gate || storage->up || storage->down || storage->remap) &&
+        storage->owner_device != g_gpu[0].device_id) {
         if (!cuda_stream_selected_cache_free_storage_writer()) return 0;
     }
     const uint64_t remap_bytes = (uint64_t)slot_count * sizeof(int32_t);
     const int resize_binding =
-        (g_stream_selected_cache.gate_ptr &&
-         g_stream_selected_cache.gate_capacity < gate_bytes) ||
-        (g_stream_selected_cache.up_ptr &&
-         g_stream_selected_cache.up_capacity < gate_bytes) ||
-        (g_stream_selected_cache.down_ptr &&
-         g_stream_selected_cache.down_capacity < down_bytes) ||
-        (g_stream_selected_cache.slot_selected_ptr &&
-         g_stream_selected_cache.slot_selected_capacity < remap_bytes);
+        (storage->gate && storage->gate_capacity < gate_bytes) ||
+        (storage->up && storage->up_capacity < gate_bytes) ||
+        (storage->down && storage->down_capacity < down_bytes) ||
+        (storage->remap && storage->remap_capacity < remap_bytes);
     if (resize_binding && !cuda_stream_selected_consume_drain()) {
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
-    if (resize_binding) cuda_stream_selected_upload_drain();
+    if (resize_binding && !cuda_stream_selected_upload_drain_checked()) {
+        cuda_stream_selected_cache_invalidate();
+        storage->poisoned = 1;
+        return 0;
+    }
+    storage->owner_device = g_gpu[0].device_id;
     if (ds4_gpu_set_current_device(logical_tier) != 0 ||
         !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.gate_ptr,
-                &g_stream_selected_cache.gate_capacity,
+                &storage->gate,
+                &storage->gate_capacity,
                 gate_bytes, "gate experts") ||
         !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.up_ptr,
-                &g_stream_selected_cache.up_capacity,
+                &storage->up,
+                &storage->up_capacity,
                 gate_bytes, "up experts") ||
         !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.down_ptr,
-                &g_stream_selected_cache.down_capacity,
+                &storage->down,
+                &storage->down_capacity,
                 down_bytes, "down experts") ||
-        !cuda_stream_selected_ensure_i32(slot_count)) {
+        !cuda_stream_selected_ensure_i32(storage, slot_count)) {
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
@@ -32074,15 +32225,15 @@ static int cuda_stream_selected_cache_begin_load_impl(
                     const uint64_t down_dst =
                         (uint64_t)i * table->down_expert_bytes;
                     tasks.push_back({
-                        g_stream_selected_cache.gate_ptr + gate_dst,
+                        storage->gate + gate_dst,
                         gate_src, table->gate_expert_bytes, ordinal++,
                     });
                     tasks.push_back({
-                        g_stream_selected_cache.up_ptr + gate_dst,
+                        storage->up + gate_dst,
                         up_src, table->gate_expert_bytes, ordinal++,
                     });
                     tasks.push_back({
-                        g_stream_selected_cache.down_ptr + down_dst,
+                        storage->down + down_dst,
                         down_src, table->down_expert_bytes, ordinal++,
                     });
                 }
@@ -32096,7 +32247,7 @@ static int cuda_stream_selected_cache_begin_load_impl(
             g_stream_selected_batch_io_attempts++;
             copied = cuda_model_copy_tasks_to_device_streamed(
                 tasks, table->model_map, table->model_size,
-                g_stream_selected_cache.slot_selected_ptr,
+                storage->remap,
                 slot_ids.data(), slot_count,
                 cuda_stream_selected_batch_io_oracle_requested(),
                 /*chunk_override=*/0, &submitted,
@@ -32160,17 +32311,17 @@ static int cuda_stream_selected_cache_begin_load_impl(
             const uint64_t down_dst =
                 (uint64_t)i * table->down_expert_bytes;
             if (!cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.gate_ptr + gate_dst,
+                        storage->gate + gate_dst,
                         table->model_map, table->model_size,
                         gate_src, table->gate_expert_bytes,
                         "stream gate expert copy") ||
                 !cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.up_ptr + gate_dst,
+                        storage->up + gate_dst,
                         table->model_map, table->model_size,
                         up_src, table->gate_expert_bytes,
                         "stream up expert copy") ||
                 !cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.down_ptr + down_dst,
+                        storage->down + down_dst,
                         table->model_map, table->model_size,
                         down_src, table->down_expert_bytes,
                         "stream down expert copy")) {
@@ -32178,7 +32329,7 @@ static int cuda_stream_selected_cache_begin_load_impl(
                 return 0;
             }
         }
-        if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
+        if (!cuda_ok(cudaMemcpy(storage->remap,
                                 slot_ids.data(),
                                 (size_t)slot_count * sizeof(int32_t),
                                 cudaMemcpyHostToDevice),
@@ -32207,12 +32358,11 @@ static int cuda_stream_selected_cache_begin_load_impl(
     g_stream_selected_cache.down_offset = table->down_offset;
     g_stream_selected_cache.gate_expert_bytes = table->gate_expert_bytes;
     g_stream_selected_cache.down_expert_bytes = table->down_expert_bytes;
-    g_stream_selected_cache.slot_selected_tensor.ptr =
-        g_stream_selected_cache.slot_selected_ptr;
-    g_stream_selected_cache.slot_selected_tensor.bytes =
-        (uint64_t)slot_count * sizeof(int32_t);
-    g_stream_selected_cache.slot_selected_tensor.owner = 0;
-    g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
+    if (!cuda_stream_selected_cache_bind_transient_storage(
+            logical_tier, gate_bytes, down_bytes, remap_bytes)) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
     /* Publish all binding metadata atomically with respect to consumer
      * acquisition.  The upload itself may still be in flight; its exact
      * completion token is part of the metadata guarded by this release. */
@@ -39168,21 +39318,13 @@ static int cuda_stream_expert_persistent_arena_release_locked(
     const uint64_t down_expert_bytes = reset_class ? 0 :
         arena->down_expert_bytes;
     int previous_device = -1;
-    if (arena->base) {
+    const int has_storage = arena->base || arena->remap;
+    if (has_storage) {
         (void)cudaGetDevice(&previous_device);
         /* The arena is not a transient-cache alias, but it shares the upload
          * and consumer epoch boundary which its future loader will use. */
-        int drained = cuda_stream_selected_consume_drain();
-        if (g_stream_selected_upload_stream) {
-            if (g_stream_selected_upload_owner_device < 0 ||
-                cudaSetDevice(g_stream_selected_upload_owner_device) !=
-                    cudaSuccess ||
-                cudaStreamSynchronize(g_stream_selected_upload_stream) !=
-                    cudaSuccess) {
-                (void)cudaGetLastError();
-                drained = 0;
-            }
-        }
+        int drained = cuda_stream_selected_consume_drain() &&
+                      cuda_stream_selected_upload_drain_checked();
         if (!drained) {
             drained = cudaSetDevice(arena->owner_device) == cudaSuccess &&
                       cudaDeviceSynchronize() == cudaSuccess;
@@ -39197,7 +39339,17 @@ static int cuda_stream_expert_persistent_arena_release_locked(
             if (previous_device >= 0) (void)cudaSetDevice(previous_device);
             return 0;
         }
-        if (cudaFree(arena->base) != cudaSuccess) {
+        if (arena->remap && cudaFree(arena->remap) != cudaSuccess) {
+            (void)cudaGetLastError();
+            arena->poisoned = 1;
+            g_stream_expert_persistent_arena_failures.fetch_add(
+                1, std::memory_order_relaxed);
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return 0;
+        }
+        arena->remap = NULL;
+        arena->remap_capacity = 0;
+        if (arena->base && cudaFree(arena->base) != cudaSuccess) {
             (void)cudaGetLastError();
             arena->poisoned = 1;
             g_stream_expert_persistent_arena_failures.fetch_add(
@@ -39283,6 +39435,61 @@ static int cuda_stream_expert_persistent_arena_ensure_locked(void) {
     return 1;
 }
 
+/* The persistent remap has a different lifetime/shape from the three weight
+ * planes, so it is a distinct allocation owned by the arena.  Phase 3a only
+ * exercises this through the device oracle; the production loader remains
+ * on g_stream_selected_transient_storage. */
+static int cuda_stream_expert_persistent_remap_ensure_locked(
+        uint64_t count) {
+    cuda_stream_expert_persistent_arena *arena =
+        &g_stream_expert_persistent_arena;
+    uint64_t bytes = 0;
+    if (!arena->base || arena->poisoned || arena->owner_device < 0 ||
+        count == 0 ||
+        !cuda_stream_expert_persistent_mul_u64(
+            count, sizeof(int32_t), &bytes) ||
+        bytes > SIZE_MAX) {
+        return 0;
+    }
+    if (arena->remap && arena->remap_capacity >= bytes) return 1;
+
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    int32_t *replacement = NULL;
+    cudaError_t err = cudaSetDevice(arena->owner_device);
+    if (err == cudaSuccess) {
+        err = cudaMalloc((void **)&replacement, (size_t)bytes);
+    }
+    if (err != cudaSuccess || !replacement) {
+        if (replacement) (void)cudaFree(replacement);
+        (void)cudaGetLastError();
+        g_stream_expert_persistent_arena_failures.fetch_add(
+            1, std::memory_order_relaxed);
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    if (arena->remap) {
+        int drained = cuda_stream_selected_consume_drain() &&
+                      cuda_stream_selected_upload_drain_checked();
+        if (!drained) {
+            drained = cudaDeviceSynchronize() == cudaSuccess;
+        }
+        if (!drained || cudaFree(arena->remap) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFree(replacement);
+            arena->poisoned = 1;
+            g_stream_expert_persistent_arena_failures.fetch_add(
+                1, std::memory_order_relaxed);
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return 0;
+        }
+    }
+    arena->remap = replacement;
+    arena->remap_capacity = bytes;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
+}
+
 extern "C" int ds4_cuda_test_stream_expert_persistent_arena(void) {
     g_stream_expert_persistent_arena_oracle_runs.fetch_add(
         1, std::memory_order_relaxed);
@@ -39294,21 +39501,25 @@ extern "C" int ds4_cuda_test_stream_expert_persistent_arena(void) {
     const uint64_t saved_total = arena->configured_expert_bytes;
     const uint64_t saved_gate = arena->gate_expert_bytes;
     const uint64_t saved_down = arena->down_expert_bytes;
-    int ok = g_n_gpus == 1 && !arena->base && !arena->poisoned;
+    int ok = g_n_gpus == 1 && !arena->base && !arena->remap &&
+             !arena->poisoned;
     arena->configured_budget = 3u;
     arena->configured_expert_bytes = 40u;
     arena->gate_expert_bytes = 16u;
     arena->down_expert_bytes = 8u;
 
     void *first_base = NULL;
+    int32_t *first_remap = NULL;
     if (ok) {
-        ok = cuda_stream_expert_persistent_arena_ensure_locked();
+        ok = cuda_stream_expert_persistent_arena_ensure_locked() &&
+             cuda_stream_expert_persistent_remap_ensure_locked(7u);
     }
     uint64_t expected_up = 0;
     uint64_t expected_down = 0;
     uint64_t expected_total = 0;
     if (ok) {
         first_base = arena->base;
+        first_remap = arena->remap;
         ok = cuda_stream_expert_persistent_arena_layout(
                  3u, 16u, 8u, &expected_up, &expected_down,
                  &expected_total) &&
@@ -39319,12 +39530,17 @@ extern "C" int ds4_cuda_test_stream_expert_persistent_arena(void) {
              arena->gate == (char *)arena->base &&
              arena->up == (char *)arena->base + expected_up &&
              arena->down == (char *)arena->base + expected_down &&
+             arena->remap &&
+             arena->remap_capacity >= 7u * sizeof(int32_t) &&
              (((uintptr_t)arena->base | (uintptr_t)arena->gate |
-               (uintptr_t)arena->up | (uintptr_t)arena->down) & 255u) == 0u;
+               (uintptr_t)arena->up | (uintptr_t)arena->down |
+               (uintptr_t)arena->remap) & 255u) == 0u;
     }
 
     int previous_device = -1;
     unsigned char got[3] = {0, 0, 0};
+    int32_t remap_got = 0;
+    const int32_t remap_canary = INT32_C(0x13572468);
     if (ok) {
         (void)cudaGetDevice(&previous_device);
         ok = cudaSetDevice(arena->owner_device) == cudaSuccess &&
@@ -39332,31 +39548,44 @@ extern "C" int ds4_cuda_test_stream_expert_persistent_arena(void) {
              cudaMemset(arena->gate + 47u, 0xa1, 1u) == cudaSuccess &&
              cudaMemset(arena->up + 47u, 0xb2, 1u) == cudaSuccess &&
              cudaMemset(arena->down + 23u, 0xc3, 1u) == cudaSuccess &&
+             cudaMemcpy(arena->remap + 6u, &remap_canary,
+                        sizeof(remap_canary),
+                        cudaMemcpyHostToDevice) == cudaSuccess &&
              cudaMemcpy(&got[0], arena->gate + 47u, 1u,
                         cudaMemcpyDeviceToHost) == cudaSuccess &&
              cudaMemcpy(&got[1], arena->up + 47u, 1u,
                         cudaMemcpyDeviceToHost) == cudaSuccess &&
              cudaMemcpy(&got[2], arena->down + 23u, 1u,
                         cudaMemcpyDeviceToHost) == cudaSuccess &&
-             got[0] == 0xa1 && got[1] == 0xb2 && got[2] == 0xc3;
+             cudaMemcpy(&remap_got, arena->remap + 6u,
+                        sizeof(remap_got),
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             got[0] == 0xa1 && got[1] == 0xb2 && got[2] == 0xc3 &&
+             remap_got == remap_canary;
         if (!ok) (void)cudaGetLastError();
         if (previous_device >= 0) (void)cudaSetDevice(previous_device);
     }
     if (ok) {
         ok = cuda_stream_expert_persistent_arena_ensure_locked() &&
-             arena->base == first_base;
+             cuda_stream_expert_persistent_remap_ensure_locked(3u) &&
+             arena->base == first_base && arena->remap == first_remap;
     }
     if (ok) {
         ok = cuda_stream_expert_persistent_arena_release_locked(0) &&
-             !arena->base && arena->gate_expert_bytes == 16u &&
+             !arena->base && !arena->remap &&
+             arena->remap_capacity == 0 &&
+             arena->gate_expert_bytes == 16u &&
              arena->down_expert_bytes == 8u &&
              cuda_stream_expert_persistent_arena_ensure_locked() &&
-             arena->base;
+             cuda_stream_expert_persistent_remap_ensure_locked(9u) &&
+             arena->base && arena->remap;
     }
     const int cleanup_ok =
         cuda_stream_expert_persistent_arena_release_locked(1);
     if (cleanup_ok) {
-        ok = ok && !arena->base && arena->gate_expert_bytes == 0 &&
+        ok = ok && !arena->base && !arena->remap &&
+             arena->remap_capacity == 0 &&
+             arena->gate_expert_bytes == 0 &&
              arena->down_expert_bytes == 0 &&
              arena->configured_expert_bytes == 40u;
         arena->configured_budget = saved_budget;
@@ -39645,6 +39874,63 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
     const uint64_t saved_model_direct_align = g_model_direct_align;
     const uint64_t saved_model_file_size = g_model_file_size;
     cuda_stream_selected_cache_release();
+    if (g_stream_selected_transient_storage.gate ||
+        g_stream_selected_transient_storage.up ||
+        g_stream_selected_transient_storage.down ||
+        g_stream_selected_transient_storage.remap ||
+        g_stream_selected_cache.valid ||
+        g_stream_selected_cache.storage_kind !=
+            CUDA_STREAM_SELECTED_STORAGE_NONE) {
+        return 0;
+    }
+
+    uint32_t saved_arena_budget = 0;
+    uint64_t saved_arena_total = 0;
+    uint64_t saved_arena_gate = 0;
+    uint64_t saved_arena_down = 0;
+    void *persistent_base = NULL;
+    int32_t *persistent_remap = NULL;
+    uint64_t persistent_bytes = 0;
+    const unsigned char persistent_base_canary = 0x5au;
+    const int32_t persistent_remap_canary = INT32_C(0x31415926);
+    int persistent_touched = 0;
+    int ok = 1;
+    {
+        std::lock_guard<std::mutex> lock(
+            g_stream_expert_persistent_arena_mutex);
+        cuda_stream_expert_persistent_arena *arena =
+            &g_stream_expert_persistent_arena;
+        saved_arena_budget = arena->configured_budget;
+        saved_arena_total = arena->configured_expert_bytes;
+        saved_arena_gate = arena->gate_expert_bytes;
+        saved_arena_down = arena->down_expert_bytes;
+        if (arena->base || arena->remap || arena->poisoned) {
+            ok = 0;
+        } else {
+            persistent_touched = 1;
+            arena->configured_budget = 3u;
+            arena->configured_expert_bytes = 40u;
+            arena->gate_expert_bytes = 16u;
+            arena->down_expert_bytes = 8u;
+            ok = cuda_stream_expert_persistent_arena_ensure_locked() &&
+                 cuda_stream_expert_persistent_remap_ensure_locked(7u);
+            if (ok) {
+                persistent_base = arena->base;
+                persistent_remap = arena->remap;
+                persistent_bytes = arena->bytes;
+                ok = persistent_base && persistent_remap &&
+                     persistent_bytes != 0 &&
+                     cudaMemset((char *)persistent_base +
+                                    persistent_bytes - 1u,
+                                persistent_base_canary, 1u) == cudaSuccess &&
+                     cudaMemcpy(persistent_remap + 6u,
+                                &persistent_remap_canary,
+                                sizeof(persistent_remap_canary),
+                                cudaMemcpyHostToDevice) == cudaSuccess;
+                if (!ok) (void)cudaGetLastError();
+            }
+        }
+    }
     {
         cuda_stream_selected_writer_guard writer;
         g_ssd_streaming_mode = 1;
@@ -39669,7 +39955,7 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
     const uint64_t test_down_offset = 2u * full_table_bytes;
     const uint64_t test_model_bytes = 3u * full_table_bytes;
     g_model_file_size = test_model_bytes;
-    int ok = cuda_stream_selected_stage_pool_alloc(4096u) &&
+    ok = ok && cuda_stream_selected_stage_pool_alloc(4096u) &&
              cuda_stream_selected_event_pipeline_ensure() &&
              cudaMallocHost((void **)&test_model,
                             (size_t)test_model_bytes) == cudaSuccess &&
@@ -39704,11 +39990,42 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
             /*upload_event_out=*/NULL,
             /*submitted_any_out=*/NULL);
     }
+    if (ok) {
+        std::lock_guard<std::mutex> lock(
+            g_stream_expert_persistent_arena_mutex);
+        const cuda_stream_expert_persistent_arena *arena =
+            &g_stream_expert_persistent_arena;
+        const uintptr_t arena_begin = (uintptr_t)persistent_base;
+        const uintptr_t arena_end = arena_begin + persistent_bytes;
+        const uintptr_t transient_gate =
+            (uintptr_t)g_stream_selected_transient_storage.gate;
+        const uintptr_t transient_up =
+            (uintptr_t)g_stream_selected_transient_storage.up;
+        const uintptr_t transient_down =
+            (uintptr_t)g_stream_selected_transient_storage.down;
+        ok = arena->base == persistent_base &&
+             arena->remap == persistent_remap &&
+             arena_begin < arena_end &&
+             (transient_gate < arena_begin || transient_gate >= arena_end) &&
+             (transient_up < arena_begin || transient_up >= arena_end) &&
+             (transient_down < arena_begin || transient_down >= arena_end) &&
+             g_stream_selected_transient_storage.remap != persistent_remap;
+    }
     const uint64_t generation_a = ok
         ? g_stream_selected_cache.generation : 0;
     if (ok && (!g_stream_selected_cache.valid || generation_a == 0 ||
+               g_stream_selected_cache.storage_kind !=
+                   CUDA_STREAM_SELECTED_STORAGE_TRANSIENT ||
                g_stream_selected_cache.upload_event_value != 0 ||
-               g_stream_selected_cache.weight_domain != weight_domain)) {
+               g_stream_selected_cache.weight_domain != weight_domain ||
+               g_stream_selected_cache.gate_ptr !=
+                   g_stream_selected_transient_storage.gate ||
+               g_stream_selected_cache.up_ptr !=
+                   g_stream_selected_transient_storage.up ||
+               g_stream_selected_cache.down_ptr !=
+                   g_stream_selected_transient_storage.down ||
+               g_stream_selected_cache.slot_selected_ptr !=
+                   g_stream_selected_transient_storage.remap)) {
         ok = 0;
     }
 
@@ -39729,10 +40046,12 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
                  test_gate_offset, test_up_offset, test_down_offset,
                  expert_bytes, expert_bytes, weight_domain) &&
              binding_a.generation == generation_a &&
+             binding_a.storage_kind ==
+                 CUDA_STREAM_SELECTED_STORAGE_TRANSIENT &&
              binding_a.weight_domain == weight_domain &&
              binding_a.selected &&
              binding_a.selected->ptr ==
-                 g_stream_selected_cache.slot_selected_ptr;
+                 g_stream_selected_transient_storage.remap;
     }
     if (ok) {
         /* A is deliberately longer than writer B's 1M-clock store.  If B
@@ -39768,7 +40087,7 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
                      * and deterministically observes sentinel A. */
                     cuda_stream_selected_lease_delay_store_kernel<<<
                         1, 1, 0, g_stream_selected_upload_stream>>>(
-                        g_stream_selected_cache.slot_selected_ptr,
+                        g_stream_selected_transient_storage.remap,
                         host_words[1], 1000000u);
                     local_ok = cudaGetLastError() == cudaSuccess;
                 }
@@ -39777,13 +40096,21 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
                         g_stream_selected_upload_done_event,
                         g_stream_selected_upload_stream) == cudaSuccess;
                 }
+                uint64_t upload_value = 0;
                 if (local_ok) {
-                    uint64_t upload_value =
-                        ++g_stream_selected_upload_event_value;
+                    upload_value = ++g_stream_selected_upload_event_value;
                     if (upload_value == 0) {
                         upload_value =
                             ++g_stream_selected_upload_event_value;
                     }
+                    local_ok =
+                        cuda_stream_selected_cache_bind_transient_storage(
+                            /*logical_tier=*/0,
+                            expert_bytes * weight_domain,
+                            expert_bytes * weight_domain,
+                            sizeof(selected_ids));
+                }
+                if (local_ok) {
                     g_stream_selected_cache.generation = generation_b;
                     g_stream_selected_cache.upload_event_value =
                         upload_value;
@@ -39847,6 +40174,8 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
                 test_gate_offset, test_up_offset, test_down_offset,
                 expert_bytes, expert_bytes, weight_domain) ||
             binding_b.generation != generation_b ||
+            binding_b.storage_kind !=
+                CUDA_STREAM_SELECTED_STORAGE_TRANSIENT ||
             binding_b.upload_event_value == 0) {
             ok = 0;
         } else if (cudaMemcpyAsync(
@@ -39875,6 +40204,70 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_lease(void) {
         (void)cudaDeviceSynchronize();
     }
     cuda_stream_selected_cache_release();
+    if (g_stream_selected_transient_storage.gate ||
+        g_stream_selected_transient_storage.up ||
+        g_stream_selected_transient_storage.down ||
+        g_stream_selected_transient_storage.remap ||
+        g_stream_selected_cache.valid || g_stream_selected_cache.gate_ptr ||
+        g_stream_selected_cache.up_ptr || g_stream_selected_cache.down_ptr ||
+        g_stream_selected_cache.slot_selected_ptr ||
+        g_stream_selected_cache.storage_kind !=
+            CUDA_STREAM_SELECTED_STORAGE_NONE) {
+        ok = 0;
+    }
+    if (persistent_touched) {
+        std::lock_guard<std::mutex> lock(
+            g_stream_expert_persistent_arena_mutex);
+        cuda_stream_expert_persistent_arena *arena =
+            &g_stream_expert_persistent_arena;
+        unsigned char base_got = 0;
+        int32_t remap_got = 0;
+        const int32_t resized_canary = INT32_C(0x27182818);
+        int isolation_ok = arena->base == persistent_base &&
+                           arena->remap == persistent_remap &&
+                           arena->bytes == persistent_bytes &&
+                           arena->remap_capacity >=
+                               7u * sizeof(int32_t) &&
+                           cudaSetDevice(arena->owner_device) == cudaSuccess &&
+                           cudaMemcpy(&base_got,
+                                      (char *)arena->base +
+                                          arena->bytes - 1u,
+                                      1u, cudaMemcpyDeviceToHost) ==
+                               cudaSuccess &&
+                           cudaMemcpy(&remap_got, arena->remap + 6u,
+                                      sizeof(remap_got),
+                                      cudaMemcpyDeviceToHost) == cudaSuccess &&
+                           base_got == persistent_base_canary &&
+                           remap_got == persistent_remap_canary;
+        if (isolation_ok) {
+            isolation_ok =
+                cuda_stream_expert_persistent_remap_ensure_locked(9u) &&
+                arena->base == persistent_base &&
+                arena->remap && arena->remap != persistent_remap &&
+                arena->remap_capacity >= 9u * sizeof(int32_t) &&
+                cudaMemcpy(arena->remap + 8u, &resized_canary,
+                           sizeof(resized_canary),
+                           cudaMemcpyHostToDevice) == cudaSuccess &&
+                cudaMemcpy(&remap_got, arena->remap + 8u,
+                           sizeof(remap_got),
+                           cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaMemcpy(&base_got,
+                           (char *)arena->base + arena->bytes - 1u,
+                           1u, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                remap_got == resized_canary &&
+                base_got == persistent_base_canary;
+        }
+        if (!isolation_ok) (void)cudaGetLastError();
+        const int arena_cleanup_ok =
+            cuda_stream_expert_persistent_arena_release_locked(1);
+        if (arena_cleanup_ok) {
+            arena->configured_budget = saved_arena_budget;
+            arena->configured_expert_bytes = saved_arena_total;
+            arena->gate_expert_bytes = saved_arena_gate;
+            arena->down_expert_bytes = saved_arena_down;
+        }
+        ok = ok && isolation_ok && arena_cleanup_ok;
+    }
     if (test_model) (void)cudaFreeHost(test_model);
     if (host_words) (void)cudaFreeHost(host_words);
     cuda_stream_selected_stage_release();
@@ -40034,8 +40427,7 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     cuda_stream_selected_writer_guard writer;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     if (!g_ssd_streaming_mode) {
-        (void)cuda_stream_selected_cache_free_storage_writer();
-        cuda_stream_expert_persistent_arena_release(0);
+        (void)cuda_stream_expert_storage_release_writer(0);
     }
 }
 
@@ -40082,8 +40474,7 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
-    cuda_stream_selected_cache_release();
-    cuda_stream_expert_persistent_arena_release(1);
+    cuda_stream_expert_storage_release(1);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
