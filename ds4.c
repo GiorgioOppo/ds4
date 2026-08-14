@@ -38403,13 +38403,15 @@ static void metal_graph_release_exactn_union_row_alias(
 
 static DS4_MAYBE_UNUSED bool metal_graph_bind_exactn_union_row(
         ds4_gpu_graph                    *g,
+        const ds4_gpu_graph              *workspace,
         uint32_t                          row,
         ds4_gpu_tensor                   *cur_hc,
         ds4_gpu_tensor                   *next_hc,
         metal_graph_exactn_union_row_alias *alias) {
     if (!alias) return false;
-    if (!g || !cur_hc || !next_hc ||
-        g->active_tier < 0 || row >= g->prefill_cap || alias->active) {
+    if (!g || !workspace || !cur_hc || !next_hc ||
+        g->active_tier < 0 || workspace->active_tier != g->active_tier ||
+        row >= workspace->prefill_cap || alias->active) {
         return false;
     }
     if (!alias->after_attn_hc) {
@@ -38419,19 +38421,19 @@ static DS4_MAYBE_UNUSED bool metal_graph_bind_exactn_union_row(
         const uint64_t mix_hc = 2ull * DS4_N_HC +
                                 (uint64_t)DS4_N_HC * DS4_N_HC;
         alias->after_attn_hc = ds4_gpu_tensor_view(
-                    metal_graph_batch_after_attn_hc(g),
+                    metal_graph_batch_after_attn_hc(workspace),
                     (uint64_t)row * hc_dim * sizeof(float),
                     hc_dim * sizeof(float));
         alias->ffn_cur = ds4_gpu_tensor_view(
-                    metal_graph_batch_ffn_cur(g),
+                    metal_graph_batch_ffn_cur(workspace),
                     (uint64_t)row * DS4_N_EMBD * sizeof(float),
                     (uint64_t)DS4_N_EMBD * sizeof(float));
         alias->ffn_norm = ds4_gpu_tensor_view(
-                    metal_graph_batch_ffn_norm(g),
+                    metal_graph_batch_ffn_norm(workspace),
                     (uint64_t)row * DS4_N_EMBD * sizeof(float),
                     (uint64_t)DS4_N_EMBD * sizeof(float));
         alias->hc_split = ds4_gpu_tensor_view(
-                    metal_graph_batch_hc_split(g),
+                    metal_graph_batch_hc_split(workspace),
                     (uint64_t)row * mix_hc * sizeof(float),
                     mix_hc * sizeof(float));
         alias->hc_pre = ds4_gpu_tensor_view(
@@ -38447,11 +38449,11 @@ static DS4_MAYBE_UNUSED bool metal_graph_bind_exactn_union_row(
                     2ull * DS4_N_HC * sizeof(float),
                     (uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float));
         alias->router_selected = ds4_gpu_tensor_view(
-                    metal_graph_batch_router_selected(g),
+                    metal_graph_batch_router_selected(workspace),
                     (uint64_t)row * DS4_N_EXPERT_USED * sizeof(int32_t),
                     (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
         alias->router_weights = ds4_gpu_tensor_view(
-                    metal_graph_batch_router_weights(g),
+                    metal_graph_batch_router_weights(workspace),
                     (uint64_t)row * DS4_N_EXPERT_USED * sizeof(float),
                     (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
     }
@@ -38647,7 +38649,7 @@ static bool metal_graph_verify_decode_exactn_union_impl(
         for (uint32_t row = 0; ok && row < n_tokens; row++) {
             const uint32_t pos = start + row;
             ok = metal_graph_bind_exactn_union_row(
-                    g, row, cur_rows[row], next_rows[row],
+                    g, g, row, cur_rows[row], next_rows[row],
                     &row_aliases[row]);
             if (ok) {
                 ok = metal_graph_encode_decode_layer_phase(
@@ -38699,7 +38701,7 @@ static bool metal_graph_verify_decode_exactn_union_impl(
         for (uint32_t row = 0; ok && row < n_tokens; row++) {
             const uint32_t pos = start + row;
             ok = metal_graph_bind_exactn_union_row(
-                    g, row, cur_rows[row], next_rows[row],
+                    g, g, row, cur_rows[row], next_rows[row],
                     &row_aliases[row]);
             if (ok) {
                 ok = ds4_gpu_stream_expert_exact_rows_set_row(row) != 0;
@@ -70513,6 +70515,10 @@ int ds4_test_q4_stream_overlap_policy(
 #endif
 
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
+static bool metal_graph_mixed_workspace_compatible(
+        const ds4_gpu_graph *owner,
+        const ds4_gpu_graph *member);
+
 static bool ds4_engine_has_q4_stream_overlap_weights(const ds4_engine *e) {
     if (!e) return false;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -70562,6 +70568,142 @@ static bool ds4_session_q4_stream_overlap_eligible(ds4_session *s) {
            getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
            getenv("DS4_METAL_MOE_STAGE_PROFILE") == NULL &&
            ds4_engine_has_q4_stream_overlap_weights(e);
+}
+
+static bool ds4_q4_ssd_session_union_required(void) {
+    if (metal_graph_tp_env_flag(
+            "DS4_METAL_DISABLE_Q4_SSD_SESSION_UNION", false)) {
+        return false;
+    }
+    return metal_graph_tp_env_flag(
+            "DS4_METAL_REQUIRE_Q4_SSD_SESSION_UNION", false);
+}
+
+static bool ds4_q4_ssd_session_union_requested(void) {
+    const bool disabled = metal_graph_tp_env_flag(
+            "DS4_METAL_DISABLE_Q4_SSD_SESSION_UNION", false);
+    const bool enabled = metal_graph_tp_env_flag(
+            "DS4_METAL_ENABLE_Q4_SSD_SESSION_UNION", false) ||
+        ds4_q4_ssd_session_union_required();
+    return enabled && !disabled;
+}
+
+static bool ds4_q4_ssd_session_union_workspace_compatible(
+        const ds4_gpu_graph *owner,
+        const ds4_gpu_graph *member) {
+    if (!owner || !member ||
+        !metal_graph_mixed_workspace_compatible(owner, member)) {
+        return false;
+    }
+    const int t = owner->active_tier;
+    return t == 0 && member->active_tier == t &&
+           owner->batch_after_attn_hc_by_tier[t] ==
+               member->batch_after_attn_hc_by_tier[t] &&
+           owner->batch_ffn_cur_by_tier[t] ==
+               member->batch_ffn_cur_by_tier[t] &&
+           owner->batch_ffn_norm_by_tier[t] ==
+               member->batch_ffn_norm_by_tier[t] &&
+           owner->batch_hc_split_by_tier[t] ==
+               member->batch_hc_split_by_tier[t] &&
+           owner->batch_router_selected_by_tier[t] ==
+               member->batch_router_selected_by_tier[t] &&
+           owner->batch_router_weights_by_tier[t] ==
+               member->batch_router_weights_by_tier[t];
+}
+
+static bool ds4_engine_q4_ssd_session_union_layout_supported(
+        const ds4_engine    *e,
+        const ds4_gpu_graph *g) {
+    if (!e || !g || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 ||
+        DS4_N_LAYER == 0u || DS4_N_EXPERT_USED != 6u ||
+        DS4_N_EXPERT < 128u || DS4_N_EXPERT > 384u ||
+        !e->weights.output ||
+        e->weights.output->type != DS4_TENSOR_Q8_0) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        if (!weights_layer_has_required(layer, il) ||
+            !layer->attn_q_a || !layer->attn_kv ||
+            layer->attn_q_a->type != DS4_TENSOR_Q4_K ||
+            layer->attn_kv->type != DS4_TENSOR_Q4_K ||
+            !layer->ffn_gate_shexp || !layer->ffn_up_shexp ||
+            !layer->ffn_down_shexp ||
+            layer->ffn_gate_shexp->type != DS4_TENSOR_Q8_0 ||
+            layer->ffn_up_shexp->type != DS4_TENSOR_Q8_0 ||
+            layer->ffn_down_shexp->type != DS4_TENSOR_Q8_0 ||
+            !layer->ffn_gate_exps || !layer->ffn_up_exps ||
+            !layer->ffn_down_exps ||
+            layer->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+            layer->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+            layer->ffn_down_exps->type != DS4_TENSOR_Q2_K ||
+            !weights_streaming_layer_experts_uniform(&e->weights, il) ||
+            !metal_graph_decode_iq2_selected_slots_expected(g, layer) ||
+            metal_graph_decode_cpu_router_applicable(g, layer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ds4_session_q4_ssd_session_union_eligible(
+        ds4_session         *s,
+        const ds4_gpu_graph *workspace,
+        int                  count) {
+    if (!s || !s->engine || !workspace || count < 2 ||
+        count > DS4_METAL_EXACTN_UNION_MAX_ROWS) {
+        return false;
+    }
+    const ds4_engine *e = s->engine;
+    const ds4_gpu_graph *g = &s->graph;
+    const uint64_t working_set =
+        (uint64_t)(uint32_t)count * (uint64_t)DS4_N_EXPERT_USED;
+    return ds4_q4_ssd_session_union_requested() &&
+           e->backend == DS4_BACKEND_METAL &&
+           e->support_kind == DS4_SUPPORT_NONE &&
+           e->ssd_streaming && !e->tp.active && !e->multi_tier &&
+           e->share_session_prefill_workspace &&
+           e->shared_prefill_workspace_ready &&
+           engine_placement_session_count(e) >= (uint32_t)count &&
+           ds4_q4_ssd_session_union_workspace_compatible(
+               &e->shared_prefill_workspace, workspace) &&
+           working_set <= UINT32_MAX &&
+           e->ssd_streaming_cache_experts >= (uint32_t)working_set &&
+           ds4_gpu_stream_expert_cache_configured_count() >=
+               (uint32_t)working_set &&
+           !s->distributed && !ds4_session_is_cpu(s) &&
+           !ds4_session_is_glm(s) && !ds4_session_cancelled(s) &&
+           s->checkpoint_valid &&
+           g->ssd_streaming && !g->placement && !g->quality &&
+           g->tp_world < 2u && g->raw_cap != 0u &&
+           g->active_tier == 0 && workspace->active_tier == 0 &&
+           workspace->prefill_cap >= (uint32_t)count &&
+           !g->materialize_ffn_out && !g->decode_stage_profile &&
+           !g->decode_index_stage_profile && !g->output_stage_profile &&
+           !g_expert_profile.active &&
+           !graph_power_throttle_enabled(g) &&
+           !g->spec_exactn_union_collect_routes &&
+           !metal_graph_hc_norm_fusion_check_enabled() &&
+           !metal_graph_use_reference_shared_down_hc() &&
+           !metal_graph_use_pro_q4_cpu_router() &&
+           !metal_graph_directional_steering_attn_enabled(g) &&
+           !metal_graph_directional_steering_ffn_enabled(g) &&
+           metal_graph_stream_decode_static_map_enabled() &&
+           metal_graph_debug_get_config()->prefix == NULL &&
+           getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL &&
+           getenv("DS4_METAL_DECODE_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_LAYER_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_ATTN_OUT_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_MOE_STAGE_PROFILE") == NULL &&
+           getenv("DS4_METAL_SELECTED_PROFILE") == NULL &&
+           getenv("DS4_METAL_Q4_SELECTED_PROFILE") == NULL &&
+           getenv("DS4_METAL_DSPARK_EXACT_ROWS_ASYNC_TAILS") == NULL &&
+           getenv("DS4_TP_ABLATE") == NULL &&
+           getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
+           getenv("DS4_MOE_RECORD_SELECTED_IDS") == NULL &&
+           ds4_engine_q4_ssd_session_union_layout_supported(e, g);
 }
 #endif
 
@@ -71238,6 +71380,60 @@ static bool ds4_sessions_eval_batch_metal_supported(
     return true;
 }
 
+static bool ds4_sessions_q4_ssd_session_union_supported(
+        ds4_decode_item *items,
+        int              count,
+        ds4_engine      *e) {
+#if !defined(__APPLE__)
+    (void)items;
+    (void)count;
+    (void)e;
+    return false;
+#else
+    if (!items || count < 2 ||
+        count > DS4_METAL_EXACTN_UNION_MAX_ROWS || !e ||
+        !items[0].session) {
+        return false;
+    }
+    ds4_gpu_graph *workspace = &items[0].session->graph;
+    const uint64_t rows = (uint64_t)(uint32_t)count;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC +
+                            (uint64_t)DS4_N_HC * DS4_N_HC;
+    if (!metal_graph_batch_after_attn_hc(workspace) ||
+        !metal_graph_batch_ffn_cur(workspace) ||
+        !metal_graph_batch_ffn_norm(workspace) ||
+        !metal_graph_batch_hc_split(workspace) ||
+        !metal_graph_batch_router_selected(workspace) ||
+        !metal_graph_batch_router_weights(workspace) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_after_attn_hc(workspace)) <
+            rows * hc_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_ffn_cur(workspace)) <
+            rows * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_ffn_norm(workspace)) <
+            rows * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(workspace)) <
+            rows * mix_hc * sizeof(float) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_router_selected(workspace)) <
+            rows * DS4_N_EXPERT_USED * sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(metal_graph_batch_router_weights(workspace)) <
+            rows * DS4_N_EXPERT_USED * sizeof(float)) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s || s->engine != e ||
+            !ds4_q4_ssd_session_union_workspace_compatible(
+                    &e->shared_prefill_workspace, &s->graph) ||
+            !ds4_session_q4_ssd_session_union_eligible(
+                    s, workspace, count)) {
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
 static bool ds4_sessions_q4_stream_overlap_supported(
         ds4_decode_item *items,
         int count,
@@ -71633,12 +71829,246 @@ static bool ds4_sessions_tp_recv_logits(
     return true;
 }
 
+#if defined(__APPLE__)
+/* Queue-0 SSD batch for the AProjQ4 + routed IQ2/Q2 layout.  Each layer first
+ * encodes every independent session through its router into distinct rows of
+ * one borrowed prefill workspace.  The established exact-row backend then
+ * loads one immutable union of selected experts and runs every routed tail.
+ * A synchronous boundary retires that layer before the shared cache can be
+ * reused, avoiding both a second cache and the unordered multi-queue epoch. */
+static bool metal_graph_encode_q4_ssd_session_union(
+        ds4_decode_item   *items,
+        int                count,
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    if (!items || count < 2 ||
+        count > DS4_METAL_EXACTN_UNION_MAX_ROWS ||
+        !items[0].session || !model || !weights) {
+        return false;
+    }
+
+    ds4_gpu_graph *workspace = &items[0].session->graph;
+    metal_graph_exactn_union_row_alias
+        aliases[DS4_METAL_EXACTN_UNION_MAX_ROWS] = {0};
+    bool saved_capture[DS4_METAL_EXACTN_UNION_MAX_ROWS] = {0};
+    bool collecting = false;
+    bool ok = true;
+
+    for (int i = 0; i < count; i++) {
+        saved_capture[i] =
+            items[i].session->graph.spec_capture_prefixes;
+    }
+
+    ds4_gpu_tensor *selected_rows = ds4_gpu_tensor_view(
+            metal_graph_batch_router_selected(workspace),
+            0,
+            (uint64_t)(uint32_t)count * DS4_N_EXPERT_USED *
+                sizeof(int32_t));
+    ok = selected_rows != NULL;
+
+    /* Allocate and validate every row view before model mapping, KV writes,
+     * or command submission.  Later binds cannot fail due to allocation. */
+    for (int i = 0; ok && i < count; i++) {
+        ds4_gpu_graph *g = &items[i].session->graph;
+        ok = metal_graph_bind_exactn_union_row(
+                g,
+                workspace,
+                (uint32_t)i,
+                metal_graph_cur_hc(g),
+                metal_graph_after_ffn_hc(g),
+                &aliases[i]);
+        metal_graph_unbind_exactn_union_row(g, &aliases[i]);
+    }
+
+    /* The model-view registry is process-global.  Reinstall the complete
+     * static decode set before opening queue 0 so no layer remap can retire a
+     * view referenced by this batch. */
+    if (ok) ok = metal_graph_stream_map_decode_static_all(model, weights);
+    if (ok) {
+        const bool cache_map_state =
+            metal_graph_stream_decode_static_map_state_cache_enabled();
+        for (int i = 0; i < count; i++) {
+            items[i].session->graph.streaming_static_decode_map_current =
+                cache_map_state;
+        }
+    }
+
+    ds4_gpu_set_stream(0);
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    for (int i = 0; ok && i < count; i++) {
+        ds4_gpu_graph *g = &items[i].session->graph;
+        g->spec_capture_prefixes = false;
+        metal_graph_dspark_capture_begin(g);
+        ok = ds4_gpu_embed_token_hc_tensor(
+                     metal_graph_cur_hc(g),
+                     model->map,
+                     model->size,
+                     weights->token_embd->abs_offset,
+                     (uint32_t)weights->token_embd->dim[1],
+                     (uint32_t)items[i].token,
+                     DS4_N_EMBD,
+                     DS4_N_HC) != 0;
+    }
+
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        ok = ds4_gpu_stream_expert_exact_rows_begin_collect() != 0;
+        collecting = ok;
+
+        for (int i = 0; ok && i < count; i++) {
+            ds4_session *s = items[i].session;
+            ds4_gpu_graph *g = &s->graph;
+            const uint32_t pos = (uint32_t)s->checkpoint.len;
+            g->spec_exactn_union_collect_routes = true;
+            ok = metal_graph_bind_exactn_union_row(
+                    g,
+                    workspace,
+                    (uint32_t)i,
+                    metal_graph_cur_hc(g),
+                    metal_graph_after_ffn_hc(g),
+                    &aliases[i]);
+            if (ok) {
+                ok = metal_graph_encode_decode_layer_phase(
+                        g,
+                        model,
+                        layer,
+                        il,
+                        pos,
+                        g->layer_raw_cache[il],
+                        g->raw_cap,
+                        pos % g->raw_cap,
+                        metal_graph_raw_span_for_batch(g, pos, 1),
+                        items[i].token,
+                        METAL_DECODE_LAYER_TO_ROUTER);
+            }
+            metal_graph_unbind_exactn_union_row(g, &aliases[i]);
+            g->spec_exactn_union_collect_routes = false;
+        }
+
+        uint64_t gate_expert_bytes = 0;
+        uint64_t down_expert_bytes = 0;
+        if (ok) {
+            ok = streaming_layer_gate_down_expert_bytes(
+                    layer, &gate_expert_bytes, &down_expert_bytes);
+        }
+        if (ok) {
+            const ds4_gpu_stream_expert_table table =
+                graph_stream_expert_table_make(model,
+                                               layer,
+                                               il,
+                                               gate_expert_bytes,
+                                               down_expert_bytes);
+            ok = ds4_gpu_stream_expert_exact_rows_prepare(
+                         &table,
+                         selected_rows,
+                         (uint32_t)count,
+                         DS4_N_EXPERT_USED) != 0;
+        }
+
+        for (int i = 0; ok && i < count; i++) {
+            ds4_session *s = items[i].session;
+            ds4_gpu_graph *g = &s->graph;
+            const uint32_t pos = (uint32_t)s->checkpoint.len;
+            ok = metal_graph_bind_exactn_union_row(
+                    g,
+                    workspace,
+                    (uint32_t)i,
+                    metal_graph_cur_hc(g),
+                    metal_graph_after_ffn_hc(g),
+                    &aliases[i]);
+            if (ok) {
+                ok = ds4_gpu_stream_expert_exact_rows_set_row(
+                             (uint32_t)i) != 0;
+            }
+            if (ok) {
+                ok = metal_graph_encode_decode_layer_phase(
+                        g,
+                        model,
+                        layer,
+                        il,
+                        pos,
+                        g->layer_raw_cache[il],
+                        g->raw_cap,
+                        pos % g->raw_cap,
+                        metal_graph_raw_span_for_batch(g, pos, 1),
+                        items[i].token,
+                        METAL_DECODE_LAYER_FROM_ROUTER);
+            }
+            metal_graph_unbind_exactn_union_row(g, &aliases[i]);
+        }
+
+        if (ok) {
+            ok = ds4_gpu_end_commands() != 0;
+        } else {
+            (void)ds4_gpu_synchronize();
+        }
+        if (!ok) (void)ds4_gpu_synchronize();
+        if (collecting) {
+            ds4_gpu_stream_expert_exact_rows_release();
+            collecting = false;
+        }
+        if (!ok) break;
+
+        for (int i = 0; ok && i < count; i++) {
+            ds4_gpu_graph *g = &items[i].session->graph;
+            ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
+            g->cur_hc_by_tier[g->active_tier] =
+                metal_graph_after_ffn_hc(g);
+            g->after_ffn_hc_by_tier[g->active_tier] = tmp;
+            ok = metal_graph_dspark_capture_decode_layer(g, il);
+        }
+        if (ok && il + 1u < DS4_N_LAYER) {
+            ok = ds4_gpu_begin_commands() != 0;
+        }
+    }
+
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    for (int i = 0; ok && i < count; i++) {
+        ok = metal_graph_encode_output_head(
+                &items[i].session->graph,
+                model,
+                weights,
+                weights->output->dim[1]);
+    }
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+    } else {
+        (void)ds4_gpu_synchronize();
+    }
+
+    /* No view or exact-row resource may outlive work that references it. */
+    if (!ok) (void)ds4_gpu_synchronize();
+    if (collecting) ds4_gpu_stream_expert_exact_rows_release();
+    for (int i = 0; i < count; i++) {
+        ds4_gpu_graph *g = &items[i].session->graph;
+        g->spec_exactn_union_collect_routes = false;
+        g->spec_capture_prefixes = saved_capture[i];
+        metal_graph_release_exactn_union_row_alias(g, &aliases[i]);
+    }
+    ds4_gpu_tensor_free(selected_rows);
+    return ok;
+}
+#endif
+
 static int ds4_sessions_eval_batch_metal(
         ds4_decode_item *items,
         int count,
         ds4_engine *e,
         char *err,
         size_t errlen) {
+    const bool ssd_session_union =
+        ds4_sessions_q4_ssd_session_union_supported(items, count, e);
+    /* The generic Metal batch tape assumes resident model ranges.  If the
+     * opt-in changed between admission and execution, fail closed instead of
+     * accidentally running that tape against an SSD-streamed graph. */
+    if (e && e->ssd_streaming && !ssd_session_union) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "Metal SSD session union changed or became ineligible "
+                     "before execution");
+        }
+        return 1;
+    }
     const bool mirror = e->tp.active && e->tp.rank == 0;
     if (mirror) {
         ds4_tp_batch_item *wire = ds4_sessions_tp_batch_items(items, count);
@@ -71662,10 +72092,14 @@ static int ds4_sessions_eval_batch_metal(
     bool native_shared = false;
     bool native_qkv = false;
     const bool stream_overlap =
+        !ssd_session_union &&
         ds4_sessions_q4_stream_overlap_supported(items, count, e);
     bool ok = true;
 #if defined(__APPLE__)
-    if (stream_overlap) {
+    if (ssd_session_union) {
+        ok = metal_graph_encode_q4_ssd_session_union(
+                items, count, &e->model, &e->weights);
+    } else if (stream_overlap) {
         int started = 0;
         for (int i = 0; ok && i < count; i++) {
             ds4_session *s = items[i].session;
@@ -71787,14 +72221,15 @@ static int ds4_sessions_eval_batch_metal(
                 "ds4: Metal session batch rows=%d family=%s "
                 "native_glm53=%d native_shared=%d native_qkv=%d "
                 "stream_overlap=%d "
-                "streams=%d\n",
+                "streams=%d ssd_session_union=%d\n",
                 count,
                 ds4_session_is_glm(items[0].session) ? "glm" : "deepseek",
                 native_glm53 ? 1 : 0,
                 native_shared ? 1 : 0,
                 native_qkv ? 1 : 0,
                 stream_overlap ? 1 : 0,
-                stream_overlap ? count : 1);
+                stream_overlap ? count : 1,
+                ssd_session_union ? 1 : 0);
     }
     return 0;
 }
@@ -72101,9 +72536,25 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     if (e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
     }
-    if (ds4_sessions_eval_batch_metal_supported(items, count, e)) {
+    const bool q4_ssd_session_union =
+        ds4_sessions_q4_ssd_session_union_supported(items, count, e);
+    if (q4_ssd_session_union ||
+        ds4_sessions_eval_batch_metal_supported(items, count, e)) {
         return ds4_sessions_eval_batch_metal(items, count, e, err, errlen);
     }
+#if defined(__APPLE__)
+    if (e->backend == DS4_BACKEND_METAL && e->ssd_streaming &&
+        ds4_q4_ssd_session_union_required()) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "required Metal Q4 SSD session union is ineligible "
+                     "(need 2..5 valid sessions, AProjQ4 + routed "
+                     "IQ2_XXS/Q2_K, static decode map, and >= rows*6 "
+                     "cached experts)");
+        }
+        return 1;
+    }
+#endif
 #endif
 
     /* Preserve logical all-or-nothing behavior even on the serialized path.
