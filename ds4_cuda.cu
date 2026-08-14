@@ -190,6 +190,28 @@ static int cuda_stream_selected_consume_drain(void);
 static void cuda_stream_selected_consume_release(void);
 static void cuda_stream_selected_cache_release(void);
 
+typedef struct {
+    void *base;
+    char *gate;
+    char *up;
+    char *down;
+    uint64_t bytes;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t configured_expert_bytes;
+    uint32_t capacity;
+    uint32_t valid_count;
+    uint32_t configured_budget;
+    int owner_device;
+    int poisoned;
+} cuda_stream_expert_persistent_arena;
+
+static cuda_stream_expert_persistent_arena g_stream_expert_persistent_arena;
+static std::mutex g_stream_expert_persistent_arena_mutex;
+static void cuda_stream_expert_persistent_arena_release(int reset_class);
+
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
     g_stream_selected_cache.upload_event_value = 0;
@@ -615,6 +637,13 @@ static std::atomic<uint64_t> g_stream_expert_persistent_key_misses{0};
 static std::atomic<uint64_t> g_stream_expert_persistent_overflow_rejects{0};
 static std::atomic<uint64_t> g_stream_expert_persistent_oracle_runs{0};
 static std::atomic<uint64_t> g_stream_expert_persistent_oracle_failures{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_arena_allocations{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_arena_reuses{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_arena_releases{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_arena_failures{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_arena_oracle_runs{0};
+static std::atomic<uint64_t> g_stream_expert_persistent_arena_oracle_failures{0};
+static int g_stream_expert_persistent_runtime_ready;
 
 static int cuda_ok(cudaError_t err, const char *what);
 static void cuda_stream_selected_event_pipeline_release(void);
@@ -3007,6 +3036,12 @@ typedef struct {
     uint64_t overflow_rejects;
     uint64_t oracle_runs;
     uint64_t oracle_failures;
+    uint64_t arena_allocations;
+    uint64_t arena_reuses;
+    uint64_t arena_releases;
+    uint64_t arena_failures;
+    uint64_t arena_oracle_runs;
+    uint64_t arena_oracle_failures;
     int enabled;
     int required;
     int stats;
@@ -3730,6 +3765,12 @@ static void cuda_stream_expert_persistent_init(void) {
     }
 }
 
+static int cuda_stream_expert_persistent_requested(void) {
+    std::call_once(g_stream_expert_persistent_once,
+                   cuda_stream_expert_persistent_init);
+    return g_stream_expert_persistent_enabled;
+}
+
 extern "C" void ds4_cuda_stream_expert_persistent_get_report(
         ds4_cuda_stream_expert_persistent_report *report) {
     if (!report) return;
@@ -3758,6 +3799,15 @@ extern "C" void ds4_cuda_stream_expert_persistent_get_report(
     out.oracle_runs = g_stream_expert_persistent_oracle_runs.load();
     out.oracle_failures =
         g_stream_expert_persistent_oracle_failures.load();
+    out.arena_allocations =
+        g_stream_expert_persistent_arena_allocations.load();
+    out.arena_reuses = g_stream_expert_persistent_arena_reuses.load();
+    out.arena_releases = g_stream_expert_persistent_arena_releases.load();
+    out.arena_failures = g_stream_expert_persistent_arena_failures.load();
+    out.arena_oracle_runs =
+        g_stream_expert_persistent_arena_oracle_runs.load();
+    out.arena_oracle_failures =
+        g_stream_expert_persistent_arena_oracle_failures.load();
     out.enabled = g_stream_expert_persistent_enabled;
     out.required = g_stream_expert_persistent_required;
     out.stats = g_stream_expert_persistent_stats;
@@ -6335,6 +6385,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     /* The selected cache may still be the destination of an event-published
      * upload.  Drain and retire its auxiliary streams before freeing device
      * storage or invalidating the owner-device context. */
+    cuda_stream_expert_persistent_arena_release(1);
     cuda_stream_selected_stage_release();
     cuda_stream_selected_event_pipeline_release();
     cuda_stream_selected_cache_release();
@@ -7213,6 +7264,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_q8_fold_invalidate_all();
     cuda_stream_selected_cache_release();
+    cuda_stream_expert_persistent_arena_release(1);
     cuda_f16_pair_chunk32_release_all();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -7416,6 +7468,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     cuda_q8_fold_invalidate_all();
 
     cuda_stream_selected_cache_release();
+    cuda_stream_expert_persistent_arena_release(1);
     cuda_f16_pair_chunk32_release_all();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -39062,12 +39115,299 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load_async(
     return submitted ? -1 : 0;
 }
 
+static int cuda_stream_expert_persistent_align256(
+        uint64_t value, uint64_t *out) {
+    if (!out || value > UINT64_MAX - 255u) return 0;
+    *out = (value + 255u) & ~UINT64_C(255);
+    return 1;
+}
+
+static int cuda_stream_expert_persistent_arena_layout(
+        uint32_t capacity,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t *up_offset,
+        uint64_t *down_offset,
+        uint64_t *total_bytes) {
+    uint64_t gate_plane = 0;
+    uint64_t down_plane = 0;
+    uint64_t after_up = 0;
+    uint64_t after_down = 0;
+    if (!up_offset || !down_offset || !total_bytes || capacity == 0 ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        !cuda_stream_expert_persistent_mul_u64(
+            capacity, gate_expert_bytes, &gate_plane) ||
+        !cuda_stream_expert_persistent_mul_u64(
+            capacity, down_expert_bytes, &down_plane) ||
+        !cuda_stream_expert_persistent_align256(gate_plane, up_offset) ||
+        !cuda_stream_expert_persistent_add_u64(
+            *up_offset, gate_plane, &after_up) ||
+        !cuda_stream_expert_persistent_align256(after_up, down_offset) ||
+        !cuda_stream_expert_persistent_add_u64(
+            *down_offset, down_plane, &after_down) ||
+        !cuda_stream_expert_persistent_align256(
+            after_down, total_bytes) ||
+        *total_bytes > SIZE_MAX) {
+        return 0;
+    }
+    return *up_offset >= gate_plane && *down_offset >= after_up &&
+           *total_bytes >= after_down;
+}
+
+static int cuda_stream_expert_persistent_arena_release_locked(
+        int reset_class) {
+    cuda_stream_expert_persistent_arena *arena =
+        &g_stream_expert_persistent_arena;
+    const uint32_t configured_budget = arena->configured_budget;
+    /* The engine seeds the majority total before installing a new model map.
+     * Preserve that startup pin while resetting the learned exact split. */
+    const uint64_t configured_expert_bytes =
+        arena->configured_expert_bytes;
+    const uint64_t gate_expert_bytes = reset_class ? 0 :
+        arena->gate_expert_bytes;
+    const uint64_t down_expert_bytes = reset_class ? 0 :
+        arena->down_expert_bytes;
+    int previous_device = -1;
+    if (arena->base) {
+        (void)cudaGetDevice(&previous_device);
+        /* The arena is not a transient-cache alias, but it shares the upload
+         * and consumer epoch boundary which its future loader will use. */
+        int drained = cuda_stream_selected_consume_drain();
+        if (g_stream_selected_upload_stream) {
+            if (g_stream_selected_upload_owner_device < 0 ||
+                cudaSetDevice(g_stream_selected_upload_owner_device) !=
+                    cudaSuccess ||
+                cudaStreamSynchronize(g_stream_selected_upload_stream) !=
+                    cudaSuccess) {
+                (void)cudaGetLastError();
+                drained = 0;
+            }
+        }
+        if (!drained) {
+            drained = cudaSetDevice(arena->owner_device) == cudaSuccess &&
+                      cudaDeviceSynchronize() == cudaSuccess;
+            if (!drained) (void)cudaGetLastError();
+        }
+        if (!drained ||
+            cudaSetDevice(arena->owner_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            arena->poisoned = 1;
+            g_stream_expert_persistent_arena_failures.fetch_add(
+                1, std::memory_order_relaxed);
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return 0;
+        }
+        if (cudaFree(arena->base) != cudaSuccess) {
+            (void)cudaGetLastError();
+            arena->poisoned = 1;
+            g_stream_expert_persistent_arena_failures.fetch_add(
+                1, std::memory_order_relaxed);
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return 0;
+        }
+        g_stream_expert_persistent_arena_releases.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    memset(arena, 0, sizeof(*arena));
+    arena->owner_device = -1;
+    arena->configured_budget = configured_budget;
+    arena->configured_expert_bytes = configured_expert_bytes;
+    arena->gate_expert_bytes = gate_expert_bytes;
+    arena->down_expert_bytes = down_expert_bytes;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
+}
+
+static void cuda_stream_expert_persistent_arena_release(int reset_class) {
+    std::lock_guard<std::mutex> lock(
+        g_stream_expert_persistent_arena_mutex);
+    (void)cuda_stream_expert_persistent_arena_release_locked(reset_class);
+}
+
+static int cuda_stream_expert_persistent_arena_ensure_locked(void) {
+    cuda_stream_expert_persistent_arena *arena =
+        &g_stream_expert_persistent_arena;
+    if (arena->poisoned || g_n_gpus != 1 ||
+        arena->configured_budget == 0 ||
+        arena->gate_expert_bytes == 0 || arena->down_expert_bytes == 0) {
+        return 0;
+    }
+    uint64_t up_offset = 0;
+    uint64_t down_offset = 0;
+    uint64_t total_bytes = 0;
+    if (!cuda_stream_expert_persistent_arena_layout(
+            arena->configured_budget, arena->gate_expert_bytes,
+            arena->down_expert_bytes, &up_offset, &down_offset,
+            &total_bytes)) {
+        g_stream_expert_persistent_arena_failures.fetch_add(
+            1, std::memory_order_relaxed);
+        return 0;
+    }
+    const int owner = g_gpu[0].device_id;
+    if (arena->base && arena->owner_device == owner &&
+        arena->capacity == arena->configured_budget &&
+        arena->bytes == total_bytes && arena->up_offset == up_offset &&
+        arena->down_offset == down_offset) {
+        g_stream_expert_persistent_arena_reuses.fetch_add(
+            1, std::memory_order_relaxed);
+        return 1;
+    }
+    if (!cuda_stream_expert_persistent_arena_release_locked(0)) return 0;
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    void *base = NULL;
+    cudaError_t err = cudaSetDevice(owner);
+    if (err == cudaSuccess) err = cudaMalloc(&base, (size_t)total_bytes);
+    if (err != cudaSuccess || !base ||
+        (((uintptr_t)base) & 255u) != 0u) {
+        if (base) (void)cudaFree(base);
+        (void)cudaGetLastError();
+        g_stream_expert_persistent_arena_failures.fetch_add(
+            1, std::memory_order_relaxed);
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    arena->base = base;
+    arena->gate = (char *)base;
+    arena->up = (char *)base + up_offset;
+    arena->down = (char *)base + down_offset;
+    arena->bytes = total_bytes;
+    arena->up_offset = up_offset;
+    arena->down_offset = down_offset;
+    arena->capacity = arena->configured_budget;
+    arena->valid_count = 0;
+    arena->owner_device = owner;
+    g_stream_expert_persistent_arena_allocations.fetch_add(
+        1, std::memory_order_relaxed);
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
+}
+
+extern "C" int ds4_cuda_test_stream_expert_persistent_arena(void) {
+    g_stream_expert_persistent_arena_oracle_runs.fetch_add(
+        1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(
+        g_stream_expert_persistent_arena_mutex);
+    cuda_stream_expert_persistent_arena *arena =
+        &g_stream_expert_persistent_arena;
+    const uint32_t saved_budget = arena->configured_budget;
+    const uint64_t saved_total = arena->configured_expert_bytes;
+    const uint64_t saved_gate = arena->gate_expert_bytes;
+    const uint64_t saved_down = arena->down_expert_bytes;
+    int ok = g_n_gpus == 1 && !arena->base && !arena->poisoned;
+    arena->configured_budget = 3u;
+    arena->configured_expert_bytes = 40u;
+    arena->gate_expert_bytes = 16u;
+    arena->down_expert_bytes = 8u;
+
+    void *first_base = NULL;
+    if (ok) {
+        ok = cuda_stream_expert_persistent_arena_ensure_locked();
+    }
+    uint64_t expected_up = 0;
+    uint64_t expected_down = 0;
+    uint64_t expected_total = 0;
+    if (ok) {
+        first_base = arena->base;
+        ok = cuda_stream_expert_persistent_arena_layout(
+                 3u, 16u, 8u, &expected_up, &expected_down,
+                 &expected_total) &&
+             arena->owner_device == g_gpu[0].device_id &&
+             arena->capacity == 3u && arena->bytes == expected_total &&
+             arena->up_offset == expected_up &&
+             arena->down_offset == expected_down &&
+             arena->gate == (char *)arena->base &&
+             arena->up == (char *)arena->base + expected_up &&
+             arena->down == (char *)arena->base + expected_down &&
+             (((uintptr_t)arena->base | (uintptr_t)arena->gate |
+               (uintptr_t)arena->up | (uintptr_t)arena->down) & 255u) == 0u;
+    }
+
+    int previous_device = -1;
+    unsigned char got[3] = {0, 0, 0};
+    if (ok) {
+        (void)cudaGetDevice(&previous_device);
+        ok = cudaSetDevice(arena->owner_device) == cudaSuccess &&
+             cudaMemset(arena->base, 0, (size_t)arena->bytes) == cudaSuccess &&
+             cudaMemset(arena->gate + 47u, 0xa1, 1u) == cudaSuccess &&
+             cudaMemset(arena->up + 47u, 0xb2, 1u) == cudaSuccess &&
+             cudaMemset(arena->down + 23u, 0xc3, 1u) == cudaSuccess &&
+             cudaMemcpy(&got[0], arena->gate + 47u, 1u,
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             cudaMemcpy(&got[1], arena->up + 47u, 1u,
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             cudaMemcpy(&got[2], arena->down + 23u, 1u,
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             got[0] == 0xa1 && got[1] == 0xb2 && got[2] == 0xc3;
+        if (!ok) (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    }
+    if (ok) {
+        ok = cuda_stream_expert_persistent_arena_ensure_locked() &&
+             arena->base == first_base;
+    }
+    if (ok) {
+        ok = cuda_stream_expert_persistent_arena_release_locked(0) &&
+             !arena->base && arena->gate_expert_bytes == 16u &&
+             arena->down_expert_bytes == 8u &&
+             cuda_stream_expert_persistent_arena_ensure_locked() &&
+             arena->base;
+    }
+    const int cleanup_ok =
+        cuda_stream_expert_persistent_arena_release_locked(1);
+    if (cleanup_ok) {
+        ok = ok && !arena->base && arena->gate_expert_bytes == 0 &&
+             arena->down_expert_bytes == 0 &&
+             arena->configured_expert_bytes == 40u;
+        arena->configured_budget = saved_budget;
+        arena->configured_expert_bytes = saved_total;
+        arena->gate_expert_bytes = saved_gate;
+        arena->down_expert_bytes = saved_down;
+    } else {
+        ok = 0;
+    }
+    if (!ok) {
+        g_stream_expert_persistent_arena_oracle_failures.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    return ok;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return 0;
+    uint64_t two_gate = 0;
+    uint64_t total_class = 0;
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        !cuda_stream_expert_persistent_mul_u64(
+            gate_expert_bytes, 2u, &two_gate) ||
+        !cuda_stream_expert_persistent_add_u64(
+            two_gate, down_expert_bytes, &total_class) ||
+        total_class == 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(
+        g_stream_expert_persistent_arena_mutex);
+    cuda_stream_expert_persistent_arena *arena =
+        &g_stream_expert_persistent_arena;
+    if (arena->configured_expert_bytes == 0) {
+        arena->configured_expert_bytes = total_class;
+    }
+    if (arena->configured_expert_bytes != total_class) return 0;
+    if (arena->gate_expert_bytes == 0 && arena->down_expert_bytes == 0) {
+        arena->gate_expert_bytes = gate_expert_bytes;
+        arena->down_expert_bytes = down_expert_bytes;
+    } else if (arena->gate_expert_bytes != gate_expert_bytes ||
+               arena->down_expert_bytes != down_expert_bytes) {
+        return 0;
+    }
+    if (!g_stream_expert_persistent_runtime_ready ||
+        !g_ssd_streaming_mode || arena->configured_budget == 0 ||
+        !cuda_stream_expert_persistent_requested()) {
+        return 0;
+    }
+    return cuda_stream_expert_persistent_arena_ensure_locked() ?
+        arena->configured_budget : 0;
 }
 
 extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -39695,26 +40035,47 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     if (!g_ssd_streaming_mode) {
         (void)cuda_stream_selected_cache_free_storage_writer();
+        cuda_stream_expert_persistent_arena_release(0);
     }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    (void)experts;
+    std::lock_guard<std::mutex> lock(
+        g_stream_expert_persistent_arena_mutex);
+    if (experts == g_stream_expert_persistent_arena.configured_budget) return;
+    if (!cuda_stream_expert_persistent_arena_release_locked(0)) return;
+    g_stream_expert_persistent_arena.configured_budget = experts;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    (void)bytes;
+    std::lock_guard<std::mutex> lock(
+        g_stream_expert_persistent_arena_mutex);
+    if (bytes ==
+        g_stream_expert_persistent_arena.configured_expert_bytes) return;
+    if (!cuda_stream_expert_persistent_arena_release_locked(1)) return;
+    g_stream_expert_persistent_arena.configured_expert_bytes = bytes;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
+    std::lock_guard<std::mutex> lock(
+        g_stream_expert_persistent_arena_mutex);
+    return g_stream_expert_persistent_runtime_ready &&
+           g_ssd_streaming_mode &&
+           cuda_stream_expert_persistent_requested() ?
+        g_stream_expert_persistent_arena.configured_budget : 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
-    return !g_stream_selected_writer_active &&
-           g_stream_selected_cache.valid
-        ? g_stream_selected_cache.compact_count : 0;
+    if (!g_stream_expert_persistent_runtime_ready) {
+        std::lock_guard<std::mutex> lock(g_stream_selected_consume_mutex);
+        return !g_stream_selected_writer_active &&
+               g_stream_selected_cache.valid ?
+            g_stream_selected_cache.compact_count : 0;
+    }
+    std::lock_guard<std::mutex> lock(
+        g_stream_expert_persistent_arena_mutex);
+    return g_stream_expert_persistent_arena.base ?
+        g_stream_expert_persistent_arena.valid_count : 0;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -39722,6 +40083,7 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_selected_cache_release();
+    cuda_stream_expert_persistent_arena_release(1);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
