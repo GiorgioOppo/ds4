@@ -350,6 +350,36 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
  * values may follow partial enqueue. */
 #define DS4_MMQ_NOT_APPLICABLE 1
 
+/* Raw-layout twin of ds4_mmq_iq2_xxs_q2_K_moe_fused_soa.  This is the
+ * grouped SSD entry: callers may pass a compact expert table together with
+ * ids remapped into [0, n_experts).  Gate/up/down use canonical GGUF block
+ * layouts while the routing map, activation quantize, and expert bounds are
+ * built only once for the complete fused pipeline.  As with router top-k,
+ * ids for one token must be unique.
+ *
+ * Capability/shape failures return DS4_MMQ_NOT_APPLICABLE before enqueue.
+ * Once work has been submitted, failures are negative and must not be
+ * retried on the same stream as a materialized fallback. */
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+    const void    * W_gate_raw,
+    const void    * W_up_raw,
+    const void    * W_down_raw,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * up_f32,
+    float         * mid_f32,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
 /* Aligned-artifact production fast path: gate/up stay in registers, weighted
  * SwiGLU is quantized directly into down_q8_scratch, and only the pair-major
  * down output is materialized.  Caller-owned scratch keeps this hot path free

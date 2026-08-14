@@ -2229,6 +2229,100 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
     return 0;
 }
 
+/* Canonical-GGUF/raw counterpart of the materialized aligned-SoA pipeline.
+ * SSD streaming compacts the selected experts and remaps ids before this
+ * boundary, so n_experts describes the compact table rather than the model's
+ * global expert count.  Keep all preflight ahead of the single pair_impl
+ * invocation: after that point map/quantize/MMQ work may already be queued and
+ * a negative result must be propagated instead of being converted into the
+ * retryable NOT_APPLICABLE result. */
+extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+        const void * W_gate, const void * W_up, const void * W_down,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * up, float * mid_f32, float * down,
+        int expert_mid_dim, int expert_in_dim, int out_dim,
+        int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    if (!W_gate || !W_up || !W_down || !X || !ids || !router_weights ||
+        !gate || !up || !mid_f32 || !down ||
+        expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
+        n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || n_experts == INT_MAX ||
+        n_tokens >= (1 << 22) || n_expert_used >= (1 << 10) ||
+        expert_in_dim % 256 != 0 || expert_mid_dim % 256 != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const size_t nt = (size_t)n_tokens;
+    const size_t nu = (size_t)n_expert_used;
+    const size_t mid = (size_t)expert_mid_dim;
+    const size_t in = (size_t)expert_in_dim;
+    const size_t out = (size_t)out_dim;
+    if (nt > SIZE_MAX / nu) return DS4_MMQ_NOT_APPLICABLE;
+    const size_t assignments = nt * nu;
+    if (assignments > SIZE_MAX / mid ||
+        assignments * mid > SIZE_MAX / sizeof(float) ||
+        assignments > SIZE_MAX / out ||
+        assignments * out > SIZE_MAX / sizeof(float) ||
+        assignments > SIZE_MAX / in ||
+        assignments * in > SIZE_MAX / 512u ||
+        assignments * mid > SIZE_MAX / 512u) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    /* Bound the raw per-expert strides used by both MMQs before any pool or
+     * stream operation.  All dimensions enter as int, but their products do
+     * not necessarily fit int64_t. */
+    const int64_t iq2_k_blocks = expert_in_dim / 256;
+    const int64_t q2_k_blocks = expert_mid_dim / 256;
+    if ((int64_t)n_experts > INT64_MAX / expert_mid_dim ||
+        (int64_t)n_experts * expert_mid_dim > INT64_MAX / iq2_k_blocks ||
+        (int64_t)n_experts > INT64_MAX / out_dim ||
+        (int64_t)n_experts * out_dim > INT64_MAX / q2_k_blocks) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_k_tile_supported<GGML_TYPE_IQ2_XXS>(
+            "ds4_mmq_iq2_xxs_q2_K_moe_fused_raw", expert_in_dim, cc) ||
+        !get_ctx_for_device(dev) ||
+        ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo &&
+         !ds4_mmid_large_enabled())) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const ds4_mmq_fused_down fused_down = {
+        W_down,
+        nullptr,
+        0,
+        router_weights,
+        mid_f32,
+        down,
+        out_dim,
+        clamp,
+        false,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        0,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
+        "ds4_mmq_iq2_xxs_q2_K_moe_fused_raw",
+        W_gate, W_up, X, ids, gate, up,
+        expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
+        stream,
+        nullptr, nullptr, 0,
+        /*sanitize_out=*/false, &fused_down);
+}
+
 /* Aligned-artifact production fast path: gate/up accumulators stay in
  * registers, weighted SwiGLU is quantized directly into down_q8_scratch by
  * the fused D2R kernel, and only the pair-major down output is materialized.

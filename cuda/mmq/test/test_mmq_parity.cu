@@ -807,6 +807,364 @@ bool run_moe_pair_generic(
     return ok;
 }
 
+// Reference glue for the raw fused IQ2/Q2 pipeline.  Keep the expression and
+// non-finite handling identical to ds4_swiglu_weighted_f32 in ds4_mmq.cu so
+// parity below isolates routing-map reuse rather than activation math.
+__global__ void test_swiglu_weighted_f32(
+        const float * gate, const float * up, const float * router_weights,
+        float * mid, uint64_t n, int K, float clamp) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t pair = i / (uint64_t)K;
+    float g = isfinite(gate[i]) ? gate[i] : 0.0f;
+    float u = isfinite(up[i]) ? up[i] : 0.0f;
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    mid[i] = (g / (1.0f + expf(-g))) * u * router_weights[pair];
+}
+
+// Exercise the SSD-facing raw fused ABI with a non-identity compact expert
+// table.  The reference is the established materialized chain:
+//   raw pair -> weighted SwiGLU -> raw down.
+// Every token has six distinct experts.  Flattening ids to [assignments, 1]
+// for the reference down leg produces the same stable expert ordering as the
+// single routing map reused by the fused candidate.
+bool run_iq2_xxs_q2_K_fused_raw_parity(int n_tokens, uint32_t seed) {
+    constexpr int global_experts = 13;
+    constexpr int compact_experts = 8;
+    constexpr int n_expert_used = 6;
+    // Deliberately asymmetric and multi-block in both legs.  A 256x256
+    // fixture degenerates every raw row to one GGUF block and cannot catch a
+    // bad row/expert stride in either the IQ2 gate/up or Q2 down tensor.
+    constexpr int expert_mid_dim = 512;
+    constexpr int expert_in_dim = 768;
+    constexpr int out_dim = 768;
+    constexpr float clamp = 6.0f;
+    const int compact_to_global[compact_experts] = {11, 2, 9, 0, 7, 12, 4, 6};
+
+    fprintf(stderr,
+            "=== IQ2_XXS+Q2_K/FUSED_RAW compact-remap ntok=%d "
+            "nexp=%d nused=%d seed=%u ===\n",
+            n_tokens, compact_experts, n_expert_used, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> activation(0.0f, 0.05f);
+    const size_t iq2_blocks_per_expert =
+        (size_t)expert_mid_dim * (expert_in_dim / QK_K_LOCAL);
+    const size_t q2_blocks_per_expert =
+        (size_t)out_dim * (expert_mid_dim / QK_K_LOCAL);
+
+    std::vector<block_iq2_xxs> gate_global(
+        (size_t)global_experts * iq2_blocks_per_expert);
+    std::vector<block_iq2_xxs> up_global(
+        (size_t)global_experts * iq2_blocks_per_expert);
+    std::vector<block_q2_K> down_global(
+        (size_t)global_experts * q2_blocks_per_expert);
+    for (auto & block : gate_global) generate_random_block_iq2_xxs(&block, rng);
+    for (auto & block : up_global) generate_random_block_iq2_xxs(&block, rng);
+    for (auto & block : down_global) generate_random_block_q2_K(&block, rng);
+
+    std::vector<block_iq2_xxs> gate_compact(
+        (size_t)compact_experts * iq2_blocks_per_expert);
+    std::vector<block_iq2_xxs> up_compact(
+        (size_t)compact_experts * iq2_blocks_per_expert);
+    std::vector<block_q2_K> down_compact(
+        (size_t)compact_experts * q2_blocks_per_expert);
+    int global_to_compact[global_experts];
+    std::fill(global_to_compact, global_to_compact + global_experts, -1);
+    for (int compact = 0; compact < compact_experts; compact++) {
+        const int global = compact_to_global[compact];
+        global_to_compact[global] = compact;
+        std::memcpy(gate_compact.data() + (size_t)compact * iq2_blocks_per_expert,
+                    gate_global.data() + (size_t)global * iq2_blocks_per_expert,
+                    iq2_blocks_per_expert * sizeof(block_iq2_xxs));
+        std::memcpy(up_compact.data() + (size_t)compact * iq2_blocks_per_expert,
+                    up_global.data() + (size_t)global * iq2_blocks_per_expert,
+                    iq2_blocks_per_expert * sizeof(block_iq2_xxs));
+        std::memcpy(down_compact.data() + (size_t)compact * q2_blocks_per_expert,
+                    down_global.data() + (size_t)global * q2_blocks_per_expert,
+                    q2_blocks_per_expert * sizeof(block_q2_K));
+    }
+
+    const size_t assignments = (size_t)n_tokens * n_expert_used;
+    std::vector<int32_t> global_ids(assignments);
+    std::vector<int32_t> remapped_ids(assignments);
+    std::vector<float> router_weights(assignments);
+    for (int token = 0; token < n_tokens; token++) {
+        bool seen[compact_experts] = {};
+        float router_sum = 0.0f;
+        for (int slot = 0; slot < n_expert_used; slot++) {
+            // Three is coprime with eight, so the six positions are unique;
+            // the global round-trip makes this an explicit compact-remap test.
+            const int compact = (token * 5 + slot * 3) % compact_experts;
+            const int global = compact_to_global[compact];
+            if (seen[compact] || global_to_compact[global] != compact) {
+                fprintf(stderr, "invalid compact routing fixture\n");
+                return false;
+            }
+            seen[compact] = true;
+            const size_t pair = (size_t)token * n_expert_used + slot;
+            global_ids[pair] = global;
+            remapped_ids[pair] = global_to_compact[global];
+            // Token- and slot-varying values make a pair-stride bug visible;
+            // normalize per token to retain the production router contract.
+            const float raw_weight =
+                (float)(1 + ((token * 11 + slot * 7) % 23));
+            router_weights[pair] = raw_weight;
+            router_sum += raw_weight;
+        }
+        for (int slot = 0; slot < n_expert_used; slot++) {
+            const size_t pair = (size_t)token * n_expert_used + slot;
+            router_weights[pair] /= router_sum;
+        }
+    }
+    std::vector<float> X((size_t)n_tokens * expert_in_dim);
+    for (float & value : X) value = activation(rng);
+
+    const size_t mid_count = assignments * expert_mid_dim;
+    const size_t down_count = assignments * out_dim;
+    cudaStream_t stream = nullptr;
+    void *d_gate_w = nullptr, *d_up_w = nullptr, *d_down_w = nullptr;
+    void *d_gate_global_w = nullptr, *d_up_global_w = nullptr,
+         *d_down_global_w = nullptr;
+    float *d_x = nullptr, *d_router = nullptr;
+    int32_t *d_ids = nullptr, *d_global_ids = nullptr;
+    float *d_gate_ref = nullptr, *d_up_ref = nullptr, *d_mid_ref = nullptr,
+          *d_down_ref = nullptr;
+    float *d_gate_got = nullptr, *d_up_got = nullptr, *d_mid_got = nullptr,
+          *d_down_got = nullptr;
+    float *d_gate_global = nullptr, *d_up_global = nullptr,
+          *d_mid_global = nullptr, *d_down_global = nullptr;
+
+    bool allocated = cudaStreamCreate(&stream) == cudaSuccess &&
+        cudaMalloc(&d_gate_w, gate_compact.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
+        cudaMalloc(&d_up_w, up_compact.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
+        cudaMalloc(&d_down_w, down_compact.size() * sizeof(block_q2_K)) == cudaSuccess &&
+        cudaMalloc(&d_gate_global_w, gate_global.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
+        cudaMalloc(&d_up_global_w, up_global.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
+        cudaMalloc(&d_down_global_w, down_global.size() * sizeof(block_q2_K)) == cudaSuccess &&
+        cudaMalloc(&d_x, X.size() * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_ids, remapped_ids.size() * sizeof(int32_t)) == cudaSuccess &&
+        cudaMalloc(&d_global_ids, global_ids.size() * sizeof(int32_t)) == cudaSuccess &&
+        cudaMalloc(&d_router, router_weights.size() * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_gate_ref, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_up_ref, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_mid_ref, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_down_ref, down_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_gate_got, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_up_got, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_mid_got, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_down_got, down_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_gate_global, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_up_global, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_mid_global, mid_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&d_down_global, down_count * sizeof(float)) == cudaSuccess;
+
+    auto cleanup = [&]() {
+        if (d_down_global) cudaFree(d_down_global);
+        if (d_mid_global) cudaFree(d_mid_global);
+        if (d_up_global) cudaFree(d_up_global);
+        if (d_gate_global) cudaFree(d_gate_global);
+        if (d_down_got) cudaFree(d_down_got);
+        if (d_mid_got) cudaFree(d_mid_got);
+        if (d_up_got) cudaFree(d_up_got);
+        if (d_gate_got) cudaFree(d_gate_got);
+        if (d_down_ref) cudaFree(d_down_ref);
+        if (d_mid_ref) cudaFree(d_mid_ref);
+        if (d_up_ref) cudaFree(d_up_ref);
+        if (d_gate_ref) cudaFree(d_gate_ref);
+        if (d_router) cudaFree(d_router);
+        if (d_global_ids) cudaFree(d_global_ids);
+        if (d_ids) cudaFree(d_ids);
+        if (d_x) cudaFree(d_x);
+        if (d_down_global_w) cudaFree(d_down_global_w);
+        if (d_up_global_w) cudaFree(d_up_global_w);
+        if (d_gate_global_w) cudaFree(d_gate_global_w);
+        if (d_down_w) cudaFree(d_down_w);
+        if (d_up_w) cudaFree(d_up_w);
+        if (d_gate_w) cudaFree(d_gate_w);
+        if (stream) cudaStreamDestroy(stream);
+    };
+    if (!allocated) {
+        fprintf(stderr, "fused raw parity allocation failed\nFAIL\n\n");
+        cleanup();
+        return false;
+    }
+
+    cudaMemcpyAsync(d_gate_w, gate_compact.data(),
+                    gate_compact.size() * sizeof(block_iq2_xxs),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_up_w, up_compact.data(),
+                    up_compact.size() * sizeof(block_iq2_xxs),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_down_w, down_compact.data(),
+                    down_compact.size() * sizeof(block_q2_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_gate_global_w, gate_global.data(),
+                    gate_global.size() * sizeof(block_iq2_xxs),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_up_global_w, up_global.data(),
+                    up_global.size() * sizeof(block_iq2_xxs),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_down_global_w, down_global.data(),
+                    down_global.size() * sizeof(block_q2_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_x, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_ids, remapped_ids.data(),
+                    remapped_ids.size() * sizeof(int32_t),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_global_ids, global_ids.data(),
+                    global_ids.size() * sizeof(int32_t),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_router, router_weights.data(),
+                    router_weights.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+
+    // A rejected shape must be retryable and must not enqueue writes.  Check
+    // every materialized output, not just the final down buffer, with canaries.
+    cudaMemsetAsync(d_gate_got, 0xA5, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_up_got, 0xA5, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_mid_got, 0xA5, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_down_got, 0xA5, down_count * sizeof(float), stream);
+    const int rc_na = ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+        d_gate_w, d_up_w, d_down_w, d_x, d_ids, d_router,
+        d_gate_got, d_up_got, d_mid_got, d_down_got,
+        expert_mid_dim, expert_in_dim, /*out_dim=*/0,
+        n_tokens, compact_experts, n_expert_used, clamp, stream);
+    std::vector<uint8_t> gate_canary(mid_count * sizeof(float));
+    std::vector<uint8_t> up_canary(mid_count * sizeof(float));
+    std::vector<uint8_t> mid_canary(mid_count * sizeof(float));
+    std::vector<uint8_t> down_canary(down_count * sizeof(float));
+    cudaMemcpyAsync(gate_canary.data(), d_gate_got, gate_canary.size(),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(up_canary.data(), d_up_got, up_canary.size(),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(mid_canary.data(), d_mid_got, mid_canary.size(),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(down_canary.data(), d_down_got, down_canary.size(),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    const auto canary_intact = [](const std::vector<uint8_t> & bytes) {
+        return std::all_of(bytes.begin(), bytes.end(),
+                           [](uint8_t value) { return value == 0xA5; });
+    };
+    const bool na_ok = rc_na == DS4_MMQ_NOT_APPLICABLE &&
+        sync_err == cudaSuccess && canary_intact(gate_canary) &&
+        canary_intact(up_canary) && canary_intact(mid_canary) &&
+        canary_intact(down_canary);
+
+    cudaMemsetAsync(d_gate_ref, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_up_ref, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_mid_ref, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_down_ref, 0, down_count * sizeof(float), stream);
+    cudaMemsetAsync(d_gate_got, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_up_got, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_mid_got, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_down_got, 0, down_count * sizeof(float), stream);
+    cudaMemsetAsync(d_gate_global, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_up_global, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_mid_global, 0, mid_count * sizeof(float), stream);
+    cudaMemsetAsync(d_down_global, 0, down_count * sizeof(float), stream);
+
+    const int rc_pair = ds4_mmq_iq2_xxs_moe_pair(
+        d_gate_w, d_up_w, d_x, d_ids, d_gate_ref, d_up_ref,
+        expert_mid_dim, expert_in_dim, n_tokens, compact_experts,
+        n_expert_used, stream);
+    test_swiglu_weighted_f32<<<
+        (unsigned)((mid_count + 255u) / 256u), 256, 0, stream>>>(
+            d_gate_ref, d_up_ref, d_router, d_mid_ref, mid_count,
+            expert_mid_dim, clamp);
+    const cudaError_t swiglu_err = cudaGetLastError();
+    const int rc_down = ds4_mmq_q2_K_moe(
+        d_down_w, d_mid_ref, d_ids, d_down_ref,
+        out_dim, expert_mid_dim, (int)assignments, compact_experts,
+        /*n_expert_used=*/1, stream);
+    const int rc_fused = ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+        d_gate_w, d_up_w, d_down_w, d_x, d_ids, d_router,
+        d_gate_got, d_up_got, d_mid_got, d_down_got,
+        expert_mid_dim, expert_in_dim, out_dim,
+        n_tokens, compact_experts, n_expert_used, clamp, stream);
+    // Run the same fused path against the original global expert table and
+    // unremapped ids.  Bitwise equality with the compact result validates the
+    // full-expert copies and, with the multi-block shape above, both raw
+    // channel strides independently of the materialized compact reference.
+    const int rc_global = ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+        d_gate_global_w, d_up_global_w, d_down_global_w,
+        d_x, d_global_ids, d_router,
+        d_gate_global, d_up_global, d_mid_global, d_down_global,
+        expert_mid_dim, expert_in_dim, out_dim,
+        n_tokens, global_experts, n_expert_used, clamp, stream);
+
+    std::vector<float> gate_ref(mid_count), up_ref(mid_count),
+                       mid_ref(mid_count), down_ref(down_count);
+    std::vector<float> gate_got(mid_count), up_got(mid_count),
+                       mid_got(mid_count), down_got(down_count);
+    std::vector<float> gate_global_out(mid_count), up_global_out(mid_count),
+                       mid_global_out(mid_count), down_global_out(down_count);
+    cudaMemcpyAsync(gate_ref.data(), d_gate_ref, mid_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(up_ref.data(), d_up_ref, mid_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(mid_ref.data(), d_mid_ref, mid_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(down_ref.data(), d_down_ref, down_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(gate_got.data(), d_gate_got, mid_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(up_got.data(), d_up_got, mid_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(mid_got.data(), d_mid_got, mid_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(down_got.data(), d_down_got, down_count * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(gate_global_out.data(), d_gate_global,
+                    mid_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(up_global_out.data(), d_up_global,
+                    mid_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(mid_global_out.data(), d_mid_global,
+                    mid_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(down_global_out.data(), d_down_global,
+                    down_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    sync_err = cudaStreamSynchronize(stream);
+
+    const auto mismatches = [](const std::vector<float> & a,
+                               const std::vector<float> & b) {
+        size_t bad = 0;
+        for (size_t i = 0; i < a.size(); i++) {
+            if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) bad++;
+        }
+        return bad;
+    };
+    const size_t gate_bad = mismatches(gate_got, gate_ref);
+    const size_t up_bad = mismatches(up_got, up_ref);
+    const size_t mid_bad = mismatches(mid_got, mid_ref);
+    const size_t down_bad = mismatches(down_got, down_ref);
+    const size_t gate_remap_bad = mismatches(gate_got, gate_global_out);
+    const size_t up_remap_bad = mismatches(up_got, up_global_out);
+    const size_t mid_remap_bad = mismatches(mid_got, mid_global_out);
+    const size_t down_remap_bad = mismatches(down_got, down_global_out);
+    const bool ok = na_ok && rc_pair == 0 && swiglu_err == cudaSuccess &&
+        rc_down == 0 && rc_fused == 0 && rc_global == 0 &&
+        sync_err == cudaSuccess && gate_bad == 0 && up_bad == 0 &&
+        mid_bad == 0 && down_bad == 0 && gate_remap_bad == 0 &&
+        up_remap_bad == 0 && mid_remap_bad == 0 && down_remap_bad == 0;
+    fprintf(stderr,
+            "rc_na=%d canary=%s rc_pair=%d swiglu=%s rc_down=%d "
+            "rc_fused=%d rc_global=%d mismatches(g/u/m/d)=%zu/%zu/%zu/%zu "
+            "remap_mismatches(g/u/m/d)=%zu/%zu/%zu/%zu sync=%s\n%s\n\n",
+            rc_na, na_ok ? "intact" : "FAILED", rc_pair,
+            cudaGetErrorString(swiglu_err), rc_down, rc_fused, rc_global,
+            gate_bad, up_bad, mid_bad, down_bad,
+            gate_remap_bad, up_remap_bad, mid_remap_bad, down_remap_bad,
+            cudaGetErrorString(sync_err), ok ? "PASS" : "FAIL");
+
+    cleanup();
+    return ok;
+}
+
 bool run_q4_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
     auto fn = [](block_q4_K * blk, float * out,
                  int n_experts, int M, int K, int blocks_per_expert,
@@ -1498,6 +1856,13 @@ int main(int argc, char ** argv) {
         "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC4FE10, gen_q4k,
         ds4_mmq_q4_K_moe_pair, ds4_mmq_q4_K_moe);
+
+    // SSD compact-table raw fusion: one expert map/activation quantize for
+    // IQ2 gate+up and Q2 down.  Cover the production top-6 routing shape at
+    // each target prefill width.
+    all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/8,   0xC2F008);
+    all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/32,  0xC2F020);
+    all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/128, 0xC2F080);
 
     // Step 6 - mmvq vector matmul tests.
     //
