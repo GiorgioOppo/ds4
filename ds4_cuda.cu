@@ -39,6 +39,19 @@
 #define CUDA_QK_K 256
 #define DS4_CUDA_UNUSED __attribute__((unused))
 
+/* Environment switches used by opt-in CUDA experiments are value-aware:
+ * spelling a switch as 0/off/no/false must behave like leaving it unset.
+ * Keep this helper above the MMQ policy code so early dispatch gates and
+ * later streaming policies share the exact same interpretation. */
+static int cuda_env_value_enabled(const char *value) {
+    if (!value || !value[0]) return 0;
+    if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
      * compressed scores in shared memory.  The host routes larger unmasked
@@ -704,6 +717,22 @@ static std::atomic<uint64_t> g_stream_expert_persistent_runtime_oracle_runs{0};
 static std::atomic<uint64_t> g_stream_expert_persistent_runtime_oracle_failures{0};
 static int g_stream_expert_persistent_test_fail_after_enqueue;
 static int g_stream_expert_persistent_runtime_ready;
+static std::once_flag g_q8_hc_expand_policy_once;
+static int g_q8_hc_expand_force_fused;
+static int g_q8_hc_expand_split_requested;
+static int g_q8_hc_expand_stats;
+static int g_q8_hc_expand_report_registered;
+static std::atomic<uint64_t> g_q8_hc_expand_candidates{0};
+static std::atomic<uint64_t> g_q8_hc_expand_fused_attempts{0};
+static std::atomic<uint64_t> g_q8_hc_expand_fused_completed{0};
+static std::atomic<uint64_t> g_q8_hc_expand_split_attempts{0};
+static std::atomic<uint64_t> g_q8_hc_expand_split_completed{0};
+static std::atomic<uint64_t> g_q8_hc_expand_failures{0};
+static std::atomic<uint64_t> g_q8_hc_expand_capture_candidates{0};
+static std::atomic<uint64_t> g_q8_hc_expand_owned_forced_fused{0};
+static std::atomic<uint64_t> g_q8_hc_expand_multi_gpu_forced_fused{0};
+static std::atomic<uint64_t> g_q8_hc_expand_oracle_runs{0};
+static std::atomic<uint64_t> g_q8_hc_expand_oracle_failures{0};
 
 static int cuda_ok(cudaError_t err, const char *what);
 static void cuda_stream_selected_event_pipeline_release(void);
@@ -1701,9 +1730,9 @@ static int cuda_use_mmq(void) {
 /* MXFP4 has no dequant+cublas fallback, so it must retain MMQ on multi-GPU
  * placements where the optional Q8/IQ2 prefill tier stays disabled. MMQ
  * resolves the active CUDA device on every call; initialization only warms
- * its device-info singleton. The grouped persistent Q8_1 arena is device-bound
- * and is never consumed by the MXFP4 wrappers, so it does not constrain this
- * multi-GPU path. */
+ * its device-info singleton. The grouped persistent Q8_1 arena is owned by
+ * MMQ, device-bound, and never consumed by the MXFP4 wrappers, so it does not
+ * constrain this required multi-GPU path. */
 static int cuda_use_mxfp4_mmq(void) {
     static int init = 0;
     static int use = 0;
@@ -1955,6 +1984,190 @@ static int cuda_env_flag_enabled(const char *name, int fallback) {
     const char *env = getenv(name);
     if (!env || !env[0]) return fallback;
     return strcmp(env, "0") != 0;
+}
+
+enum cuda_q8_hc_expand_path {
+    CUDA_Q8_HC_EXPAND_FUSED = 1,
+    CUDA_Q8_HC_EXPAND_SPLIT = 2,
+};
+
+struct ds4_cuda_q8_hc_expand_report;
+typedef struct ds4_cuda_q8_hc_expand_report
+    ds4_cuda_q8_hc_expand_report;
+typedef struct {
+    uint64_t candidates;
+    uint64_t fused_attempts;
+    uint64_t fused_completed;
+    uint64_t split_attempts;
+    uint64_t split_completed;
+    uint64_t failures;
+    uint64_t capture_candidates;
+    uint64_t owned_forced_fused;
+    uint64_t multi_gpu_forced_fused;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    int force_fused;
+    int split_requested;
+    int stats;
+} cuda_q8_hc_expand_report_layout;
+
+/* Resolve the Q8 shared-down/HC A/B policy without consulting global state.
+ * The opt-in split is deliberately narrow: single GPU and non-owned only.
+ * Force-fused wins conflicts, while owned/multi-GPU dispatches retain their
+ * existing fused implementation instead of turning an A/B switch into a
+ * hard inference failure.  Capture is observable but does not change the
+ * selected graph, so eager warm/capture record the same kernel sequence. */
+static int cuda_q8_hc_expand_resolve_policy(
+        int force_fused, int disable_fused, int n_gpus, int owned,
+        int capture, int *owned_forced_out, int *multi_gpu_forced_out,
+        int *capture_out) {
+    const int split_requested = disable_fused && !force_fused;
+    const int owned_forced = split_requested && owned;
+    const int multi_gpu_forced =
+        split_requested && !owned && n_gpus != 1;
+    if (owned_forced_out) *owned_forced_out = owned_forced;
+    if (multi_gpu_forced_out) *multi_gpu_forced_out = multi_gpu_forced;
+    if (capture_out) *capture_out = capture != 0;
+    return split_requested && n_gpus == 1 && !owned
+        ? CUDA_Q8_HC_EXPAND_SPLIT : CUDA_Q8_HC_EXPAND_FUSED;
+}
+
+extern "C" int ds4_cuda_test_q8_hc_expand_policy(
+        int force_fused, int disable_fused, int n_gpus, int owned,
+        int capture, int *fused_out, int *owned_forced_out,
+        int *multi_gpu_forced_out, int *capture_out) {
+    if (!fused_out || !owned_forced_out || !multi_gpu_forced_out ||
+        !capture_out) {
+        return 0;
+    }
+    const int path = cuda_q8_hc_expand_resolve_policy(
+        force_fused, disable_fused, n_gpus, owned, capture,
+        owned_forced_out, multi_gpu_forced_out, capture_out);
+    *fused_out = path == CUDA_Q8_HC_EXPAND_FUSED;
+    return 1;
+}
+
+extern "C" int ds4_cuda_test_q8_hc_expand_env_value(
+        const char *value) {
+    return cuda_env_value_enabled(value);
+}
+
+static void cuda_q8_hc_expand_report_at_exit(void) {
+    fprintf(stderr,
+            "ds4: CUDA Q8 shared-down/HC: candidates=%llu "
+            "fused=%llu/%llu split=%llu/%llu failures=%llu "
+            "capture=%llu owned_forced=%llu multi_gpu_forced=%llu "
+            "oracle=%llu/%llu\n",
+            (unsigned long long)g_q8_hc_expand_candidates.load(),
+            (unsigned long long)g_q8_hc_expand_fused_completed.load(),
+            (unsigned long long)g_q8_hc_expand_fused_attempts.load(),
+            (unsigned long long)g_q8_hc_expand_split_completed.load(),
+            (unsigned long long)g_q8_hc_expand_split_attempts.load(),
+            (unsigned long long)g_q8_hc_expand_failures.load(),
+            (unsigned long long)g_q8_hc_expand_capture_candidates.load(),
+            (unsigned long long)g_q8_hc_expand_owned_forced_fused.load(),
+            (unsigned long long)g_q8_hc_expand_multi_gpu_forced_fused.load(),
+            (unsigned long long)g_q8_hc_expand_oracle_runs.load(),
+            (unsigned long long)g_q8_hc_expand_oracle_failures.load());
+}
+
+static void cuda_q8_hc_expand_policy_init(void) {
+    std::call_once(g_q8_hc_expand_policy_once, []() {
+        g_q8_hc_expand_force_fused = cuda_env_value_enabled(
+            getenv("DS4_CUDA_Q8_HC_EXPAND_FUSED"));
+        const int disable_fused = cuda_env_value_enabled(
+            getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED"));
+        g_q8_hc_expand_split_requested =
+            disable_fused && !g_q8_hc_expand_force_fused;
+        g_q8_hc_expand_stats = cuda_env_value_enabled(
+            getenv("DS4_CUDA_Q8_HC_EXPAND_STATS"));
+        if ((g_q8_hc_expand_force_fused || disable_fused ||
+             g_q8_hc_expand_stats) && !g_q8_hc_expand_report_registered) {
+            g_q8_hc_expand_report_registered = 1;
+            (void)atexit(cuda_q8_hc_expand_report_at_exit);
+        }
+        if (g_q8_hc_expand_force_fused) {
+            fprintf(stderr,
+                    "ds4: CUDA Q8 shared-down/HC fused path forced%s\n",
+                    disable_fused ? " (overrides split request)" : "");
+        } else if (g_q8_hc_expand_split_requested) {
+            fprintf(stderr,
+                    "ds4: CUDA Q8 shared-down/HC split A/B enabled "
+                    "for single-GPU non-owned dispatches\n");
+        }
+    });
+}
+
+static int cuda_q8_hc_expand_policy_path(int owned) {
+    cuda_q8_hc_expand_policy_init();
+    int owned_forced = 0;
+    int multi_gpu_forced = 0;
+    int capture = 0;
+    const int path = cuda_q8_hc_expand_resolve_policy(
+        g_q8_hc_expand_force_fused,
+        g_q8_hc_expand_split_requested,
+        g_n_gpus, owned, g_decode_graph_capturing,
+        &owned_forced, &multi_gpu_forced, &capture);
+    if (!g_q8_hc_expand_report_registered) return path;
+    g_q8_hc_expand_candidates.fetch_add(1u, std::memory_order_relaxed);
+    if (capture) {
+        g_q8_hc_expand_capture_candidates.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    if (owned_forced) {
+        g_q8_hc_expand_owned_forced_fused.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    if (multi_gpu_forced) {
+        g_q8_hc_expand_multi_gpu_forced_fused.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    if (path == CUDA_Q8_HC_EXPAND_SPLIT) {
+        g_q8_hc_expand_split_attempts.fetch_add(
+            1u, std::memory_order_relaxed);
+    } else {
+        g_q8_hc_expand_fused_attempts.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    return path;
+}
+
+static int cuda_q8_hc_expand_policy_complete(int path, int result) {
+    if (!g_q8_hc_expand_report_registered) return result;
+    if (result) {
+        if (path == CUDA_Q8_HC_EXPAND_SPLIT) {
+            g_q8_hc_expand_split_completed.fetch_add(
+                1u, std::memory_order_relaxed);
+        } else {
+            g_q8_hc_expand_fused_completed.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    } else {
+        g_q8_hc_expand_failures.fetch_add(1u, std::memory_order_relaxed);
+    }
+    return result;
+}
+
+extern "C" void ds4_cuda_q8_hc_expand_get_report(
+        ds4_cuda_q8_hc_expand_report *report) {
+    if (!report) return;
+    cuda_q8_hc_expand_policy_init();
+    cuda_q8_hc_expand_report_layout out = {};
+    out.candidates = g_q8_hc_expand_candidates.load();
+    out.fused_attempts = g_q8_hc_expand_fused_attempts.load();
+    out.fused_completed = g_q8_hc_expand_fused_completed.load();
+    out.split_attempts = g_q8_hc_expand_split_attempts.load();
+    out.split_completed = g_q8_hc_expand_split_completed.load();
+    out.failures = g_q8_hc_expand_failures.load();
+    out.capture_candidates = g_q8_hc_expand_capture_candidates.load();
+    out.owned_forced_fused = g_q8_hc_expand_owned_forced_fused.load();
+    out.multi_gpu_forced_fused = g_q8_hc_expand_multi_gpu_forced_fused.load();
+    out.oracle_runs = g_q8_hc_expand_oracle_runs.load();
+    out.oracle_failures = g_q8_hc_expand_oracle_failures.load();
+    out.force_fused = g_q8_hc_expand_force_fused;
+    out.split_requested = g_q8_hc_expand_split_requested;
+    out.stats = g_q8_hc_expand_stats;
+    memcpy(report, &out, sizeof(out));
 }
 
 /* Conservative AProjQ4 port of the GB10 Q8 decode dispatch ideas.  Q4_K
@@ -3104,12 +3317,7 @@ typedef struct {
 } cuda_stream_selected_batch_io_report_layout;
 
 static int cuda_stream_selected_env_value_enabled(const char *value) {
-    if (!value || !value[0]) return 0;
-    if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
-        strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0) {
-        return 0;
-    }
-    return 1;
+    return cuda_env_value_enabled(value);
 }
 
 static int cuda_stream_selected_env_flag(const char *name) {
@@ -10008,6 +10216,37 @@ __global__ static void matmul_q8_0_hc_expand_aligned_preq_warp8_kernel(
             out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
         }
     }
+}
+
+/* Split A/B matmul leg for the aligned artifact.  Unlike the general MMQ
+ * aligned consumer, this intentionally keeps the fused baseline's canonical
+ * Q8_0 activation codes and FP32 scale.  Lane/block assignment, multiply
+ * order and warp reduction are identical to the fused aligned kernel above;
+ * only the HC epilogue moves to its own launch. */
+__global__ static void matmul_q8_0_aligned_preq_warp8_kernel(
+        float *out,
+        const int4 *w_qs,
+        const __half *w_dq,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    const uint64_t row =
+        (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const uint64_t rbase = row * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int4 w0 = w_qs[(rbase + b) * 2u];
+        const int4 w1 = w_qs[(rbase + b) * 2u + 1u];
+        const int32_t dot =
+            dot_i8x32_aligned_int4(w0, w1, xq + b * 32u);
+        acc += __half2float(w_dq[rbase + b]) *
+               xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
 }
 
 __global__ static void matmul_q8_0_kslice_hc_expand_add_preq_warp8_kernel(
@@ -20517,6 +20756,95 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
                    "q8_0 pair decode rows exact warp launch");
 }
 
+typedef struct {
+    const char *raw;
+    const char *aligned;
+    int8_t     *xq;
+    float      *xscale;
+    uint64_t    blocks;
+    int         use_dp4a;
+} cuda_q8_hc_matmul_prepared;
+
+/* One preparation contract feeds both sides of the HC A/B: identical weight
+ * resolution, aligned-artifact selection, scratch layout and Q8_0 activation
+ * quantization.  Keeping this centralized prevents the split experiment from
+ * silently inheriting MMQ's half-scale Q8_1 numerics. */
+static int cuda_q8_hc_matmul_prepare(
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        int                     logical_tier,
+        const char             *label,
+        cuda_q8_hc_matmul_prepared *prepared) {
+    if (!block_out || !model_map || !x || !prepared ||
+        in_dim == 0u || out_dim == 0u) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks == 0u || blocks > UINT64_MAX / 34u ||
+        out_dim > UINT64_MAX / (blocks * 34u) ||
+        weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        out_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < in_dim * sizeof(float) ||
+        block_out->bytes < out_dim * sizeof(float)) {
+        return 0;
+    }
+    const char *raw = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        label ? label : "q8_0_hc_expand");
+    if (!raw) return 0;
+    const uint64_t aligned_bytes =
+        in_dim <= INT_MAX && out_dim <= INT_MAX &&
+        (in_dim % 1024u) == 0u && (out_dim % 128u) == 0u
+            ? ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim)
+            : 0u;
+    const int use_dp4a = cuda_q8_use_dp4a();
+    const char *aligned =
+        g_n_gpus == 1 &&
+        logical_tier >= 0 && logical_tier < DS4_MAX_GPUS &&
+        g_cuda_is_gb10[logical_tier] &&
+        getenv("DS4_CUDA_NO_Q8_FUSED_ALIGNED") == NULL &&
+        aligned_bytes != 0u && cuda_aligned_q8_enabled() && use_dp4a
+            ? cuda_derived_weight_ptr(
+                  model_map, weight_offset, weight_bytes,
+                  CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                  in_dim, out_dim, 1u, aligned_bytes)
+            : NULL;
+
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    if (blocks > (UINT64_MAX - scale_offset) / sizeof(float)) return 0;
+    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc_on(
+        logical_tier, tmp_bytes, "q8_0 hc expand prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    quantize_q8_0_f32_kernel<<<
+        (unsigned)blocks, 32, 0, cuda_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "matmul_q8_0_hc_expand quantize launch")) {
+        return 0;
+    }
+    prepared->raw = raw;
+    prepared->aligned = aligned;
+    prepared->xq = xq;
+    prepared->xscale = xscale;
+    prepared->blocks = blocks;
+    prepared->use_dp4a = use_dp4a;
+    return 1;
+}
+
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -20542,15 +20870,9 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         out_dim != (uint64_t)n_embd) {
         return 0;
     }
-    const uint64_t blocks = (in_dim + 31) / 32;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
-    const uint64_t weight_bytes = out_dim * blocks * 34;
     const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
     const uint64_t split_bytes = (uint64_t)(2u * n_hc + n_hc * n_hc) * sizeof(float);
-    if (weight_bytes > model_size - weight_offset ||
-        x->bytes < in_dim * sizeof(float) ||
-        block_out->bytes < out_dim * sizeof(float) ||
-        residual_hc->bytes < hc_bytes ||
+    if (residual_hc->bytes < hc_bytes ||
         split->bytes < split_bytes ||
         out_hc->bytes < hc_bytes ||
         (block_add && block_add->bytes < out_dim * sizeof(float)) ||
@@ -20560,40 +20882,22 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
           owned_expert_split == 0u ||
           owned_home_slots->bytes < 6u * out_dim * sizeof(float) ||
           owned_peer_packed->bytes < 4u * out_dim * sizeof(float) ||
-          owned_selected->bytes < 6u * sizeof(int32_t)))) {
+         owned_selected->bytes < 6u * sizeof(int32_t)))) {
         return 0;
     }
-    const int logical_tier = ds4_tensor_device_idx(out_hc);
-    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, label ? label : "q8_0_hc_expand");
-    if (!wptr) return 0;
-    const uint64_t aligned_bytes =
-        in_dim <= INT_MAX && out_dim <= INT_MAX &&
-        (in_dim % 1024u) == 0u && (out_dim % 128u) == 0u
-            ? ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim)
-            : 0u;
-    const char *aligned =
-        g_n_gpus == 1 &&
-        logical_tier >= 0 && logical_tier < DS4_MAX_GPUS &&
-        g_cuda_is_gb10[logical_tier] &&
-        getenv("DS4_CUDA_NO_Q8_FUSED_ALIGNED") == NULL &&
-        aligned_bytes != 0u && cuda_aligned_q8_enabled() &&
-        cuda_q8_use_dp4a()
-            ? cuda_derived_weight_ptr(
-                  model_map, weight_offset, weight_bytes,
-                  CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
-                  in_dim, out_dim, 1u, aligned_bytes)
-            : NULL;
-
-    const uint64_t xq_bytes = blocks * 32u;
-    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "q8_0 hc expand prequant");
-    if (!tmp) return 0;
-    int8_t *xq = (int8_t *)tmp;
-    float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    cuda_q8_hc_matmul_prepared prepared = {};
+    if (!cuda_q8_hc_matmul_prepare(
+            block_out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, ds4_tensor_device_idx(out_hc),
+            label, &prepared)) {
+        return 0;
+    }
+    const char *wptr = prepared.raw;
+    const char *aligned = prepared.aligned;
+    int8_t *xq = prepared.xq;
+    float *xscale = prepared.xscale;
+    const uint64_t blocks = prepared.blocks;
+    const int use_dp4a = prepared.use_dp4a;
     const dim3 grid(((unsigned)out_dim + 7u) / 8u, 1u, 1u);
     if (aligned) {
         const uint64_t nblk = out_dim * blocks;
@@ -20635,6 +20939,46 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             use_dp4a);
     }
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
+}
+
+static int cuda_matmul_q8_0_hc_split_matmul_tensor_labeled(
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        int                     logical_tier,
+        const char             *label) {
+    cuda_q8_hc_matmul_prepared prepared = {};
+    if (!cuda_q8_hc_matmul_prepare(
+            block_out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, logical_tier, label, &prepared)) {
+        return 0;
+    }
+    const cudaStream_t stream = cuda_decode_stream();
+    if (prepared.aligned) {
+        const uint64_t nblk = out_dim * prepared.blocks;
+        const uint64_t dq_bytes =
+            (nblk * sizeof(__half) + 63u) & ~63ull;
+        matmul_q8_0_aligned_preq_warp8_kernel<<<
+            ((unsigned)out_dim + 7u) / 8u, 256, 0, stream>>>(
+                (float *)block_out->ptr,
+                (const int4 *)(prepared.aligned + dq_bytes),
+                (const __half *)prepared.aligned,
+                prepared.xq, prepared.xscale,
+                out_dim, prepared.blocks);
+    } else {
+        matmul_q8_0_preq_warp8_kernel<<<
+            ((unsigned)out_dim + 7u) / 8u, 256, 0, stream>>>(
+                (float *)block_out->ptr,
+                reinterpret_cast<const unsigned char *>(prepared.raw),
+                prepared.xq, prepared.xscale,
+                in_dim, out_dim, prepared.blocks, prepared.use_dp4a);
+    }
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_q8_0_hc_split matmul launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -31857,7 +32201,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
@@ -31893,7 +32237,7 @@ extern "C" int ds4_gpu_hc_expand_add2_split_tensor(ds4_gpu_tensor *out_hc, const
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
                                                     (const float *)block_add2->ptr,
@@ -31919,25 +32263,22 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
-        return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
-                                                        model_map, model_size,
-                                                        weight_offset,
-                                                        in_dim, out_dim,
-                                                        shared_mid,
-                                                        routed_out,
-                                                        NULL,
-                                                        NULL, NULL, NULL, 0,
-                                                        residual_hc,
-                                                        split,
-                                                        n_embd, n_hc,
-                                                        "shared_down_hc_expand");
-    }
-    return ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
-                                        weight_offset, in_dim, out_dim,
-                                        shared_mid, 1) &&
-           ds4_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
-	                                                residual_hc, split, n_embd, n_hc);
+    const int path = cuda_q8_hc_expand_policy_path(/*owned=*/0);
+    const int result = path == CUDA_Q8_HC_EXPAND_FUSED
+        ? cuda_matmul_q8_0_hc_expand_tensor_labeled(
+              out_hc, shared_out, model_map, model_size, weight_offset,
+              in_dim, out_dim, shared_mid, routed_out, NULL,
+              NULL, NULL, NULL, 0, residual_hc, split, n_embd, n_hc,
+              "shared_down_hc_expand")
+        : (cuda_matmul_q8_0_hc_split_matmul_tensor_labeled(
+               shared_out, model_map, model_size, weight_offset,
+               in_dim, out_dim, shared_mid,
+               ds4_tensor_device_idx(out_hc),
+               "shared_down_hc_expand_split") &&
+           ds4_gpu_hc_expand_add_split_tensor(
+               out_hc, shared_out, routed_out, residual_hc, split,
+               n_embd, n_hc));
+    return cuda_q8_hc_expand_policy_complete(path, result);
 }
 
 extern "C" int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
@@ -31955,26 +32296,22 @@ extern "C" int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
-        return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
-                                                        model_map, model_size,
-                                                        weight_offset,
-                                                        in_dim, out_dim,
-                                                        shared_mid,
-                                                        routed_out,
-                                                        routed_add,
-                                                        NULL, NULL, NULL, 0,
-                                                        residual_hc,
-                                                        split,
-                                                        n_embd, n_hc,
-                                                        "shared_down_hc_expand_add");
-    }
-    return ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
-                                        weight_offset, in_dim, out_dim,
-                                        shared_mid, 1) &&
-           ds4_gpu_hc_expand_add2_split_tensor(out_hc, shared_out, routed_out,
-                                                routed_add, residual_hc, split,
-                                                n_embd, n_hc);
+    const int path = cuda_q8_hc_expand_policy_path(/*owned=*/0);
+    const int result = path == CUDA_Q8_HC_EXPAND_FUSED
+        ? cuda_matmul_q8_0_hc_expand_tensor_labeled(
+              out_hc, shared_out, model_map, model_size, weight_offset,
+              in_dim, out_dim, shared_mid, routed_out, routed_add,
+              NULL, NULL, NULL, 0, residual_hc, split, n_embd, n_hc,
+              "shared_down_hc_expand_add")
+        : (cuda_matmul_q8_0_hc_split_matmul_tensor_labeled(
+               shared_out, model_map, model_size, weight_offset,
+               in_dim, out_dim, shared_mid,
+               ds4_tensor_device_idx(out_hc),
+               "shared_down_hc_expand_add_split") &&
+           ds4_gpu_hc_expand_add2_split_tensor(
+               out_hc, shared_out, routed_out, routed_add, residual_hc,
+               split, n_embd, n_hc));
+    return cuda_q8_hc_expand_policy_complete(path, result);
 }
 
 extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
@@ -31994,8 +32331,8 @@ extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t n_embd,
         uint32_t n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") != NULL) return 0;
-    return cuda_matmul_q8_0_hc_expand_tensor_labeled(
+    const int path = cuda_q8_hc_expand_policy_path(/*owned=*/1);
+    const int result = cuda_matmul_q8_0_hc_expand_tensor_labeled(
             out_hc,
             shared_out,
             model_map,
@@ -32015,6 +32352,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
             n_embd,
             n_hc,
             "shared_down_hc_expand_owned");
+    return cuda_q8_hc_expand_policy_complete(path, result);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
@@ -32030,24 +32368,391 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
-        return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, block_out,
-                                                        model_map, model_size,
-                                                        weight_offset,
-                                                        in_dim, out_dim,
-                                                        x,
-                                                        NULL,
-                                                        NULL,
-                                                        NULL, NULL, NULL, 0,
-                                                        residual_hc,
-                                                        split,
-                                                        n_embd, n_hc,
-                                                        "q8_hc_expand");
+    const int path = cuda_q8_hc_expand_policy_path(/*owned=*/0);
+    const int result = path == CUDA_Q8_HC_EXPAND_FUSED
+        ? cuda_matmul_q8_0_hc_expand_tensor_labeled(
+              out_hc, block_out, model_map, model_size, weight_offset,
+              in_dim, out_dim, x, NULL, NULL, NULL, NULL, NULL, 0,
+              residual_hc, split, n_embd, n_hc, "q8_hc_expand")
+        : (cuda_matmul_q8_0_hc_split_matmul_tensor_labeled(
+               block_out, model_map, model_size, weight_offset,
+               in_dim, out_dim, x, ds4_tensor_device_idx(out_hc),
+               "q8_hc_expand_split") &&
+           ds4_gpu_hc_expand_split_tensor(
+               out_hc, block_out, residual_hc, split, n_embd, n_hc));
+    return cuda_q8_hc_expand_policy_complete(path, result);
+}
+
+/* Device oracle for the Q8 shared-down/HC A/B boundary.  Its 128x1024
+ * fixture satisfies the production aligned-artifact predicate and installs
+ * temporary raw/derived resolver entries so the real fused and split helpers
+ * run.  It checks both aligned and raw paths bit-for-bit; the aligned split
+ * plus both HC epilogues are also recorded in a CUDA graph to catch accidental
+ * legacy-stream launches. */
+extern "C" int ds4_cuda_test_q8_hc_expand_oracle(void) {
+    g_q8_hc_expand_oracle_runs.fetch_add(1u, std::memory_order_relaxed);
+
+    constexpr uint32_t in_dim = 1024u;
+    constexpr uint32_t n_embd = 128u;
+    constexpr uint32_t n_hc = 4u;
+    constexpr uint32_t blocks = in_dim / 32u;
+    constexpr uint64_t n_weight_blocks =
+        (uint64_t)n_embd * blocks;
+    constexpr uint64_t weight_bytes =
+        n_weight_blocks * 34u;
+    constexpr uint64_t aligned_dq_bytes =
+        (n_weight_blocks * sizeof(__half) + 63u) & ~63ull;
+    constexpr uint64_t aligned_bytes =
+        aligned_dq_bytes + n_weight_blocks * 32u;
+    constexpr uint64_t x_bytes = (uint64_t)in_dim * sizeof(float);
+    constexpr uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
+    constexpr uint64_t hc_bytes =
+        (uint64_t)n_hc * n_embd * sizeof(float);
+    constexpr uint64_t split_count = 2u * n_hc + n_hc * n_hc;
+    constexpr uint64_t split_bytes = split_count * sizeof(float);
+
+    void *d_aligned = NULL;
+    void *d_raw = NULL;
+    void *d_x = NULL;
+    void *d_residual = NULL;
+    void *d_split = NULL;
+    void *d_add = NULL;
+    void *d_add2 = NULL;
+    void *d_block_fused_add = NULL;
+    void *d_block_fused_plain = NULL;
+    void *d_block_split = NULL;
+    void *d_hc_fused_add = NULL;
+    void *d_hc_fused_plain = NULL;
+    void *d_hc_split_add = NULL;
+    void *d_hc_split_plain = NULL;
+    cudaStream_t stream = NULL;
+    cudaGraph_t graph = NULL;
+    cudaGraphExec_t exec = NULL;
+    cudaStream_t saved_decode_graph_stream = g_decode_graph_stream;
+    const int saved_decode_graph_capturing = g_decode_graph_capturing;
+    const size_t saved_model_range_count = g_model_ranges.size();
+    const size_t saved_derived_range_count = g_derived_ranges.size();
+    const int saved_gb10_tier0 = g_cuda_is_gb10[0];
+    int oracle_ranges_installed = 0;
+    int capture_started = 0;
+    int ok = 0;
+
+    std::vector<void *> allocations;
+    auto alloc = [&allocations](void **ptr, uint64_t bytes) -> int {
+        if (cudaMalloc(ptr, (size_t)bytes) != cudaSuccess) return 0;
+        allocations.push_back(*ptr);
+        return 1;
+    };
+
+    do {
+        if (saved_decode_graph_capturing) break;
+        if (!alloc(&d_aligned, aligned_bytes) ||
+            !alloc(&d_raw, weight_bytes) ||
+            !alloc(&d_x, x_bytes) ||
+            !alloc(&d_residual, hc_bytes) ||
+            !alloc(&d_split, split_bytes) ||
+            !alloc(&d_add, row_bytes) ||
+            !alloc(&d_add2, row_bytes) ||
+            !alloc(&d_block_fused_add, row_bytes) ||
+            !alloc(&d_block_fused_plain, row_bytes) ||
+            !alloc(&d_block_split, row_bytes) ||
+            !alloc(&d_hc_fused_add, hc_bytes) ||
+            !alloc(&d_hc_fused_plain, hc_bytes) ||
+            !alloc(&d_hc_split_add, hc_bytes) ||
+            !alloc(&d_hc_split_plain, hc_bytes)) {
+            break;
+        }
+        if (cudaStreamCreate(&stream) != cudaSuccess) break;
+
+        std::vector<unsigned char> h_weight((size_t)weight_bytes);
+        for (uint32_t row = 0; row < n_embd; row++) {
+            for (uint32_t block = 0; block < blocks; block++) {
+                unsigned char *dst = h_weight.data() +
+                    ((uint64_t)row * blocks + block) * 34u;
+                const __half scale = __float2half(
+                    0.00390625f * (float)(1u + ((row + block) % 3u)));
+                memcpy(dst, &scale, sizeof(scale));
+                int8_t *codes = (int8_t *)(dst + sizeof(scale));
+                for (uint32_t i = 0; i < 32u; i++) {
+                    codes[i] = (int8_t)(
+                        (int)((row * 5u + block * 7u + i * 3u) % 23u) - 11);
+                }
+            }
+        }
+        std::vector<unsigned char> h_aligned((size_t)aligned_bytes);
+        for (uint64_t block = 0; block < n_weight_blocks; block++) {
+            const unsigned char *src = h_weight.data() + block * 34u;
+            memcpy(h_aligned.data() + block * sizeof(__half),
+                   src, sizeof(__half));
+            memcpy(h_aligned.data() + aligned_dq_bytes + block * 32u,
+                   src + sizeof(__half), 32u);
+        }
+        std::vector<float> h_x(in_dim);
+        std::vector<float> h_residual((size_t)n_hc * n_embd);
+        std::vector<float> h_split((size_t)split_count);
+        constexpr float host_guard = 12345.5f;
+        std::vector<float> h_add_storage(n_embd + 2u, host_guard);
+        std::vector<float> h_add2_storage(n_embd + 2u, host_guard);
+        float *h_add = h_add_storage.data() + 1u;
+        float *h_add2 = h_add2_storage.data() + 1u;
+        for (uint32_t i = 0; i < in_dim; i++) {
+            h_x[i] = (float)((int)(i % 17u) - 8) * 0.0625f;
+        }
+        for (uint32_t i = 0; i < n_embd; i++) {
+            h_add[i] = (float)((int)(i % 7u) - 3) * 0.03125f;
+            h_add2[i] = (float)((int)(i % 5u) - 2) * 0.015625f;
+        }
+        if (h_add_storage.front() != host_guard ||
+            h_add_storage.back() != host_guard ||
+            h_add2_storage.front() != host_guard ||
+            h_add2_storage.back() != host_guard) {
+            break;
+        }
+        for (uint32_t h = 0; h < n_hc; h++) {
+            for (uint32_t d = 0; d < n_embd; d++) {
+                h_residual[(uint64_t)h * n_embd + d] =
+                    (float)((int)((h * 13u + d) % 19u) - 9) * 0.0078125f;
+            }
+            h_split[n_hc + h] = 0.25f + (float)h * 0.0625f;
+        }
+        for (uint32_t src = 0; src < n_hc; src++) {
+            for (uint32_t dst = 0; dst < n_hc; dst++) {
+                h_split[2u * n_hc + dst + (uint64_t)src * n_hc] =
+                    src == dst ? 0.75f : 0.03125f * (float)(src + dst + 1u);
+            }
+        }
+
+        if (cudaMemcpy(d_aligned, h_aligned.data(), (size_t)aligned_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_raw, h_weight.data(), (size_t)weight_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_x, h_x.data(), (size_t)x_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_residual, h_residual.data(), (size_t)hc_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_split, h_split.data(), (size_t)split_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_add, h_add, (size_t)row_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_add2, h_add2, (size_t)row_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            break;
+        }
+
+        if (g_n_gpus != 1 || !cuda_q8_use_dp4a() ||
+            !cuda_aligned_q8_enabled() ||
+            getenv("DS4_CUDA_NO_Q8_FUSED_ALIGNED") != NULL ||
+            getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) {
+            break;
+        }
+        const void *oracle_model_map = h_weight.data();
+        g_model_ranges.push_back({
+            oracle_model_map, 0u, weight_bytes, (char *)d_raw,
+            NULL, NULL, 0u, 0, 1});
+        g_derived_ranges.push_back({
+            oracle_model_map, 0u, weight_bytes,
+            CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+            in_dim, n_embd, 1u, aligned_bytes, (char *)d_aligned});
+        g_cuda_is_gb10[0] = 1;
+        oracle_ranges_installed = 1;
+
+        ds4_gpu_tensor x = {};
+        ds4_gpu_tensor block_fused_add = {};
+        ds4_gpu_tensor block_fused_plain = {};
+        ds4_gpu_tensor block_split = {};
+        ds4_gpu_tensor add = {};
+        ds4_gpu_tensor add2 = {};
+        ds4_gpu_tensor residual = {};
+        ds4_gpu_tensor split = {};
+        ds4_gpu_tensor hc_fused_add = {};
+        ds4_gpu_tensor hc_fused_plain = {};
+        ds4_gpu_tensor hc_split_add = {};
+        ds4_gpu_tensor hc_split_plain = {};
+        x.ptr = d_x;
+        x.bytes = x_bytes;
+        x.device_id = 0;
+        block_fused_add.ptr = d_block_fused_add;
+        block_fused_add.bytes = row_bytes;
+        block_fused_add.device_id = 0;
+        block_fused_plain.ptr = d_block_fused_plain;
+        block_fused_plain.bytes = row_bytes;
+        block_fused_plain.device_id = 0;
+        block_split.ptr = d_block_split;
+        block_split.bytes = row_bytes;
+        block_split.device_id = 0;
+        add.ptr = d_add;
+        add.bytes = row_bytes;
+        add.device_id = 0;
+        add2.ptr = d_add2;
+        add2.bytes = row_bytes;
+        add2.device_id = 0;
+        residual.ptr = d_residual;
+        residual.bytes = hc_bytes;
+        residual.device_id = 0;
+        split.ptr = d_split;
+        split.bytes = split_bytes;
+        split.device_id = 0;
+        hc_fused_add.ptr = d_hc_fused_add;
+        hc_fused_add.bytes = hc_bytes;
+        hc_fused_add.device_id = 0;
+        hc_fused_plain.ptr = d_hc_fused_plain;
+        hc_fused_plain.bytes = hc_bytes;
+        hc_fused_plain.device_id = 0;
+        hc_split_add.ptr = d_hc_split_add;
+        hc_split_add.bytes = hc_bytes;
+        hc_split_add.device_id = 0;
+        hc_split_plain.ptr = d_hc_split_plain;
+        hc_split_plain.bytes = hc_bytes;
+        hc_split_plain.device_id = 0;
+
+        /* Exercise the actual fused preparation/resolver wrapper and warm
+         * its reusable Q8 scratch before graph capture. */
+        const cudaStream_t eager_helper_stream = cuda_decode_stream();
+        if (!cuda_matmul_q8_0_hc_expand_tensor_labeled(
+                &hc_fused_add, &block_fused_add,
+                oracle_model_map, weight_bytes, 0u,
+                in_dim, n_embd, &x, &add, &add2,
+                NULL, NULL, NULL, 0u, &residual, &split,
+                n_embd, n_hc, "q8_hc_oracle_aligned_add") ||
+            !cuda_matmul_q8_0_hc_expand_tensor_labeled(
+                &hc_fused_plain, &block_fused_plain,
+                oracle_model_map, weight_bytes, 0u,
+                in_dim, n_embd, &x, NULL, NULL,
+                NULL, NULL, NULL, 0u, &residual, &split,
+                n_embd, n_hc, "q8_hc_oracle_aligned_plain") ||
+            cudaStreamSynchronize(eager_helper_stream) != cudaSuccess) {
+            break;
+        }
+
+        if (cudaStreamBeginCapture(stream,
+                                   cudaStreamCaptureModeGlobal) != cudaSuccess) {
+            break;
+        }
+        capture_started = 1;
+        g_decode_graph_stream = stream;
+        g_decode_graph_capturing = 1;
+        const int matmul_ok =
+            cuda_matmul_q8_0_hc_split_matmul_tensor_labeled(
+                &block_split, oracle_model_map, weight_bytes, 0u,
+                in_dim, n_embd, &x, 0,
+                "q8_hc_oracle_aligned_split");
+        const int add_ok = ds4_gpu_hc_expand_add2_split_tensor(
+            &hc_split_add, &block_split, &add, &add2, &residual, &split,
+            n_embd, n_hc);
+        const int plain_ok = ds4_gpu_hc_expand_split_tensor(
+            &hc_split_plain, &block_split, &residual, &split,
+            n_embd, n_hc);
+        g_decode_graph_capturing = saved_decode_graph_capturing;
+        g_decode_graph_stream = saved_decode_graph_stream;
+        const cudaError_t capture_end = cudaStreamEndCapture(stream, &graph);
+        capture_started = 0;
+        if (!matmul_ok || !add_ok || !plain_ok ||
+            capture_end != cudaSuccess || !graph) {
+            break;
+        }
+        if (cudaGraphInstantiate(&exec, graph, NULL, NULL, 0) != cudaSuccess ||
+            !exec || cudaGraphLaunch(exec, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+            break;
+        }
+
+        auto outputs_match = [&]() -> int {
+            std::vector<float> h_block_fused_add(n_embd);
+            std::vector<float> h_block_fused_plain(n_embd);
+            std::vector<float> h_block_split(n_embd);
+            std::vector<float> h_fused_add((size_t)n_hc * n_embd);
+            std::vector<float> h_split_add((size_t)n_hc * n_embd);
+            std::vector<float> h_fused_plain((size_t)n_hc * n_embd);
+            std::vector<float> h_split_plain((size_t)n_hc * n_embd);
+            if (cudaMemcpy(h_block_fused_add.data(), d_block_fused_add,
+                           (size_t)row_bytes, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess ||
+                cudaMemcpy(h_block_fused_plain.data(), d_block_fused_plain,
+                           (size_t)row_bytes, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess ||
+                cudaMemcpy(h_block_split.data(), d_block_split,
+                           (size_t)row_bytes, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess ||
+                cudaMemcpy(h_fused_add.data(), d_hc_fused_add,
+                           (size_t)hc_bytes, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess ||
+                cudaMemcpy(h_split_add.data(), d_hc_split_add,
+                           (size_t)hc_bytes, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess ||
+                cudaMemcpy(h_fused_plain.data(), d_hc_fused_plain,
+                           (size_t)hc_bytes, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess ||
+                cudaMemcpy(h_split_plain.data(), d_hc_split_plain,
+                           (size_t)hc_bytes, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess) {
+                return 0;
+            }
+            return memcmp(h_block_fused_add.data(), h_block_split.data(),
+                          (size_t)row_bytes) == 0 &&
+                   memcmp(h_block_fused_plain.data(), h_block_split.data(),
+                          (size_t)row_bytes) == 0 &&
+                   memcmp(h_fused_add.data(), h_split_add.data(),
+                          (size_t)hc_bytes) == 0 &&
+                   memcmp(h_fused_plain.data(), h_split_plain.data(),
+                          (size_t)hc_bytes) == 0;
+        };
+        if (!outputs_match()) break;
+
+        /* Remove only the temporary derived entry to force the same public
+         * helpers through their raw-weight side, then repeat bit parity. */
+        g_derived_ranges.resize(saved_derived_range_count);
+        g_cuda_is_gb10[0] = 0;
+        const cudaStream_t raw_helper_stream = cuda_decode_stream();
+        if (!cuda_matmul_q8_0_hc_expand_tensor_labeled(
+                &hc_fused_add, &block_fused_add,
+                oracle_model_map, weight_bytes, 0u,
+                in_dim, n_embd, &x, &add, &add2,
+                NULL, NULL, NULL, 0u, &residual, &split,
+                n_embd, n_hc, "q8_hc_oracle_raw_add") ||
+            !cuda_matmul_q8_0_hc_expand_tensor_labeled(
+                &hc_fused_plain, &block_fused_plain,
+                oracle_model_map, weight_bytes, 0u,
+                in_dim, n_embd, &x, NULL, NULL,
+                NULL, NULL, NULL, 0u, &residual, &split,
+                n_embd, n_hc, "q8_hc_oracle_raw_plain") ||
+            !cuda_matmul_q8_0_hc_split_matmul_tensor_labeled(
+                &block_split, oracle_model_map, weight_bytes, 0u,
+                in_dim, n_embd, &x, 0, "q8_hc_oracle_raw_split") ||
+            !ds4_gpu_hc_expand_add2_split_tensor(
+                &hc_split_add, &block_split, &add, &add2,
+                &residual, &split, n_embd, n_hc) ||
+            !ds4_gpu_hc_expand_split_tensor(
+                &hc_split_plain, &block_split, &residual, &split,
+                n_embd, n_hc) ||
+            cudaStreamSynchronize(raw_helper_stream) != cudaSuccess) {
+            break;
+        }
+        ok = outputs_match();
+    } while (0);
+
+    g_decode_graph_capturing = saved_decode_graph_capturing;
+    g_decode_graph_stream = saved_decode_graph_stream;
+    if (capture_started && stream) {
+        cudaGraph_t abandoned = NULL;
+        (void)cudaStreamEndCapture(stream, &abandoned);
+        if (abandoned) (void)cudaGraphDestroy(abandoned);
     }
-    return ds4_gpu_matmul_q8_0_tensor(block_out, model_map, model_size,
-                                        weight_offset, in_dim, out_dim, x, 1) &&
-           ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
-                                            split, n_embd, n_hc);
+    if (oracle_ranges_installed) {
+        g_model_ranges.resize(saved_model_range_count);
+        g_derived_ranges.resize(saved_derived_range_count);
+        g_cuda_is_gb10[0] = saved_gb10_tier0;
+        oracle_ranges_installed = 0;
+    }
+    if (exec) (void)cudaGraphExecDestroy(exec);
+    if (graph) (void)cudaGraphDestroy(graph);
+    if (stream) (void)cudaStreamDestroy(stream);
+    for (void *ptr : allocations) (void)cudaFree(ptr);
+    if (!ok) {
+        (void)cudaGetLastError();
+        g_q8_hc_expand_oracle_failures.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 /* --gpu-vram auto probe. Defined here (in the .cu unit) so the

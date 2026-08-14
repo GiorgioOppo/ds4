@@ -381,9 +381,33 @@ typedef struct ds4_cuda_stream_expert_persistent_report {
     int stats;
     int oracle;
 } ds4_cuda_stream_expert_persistent_report;
+typedef struct ds4_cuda_q8_hc_expand_report {
+    uint64_t candidates;
+    uint64_t fused_attempts;
+    uint64_t fused_completed;
+    uint64_t split_attempts;
+    uint64_t split_completed;
+    uint64_t failures;
+    uint64_t capture_candidates;
+    uint64_t owned_forced_fused;
+    uint64_t multi_gpu_forced_fused;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    int force_fused;
+    int split_requested;
+    int stats;
+} ds4_cuda_q8_hc_expand_report;
 /* CUDA-only policy/planner/scatter hooks.  The policy hook takes explicit
  * values so tests do not need to mutate process environment around once_flag
  * initialization. */
+int ds4_cuda_test_q8_hc_expand_policy(
+        int force_fused, int disable_fused, int n_gpus, int owned,
+        int capture, int *fused_out, int *owned_forced_out,
+        int *multi_gpu_forced_out, int *capture_out);
+int ds4_cuda_test_q8_hc_expand_env_value(const char *value);
+int ds4_cuda_test_q8_hc_expand_oracle(void);
+void ds4_cuda_q8_hc_expand_get_report(
+        ds4_cuda_q8_hc_expand_report *report);
 int ds4_cuda_test_stream_selected_batch_policy(
         int enable, int disable, int require, int oracle,
         int *enabled_out, int *required_out, int *oracle_out);
