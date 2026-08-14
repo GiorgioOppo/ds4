@@ -209,6 +209,30 @@ typedef struct ds4_gpu_iq2_mid_only_oracle_report {
  * sentinel failures are reported explicitly in `report`. */
 int ds4_gpu_test_iq2_addr_mid_only_oracle(
         ds4_gpu_iq2_mid_only_oracle_report *report);
+typedef struct ds4_gpu_stream_expert_live_index_report {
+    uint64_t scans;
+    uint64_t entries;
+    uint64_t fallbacks;
+    uint64_t inserts;
+    uint64_t removes;
+    uint64_t reuse_scan_calls;
+    uint64_t reuse_scan_entries;
+    uint64_t resident_hash;
+    uint32_t live_count;
+    uint32_t cache_entries;
+    uint32_t eligible;
+    uint32_t active;
+    uint32_t broken;
+} ds4_gpu_stream_expert_live_index_report;
+/* Test-only policy/state hooks for the IQ2 production-size SSD cache index. */
+int ds4_gpu_test_stream_expert_live_index_policy(
+        int ssd_streaming,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        int enable,
+        int disable);
+void ds4_gpu_test_stream_expert_live_index_report(
+        ds4_gpu_stream_expert_live_index_report *report);
 enum {
     DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL = 1u << 0,
     DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE = 1u << 1,
@@ -217,6 +241,7 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_STREAMING_LIVE_INDEX_FAILURE = 1u << 7,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
