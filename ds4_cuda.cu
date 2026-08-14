@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -515,11 +517,31 @@ static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
+static uint64_t g_model_stage_align = 1;
 static void *g_stream_selected_stage_raw[4];
 static void *g_stream_selected_stage[4];
 static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
+static uint64_t g_stream_selected_stage_align = 1;
 static cudaStream_t g_stream_selected_upload_stream;
+static std::once_flag g_stream_selected_batch_io_once;
+static int g_stream_selected_batch_io_enabled;
+static int g_stream_selected_batch_io_required;
+static int g_stream_selected_batch_io_oracle;
+static int g_stream_selected_batch_io_report_registered;
+static uint64_t g_stream_selected_batch_io_candidates;
+static uint64_t g_stream_selected_batch_io_attempts;
+static uint64_t g_stream_selected_batch_io_completed;
+static uint64_t g_stream_selected_batch_io_legacy;
+static uint64_t g_stream_selected_batch_io_safe_fallbacks;
+static uint64_t g_stream_selected_batch_io_failures;
+static uint64_t g_stream_selected_batch_io_required_failures;
+static uint64_t g_stream_selected_batch_io_oracle_runs;
+static uint64_t g_stream_selected_batch_io_oracle_failures;
+static uint64_t g_stream_selected_batch_io_tasks;
+static uint64_t g_stream_selected_batch_io_segments;
+static uint64_t g_stream_selected_batch_io_reads;
+static uint64_t g_stream_selected_batch_io_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
@@ -2469,15 +2491,60 @@ static uint64_t cuda_round_up(uint64_t v, uint64_t align) {
     return rem == 0 ? v : v + (align - rem);
 }
 
-static void *cuda_align_ptr(void *ptr, uint64_t align) {
-    if (align <= 1) return ptr;
-    uintptr_t p = (uintptr_t)ptr;
-    uintptr_t a = (uintptr_t)align;
-    return (void *)(((p + a - 1u) / a) * a);
+/* The aligned pointer can advance by align-1 bytes from the allocation base.
+ * Allocate that prefix explicitly and validate every representation boundary
+ * before exposing the requested usable span to O_DIRECT or CUDA DMA. */
+static int cuda_host_stage_allocation_bytes(uint64_t usable_bytes,
+                                            uint64_t align,
+                                            size_t *allocation_bytes) {
+    if (!allocation_bytes || usable_bytes == 0) return 0;
+    const uint64_t a = align > 1 ? align : 1;
+    const uint64_t extra = a - 1u;
+    if (a > (uint64_t)UINTPTR_MAX ||
+        usable_bytes > (uint64_t)SIZE_MAX ||
+        extra > (uint64_t)SIZE_MAX - usable_bytes) {
+        return 0;
+    }
+    *allocation_bytes = (size_t)(usable_bytes + extra);
+    return 1;
 }
 
-static int cuda_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
+static int cuda_host_stage_bytes_for_chunk(uint64_t chunk, uint64_t align,
+                                           uint64_t *usable_bytes) {
+    if (!usable_bytes || chunk == 0) return 0;
+    const uint64_t a = align > 1 ? align : 1;
+    if (chunk > UINT64_MAX - a || chunk + a > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    *usable_bytes = chunk + a;
+    return 1;
+}
+
+static int cuda_host_stage_aligned_view(void *raw,
+                                        size_t allocation_bytes,
+                                        uint64_t usable_bytes,
+                                        uint64_t align,
+                                        void **aligned_out) {
+    if (!raw || !aligned_out || usable_bytes == 0 ||
+        usable_bytes > (uint64_t)allocation_bytes) {
+        return 0;
+    }
+    const uint64_t align64 = align > 1 ? align : 1;
+    if (align64 > (uint64_t)UINTPTR_MAX) return 0;
+    const uintptr_t a = (uintptr_t)align64;
+    if (a == 0) return 0;
+    const uintptr_t p = (uintptr_t)raw;
+    const uintptr_t rem = p % a;
+    const size_t delta = rem == 0 ? 0u : (size_t)(a - rem);
+    if (delta > allocation_bytes ||
+        usable_bytes > (uint64_t)(allocation_bytes - delta)) {
+        return 0;
+    }
+    *aligned_out = (char *)raw + delta;
+    return 1;
+}
+
+static void cuda_model_stage_pool_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -2490,6 +2557,20 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_model_stage_bytes = 0;
+    g_model_stage_align = 1;
+}
+
+static int cuda_model_stage_pool_alloc(uint64_t bytes) {
+    const uint64_t align = g_model_direct_align > 1 ?
+                           g_model_direct_align : 1;
+    size_t allocation_bytes = 0;
+    if (!cuda_host_stage_allocation_bytes(bytes, align,
+                                          &allocation_bytes)) {
+        return 0;
+    }
+    if (g_model_stage_bytes >= bytes &&
+        g_model_stage_align == align) return 1;
+    cuda_model_stage_pool_release();
     if (!g_model_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
@@ -2499,22 +2580,50 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     for (size_t i = 0; i < 4; i++) {
-        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
+        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i],
+                                         allocation_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_stage_pool_release();
             return 0;
         }
-        g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], g_model_direct_align);
+        if (!cuda_host_stage_aligned_view(g_model_stage_raw[i],
+                                          allocation_bytes, bytes, align,
+                                          &g_model_stage[i])) {
+            fprintf(stderr,
+                    "ds4: CUDA pinned model staging alignment rejected\n");
+            cuda_model_stage_pool_release();
+            return 0;
+        }
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model staging event creation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_stage_pool_release();
             return 0;
         }
     }
     g_model_stage_bytes = bytes;
+    g_model_stage_align = align;
     return 1;
+}
+
+/* A range load can fail after prior chunks were queued from the pinned ring.
+ * Drain before any caller can reuse or free that storage. */
+static int cuda_model_upload_fail(const char *what) {
+    if (g_model_upload_stream) {
+        const cudaError_t sync_err =
+            cudaStreamSynchronize(g_model_upload_stream);
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA model upload abort sync failed for %s: %s\n",
+                    what ? what : "weights",
+                    cudaGetErrorString(sync_err));
+            (void)cudaGetLastError();
+        }
+    }
+    return 0;
 }
 
 static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
@@ -2582,6 +2691,7 @@ static void cuda_stream_selected_stage_release(void) {
         }
     }
     g_stream_selected_stage_bytes = 0;
+    g_stream_selected_stage_align = 1;
     if (g_stream_selected_upload_stream) {
         (void)cudaStreamDestroy(g_stream_selected_upload_stream);
         g_stream_selected_upload_stream = NULL;
@@ -2589,7 +2699,15 @@ static void cuda_stream_selected_stage_release(void) {
 }
 
 static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
-    if (g_stream_selected_stage_bytes >= bytes) return 1;
+    const uint64_t align = g_model_direct_align > 1 ?
+                           g_model_direct_align : 1;
+    size_t allocation_bytes = 0;
+    if (!cuda_host_stage_allocation_bytes(bytes, align,
+                                          &allocation_bytes)) {
+        return 0;
+    }
+    if (g_stream_selected_stage_bytes >= bytes &&
+        g_stream_selected_stage_align == align) return 1;
     cuda_stream_selected_stage_release();
     cudaError_t err = cudaStreamCreateWithFlags(
             &g_stream_selected_upload_stream, cudaStreamNonBlocking);
@@ -2601,7 +2719,8 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
         return 0;
     }
     for (size_t i = 0; i < 4; i++) {
-        err = cudaMallocHost(&g_stream_selected_stage_raw[i], (size_t)bytes);
+        err = cudaMallocHost(&g_stream_selected_stage_raw[i],
+                             allocation_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected staging allocation failed: %s\n",
@@ -2610,8 +2729,14 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
             cuda_stream_selected_stage_release();
             return 0;
         }
-        g_stream_selected_stage[i] = cuda_align_ptr(
-                g_stream_selected_stage_raw[i], g_model_direct_align);
+        if (!cuda_host_stage_aligned_view(
+                g_stream_selected_stage_raw[i], allocation_bytes,
+                bytes, align, &g_stream_selected_stage[i])) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected staging alignment rejected\n");
+            cuda_stream_selected_stage_release();
+            return 0;
+        }
         err = cudaEventCreateWithFlags(&g_stream_selected_stage_event[i],
                                        cudaEventDisableTiming);
         if (err != cudaSuccess) {
@@ -2624,7 +2749,896 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_stream_selected_stage_bytes = bytes;
+    g_stream_selected_stage_align = align;
     return 1;
+}
+
+typedef struct {
+    char *dst;
+    uint64_t offset;
+    uint64_t bytes;
+    uint32_t ordinal;
+} cuda_stream_selected_copy_task;
+
+typedef struct {
+    uint32_t task_index;
+    uint64_t task_offset;
+    uint64_t offset;
+    uint64_t bytes;
+} cuda_stream_selected_copy_segment;
+
+typedef struct {
+    uint32_t segment_begin;
+    uint32_t segment_end;
+    uint64_t offset;
+    uint64_t bytes;
+} cuda_stream_selected_copy_group;
+
+struct ds4_cuda_stream_selected_batch_io_report;
+typedef struct ds4_cuda_stream_selected_batch_io_report
+    ds4_cuda_stream_selected_batch_io_report;
+typedef struct {
+    uint64_t candidates;
+    uint64_t attempts;
+    uint64_t completed;
+    uint64_t legacy_batches;
+    uint64_t safe_fallbacks;
+    uint64_t failures;
+    uint64_t required_failures;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    uint64_t tasks;
+    uint64_t segments;
+    uint64_t reads;
+    uint64_t bytes;
+    int enabled;
+    int required;
+    int oracle;
+} cuda_stream_selected_batch_io_report_layout;
+
+static int cuda_stream_selected_env_value_enabled(const char *value) {
+    if (!value || !value[0]) return 0;
+    if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_selected_env_flag(const char *name) {
+    return cuda_stream_selected_env_value_enabled(
+        name ? getenv(name) : NULL);
+}
+
+extern "C" int ds4_cuda_test_stream_selected_batch_env_value(
+        const char *value) {
+    return cuda_stream_selected_env_value_enabled(value);
+}
+
+static void cuda_stream_selected_batch_io_resolve_policy(
+        int enable, int disable, int require, int oracle,
+        int *enabled_out, int *required_out, int *oracle_out) {
+    const int disabled = disable != 0;
+    if (enabled_out) {
+        *enabled_out = !disabled && (enable || require || oracle);
+    }
+    if (required_out) *required_out = !disabled && require;
+    if (oracle_out) *oracle_out = !disabled && oracle;
+}
+
+extern "C" int ds4_cuda_test_stream_selected_batch_policy(
+        int enable, int disable, int require, int oracle,
+        int *enabled_out, int *required_out, int *oracle_out) {
+    if (!enabled_out || !required_out || !oracle_out) return 0;
+    cuda_stream_selected_batch_io_resolve_policy(
+        enable, disable, require, oracle,
+        enabled_out, required_out, oracle_out);
+    return 1;
+}
+
+static void cuda_stream_selected_batch_io_report_at_exit(void) {
+    fprintf(stderr,
+            "ds4: CUDA selected-expert batched I/O: candidates=%llu "
+            "attempts=%llu completed=%llu legacy=%llu safe_fallbacks=%llu "
+            "failures=%llu required_failures=%llu oracle_runs=%llu "
+            "oracle_failures=%llu tasks=%llu segments=%llu reads=%llu "
+            "bytes=%.2f MiB\n",
+            (unsigned long long)g_stream_selected_batch_io_candidates,
+            (unsigned long long)g_stream_selected_batch_io_attempts,
+            (unsigned long long)g_stream_selected_batch_io_completed,
+            (unsigned long long)g_stream_selected_batch_io_legacy,
+            (unsigned long long)g_stream_selected_batch_io_safe_fallbacks,
+            (unsigned long long)g_stream_selected_batch_io_failures,
+            (unsigned long long)g_stream_selected_batch_io_required_failures,
+            (unsigned long long)g_stream_selected_batch_io_oracle_runs,
+            (unsigned long long)g_stream_selected_batch_io_oracle_failures,
+            (unsigned long long)g_stream_selected_batch_io_tasks,
+            (unsigned long long)g_stream_selected_batch_io_segments,
+            (unsigned long long)g_stream_selected_batch_io_reads,
+            (double)g_stream_selected_batch_io_bytes / 1048576.0);
+}
+
+static void cuda_stream_selected_batch_io_init(void) {
+    const int enable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_ENABLE_STREAMING_SELECTED_BATCH_IO");
+    const int disable = cuda_stream_selected_env_flag(
+        "DS4_CUDA_DISABLE_STREAMING_SELECTED_BATCH_IO") ||
+        cuda_stream_selected_env_flag(
+            "DS4_CUDA_NO_STREAMING_SELECTED_BATCH_IO");
+    const int require = cuda_stream_selected_env_flag(
+        "DS4_CUDA_REQUIRE_STREAMING_SELECTED_BATCH_IO");
+    const int oracle = cuda_stream_selected_env_flag(
+        "DS4_CUDA_STREAMING_SELECTED_BATCH_IO_ORACLE");
+    cuda_stream_selected_batch_io_resolve_policy(
+        enable, disable, require, oracle,
+        &g_stream_selected_batch_io_enabled,
+        &g_stream_selected_batch_io_required,
+        &g_stream_selected_batch_io_oracle);
+    if ((enable || require || oracle) &&
+        !g_stream_selected_batch_io_report_registered) {
+        g_stream_selected_batch_io_report_registered = 1;
+        (void)atexit(cuda_stream_selected_batch_io_report_at_exit);
+    }
+    if (g_stream_selected_batch_io_enabled) {
+        fprintf(stderr,
+                "ds4: CUDA selected-expert batched I/O enabled%s%s\n",
+                g_stream_selected_batch_io_required ? " (required)" : "",
+                g_stream_selected_batch_io_oracle ?
+                    " with full byte oracle" : "");
+    } else if (disable && (enable || require || oracle)) {
+        fprintf(stderr,
+                "ds4: CUDA selected-expert batched I/O disabled by rollback"
+                " override\n");
+    }
+}
+
+static int cuda_stream_selected_batch_io_requested(void) {
+    std::call_once(g_stream_selected_batch_io_once,
+                   cuda_stream_selected_batch_io_init);
+    return g_stream_selected_batch_io_enabled;
+}
+
+static int cuda_stream_selected_batch_io_require_requested(void) {
+    std::call_once(g_stream_selected_batch_io_once,
+                   cuda_stream_selected_batch_io_init);
+    return g_stream_selected_batch_io_required;
+}
+
+static int cuda_stream_selected_batch_io_oracle_requested(void) {
+    std::call_once(g_stream_selected_batch_io_once,
+                   cuda_stream_selected_batch_io_init);
+    return g_stream_selected_batch_io_oracle;
+}
+
+extern "C" void ds4_cuda_stream_selected_batch_io_get_report(
+        ds4_cuda_stream_selected_batch_io_report *report) {
+    if (!report) return;
+    cuda_stream_selected_batch_io_report_layout out = {};
+    out.candidates = g_stream_selected_batch_io_candidates;
+    out.attempts = g_stream_selected_batch_io_attempts;
+    out.completed = g_stream_selected_batch_io_completed;
+    out.legacy_batches = g_stream_selected_batch_io_legacy;
+    out.safe_fallbacks = g_stream_selected_batch_io_safe_fallbacks;
+    out.failures = g_stream_selected_batch_io_failures;
+    out.required_failures =
+        g_stream_selected_batch_io_required_failures;
+    out.oracle_runs = g_stream_selected_batch_io_oracle_runs;
+    out.oracle_failures = g_stream_selected_batch_io_oracle_failures;
+    out.tasks = g_stream_selected_batch_io_tasks;
+    out.segments = g_stream_selected_batch_io_segments;
+    out.reads = g_stream_selected_batch_io_reads;
+    out.bytes = g_stream_selected_batch_io_bytes;
+    out.enabled = cuda_stream_selected_batch_io_requested();
+    out.required = cuda_stream_selected_batch_io_require_requested();
+    out.oracle = cuda_stream_selected_batch_io_oracle_requested();
+    memcpy(report, &out, sizeof(out));
+}
+
+/* Build a deterministic source-ordered plan without changing compact-slot
+ * order.  Adjacent source spans can share one bounded read even when their
+ * device destinations are discontiguous.  Overlaps are rejected because the
+ * selected-expert list has already been deduplicated. */
+static int cuda_stream_selected_copy_plan(
+        const std::vector<cuda_stream_selected_copy_task> &tasks,
+        uint64_t model_size,
+        uint64_t chunk,
+        std::vector<cuda_stream_selected_copy_task> *sorted_out,
+        std::vector<cuda_stream_selected_copy_segment> *segments_out,
+        std::vector<cuda_stream_selected_copy_group> *groups_out) {
+    if (!sorted_out || !segments_out || !groups_out ||
+        tasks.empty() || chunk == 0) {
+        return 0;
+    }
+
+    try {
+        *sorted_out = tasks;
+        std::stable_sort(
+            sorted_out->begin(), sorted_out->end(),
+            [](const cuda_stream_selected_copy_task &a,
+               const cuda_stream_selected_copy_task &b) {
+                return a.offset != b.offset ? a.offset < b.offset :
+                       a.ordinal < b.ordinal;
+            });
+        segments_out->clear();
+        groups_out->clear();
+        segments_out->reserve(tasks.size());
+        groups_out->reserve(tasks.size());
+    } catch (...) {
+        return 0;
+    }
+    if (sorted_out->size() >= UINT32_MAX) return 0;
+
+    uint64_t previous_end = 0;
+    for (uint32_t i = 0; i < sorted_out->size(); i++) {
+        const cuda_stream_selected_copy_task &task = (*sorted_out)[i];
+        if (!task.dst || task.bytes == 0 || task.offset > model_size ||
+            task.bytes > model_size - task.offset ||
+            task.bytes > (uint64_t)SIZE_MAX ||
+            (i != 0 && task.offset < previous_end)) {
+            return 0;
+        }
+        previous_end = task.offset + task.bytes;
+
+        uint64_t done = 0;
+        while (done < task.bytes) {
+            const uint64_t n = task.bytes - done < chunk ?
+                               task.bytes - done : chunk;
+            try {
+                segments_out->push_back(
+                    { i, done, task.offset + done, n });
+            } catch (...) {
+                return 0;
+            }
+            done += n;
+        }
+    }
+    if (segments_out->empty() ||
+        segments_out->size() >= UINT32_MAX) return 0;
+
+    uint32_t begin = 0;
+    while (begin < segments_out->size()) {
+        const cuda_stream_selected_copy_segment &first =
+            (*segments_out)[begin];
+        uint64_t group_bytes = first.bytes;
+        uint32_t end = begin + 1u;
+        while (end < segments_out->size()) {
+            const cuda_stream_selected_copy_segment &next =
+                (*segments_out)[end];
+            if (next.offset != first.offset + group_bytes ||
+                next.bytes > chunk - group_bytes) {
+                break;
+            }
+            group_bytes += next.bytes;
+            end++;
+        }
+        try {
+            groups_out->push_back(
+                { begin, end, first.offset, group_bytes });
+        } catch (...) {
+            return 0;
+        }
+        begin = end;
+    }
+    return !groups_out->empty();
+}
+
+static int cuda_stream_selected_upload_fail(const char *what) {
+    if (g_stream_selected_upload_stream) {
+        const cudaError_t sync_err =
+            cudaStreamSynchronize(g_stream_selected_upload_stream);
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA selected batched I/O abort sync failed for %s: %s\n",
+                    what ? what : "expert batch",
+                    cudaGetErrorString(sync_err));
+            (void)cudaGetLastError();
+        }
+    }
+    return 0;
+}
+
+static int cuda_stream_selected_copy_oracle(
+        const std::vector<cuda_stream_selected_copy_task> &tasks,
+        const void *model_map,
+        uint64_t model_size,
+        const int32_t *remap_src,
+        const int32_t *remap_dst,
+        uint64_t remap_count,
+        int report) {
+    if (!model_map || tasks.empty() ||
+        (remap_count != 0 && (!remap_src || !remap_dst)) ||
+        remap_count > SIZE_MAX / sizeof(int32_t)) {
+        return 0;
+    }
+
+    uint64_t largest_task = 0;
+    for (const cuda_stream_selected_copy_task &task : tasks) {
+        if (!task.dst || task.offset > model_size || task.bytes == 0 ||
+            task.bytes > model_size - task.offset) {
+            return 0;
+        }
+        if (task.bytes > largest_task) largest_task = task.bytes;
+    }
+    const uint64_t scratch_bytes = largest_task < 4u * 1024u * 1024u ?
+                                   largest_task : 4u * 1024u * 1024u;
+    if (scratch_bytes == 0 || scratch_bytes > SIZE_MAX) return 0;
+
+    std::vector<unsigned char> got;
+    try {
+        got.resize((size_t)scratch_bytes);
+    } catch (...) {
+        if (report) {
+            fprintf(stderr,
+                    "ds4: CUDA selected batched I/O byte oracle allocation failed\n");
+        }
+        return 0;
+    }
+
+    for (const cuda_stream_selected_copy_task &task : tasks) {
+        uint64_t done = 0;
+        while (done < task.bytes) {
+            const uint64_t n = task.bytes - done < scratch_bytes ?
+                               task.bytes - done : scratch_bytes;
+            const cudaError_t err = cudaMemcpy(
+                got.data(), task.dst + done, (size_t)n,
+                cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                if (report) {
+                    fprintf(stderr,
+                            "ds4: CUDA selected batched I/O byte oracle read "
+                            "failed at model offset %llu: %s\n",
+                            (unsigned long long)(task.offset + done),
+                            cudaGetErrorString(err));
+                }
+                (void)cudaGetLastError();
+                return 0;
+            }
+            const unsigned char *expected =
+                (const unsigned char *)model_map + task.offset + done;
+            if (memcmp(got.data(), expected, (size_t)n) != 0) {
+                if (report) {
+                    size_t mismatch = 0;
+                    while (mismatch < (size_t)n &&
+                           got[mismatch] == expected[mismatch]) {
+                        mismatch++;
+                    }
+                    fprintf(stderr,
+                            "ds4: CUDA selected batched I/O byte oracle "
+                            "mismatch at model offset %llu "
+                            "(expected=0x%02x got=0x%02x)\n",
+                            (unsigned long long)(task.offset + done + mismatch),
+                            (unsigned)expected[mismatch],
+                            (unsigned)got[mismatch]);
+                }
+                return 0;
+            }
+            done += n;
+        }
+    }
+
+    if (remap_count != 0) {
+        std::vector<int32_t> got_remap;
+        try {
+            got_remap.resize((size_t)remap_count);
+        } catch (...) {
+            return 0;
+        }
+        const size_t remap_bytes =
+            (size_t)remap_count * sizeof(got_remap[0]);
+        const cudaError_t err = cudaMemcpy(
+            got_remap.data(), remap_dst, remap_bytes,
+            cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess ||
+            memcmp(got_remap.data(), remap_src, remap_bytes) != 0) {
+            if (report) {
+                fprintf(stderr,
+                        "ds4: CUDA selected batched I/O remap byte oracle %s\n",
+                        err == cudaSuccess ? "mismatch" :
+                        cudaGetErrorString(err));
+            }
+            if (err != cudaSuccess) (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Queue every unique gate/up/down span plus the selected-id remap into one
+ * upload epoch.  The ring events protect staging reuse; the sole final stream
+ * synchronization publishes the complete compact table atomically to the
+ * caller.  submitted_out distinguishes safe pre-enqueue fallback from a
+ * partial upload, which must always fail closed. */
+static int cuda_model_copy_tasks_to_device_streamed(
+        const std::vector<cuda_stream_selected_copy_task> &tasks,
+        const void *model_map,
+        uint64_t model_size,
+        int32_t *remap_dst,
+        const int32_t *remap_src,
+        uint64_t remap_count,
+        int run_oracle,
+        uint64_t chunk_override,
+        int *submitted_out,
+        const char *what) {
+    if (submitted_out) *submitted_out = 0;
+    if (!model_map || tasks.empty() || !remap_dst || !remap_src ||
+        remap_count == 0 || remap_count > SIZE_MAX / sizeof(int32_t)) {
+        return 0;
+    }
+
+    const uint64_t chunk = chunk_override != 0 ?
+                           chunk_override : cuda_model_copy_chunk_bytes();
+    std::vector<cuda_stream_selected_copy_task> sorted;
+    std::vector<cuda_stream_selected_copy_segment> segments;
+    std::vector<cuda_stream_selected_copy_group> groups;
+    if (!cuda_stream_selected_copy_plan(tasks, model_size, chunk,
+                                        &sorted, &segments, &groups)) {
+        fprintf(stderr,
+                "ds4: CUDA selected batched I/O could not build a valid "
+                "copy plan\n");
+        return 0;
+    }
+
+    uint64_t stage_bytes = 0;
+    if (!cuda_host_stage_bytes_for_chunk(chunk, g_model_direct_align,
+                                         &stage_bytes) ||
+        !cuda_stream_selected_stage_pool_alloc(stage_bytes)) {
+        return 0;
+    }
+
+    const bool profile = cuda_stream_selected_env_flag(
+        "DS4_CUDA_STREAMING_SELECTED_BATCH_IO_PROFILE");
+    const double t0 = profile ? cuda_wall_sec() : 0.0;
+    uint64_t submitted_bytes = 0;
+    const bool use_fd =
+        g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL || g_model_fd_host_base == model_map);
+
+    if (use_fd) {
+        for (uint32_t gi = 0; gi < groups.size(); gi++) {
+            const cuda_stream_selected_copy_group &group = groups[gi];
+            const uint64_t bi = gi % 4u;
+            if (gi >= 4u) {
+                const cudaError_t err =
+                    cudaEventSynchronize(g_stream_selected_stage_event[bi]);
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            "ds4: CUDA selected batched I/O staging wait "
+                            "failed for %s: %s\n",
+                            what ? what : "expert batch",
+                            cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                    return cuda_stream_selected_upload_fail(what);
+                }
+            }
+
+            const char *payload = NULL;
+            if (!cuda_model_stage_read(g_stream_selected_stage[bi],
+                                       g_stream_selected_stage_bytes,
+                                       group.offset, group.bytes, &payload)) {
+                fprintf(stderr,
+                        "ds4: CUDA selected batched I/O read failed for %s "
+                        "at model offset %llu: %s\n",
+                        what ? what : "expert batch",
+                        (unsigned long long)group.offset,
+                        strerror(errno));
+                return cuda_stream_selected_upload_fail(what);
+            }
+
+            for (uint32_t si = group.segment_begin;
+                 si < group.segment_end; si++) {
+                const cuda_stream_selected_copy_segment &segment =
+                    segments[si];
+                const cuda_stream_selected_copy_task &task =
+                    sorted[segment.task_index];
+                const uint64_t stage_offset = segment.offset - group.offset;
+                const cudaError_t err = cudaMemcpyAsync(
+                    task.dst + segment.task_offset,
+                    payload + stage_offset,
+                    (size_t)segment.bytes,
+                    cudaMemcpyHostToDevice,
+                    g_stream_selected_upload_stream);
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            "ds4: CUDA selected batched I/O copy failed for "
+                            "%s at model offset %llu: %s\n",
+                            what ? what : "expert batch",
+                            (unsigned long long)segment.offset,
+                            cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                    return cuda_stream_selected_upload_fail(what);
+                }
+                if (submitted_out) *submitted_out = 1;
+                if (segment.bytes > UINT64_MAX - submitted_bytes) {
+                    return cuda_stream_selected_upload_fail(what);
+                }
+                submitted_bytes += segment.bytes;
+            }
+            const cudaError_t event_err = cudaEventRecord(
+                g_stream_selected_stage_event[bi],
+                g_stream_selected_upload_stream);
+            if (event_err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA selected batched I/O staging record failed "
+                        "for %s: %s\n",
+                        what ? what : "expert batch",
+                        cudaGetErrorString(event_err));
+                (void)cudaGetLastError();
+                return cuda_stream_selected_upload_fail(what);
+            }
+            cuda_model_drop_file_pages(group.offset, group.bytes);
+            cuda_model_discard_source_pages(model_map, model_size,
+                                            group.offset, group.bytes);
+        }
+    } else {
+        for (const cuda_stream_selected_copy_task &task : sorted) {
+            const cudaError_t err = cudaMemcpyAsync(
+                task.dst,
+                (const char *)model_map + task.offset,
+                (size_t)task.bytes,
+                cudaMemcpyHostToDevice,
+                g_stream_selected_upload_stream);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA selected batched host copy failed for %s "
+                        "at model offset %llu: %s\n",
+                        what ? what : "expert batch",
+                        (unsigned long long)task.offset,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return cuda_stream_selected_upload_fail(what);
+            }
+            if (submitted_out) *submitted_out = 1;
+            if (task.bytes > UINT64_MAX - submitted_bytes) {
+                return cuda_stream_selected_upload_fail(what);
+            }
+            submitted_bytes += task.bytes;
+        }
+    }
+
+    const size_t remap_bytes =
+        (size_t)remap_count * sizeof(remap_src[0]);
+    cudaError_t err = cudaMemcpyAsync(
+        remap_dst, remap_src, remap_bytes,
+        cudaMemcpyHostToDevice, g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected batched I/O remap copy failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return cuda_stream_selected_upload_fail(what);
+    }
+    if (submitted_out) *submitted_out = 1;
+
+    /* Async handoff seam: a future boundary-only change can replace this
+     * wait with an upload-done event recorded here and waited by the compute
+     * stream.  All weight scatters and the remap are ordered before it. */
+    err = cudaStreamSynchronize(g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA selected batched I/O final sync failed for %s: %s\n",
+                what ? what : "expert batch", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    if (run_oracle) {
+        g_stream_selected_batch_io_oracle_runs++;
+        if (!cuda_stream_selected_copy_oracle(
+                tasks, model_map, model_size, remap_src, remap_dst,
+                remap_count, /*report=*/1)) {
+            g_stream_selected_batch_io_oracle_failures++;
+            fprintf(stderr,
+                    "ds4: CUDA selected batched I/O failed the byte oracle; "
+                    "compact table rejected\n");
+            return 0;
+        }
+    }
+
+    g_stream_selected_batch_io_tasks += tasks.size();
+    g_stream_selected_batch_io_segments += segments.size();
+    g_stream_selected_batch_io_reads += use_fd ? groups.size() : sorted.size();
+    if (submitted_bytes <= UINT64_MAX - g_stream_selected_batch_io_bytes) {
+        g_stream_selected_batch_io_bytes += submitted_bytes;
+    } else {
+        g_stream_selected_batch_io_bytes = UINT64_MAX;
+    }
+    if (profile) {
+        const double t1 = cuda_wall_sec();
+        fprintf(stderr,
+                "ds4: CUDA selected batched I/O tasks=%zu segments=%zu "
+                "reads=%zu bytes=%.2f MiB total=%.3f ms%s\n",
+                tasks.size(), segments.size(),
+                use_fd ? groups.size() : sorted.size(),
+                (double)submitted_bytes / 1048576.0,
+                (t1 - t0) * 1000.0,
+                run_oracle ? " (includes oracle)" : "");
+    }
+    return 1;
+}
+
+extern "C" int ds4_cuda_test_stream_selected_batch_plan(void) {
+    try {
+        const uint64_t layout_align = 64u;
+        const uint64_t layout_usable = 513u;
+        size_t layout_allocation = 0;
+        std::vector<unsigned char> layout_storage(
+                (size_t)(layout_usable + 2u * layout_align));
+        const uintptr_t layout_base = (uintptr_t)layout_storage.data();
+        const size_t to_boundary = (size_t)(
+            (layout_align - layout_base % layout_align) % layout_align);
+        void *layout_raw = layout_storage.data() + to_boundary + 1u;
+        void *layout_aligned = NULL;
+        uint64_t overflow_stage = 0;
+        if (!cuda_host_stage_allocation_bytes(
+                layout_usable, layout_align, &layout_allocation) ||
+            layout_allocation != layout_usable + layout_align - 1u ||
+            !cuda_host_stage_aligned_view(
+                layout_raw, layout_allocation, layout_usable,
+                layout_align, &layout_aligned) ||
+            (uintptr_t)layout_raw % layout_align != 1u ||
+            (uintptr_t)layout_aligned % layout_align != 0u ||
+            (char *)layout_aligned + layout_usable !=
+                (char *)layout_raw + layout_allocation ||
+            cuda_host_stage_aligned_view(
+                layout_raw, layout_allocation - 1u, layout_usable,
+                layout_align, &layout_aligned) ||
+            cuda_host_stage_allocation_bytes(
+                UINT64_MAX, 2u, &layout_allocation) ||
+            cuda_host_stage_bytes_for_chunk(
+                UINT64_MAX, 2u, &overflow_stage)) {
+            return 0;
+        }
+        memset(layout_aligned, 0xa5, (size_t)layout_usable);
+
+        std::vector<char> storage(64u * 1024u);
+        std::vector<cuda_stream_selected_copy_task> tasks = {
+            { storage.data() + 0u,     8192u, 4096u, 0u },
+            { storage.data() + 4096u,     0u, 4096u, 1u },
+            { storage.data() + 8192u,  4096u, 4096u, 2u },
+            { storage.data() + 12288u, 12288u, 4096u, 3u },
+            { storage.data() + 16384u, 32768u, 4096u, 4u },
+        };
+        std::vector<cuda_stream_selected_copy_task> sorted;
+        std::vector<cuda_stream_selected_copy_segment> segments;
+        std::vector<cuda_stream_selected_copy_group> groups;
+        if (!cuda_stream_selected_copy_plan(
+                tasks, storage.size(), 12288u,
+                &sorted, &segments, &groups) ||
+            sorted.size() != 5u || segments.size() != 5u ||
+            groups.size() != 3u ||
+            sorted[0].ordinal != 1u || sorted[1].ordinal != 2u ||
+            sorted[2].ordinal != 0u || sorted[3].ordinal != 3u ||
+            sorted[4].ordinal != 4u ||
+            groups[0].offset != 0u || groups[0].bytes != 12288u ||
+            groups[0].segment_begin != 0u ||
+            groups[0].segment_end != 3u) {
+            return 0;
+        }
+
+        tasks = {
+            { storage.data(),          0u, 20000u, 0u },
+            { storage.data() + 20000u, 20000u, 4000u, 1u },
+        };
+        if (!cuda_stream_selected_copy_plan(
+                tasks, storage.size(), 8192u,
+                &sorted, &segments, &groups) ||
+            segments.size() != 4u || groups.size() != 3u ||
+            groups[2].offset != 16384u || groups[2].bytes != 7616u) {
+            return 0;
+        }
+
+        tasks = {
+            { storage.data(),          0u, 4096u, 0u },
+            { storage.data() + 4096u, 2048u, 4096u, 1u },
+        };
+        if (cuda_stream_selected_copy_plan(
+                tasks, storage.size(), 8192u,
+                &sorted, &segments, &groups)) {
+            return 0;
+        }
+
+        tasks = {
+            { storage.data(), UINT64_MAX - 1u, 2u, 0u },
+        };
+        if (cuda_stream_selected_copy_plan(
+                tasks, UINT64_MAX, 8192u,
+                &sorted, &segments, &groups)) {
+            return 0;
+        }
+    } catch (...) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Exercise aligned staging, one-read scatter, ring wrap, remap upload and a
+ * deliberate byte-oracle failure on a real CUDA device.  The test restores
+ * every temporary file-global before returning. */
+extern "C" int ds4_cuda_test_stream_selected_batch_copy(void) {
+    if (g_n_gpus < 1) return 0;
+    int saved_device = -1;
+    (void)cudaGetDevice(&saved_device);
+    const int saved_logical_tier = g_current_logical_tier;
+    const auto restore_device = [saved_device, saved_logical_tier]() {
+        if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+        g_current_logical_tier = saved_logical_tier;
+    };
+    if (ds4_gpu_set_current_device(0) != 0) {
+        restore_device();
+        return 0;
+    }
+    if (g_model_stage_bytes != 0 || g_model_upload_stream ||
+        g_stream_selected_stage_bytes != 0 ||
+        g_stream_selected_upload_stream) {
+        restore_device();
+        return 0;
+    }
+
+    const size_t model_bytes = 16u * 1024u;
+    std::vector<unsigned char> source;
+    try {
+        source.resize(model_bytes);
+    } catch (...) {
+        restore_device();
+        return 0;
+    }
+    for (size_t i = 0; i < source.size(); i++) {
+        source[i] = (unsigned char)((i * 37u + 11u) & 0xffu);
+    }
+
+    FILE *fp = tmpfile();
+    if (!fp || fwrite(source.data(), 1, source.size(), fp) != source.size() ||
+        fflush(fp) != 0) {
+        if (fp) fclose(fp);
+        restore_device();
+        return 0;
+    }
+    void *map = mmap(NULL, model_bytes, PROT_READ, MAP_PRIVATE,
+                     fileno(fp), 0);
+    if (map == MAP_FAILED) {
+        fclose(fp);
+        restore_device();
+        return 0;
+    }
+
+    char *dst[6] = { NULL, NULL, NULL, NULL, NULL, NULL };
+    int32_t *remap_dst = NULL;
+    int ok = 1;
+    for (uint32_t i = 0; i < 6u; i++) {
+        if (cudaMalloc((void **)&dst[i], 4096u) != cudaSuccess) ok = 0;
+    }
+    const int32_t remap_src[6] = { 2, 0, 1, 2, 2, 0 };
+    if (cudaMalloc((void **)&remap_dst, sizeof(remap_src)) != cudaSuccess) {
+        ok = 0;
+    }
+
+    const int saved_fd = g_model_fd;
+    const void *saved_fd_host_base = g_model_fd_host_base;
+    const int saved_direct_fd = g_model_direct_fd;
+    const uint64_t saved_direct_align = g_model_direct_align;
+    const uint64_t saved_file_size = g_model_file_size;
+    g_model_fd = fileno(fp);
+    g_model_fd_host_base = map;
+    g_model_direct_fd = -1;
+    g_model_direct_align = 257u;
+    g_model_file_size = model_bytes;
+
+    if (ok) {
+        uint64_t stage_bytes = 0;
+        size_t allocation_bytes = 0;
+        ok = cuda_host_stage_bytes_for_chunk(
+                 4096u, g_model_direct_align, &stage_bytes) &&
+             cuda_host_stage_allocation_bytes(
+                 stage_bytes, g_model_direct_align, &allocation_bytes) &&
+             cuda_model_stage_pool_alloc(stage_bytes) &&
+             g_model_stage_bytes == stage_bytes &&
+             g_model_stage_align == g_model_direct_align;
+        for (uint32_t i = 0; ok && i < 4u; i++) {
+            const size_t delta = (size_t)(
+                (char *)g_model_stage[i] -
+                (char *)g_model_stage_raw[i]);
+            ok = (uintptr_t)g_model_stage[i] % g_model_direct_align == 0u &&
+                 delta <= allocation_bytes &&
+                 stage_bytes <= allocation_bytes - delta;
+        }
+        cuda_model_stage_pool_release();
+    }
+
+    if (ok) {
+        try {
+            std::vector<cuda_stream_selected_copy_task> tasks = {
+                { dst[0], 8192u, 4096u, 0u },
+                { dst[1],    0u, 4096u, 1u },
+                { dst[2], 4096u, 4096u, 2u },
+            };
+            int submitted = 0;
+            ok = cuda_model_copy_tasks_to_device_streamed(
+                tasks, map, model_bytes,
+                remap_dst, remap_src, 6u,
+                /*run_oracle=*/1,
+                /*chunk_override=*/12288u,
+                &submitted, "selected batch selftest") && submitted;
+            if (ok) {
+                size_t selected_allocation = 0;
+                ok = cuda_host_stage_allocation_bytes(
+                    g_stream_selected_stage_bytes,
+                    g_stream_selected_stage_align,
+                    &selected_allocation);
+                void *first_ring_raw[4];
+                for (uint32_t i = 0; ok && i < 4u; i++) {
+                    first_ring_raw[i] = g_stream_selected_stage_raw[i];
+                    const size_t delta = (size_t)(
+                        (char *)g_stream_selected_stage[i] -
+                        (char *)g_stream_selected_stage_raw[i]);
+                    ok = (uintptr_t)g_stream_selected_stage[i] %
+                             g_model_direct_align == 0u &&
+                         delta <= selected_allocation &&
+                         g_stream_selected_stage_bytes <=
+                             selected_allocation - delta;
+                }
+                const int32_t wrap_remap[6] = { 5, 4, 3, 2, 1, 0 };
+                std::vector<cuda_stream_selected_copy_task> wrap_tasks = {
+                    { dst[0],     0u, 1024u, 0u },
+                    { dst[1],  2048u, 1024u, 1u },
+                    { dst[2],  4096u, 1024u, 2u },
+                    { dst[3],  6144u, 1024u, 3u },
+                    { dst[4],  8192u, 1024u, 4u },
+                    { dst[5], 10240u, 1024u, 5u },
+                };
+                std::vector<cuda_stream_selected_copy_task> wrap_sorted;
+                std::vector<cuda_stream_selected_copy_segment> wrap_segments;
+                std::vector<cuda_stream_selected_copy_group> wrap_groups;
+                submitted = 0;
+                ok = ok && cuda_stream_selected_copy_plan(
+                         wrap_tasks, model_bytes, 4096u,
+                         &wrap_sorted, &wrap_segments, &wrap_groups) &&
+                     wrap_groups.size() == 6u &&
+                     cuda_model_copy_tasks_to_device_streamed(
+                         wrap_tasks, map, model_bytes,
+                         remap_dst, wrap_remap, 6u,
+                         /*run_oracle=*/1,
+                         /*chunk_override=*/4096u,
+                         &submitted,
+                         "selected batch ring-wrap selftest") &&
+                     submitted;
+                for (uint32_t i = 0; ok && i < 4u; i++) {
+                    ok = first_ring_raw[i] ==
+                         g_stream_selected_stage_raw[i];
+                }
+                if (ok) {
+                    const unsigned char corrupt =
+                        (unsigned char)(source[8192u] ^ 0xffu);
+                    ok = cudaMemcpy(dst[4], &corrupt, sizeof(corrupt),
+                                    cudaMemcpyHostToDevice) == cudaSuccess &&
+                         !cuda_stream_selected_copy_oracle(
+                             wrap_tasks, map, model_bytes,
+                             wrap_remap, remap_dst, 6u, /*report=*/0);
+                }
+            }
+        } catch (...) {
+            ok = 0;
+        }
+    }
+
+    g_model_fd = saved_fd;
+    g_model_fd_host_base = saved_fd_host_base;
+    g_model_direct_fd = saved_direct_fd;
+    g_model_direct_align = saved_direct_align;
+    g_model_file_size = saved_file_size;
+    cuda_model_stage_pool_release();
+    if (g_model_upload_stream) {
+        (void)cudaStreamDestroy(g_model_upload_stream);
+        g_model_upload_stream = NULL;
+    }
+    cuda_stream_selected_stage_release();
+    for (uint32_t i = 0; i < 6u; i++) {
+        if (dst[i]) (void)cudaFree(dst[i]);
+    }
+    if (remap_dst) (void)cudaFree(remap_dst);
+    (void)munmap(map, model_bytes);
+    (void)fclose(fp);
+    restore_device();
+    return ok;
 }
 
 static int cuda_model_copy_to_device_streamed(
@@ -2649,9 +3663,10 @@ static int cuda_model_copy_to_device_streamed(
     }
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes =
-        chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+    uint64_t stage_bytes = 0;
+    if (!cuda_host_stage_bytes_for_chunk(chunk, g_model_direct_align,
+                                         &stage_bytes) ||
+        !cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -2666,7 +3681,7 @@ static int cuda_model_copy_to_device_streamed(
                         "ds4: CUDA streaming selected staging wait failed for %s: %s\n",
                         what ? what : "expert", cudaGetErrorString(err));
                 (void)cudaGetLastError();
-                return 0;
+                return cuda_stream_selected_upload_fail(what);
             }
         }
         const char *payload = NULL;
@@ -2677,7 +3692,7 @@ static int cuda_model_copy_to_device_streamed(
                     "ds4: CUDA streaming selected read failed for %s at %.2f MiB: %s\n",
                     what ? what : "expert", (double)copied / 1048576.0,
                     strerror(errno));
-            return 0;
+            return cuda_stream_selected_upload_fail(what);
         }
         err = cudaMemcpyAsync(dst + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice,
@@ -2688,7 +3703,7 @@ static int cuda_model_copy_to_device_streamed(
                     what ? what : "expert", (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
-            return 0;
+            return cuda_stream_selected_upload_fail(what);
         }
         err = cudaEventRecord(g_stream_selected_stage_event[bi],
                               g_stream_selected_upload_stream);
@@ -2697,7 +3712,7 @@ static int cuda_model_copy_to_device_streamed(
                     "ds4: CUDA streaming selected staging record failed for %s: %s\n",
                     what ? what : "expert", cudaGetErrorString(err));
             (void)cudaGetLastError();
-            return 0;
+            return cuda_stream_selected_upload_fail(what);
         }
         cuda_model_drop_file_pages(offset + copied, n);
         cuda_model_discard_source_pages(model_map, model_size,
@@ -2815,8 +3830,10 @@ static const char *cuda_model_range_ptr_from_fd(
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
+    uint64_t stage_bytes = 0;
+    if (!cuda_host_stage_bytes_for_chunk(chunk, g_model_direct_align,
+                                         &stage_bytes) ||
+        !cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -2829,6 +3846,7 @@ static const char *cuda_model_range_ptr_from_fd(
                 fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
                 (void)cudaGetLastError();
+                (void)cuda_model_upload_fail(what);
                 return NULL;
             }
         }
@@ -2839,6 +3857,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
+            (void)cuda_model_upload_fail(what);
             return NULL;
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
@@ -2849,6 +3868,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
+            (void)cuda_model_upload_fail(what);
             return NULL;
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
@@ -2856,6 +3876,7 @@ static const char *cuda_model_range_ptr_from_fd(
             fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            (void)cuda_model_upload_fail(what);
             return NULL;
         }
         cuda_model_drop_file_pages(offset + copied, n);
@@ -3329,18 +4350,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
-    for (size_t i = 0; i < 4; i++) {
-        if (g_model_stage_event[i]) {
-            (void)cudaEventDestroy(g_model_stage_event[i]);
-            g_model_stage_event[i] = NULL;
-        }
-        if (g_model_stage_raw[i]) {
-            (void)cudaFreeHost(g_model_stage_raw[i]);
-            g_model_stage_raw[i] = NULL;
-            g_model_stage[i] = NULL;
-        }
-    }
-    g_model_stage_bytes = 0;
+    cuda_model_stage_pool_release();
     if (g_model_upload_stream) {
         (void)cudaStreamDestroy(g_model_upload_stream);
         g_model_upload_stream = NULL;
@@ -28558,42 +29568,129 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
-    for (uint32_t i = 0; i < compact_ids.size(); i++) {
-        const uint64_t expert = (uint32_t)compact_ids[i];
-        const uint64_t gate_src =
-            table->gate_offset + expert * table->gate_expert_bytes;
-        const uint64_t up_src =
-            table->up_offset + expert * table->gate_expert_bytes;
-        const uint64_t down_src =
-            table->down_offset + expert * table->down_expert_bytes;
-        const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
-        const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
-        if (!cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.gate_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    gate_src, table->gate_expert_bytes,
-                    "stream gate expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.up_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    up_src, table->gate_expert_bytes,
-                    "stream up expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.down_ptr + down_dst,
-                    table->model_map, table->model_size,
-                    down_src, table->down_expert_bytes,
-                    "stream down expert copy")) {
+    g_stream_selected_batch_io_candidates++;
+    const int batch_io = cuda_stream_selected_batch_io_requested();
+    const int batch_io_required =
+        cuda_stream_selected_batch_io_require_requested();
+    int copied = 0;
+    if (batch_io) {
+        std::vector<cuda_stream_selected_copy_task> tasks;
+        int task_plan_ready = 1;
+        try {
+            if (compact_ids.size() > SIZE_MAX / 3u ||
+                compact_ids.size() > UINT32_MAX / 3u) {
+                task_plan_ready = 0;
+            } else {
+                tasks.reserve(compact_ids.size() * 3u);
+                uint32_t ordinal = 0;
+                for (uint32_t i = 0; i < compact_ids.size(); i++) {
+                    const uint64_t expert = (uint32_t)compact_ids[i];
+                    const uint64_t gate_src = table->gate_offset +
+                        expert * table->gate_expert_bytes;
+                    const uint64_t up_src = table->up_offset +
+                        expert * table->gate_expert_bytes;
+                    const uint64_t down_src = table->down_offset +
+                        expert * table->down_expert_bytes;
+                    const uint64_t gate_dst =
+                        (uint64_t)i * table->gate_expert_bytes;
+                    const uint64_t down_dst =
+                        (uint64_t)i * table->down_expert_bytes;
+                    tasks.push_back({
+                        g_stream_selected_cache.gate_ptr + gate_dst,
+                        gate_src, table->gate_expert_bytes, ordinal++,
+                    });
+                    tasks.push_back({
+                        g_stream_selected_cache.up_ptr + gate_dst,
+                        up_src, table->gate_expert_bytes, ordinal++,
+                    });
+                    tasks.push_back({
+                        g_stream_selected_cache.down_ptr + down_dst,
+                        down_src, table->down_expert_bytes, ordinal++,
+                    });
+                }
+            }
+        } catch (...) {
+            task_plan_ready = 0;
+        }
+
+        if (task_plan_ready) {
+            int submitted = 0;
+            g_stream_selected_batch_io_attempts++;
+            copied = cuda_model_copy_tasks_to_device_streamed(
+                tasks, table->model_map, table->model_size,
+                g_stream_selected_cache.slot_selected_ptr,
+                slot_ids.data(), slot_count,
+                cuda_stream_selected_batch_io_oracle_requested(),
+                /*chunk_override=*/0, &submitted,
+                "selected expert batch");
+            if (copied) {
+                g_stream_selected_batch_io_completed++;
+            } else {
+                g_stream_selected_batch_io_failures++;
+                if (batch_io_required) {
+                    g_stream_selected_batch_io_required_failures++;
+                }
+                if (submitted || batch_io_required) {
+                    cuda_stream_selected_cache_invalidate();
+                    return 0;
+                }
+                g_stream_selected_batch_io_safe_fallbacks++;
+            }
+        } else {
+            g_stream_selected_batch_io_failures++;
+            if (batch_io_required) {
+                g_stream_selected_batch_io_required_failures++;
+                fprintf(stderr,
+                        "ds4: required CUDA selected batched I/O could not "
+                        "allocate its copy plan\n");
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
+            g_stream_selected_batch_io_safe_fallbacks++;
+        }
+    }
+
+    if (!copied) {
+        g_stream_selected_batch_io_legacy++;
+        for (uint32_t i = 0; i < compact_ids.size(); i++) {
+            const uint64_t expert = (uint32_t)compact_ids[i];
+            const uint64_t gate_src =
+                table->gate_offset + expert * table->gate_expert_bytes;
+            const uint64_t up_src =
+                table->up_offset + expert * table->gate_expert_bytes;
+            const uint64_t down_src =
+                table->down_offset + expert * table->down_expert_bytes;
+            const uint64_t gate_dst =
+                (uint64_t)i * table->gate_expert_bytes;
+            const uint64_t down_dst =
+                (uint64_t)i * table->down_expert_bytes;
+            if (!cuda_model_copy_to_device_streamed(
+                        g_stream_selected_cache.gate_ptr + gate_dst,
+                        table->model_map, table->model_size,
+                        gate_src, table->gate_expert_bytes,
+                        "stream gate expert copy") ||
+                !cuda_model_copy_to_device_streamed(
+                        g_stream_selected_cache.up_ptr + gate_dst,
+                        table->model_map, table->model_size,
+                        up_src, table->gate_expert_bytes,
+                        "stream up expert copy") ||
+                !cuda_model_copy_to_device_streamed(
+                        g_stream_selected_cache.down_ptr + down_dst,
+                        table->model_map, table->model_size,
+                        down_src, table->down_expert_bytes,
+                        "stream down expert copy")) {
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
+        }
+        if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
+                                slot_ids.data(),
+                                (size_t)slot_count * sizeof(int32_t),
+                                cudaMemcpyHostToDevice),
+                     "stream selected-id remap copy")) {
             cuda_stream_selected_cache_invalidate();
             return 0;
         }
-    }
-    if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
-                            slot_ids.data(),
-                            (size_t)slot_count * sizeof(int32_t),
-                            cudaMemcpyHostToDevice),
-                 "stream selected-id remap copy")) {
-        cuda_stream_selected_cache_invalidate();
-        return 0;
     }
 
     g_stream_selected_cache.logical_tier = logical_tier;

@@ -285,6 +285,37 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+typedef struct ds4_cuda_stream_selected_batch_io_report {
+    uint64_t candidates;
+    uint64_t attempts;
+    uint64_t completed;
+    uint64_t legacy_batches;
+    uint64_t safe_fallbacks;
+    uint64_t failures;
+    uint64_t required_failures;
+    uint64_t oracle_runs;
+    uint64_t oracle_failures;
+    uint64_t tasks;
+    uint64_t segments;
+    uint64_t reads;
+    uint64_t bytes;
+    int enabled;
+    int required;
+    int oracle;
+} ds4_cuda_stream_selected_batch_io_report;
+/* CUDA-only policy/planner/scatter hooks.  The policy hook takes explicit
+ * values so tests do not need to mutate process environment around once_flag
+ * initialization. */
+int ds4_cuda_test_stream_selected_batch_policy(
+        int enable, int disable, int require, int oracle,
+        int *enabled_out, int *required_out, int *oracle_out);
+int ds4_cuda_test_stream_selected_batch_env_value(const char *value);
+int ds4_cuda_test_stream_selected_batch_plan(void);
+int ds4_cuda_test_stream_selected_batch_copy(void);
+void ds4_cuda_stream_selected_batch_io_get_report(
+        ds4_cuda_stream_selected_batch_io_report *report);
+#endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
