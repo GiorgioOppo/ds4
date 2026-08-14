@@ -77,6 +77,76 @@ int main(void) {
               1, 1, 1, 1, &enabled, &required, &oracle) &&
           enabled == 0 && required == 0 && oracle == 0,
           "selected-expert event-pipeline disable-dominant policy");
+    int stats = -1;
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_policy(
+              1, 0, 0, 0, &enabled, &required, &stats) &&
+          enabled == 1 && required == 0 && stats == 0,
+          "IQ2 SSD grouped-MMQ enable policy");
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_policy(
+              0, 0, 1, 1, &enabled, &required, &stats) &&
+          enabled == 1 && required == 1 && stats == 1,
+          "IQ2 SSD grouped-MMQ require and stats policy");
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_policy(
+              1, 1, 1, 1, &enabled, &required, &stats) &&
+          enabled == 0 && required == 0 && stats == 0,
+          "IQ2 SSD grouped-MMQ disable-dominant policy");
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_eligibility(
+              1, 1, 1, 1, 0, 0, 0, 1,
+              32u, 6u, 1, 1, 1),
+          "IQ2 SSD grouped-MMQ canonical eligibility");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 1u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 31u, 6u, 1, 1, 1) &&
+          ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 1, 1, 1),
+          "IQ2 SSD grouped-MMQ REQUIRE candidate excludes decode/tail");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 5u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 0, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 1, 0, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 1, 1, 0),
+          "IQ2 SSD grouped-MMQ REQUIRE excludes non-candidate layouts");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               31u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               32u, 5u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               32u, 6u, 0, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 1, 0, 0, 1,
+               32u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 1, 1,
+               32u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               32u, 6u, 1, 1, 0),
+          "IQ2 SSD grouped-MMQ exclusion matrix");
+    const uint64_t iq2_row = 16u * 66u;
+    const uint64_t iq2_expert = 2048u * iq2_row;
+    const uint64_t q2_row = 8u * 84u;
+    const uint64_t q2_expert = 4096u * q2_row;
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+              16u, 10u, iq2_expert, iq2_row,
+              q2_expert, q2_row, 4096u, 2048u, 4096u),
+          "IQ2 SSD grouped-MMQ canonical raw layout");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+               12u, 10u, iq2_expert, iq2_row,
+               q2_expert, q2_row, 4096u, 2048u, 4096u) &&
+          !ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+               16u, 10u, iq2_expert, iq2_row + 2u,
+               q2_expert, q2_row, 4096u, 2048u, 4096u) &&
+          !ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+               16u, 10u, iq2_expert, iq2_row,
+               q2_expert + 84u, q2_row, 4096u, 2048u, 4096u),
+          "IQ2 SSD grouped-MMQ raw-layout rejection matrix");
     CHECK(ds4_cuda_test_stream_selected_batch_plan(),
           "selected-expert batched-I/O planner");
 
@@ -90,6 +160,18 @@ int main(void) {
     }
 
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
+    ds4_cuda_iq2_ssd_grouped_report lease_before;
+    memset(&lease_before, 0, sizeof(lease_before));
+    ds4_cuda_iq2_ssd_grouped_get_report(&lease_before);
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_lease(),
+          "IQ2 SSD compact-binding consume/reuse lease oracle");
+    ds4_cuda_iq2_ssd_grouped_report lease_after;
+    memset(&lease_after, 0, sizeof(lease_after));
+    ds4_cuda_iq2_ssd_grouped_get_report(&lease_after);
+    CHECK(lease_after.lease_records > lease_before.lease_records &&
+          lease_after.lease_waits > lease_before.lease_waits &&
+          lease_after.lease_drains > lease_before.lease_drains,
+          "IQ2 SSD compact-binding lease coverage counters");
     CHECK(ds4_cuda_test_stream_selected_event_pipeline(),
           "selected-expert compute/readback/upload event ordering oracle");
     ds4_cuda_stream_selected_event_pipeline_report event_report;
