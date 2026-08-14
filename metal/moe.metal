@@ -8188,8 +8188,7 @@ kernel void kernel_mul_mm_id_map0(
     const short ide = tpitg;
 
     uint32_t n_all = 0;
-
-    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+    device int32_t * ids_i32 = (device int32_t *) hids;
 
     for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
         if (i21 + tpitg < args.ne21) {
@@ -8212,36 +8211,81 @@ kernel void kernel_mul_mm_id_map0(
 
             threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
 
-            short sel = 0;
+            uint32_t matches = 0;
             #pragma unroll(ne20)
             for (short i20 = 0; i20 < ne20; i20++) {
-                sel += (sids[i20] == ide)*(i20 + 1);
+                matches += sids[i20] == ide;
             }
-
-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
-
-            n_all += sel > 0;
+            n_all += matches;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    /* Store a packed route list, not a fixed n_tokens slice per expert.  A
+     * malformed/synthetic top-k list may select the same expert in multiple
+     * slots of one token.  The historical `sel += slot + 1` collapsed those
+     * routes and could even point at a different slot.  Counting every match
+     * and assigning prefix-sum ranges preserves the original (token, slot)
+     * identity while keeping total storage bounded by ne21 * ne20. */
+    threadgroup uint32_t * route_counts =
+        (threadgroup uint32_t *) shmem;
+    route_counts[ide] = n_all;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint32_t route_base = 0;
+    for (ushort i = 0; i < ide; i++) {
+        route_base += route_counts[i];
+    }
+    uint32_t tile_base = 0;
+    for (ushort i = 0; i < ide; i++) {
+        tile_base += (route_counts[i] + 31u) / 32u;
+    }
+
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
-    tpe_u32[ide] = n_all;
+    tpe_u32[2u*ide + 0u] = n_all;
+    tpe_u32[2u*ide + 1u] = route_base;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint32_t route = 0;
+    for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
+        if (i21 + tpitg < args.ne21) {
+            device const int32_t * src2_i32 =
+                (device const int32_t *)(src2 +
+                    (i21 + tpitg)*args.nb21);
+            threadgroup uint16_t * sids =
+                (threadgroup uint16_t *) shmem + tpitg*ne20;
+
+            #pragma unroll(ne20)
+            for (short i20 = 0; i20 < ne20; i20++) {
+                sids[i20] = src2_i32[i20];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short t = 0; t < ntg; t++) {
+            if (i21 + t >= args.ne21) break;
+            threadgroup const uint16_t * sids =
+                (threadgroup const uint16_t *) shmem + t*ne20;
+
+            #pragma unroll(ne20)
+            for (short i20 = 0; i20 < ne20; i20++) {
+                if (sids[i20] == ide) {
+                    ids_i32[route_base + route++] =
+                        (i21 + t)*ne20 + i20;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     // Reuse the route-id staging memory after the map is complete to build a
     // compact list of non-empty 32-row matmul tiles. The old dispatch covered
     // every possible token tile for every expert, even though most experts
     // receive only a small fraction of the prompt rows.
-    threadgroup uint16_t * tile_counts = (threadgroup uint16_t *) shmem;
     const uint16_t n_tiles = (uint16_t)((n_all + 31u) / 32u);
-    tile_counts[ide] = n_tiles;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint32_t tile_base = 0;
-    for (ushort i = 0; i < ide; i++) {
-        tile_base += tile_counts[i];
-    }
 
     device uint32_t * work_count = (device uint32_t *) work;
     device uint2 * work_items = (device uint2 *)(work + 8);
@@ -8285,8 +8329,8 @@ kernel void kernel_mul_mm_id_map_scatter_work(
         ushort   ntg[[threads_per_threadgroup]]) {
     threadgroup atomic_uint * counts =
         (threadgroup atomic_uint *) shmem;
-    threadgroup uint16_t * tile_counts =
-        (threadgroup uint16_t *)(shmem +
+    threadgroup uint32_t * route_bases =
+        (threadgroup uint32_t *)(shmem +
             (uint32_t)args.ne02*sizeof(uint32_t));
     device uint32_t * tpe_u32 = (device uint32_t *) htpe;
     device int32_t * ids_i32 = (device int32_t *) hids;
@@ -8307,32 +8351,56 @@ kernel void kernel_mul_mm_id_map_scatter_work(
                 continue;
             }
 
-            const uint32_t row = atomic_fetch_add_explicit(
-                counts + expert, 1u, memory_order_relaxed);
-            // Production top-k selections are unique. Keep malformed or
-            // synthetic duplicates from exceeding the fixed expert slice.
-            if (row < (uint32_t)args.ne21) {
-                ids_i32[(uint32_t)expert*args.ne21 + row] =
-                    i21*ne20 + i20;
-            }
+            atomic_fetch_add_explicit(counts + expert,
+                                      1u,
+                                      memory_order_relaxed);
         }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const short ide = tpitg;
-    const uint32_t n_all = min(
-        atomic_load_explicit(counts + ide, memory_order_relaxed),
-        (uint32_t)args.ne21);
-    tpe_u32[ide] = n_all;
-
-    const uint16_t n_tiles = (uint16_t)((n_all + 31u) / 32u);
-    tile_counts[ide] = n_tiles;
+    const uint32_t n_all =
+        atomic_load_explicit(counts + ide, memory_order_relaxed);
+    uint32_t route_base = 0;
+    for (ushort i = 0; i < ide; i++) {
+        route_base += atomic_load_explicit(counts + i,
+                                           memory_order_relaxed);
+    }
+    tpe_u32[2u*ide + 0u] = n_all;
+    tpe_u32[2u*ide + 1u] = route_base;
+    route_bases[ide] = route_base;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    /* Reuse the counters as per-expert write cursors for a second, stable-ABI
+     * scatter.  The packed ranges have room for every route, including
+     * repeated expert IDs in different top-k slots. */
+    atomic_store_explicit(counts + ide, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i21 = tpitg; i21 < args.ne21; i21 += ntg) {
+        device const int32_t * src2_i32 =
+            (device const int32_t *)(src2 + i21*args.nb21);
+
+        #pragma unroll(ne20)
+        for (short i20 = 0; i20 < ne20; i20++) {
+            const int32_t expert = src2_i32[i20];
+            if ((uint32_t)expert >= (uint32_t)args.ne02) continue;
+            const uint32_t row = atomic_fetch_add_explicit(
+                counts + expert, 1u, memory_order_relaxed);
+            const uint32_t base = route_bases[(uint32_t)expert];
+            ids_i32[base + row] = i21*ne20 + i20;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint16_t n_tiles = (uint16_t)((n_all + 31u) / 32u);
     uint32_t tile_base = 0;
     for (ushort i = 0; i < ide; i++) {
-        tile_base += tile_counts[i];
+        const uint32_t count_i =
+            atomic_load_explicit(counts + i, memory_order_relaxed);
+        tile_base += (count_i + 31u) / 32u;
     }
 
     device uint32_t * work_count = (device uint32_t *) work;
@@ -8396,7 +8464,8 @@ kernel void kernel_mul_mm_id(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -8415,7 +8484,7 @@ kernel void kernel_mul_mm_id(
          * the downstream swiglu/sum stages stay unchanged. Each (token,slot)
          * row belongs to exactly one expert, so nothing else writes them. */
         for (short j = sgitg; j < nr1; j += 4) {
-            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const int idj = ids_i32[route_base + r1 + j];
 
             const short ide = idj % args.ne20;
             const short idt = idj / args.ne20;
@@ -8436,7 +8505,7 @@ kernel void kernel_mul_mm_id(
 
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -8570,7 +8639,7 @@ kernel void kernel_mul_mm_id(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = sgitg; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -8604,6 +8673,7 @@ kernel void kernel_mul_mm_id_addr(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const char * work,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -8620,14 +8690,31 @@ kernel void kernel_mul_mm_id_addr(
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + SA_BYTES);
 
-    const int im = tgpig.z;
+    // The SSD address table can contain hundreds of experts while a prompt
+    // routes only top-k rows per token.  Consume the compact non-empty tile
+    // list emitted by kernel_mul_mm_id_map0 instead of launching the full
+    // expert x token-tile Cartesian grid.
+    device const uint32_t * work_count =
+        (device const uint32_t *)work;
+    const uint32_t work_index = tgpig.x;
+    if (work_index >= work_count[0]) {
+        return;
+    }
+    device const uint2 * work_items =
+        (device const uint2 *)(work + 8);
+    const uint2 item = work_items[work_index];
+    const int im = (int)item.x;
+    if ((uint)im >= (uint)args.ne02) {
+        return;
+    }
     const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+    const int r1 = (int)item.y;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -8649,7 +8736,7 @@ kernel void kernel_mul_mm_id_addr(
 
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -8778,7 +8865,7 @@ kernel void kernel_mul_mm_id_addr(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = sgitg; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -8847,7 +8934,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -8867,7 +8955,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     const short il0 = (tiitg % NL0);
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -8987,7 +9075,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     const float c = act.clamp_value;
     for (short j = sgitg; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -9062,7 +9150,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
     if (r1 >= neh1) {
         return;
     }
@@ -9080,8 +9169,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     const short il0 = (tiitg % NL0);
     short il = il0;
 
-    const int id_b0 = ids_i32[im*args.ne21 + r1 + lr1_b0];
-    const int id_b1 = ids_i32[im*args.ne21 + r1 + lr1_b1];
+    const int id_b0 = ids_i32[route_base + r1 + lr1_b0];
+    const int id_b1 = ids_i32[route_base + r1 + lr1_b1];
 
     const short i11_b0 = (id_b0 % args.ne20) % args.ne11;
     const short i12_b0 = (id_b0 / args.ne20);
@@ -9211,7 +9300,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
 
     const float c = act.clamp_value;
     for (short j = sgitg; j < nr1; j += 2) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -9457,7 +9546,8 @@ kernel void kernel_mul_mm_id_mpp(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -9468,7 +9558,7 @@ kernel void kernel_mul_mm_id_mpp(
 
     if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
         for (short j = sgitg; j < nr1; j += 4) {
-            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const int idj = ids_i32[route_base + r1 + j];
             const short ide = idj % args.ne20;
             const short idt = idj / args.ne20;
             device float *D = (device float *)dst + r0 + ide*args.ne0 +
@@ -9484,7 +9574,7 @@ kernel void kernel_mul_mm_id_mpp(
     const short il0 = (tiitg % NL0);
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -9591,7 +9681,7 @@ kernel void kernel_mul_mm_id_mpp(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = tiitg/32; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
