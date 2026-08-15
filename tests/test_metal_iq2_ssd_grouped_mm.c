@@ -92,6 +92,9 @@ int ds4_gpu_test_iq2_stream_addr_mm_stats(
     uint64_t *candidate_calls, uint64_t *calls, uint64_t *tokens,
     uint64_t *rows, uint64_t *require_failures, uint32_t *min_tokens,
     uint32_t *max_tokens);
+int ds4_gpu_test_iq2_stream_addr_mm_policy(
+    int enable, int require, int disable, int material_ready,
+    int *requested_out, int *required_out);
 
 bool ds4_log_is_tty(FILE *fp) {
     (void)fp;
@@ -100,6 +103,43 @@ bool ds4_log_is_tty(FILE *fp) {
 
 static uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1u) / alignment * alignment;
+}
+
+static int check_grouped_mm_policy(void) {
+    int ok = 1;
+#define CHECK_POLICY(label, valid_expected, request_expected,                \
+                     require_expected, enable, require, disable, ready) do { \
+    int requested = -1;                                                      \
+    int required = -1;                                                       \
+    const int valid = ds4_gpu_test_iq2_stream_addr_mm_policy(                \
+        (enable), (require), (disable), (ready), &requested, &required);     \
+    const int case_ok = valid == (valid_expected) &&                         \
+        requested == (request_expected) && required == (require_expected);  \
+    fprintf(stderr,                                                          \
+            "IQ2 grouped-MM policy %-28s %s valid=%d request=%d "           \
+            "require=%d\n",                                                \
+            (label), case_ok ? "PASS" : "FAIL", valid, requested, required);\
+    ok = case_ok && ok;                                                      \
+} while (0)
+
+    /* Unset defaults: automatic selection, with fail-closed coverage only
+     * after the complete selected-address domain is materially ready. */
+    CHECK_POLICY("default-ready",       1, 1, 1, -1, -1, -1, 1);
+    CHECK_POLICY("default-small-cache", 1, 1, 0, -1, -1, -1, 0);
+
+    /* Value-aware rollback and explicit fallback controls. */
+    CHECK_POLICY("enable-zero",         1, 0, 0,  0, -1, -1, 1);
+    CHECK_POLICY("enable-one",          1, 1, 1,  1, -1, -1, 1);
+    CHECK_POLICY("require-zero",        1, 1, 0, -1,  0, -1, 1);
+    CHECK_POLICY("require-one-not-ready", 1, 1, 1, -1, 1, -1, 0);
+    CHECK_POLICY("require-over-enable-zero", 1, 1, 1, 0, 1, -1, 0);
+    CHECK_POLICY("disable-one",         1, 0, 0, -1, -1,  1, 1);
+    CHECK_POLICY("disable-zero",        1, 1, 1, -1, -1,  0, 1);
+    /* The explicit REQUIRE is retained so an eligible IQ2 prefill fails at
+     * the candidate boundary; unrelated shapes and short tails stay valid. */
+    CHECK_POLICY("require-disable-conflict", 1, 0, 1, -1, 1, 1, 1);
+#undef CHECK_POLICY
+    return ok;
 }
 
 static void fill_iq2(block_iq2_xxs *matrix, uint32_t salt,
@@ -221,7 +261,8 @@ static int run_once(
         uint32_t n_total_expert,
         const float *x,
         const int32_t *selected,
-        const float *weights) {
+        const float *weights,
+        bool allow_mid_f16) {
     const uint32_t tokens = result->tokens;
     const uint64_t x_count = (uint64_t)tokens * IN_DIM;
     const uint64_t route_count = (uint64_t)tokens * N_EXPERT;
@@ -286,7 +327,7 @@ static int run_once(
             n_total_expert, N_EXPERT, CLAMP, x_t, 0u, tokens,
             &mid_is_f16, false);
     }
-    if (ok && mid_is_f16) {
+    if (ok && mid_is_f16 && !allow_mid_f16) {
         fprintf(stderr,
                 "IQ2_XXS SSD grouped-MM oracle unexpectedly selected f16 mid\n");
         ok = 0;
@@ -446,17 +487,17 @@ static int run_pair(
                       model, model_size, gate_offset, up_offset,
                       down_offset, gate_expert_bytes, gate_row_bytes,
                       down_expert_bytes, down_row_bytes, n_total_expert,
-                      x, selected, weights);
+                      x, selected, weights, false);
 
     unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
-    setenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
-    setenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    unsetenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
     ds4_gpu_set_streaming_expert_cache_budget(cache_budget);
     ok = ok && run_once(candidate_name, &candidate,
                         model, model_size, gate_offset, up_offset,
                         down_offset, gate_expert_bytes, gate_row_bytes,
                         down_expert_bytes, down_row_bytes, n_total_expert,
-                        x, selected, weights);
+                        x, selected, weights, false);
     if (ok) ok = compare_results(name, &candidate, &control);
 
     result_free(&control);
@@ -503,6 +544,150 @@ static int check_mm_stats_delta(const char *name,
             (unsigned long long)tokens,
             (unsigned long long)rows,
             (unsigned long long)failures);
+    return ok;
+}
+
+static int check_implicit_require_fault(
+        const void *model,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        const float *x,
+        const int32_t *selected,
+        const float *weights) {
+    run_result result;
+    run_result tail_result;
+    memset(&result, 0, sizeof(result));
+    memset(&tail_result, 0, sizeof(tail_result));
+    if (!result_alloc(&result, 32u) || !result_alloc(&tail_result, 31u)) {
+        result_free(&result);
+        result_free(&tail_result);
+        return 0;
+    }
+
+    mm_stats_snapshot before;
+    mm_stats_snapshot after;
+    int ok = read_mm_stats(&before);
+    ds4_gpu_test_set_flags(
+        DS4_GPU_TEST_IQ2_SSD_GROUPED_PIPELINE_FAILURE);
+
+    unsetenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT);
+    const int default_failed = !run_once(
+        "default-fail-closed", &result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, false);
+
+    setenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM", "0", 1);
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT);
+    const int require_zero_fallback = run_once(
+        "require-zero-fallback", &result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, false);
+
+    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
+    setenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT);
+    const int disable_fallback = run_once(
+        "disable-fallback", &result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, false);
+
+    setenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT);
+    const int require_disable_failed = !run_once(
+        "require-disable-fail", &result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, false);
+
+    /* The automatic fail-closed arm must not turn a cache that cannot hold
+     * the complete expert domain into an error. Explicit REQUIRE remains
+     * strong for exactly that same materially-ineligible configuration. */
+    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT - 1u);
+    const int small_cache_fallback = run_once(
+        "small-cache-fallback", &result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, true);
+
+    setenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT - 1u);
+    const int small_cache_require_failed = !run_once(
+        "small-cache-require-fail", &result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, false);
+
+    /* A short final chunk is outside the grouped-MM candidate contract even
+     * with a full cache and the injected missing pipeline. It must retain the
+     * established path, including for the contradictory explicit controls. */
+    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT);
+    const int short_tail_fallback = run_once(
+        "short-tail-fallback", &tail_result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, false);
+
+    setenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    setenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT);
+    const int short_tail_conflict_fallback = run_once(
+        "short-tail-conflict-fallback", &tail_result, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        N_TOTAL_EXPERT, x, selected, weights, false);
+
+    ds4_gpu_test_set_flags(0);
+    unsetenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+    ok = read_mm_stats(&after) && ok;
+
+    const int monotonic =
+        after.candidate_calls >= before.candidate_calls &&
+        after.calls >= before.calls &&
+        after.require_failures >= before.require_failures;
+    const uint64_t candidate_delta = monotonic ?
+        after.candidate_calls - before.candidate_calls : UINT64_MAX;
+    const uint64_t call_delta = monotonic ?
+        after.calls - before.calls : UINT64_MAX;
+    const uint64_t failure_delta = monotonic ?
+        after.require_failures - before.require_failures : UINT64_MAX;
+    const int coverage_ok = monotonic && candidate_delta == 6u &&
+        call_delta == 0u && failure_delta == 3u;
+    ok = default_failed && require_zero_fallback && disable_fallback &&
+        require_disable_failed && small_cache_fallback &&
+        small_cache_require_failed && short_tail_fallback &&
+        short_tail_conflict_fallback && coverage_ok && ok;
+    fprintf(stderr,
+            "IQ2 grouped-MM implicit REQUIRE integration %s "
+            "default_fail=%d require0_fallback=%d disable_fallback=%d "
+            "require_disable_fail=%d small_fallback=%d "
+            "small_require_fail=%d tail_fallback=%d tail_conflict=%d "
+            "candidates=%llu calls=%llu require_failures=%llu\n",
+            ok ? "PASS" : "FAIL", default_failed, require_zero_fallback,
+            disable_fallback, require_disable_failed, small_cache_fallback,
+            small_cache_require_failed, short_tail_fallback,
+            short_tail_conflict_fallback,
+            (unsigned long long)candidate_delta,
+            (unsigned long long)call_delta,
+            (unsigned long long)failure_delta);
+    result_free(&result);
+    result_free(&tail_result);
     return ok;
 }
 
@@ -1186,6 +1371,8 @@ int main(void) {
         return 1;
     }
 
+    int ok = check_grouped_mm_policy();
+
     const uint64_t gate_row_bytes = sizeof(block_iq2_xxs);
     const uint64_t gate_expert_bytes = MID_DIM * gate_row_bytes;
     const uint64_t gate_tensor_bytes = N_TOTAL_EXPERT * gate_expert_bytes;
@@ -1221,7 +1408,7 @@ int main(void) {
         calloc((size_t)MAX_TOKENS * N_EXPERT, sizeof(int32_t));
     float *weights =
         calloc((size_t)MAX_TOKENS * N_EXPERT, sizeof(float));
-    int ok = x && selected && selected_duplicate && selected_hot && weights;
+    ok = x && selected && selected_duplicate && selected_hot && weights && ok;
     for (uint32_t token = 0; ok && token < MAX_TOKENS; token++) {
         for (uint32_t k = 0; k < IN_DIM; k++) {
             const int32_t v = (int32_t)((token * 17u + k * 11u +
@@ -1333,6 +1520,14 @@ int main(void) {
             (unsigned long long)require_failures,
             min_tokens, max_tokens);
     ok = stats_ok && counters_ok && ok;
+
+    if (backend_ready) {
+        const int policy_fault_ok = check_implicit_require_fault(
+            model, model_size, gate_offset, up_offset, down_offset,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+            down_row_bytes, x, selected, weights);
+        ok = policy_fault_ok && ok;
+    }
 
     if (backend_ready) {
         uint32_t hot_rows = 0;

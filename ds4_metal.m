@@ -2694,6 +2694,54 @@ static int ds4_gpu_env_bool(const char *name) {
     return 1;
 }
 
+/* IQ2_XXS/Q2_K SSD grouped address-MM is the production default.  Its
+ * implicit fail-closed arm is deliberately narrower than an explicit
+ * REQUIRE: it applies only after the complete selected-address domain is
+ * materially available.  This keeps byte/automatic cache budgets that cannot
+ * retain every expert on the established sparse-MV fallback.  ENABLE=0 and
+ * DISABLE=1 are rollback controls; REQUIRE=0 retains automatic selection but
+ * permits fallback, while explicit REQUIRE=1 remains strong. */
+static int ds4_gpu_iq2_stream_addr_mm_resolve_policy(
+        int  enable,
+        int  require,
+        int  disable,
+        int  material_ready,
+        int *requested_out,
+        int *required_out) {
+    if (!requested_out || !required_out) return 0;
+
+    const int explicitly_required = require == 1;
+    const int disabled = disable == 1;
+    if (disabled) {
+        *requested_out = 0;
+        *required_out = explicitly_required;
+        return 1;
+    }
+
+    const int requested = explicitly_required || enable != 0;
+    const int implicitly_required =
+        requested && require < 0 && material_ready != 0;
+    *requested_out = requested;
+    *required_out = explicitly_required || implicitly_required;
+    return 1;
+}
+
+/* Standalone policy hook: values use ds4_gpu_env_bool's -1/0/1 convention. */
+int ds4_gpu_test_iq2_stream_addr_mm_policy(
+        int  enable,
+        int  require,
+        int  disable,
+        int  material_ready,
+        int *requested_out,
+        int *required_out) {
+    return ds4_gpu_iq2_stream_addr_mm_resolve_policy(enable,
+                                                      require,
+                                                      disable,
+                                                      material_ready,
+                                                      requested_out,
+                                                      required_out);
+}
+
 static void ds4_gpu_iq2_stream_addr_mm_stats_reset(void) {
     g_iq2_stream_addr_mm_candidate_calls = 0;
     g_iq2_stream_addr_mm_calls = 0;
@@ -44796,18 +44844,28 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
 
         /* IQ2 grouped-MM controls are value-aware. The sparse address-MM
-         * path is the default for eligible IQ2_XXS/Q2_K SSD prefill;
-         * ENABLE=0 is the legacy-MV control, REQUIRE forces coverage, and
-         * the dedicated disable always wins. */
-        const bool require_iq2_batch_addr_mm =
-            ds4_gpu_env_bool("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM") == 1;
+         * path is automatic for eligible IQ2_XXS/Q2_K SSD prefill. Once the
+         * full selected-address domain is available, the automatic choice is
+         * fail-closed; smaller byte/automatic caches retain the sparse-MV
+         * fallback. Explicit REQUIRE is intentionally stronger. */
         const int enable_iq2_batch_addr_mm =
             ds4_gpu_env_bool("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
-        const bool disable_iq2_batch_addr_mm =
-            ds4_gpu_env_bool("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM") == 1;
-        const bool request_iq2_batch_addr_mm =
-            (enable_iq2_batch_addr_mm != 0 || require_iq2_batch_addr_mm) &&
-            !disable_iq2_batch_addr_mm;
+        const int require_iq2_batch_addr_mm_env =
+            ds4_gpu_env_bool("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
+        const int disable_iq2_batch_addr_mm =
+            ds4_gpu_env_bool("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+        int request_iq2_batch_addr_mm = 0;
+        int require_iq2_batch_addr_mm = 0;
+        if (!ds4_gpu_iq2_stream_addr_mm_resolve_policy(
+                enable_iq2_batch_addr_mm,
+                require_iq2_batch_addr_mm_env,
+                disable_iq2_batch_addr_mm,
+                use_iq2_batch_selected_addr,
+                &request_iq2_batch_addr_mm,
+                &require_iq2_batch_addr_mm)) {
+            fprintf(stderr, "ds4: invalid Metal IQ2_XXS SSD grouped-MM policy\n");
+            return 0;
+        }
         const bool iq2_batch_addr_mm_candidate =
             !force_resident && g_ssd_streaming_mode &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
@@ -44832,18 +44890,23 @@ int ds4_gpu_routed_moe_batch_tensor(
             iq2_batch_addr_mm_candidate &&
             use_iq2_batch_selected_addr;
         id<MTLComputePipelineState> iq2_gate_addr_mm_pipeline =
-            iq2_batch_addr_mm_policy ?
+            iq2_batch_addr_mm_policy &&
+            (g_test_flags &
+             DS4_GPU_TEST_IQ2_SSD_GROUPED_PIPELINE_FAILURE) == 0u ?
                 ds4_gpu_routed_mm_addr_pipeline(gate_type) : nil;
         id<MTLComputePipelineState> iq2_down_addr_mm_pipeline =
-            iq2_batch_addr_mm_policy ?
+            iq2_batch_addr_mm_policy &&
+            (g_test_flags &
+             DS4_GPU_TEST_IQ2_SSD_GROUPED_PIPELINE_FAILURE) == 0u ?
                 ds4_gpu_routed_mm_addr_pipeline(down_type) : nil;
         const bool use_iq2_batch_addr_mm =
             iq2_batch_addr_mm_policy &&
             iq2_gate_addr_mm_pipeline != nil &&
             iq2_down_addr_mm_pipeline != nil;
 
-        /* REQUIRE only asserts calls that satisfy the specialization's
-         * candidate contract; short final chunks keep the established path. */
+        /* Both explicit and materially-ready implicit REQUIRE only assert
+         * calls satisfying the specialization contract. Short final chunks
+         * keep the established path. */
         if (require_iq2_batch_addr_mm &&
             !disable_iq2_batch_addr_mm &&
             iq2_batch_addr_mm_candidate &&

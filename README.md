@@ -1068,6 +1068,22 @@ applies the same routed-prefill headroom before sizing the dynamic cache. Leave
 the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` only for measurements.
 
+For Metal IQ2_XXS/Q2_K models, eligible SSD prefill chunks automatically use
+grouped address matmuls when the dynamic cache can retain the complete expert
+domain. This includes normal 128-token chunks; the automatic range is 32–760
+tokens on the 256-expert Flash model and requires, for example,
+`--ssd-streaming-cache-experts 256`. Once that material condition is met,
+selection is fail-closed by default; no environment prefix is required. Set
+`DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM=0` or
+`DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM=1` for the legacy sparse-matvec
+rollback. `DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM=0` keeps automatic
+selection but permits a fallback, while explicit `REQUIRE=1` also rejects an
+insufficient cache. Combining `REQUIRE=1` with `DISABLE=1` fails on an eligible
+grouped-MM candidate, while short tail chunks retain their normal fallback. The
+IQ2 live cache index remains automatic for its production shape, selected-load
+early commit remains off unless explicitly enabled, and grouped-MM statistics
+plus streaming timing summaries remain opt-in diagnostics.
+
 ### Practical SSD streaming examples
 
 On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
