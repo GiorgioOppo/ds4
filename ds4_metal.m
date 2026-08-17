@@ -13169,6 +13169,22 @@ static int ds4_gpu_stream_expert_readahead_enabled(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
+static int ds4_gpu_stream_prefill_expert_readahead_enabled(
+        uint32_t n_tokens) {
+    /*
+     * The selected-batch prefill loader immediately follows this hint with
+     * parallel pread() calls for the exact same ranges.  On macOS,
+     * F_RDADVISE is costly enough that issuing both operations serially slows
+     * time-to-first-token.  Keep the hint for asynchronous decode loaders,
+     * but require an explicit opt-in for this immediate-pread path so the old
+     * policy remains available for cold-storage A/B tests.
+     */
+    if (!ds4_gpu_stream_expert_readahead_enabled()) return 0;
+    if (n_tokens < 32u) return 1;
+    return ds4_gpu_env_bool(
+            "DS4_METAL_ENABLE_STREAMING_PREFILL_EXPERT_READAHEAD") > 0;
+}
+
 static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
     if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
         return;
@@ -18676,12 +18692,14 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 
             const int force_reuse =
                 cache_budget != 0 && reserved_entries >= cache_budget;
-            ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u],
-                                                  down_expert_bytes);
+            if (ds4_gpu_stream_prefill_expert_readahead_enabled(n_tokens)) {
+                ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u],
+                                                      gate_expert_bytes);
+                ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u],
+                                                      gate_expert_bytes);
+                ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u],
+                                                      down_expert_bytes);
+            }
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
             const int prepared =
                 ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,

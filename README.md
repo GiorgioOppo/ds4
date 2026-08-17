@@ -939,7 +939,12 @@ insufficient cache. Combining `REQUIRE=1` with `DISABLE=1` fails on an eligible
 grouped-MM candidate, while short tail chunks retain their normal fallback. The
 IQ2 live cache index remains automatic for its production shape, selected-load
 early commit remains off unless explicitly enabled, and grouped-MM statistics
-plus streaming timing summaries remain opt-in diagnostics.
+plus streaming timing summaries remain opt-in diagnostics. The grouped prefill
+loader also skips `F_RDADVISE` for chunks of at least 32 tokens because it
+immediately reads the same expert ranges with parallel `pread`; short chunks
+retain the hint. Set
+`DS4_METAL_ENABLE_STREAMING_PREFILL_EXPERT_READAHEAD=1` to restore the old
+hint-plus-read sequence for cold-storage A/B tests.
 
 ### Practical SSD streaming examples
 
