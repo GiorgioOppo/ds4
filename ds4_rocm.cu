@@ -124,6 +124,8 @@ typedef struct {
 
 #include "rocm/ds4_rocm_moe.cuh"
 
+#include "rocm/ds4_rocm_q4.cuh"
+
 #include "rocm/ds4_rocm_moe_launch.cuh"
 
 #include "rocm/ds4_rocm_glm.cuh"
