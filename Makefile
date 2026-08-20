@@ -63,7 +63,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-exactn-oracle test-metal-dspark-capture test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-cuda test-mmq-parity-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-strix-rocm-q4-parity test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-exactn-oracle test-metal-dspark-capture test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-cuda test-mmq-parity-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -81,7 +81,8 @@ help:
 	@echo "  make test-metal-dspark-capture  Check fused DSpark HC capture bitwise"
 	@echo "  make test-metal-iq2-midonly  Check M1 IQ2 addr mid-only output and sentinels"
 	@echo "  make test-metal-iq2-live-index  Check IQ2 SSD live-cache index policy and fallback"
-	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair CPU-oracle tests (or SKIP without HIP)"
+	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
+	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
@@ -255,7 +256,8 @@ help:
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make test-mmq-parity-cuda CUDA_ARCH=sm_N  Run quantized CUDA kernel parity tests"
-	@echo "  make test-rocm-q4-parity        Run ROCm Q4_K dense/pair CPU-oracle tests"
+	@echo "  make test-rocm-q4-parity        Run ROCm Q4_K dense/pair/prefill oracle"
+	@echo "  make test-strix-rocm-q4-prefill Require gfx1151 and run tiled-prefill oracle"
 	@echo "  make test-strix-rocm-q4-parity  Require a visible gfx1151 device and run the Q4 tests"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
@@ -501,10 +503,10 @@ test-rocm-q4-parity:
 	rocm_test_probe="$${rocm_test_hipcc%% *}"; \
 	if [ -z "$$rocm_test_probe" ] || ! command -v "$$rocm_test_probe" >/dev/null 2>&1; then \
 		if [ -n "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" ] && [ "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" != "0" ]; then \
-			echo "ROCm Q4 dense/pair oracle: FAIL (hipcc not found, device required)"; \
+			echo "ROCm Q4 dense/pair/prefill oracle: FAIL (hipcc not found, device required)"; \
 			exit 1; \
 		fi; \
-		echo "ROCm Q4 dense/pair oracle: SKIP (hipcc not found)"; exit 0; \
+		echo "ROCm Q4 dense/pair/prefill oracle: SKIP (hipcc not found)"; exit 0; \
 	fi; \
 	$(MAKE) --no-print-directory tests/test_rocm_q4_dense_pair HIPCC="$$rocm_test_hipcc" || exit $$?; \
 	if [ -n "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" ] && [ "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" != "0" ]; then \
@@ -516,7 +518,7 @@ test-rocm-q4-parity:
 	fi; \
 	rc=$$?; \
 	if [ $$rc -eq 77 ]; then \
-		echo "ROCm Q4 dense/pair oracle: SKIP (no visible HIP device)"; \
+		echo "ROCm Q4 dense/pair/prefill oracle: SKIP (no visible HIP device)"; \
 		exit 0; \
 	fi; \
 	exit $$rc
@@ -527,8 +529,19 @@ test-rocm-q4-dense:
 test-rocm-q4-pair:
 	$(MAKE) --no-print-directory test-rocm-q4-parity ROCM_Q4_TEST_ARGS=--pair
 
+test-rocm-q4-prefill:
+	$(MAKE) --no-print-directory test-rocm-q4-parity ROCM_Q4_TEST_ARGS=--prefill
+
 test-strix-rocm-q4-parity:
 	$(MAKE) --no-print-directory -B test-rocm-q4-parity ROCM_ARCH=gfx1151 DS4_TEST_REQUIRE_ROCM_DEVICE=1
+
+test-strix-rocm-q4-prefill:
+	$(MAKE) --no-print-directory -B test-rocm-q4-parity ROCM_ARCH=gfx1151 \
+		DS4_TEST_REQUIRE_ROCM_DEVICE=1 ROCM_Q4_TEST_ARGS=--prefill
+
+test-strix-rocm-q4-prefill-long:
+	$(MAKE) --no-print-directory -B test-rocm-q4-parity ROCM_ARCH=gfx1151 \
+		DS4_TEST_REQUIRE_ROCM_DEVICE=1 ROCM_Q4_TEST_ARGS=--prefill-long
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
