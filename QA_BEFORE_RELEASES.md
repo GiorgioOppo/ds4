@@ -327,15 +327,16 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   machine. Treat the FlashAttention memo rows as host-dispatch A/B tests: the
   selected specialization and output must remain identical, and any timing
   comparison must use repeated warm runs.
-- For the M1 IQ2 address-table mid-only experiment, first run
+- For the default M1 IQ2 address-table mid-only path, first run
   `make test-metal-iq2-midonly`. It must cover 12,288 full-shape top-6 mid
   words in both unmasked and complementary masked address-table modes with
   both mid mismatch counters at zero, no canonical unwritten rows, zero
   candidate gate/up writes, and zero guard mismatches. Then use the same greedy
   IQ2_XXS/Q2_K SSD-streaming model, prompt, cache state, and token count for
-  three decode runs: leave both switches unset for the canonical control, set
-  `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` for the fail-closed candidate, and set both enable
-  and `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` for the kill-switch fallback.
+  three decode runs: leave all switches unset for the automatic candidate,
+  set `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` for fail-closed coverage, and set
+  `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` for the canonical control and
+  kill-switch fallback.
   Enable the routed-MoE stage profiler on one candidate layer and require path
   `iq2_stream_addr_mid_only_4096x2048` or
   `iq2_stream_addr_mask_mid_only_4096x2048`; absence of both is failed model
@@ -808,6 +809,20 @@ a substitute for CUDA or Metal release testing.
 - Do not use the mixed q2-q4 or Q4 Flash GGUFs for routine Strix Halo QA yet.
   They are dangerous on this machine for now because the ROCm path can hit
   system OOM instead of failing cleanly.
+- When ROCm Q4 code changes, run `make test-strix-rocm-q4-parity` and
+  `make test-strix-rocm-q4-prefill` before attempting a model. The prefill
+  oracle must compare the TILE8 default with
+  `DS4_ROCM_DISABLE_Q4_PREFILL_TILE8=1` at K=256, 1024, and 4096 and at token
+  counts covering a partial tile and the 128-token production chunk. Require
+  bitwise dense, pair, Q4-attention-B, and Q8-attention-B parity with intact
+  canaries. A REQUIRE-plus-DISABLE arm must fail before modifying output.
+- Keep ROCm grouped attention-A decode opt-in until a model A/B wins. Its
+  fail-closed test uses `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A=1`,
+  `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A=1`, and
+  `DS4_ROCM_Q4_GROUPED_ATTN_A_STATS=1`; require dispatches and groups above
+  zero, with zero fallbacks/failures and bitwise equality to the per-group
+  reference. This synthetic coverage does not supersede the Q4-model OOM
+  warning above.
 - Run a short CLI prompt:
   `./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --ctx 4096 --nothink -p "Reply with exactly: OK"`.
 - For DeepSeek Flash decode, confirm the default path uses prequantized Q8

@@ -349,6 +349,19 @@ static uint64_t g_q8_fold_oracle_aligned_iq2_calls;
 static uint64_t g_q8_fold_oracle_skips;
 static int g_q8_fold_oracle_report_registered;
 
+static cudaError_t ds4_mmq_q8_fold_oracle_free(
+        void *ptr, const char *label, cudaError_t prior_err) {
+    if (!ptr) return prior_err;
+    const cudaError_t free_err = cudaFree(ptr);
+    if (free_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q8_1 fold oracle cudaFree(%s) failed: %s\n",
+                label, cudaGetErrorString(free_err));
+        if (prior_err == cudaSuccess) return free_err;
+    }
+    return prior_err;
+}
+
 static void ds4_mmq_q8_fold_oracle_report(void) {
     fprintf(stderr,
             "ds4: CUDA Q8_1 fold oracle: byte_calls=%llu "
@@ -431,7 +444,9 @@ static bool ds4_mmq_q8_fold_oracle_bytes(
                                cudaMemcpyDeviceToHost) == cudaSuccess;
     if (!setup_ok) {
         (void)cudaGetLastError();
-        (void)cudaFree(fresh);
+        cudaError_t cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            fresh, "byte-fresh", cudaSuccess);
+        if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
         free(host);
         g_q8_fold_oracle_skips++;
         return false;
@@ -444,14 +459,22 @@ static bool ds4_mmq_q8_fold_oracle_bytes(
                             cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
             cudaStreamSynchronize(stream) != cudaSuccess) {
             (void)cudaGetLastError();
-            (void)cudaFree(fresh);
+            cudaError_t cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "byte-fresh", cudaSuccess);
+            if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
             free(host);
             g_q8_fold_oracle_skips++;
             return false;
         }
     }
-    (void)cudaFree(fresh);
+    cudaError_t cleanup_err = ds4_mmq_q8_fold_oracle_free(
+        fresh, "byte-fresh", cudaSuccess);
     free(host);
+    if (cleanup_err != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
     return true;
 }
 
@@ -4745,9 +4768,14 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
             fresh && reference && mismatch_device;
         if (!allocated) {
             (void)cudaGetLastError();
-            if (fresh) (void)cudaFree(fresh);
-            if (reference) (void)cudaFree(reference);
-            if (mismatch_device) (void)cudaFree(mismatch_device);
+            cudaError_t cleanup_err = cudaSuccess;
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "raw-moe-fresh", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "raw-moe-reference", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "raw-moe-mismatch", cleanup_err);
+            if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
             g_q8_fold_oracle_skips++;
         } else {
             cudaError_t oracle_err = cudaMemsetAsync(
@@ -4800,9 +4828,12 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
             if (oracle_err == cudaSuccess) {
                 oracle_err = cudaStreamSynchronize(stream);
             }
-            (void)cudaFree(fresh);
-            (void)cudaFree(reference);
-            (void)cudaFree(mismatch_device);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "raw-moe-fresh", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "raw-moe-reference", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "raw-moe-mismatch", oracle_err);
             if (oracle_err != cudaSuccess) {
                 (void)cudaGetLastError();
                 g_q8_fold_oracle_skips++;
@@ -5227,9 +5258,14 @@ static int q8_fold_q8_aligned_output_oracle(
         cudaMalloc((void **)&mismatch_device, sizeof(uint32_t)) != cudaSuccess ||
         !fresh || !reference || !mismatch_device) {
         (void)cudaGetLastError();
-        if (fresh) (void)cudaFree(fresh);
-        if (reference) (void)cudaFree(reference);
-        if (mismatch_device) (void)cudaFree(mismatch_device);
+        cudaError_t cleanup_err = cudaSuccess;
+        cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            fresh, "aligned-q8-fresh", cleanup_err);
+        cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            reference, "aligned-q8-reference", cleanup_err);
+        cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            mismatch_device, "aligned-q8-mismatch", cleanup_err);
+        if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
         g_q8_fold_oracle_skips++;
         return 0;
     }
@@ -5269,9 +5305,12 @@ static int q8_fold_q8_aligned_output_oracle(
     }
     if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
 
-    (void)cudaFree(fresh);
-    (void)cudaFree(reference);
-    (void)cudaFree(mismatch_device);
+    err = ds4_mmq_q8_fold_oracle_free(
+        fresh, "aligned-q8-fresh", err);
+    err = ds4_mmq_q8_fold_oracle_free(
+        reference, "aligned-q8-reference", err);
+    err = ds4_mmq_q8_fold_oracle_free(
+        mismatch_device, "aligned-q8-mismatch", err);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         g_q8_fold_oracle_skips++;
@@ -5839,9 +5878,14 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
             fresh && reference && mismatch_device;
         if (!allocated) {
             (void)cudaGetLastError();
-            if (fresh) (void)cudaFree(fresh);
-            if (reference) (void)cudaFree(reference);
-            if (mismatch_device) (void)cudaFree(mismatch_device);
+            cudaError_t cleanup_err = cudaSuccess;
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "aligned-iq2-fresh", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "aligned-iq2-reference", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "aligned-iq2-mismatch", cleanup_err);
+            if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
             g_q8_fold_oracle_skips++;
         } else {
             cudaError_t oracle_err = cudaMemsetAsync(
@@ -5887,9 +5931,12 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
             if (oracle_err == cudaSuccess) {
                 oracle_err = cudaStreamSynchronize(stream);
             }
-            (void)cudaFree(fresh);
-            (void)cudaFree(reference);
-            (void)cudaFree(mismatch_device);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "aligned-iq2-fresh", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "aligned-iq2-reference", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "aligned-iq2-mismatch", oracle_err);
             if (oracle_err != cudaSuccess) {
                 (void)cudaGetLastError();
                 g_q8_fold_oracle_skips++;
