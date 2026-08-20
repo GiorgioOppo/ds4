@@ -36,6 +36,28 @@ __global__ static void rocm_matmul_q4_K_dense_kernel(
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
 }
 
+/* One independent activation row and Q4_K matrix per output group.  This is
+ * the canonical dense decode walk with only a group grid dimension added. */
+__global__ static void rocm_matmul_q4_K_dense_grouped_decode_kernel(
+        float *out, const char *w_base, const cuda_block_q8_K *xq,
+        uint64_t row_bytes, uint32_t xq_blocks, uint32_t out_dim,
+        uint32_t n_groups) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    const uint32_t group = blockIdx.z;
+    if (group >= n_groups || row >= out_dim) return;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)group * xq_blocks;
+    const cuda_block_q4_K *wr = reinterpret_cast<const cuda_block_q4_K *>(
+        w_base + ((uint64_t)group * out_dim + row) * row_bytes);
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0u) out[(uint64_t)group * out_dim + row] = acc;
+}
+
 /* Dense Q4_K prefill tile for RDNA/ROCm.
  *
  * The legacy kernel gives one eight-lane group a single (token,row) dot.  As
@@ -280,13 +302,14 @@ static int rocm_q4_K_dense_pair_requested(void) {
 static int rocm_q4_K_prefill_tile8_scope(uint64_t n_tok) {
     /* Keep decode/speculative micro-batches on the latency-oriented legacy
      * kernel.  4096 is DS4's largest supported prefill chunk and bounds the
-     * A/B surface while this path remains opt-in. */
+     * validated tiled-prefill surface. */
     return n_tok > 8u && n_tok <= 4096u;
 }
 
 static int rocm_q4_K_prefill_tile8_requested(void) {
-    return getenv("DS4_ROCM_ENABLE_Q4_PREFILL_TILE8") != NULL &&
-           getenv("DS4_ROCM_DISABLE_Q4_PREFILL_TILE8") == NULL;
+    /* TILE8 is the ROCm Q4 prefill default.  Keep the old ENABLE variable
+     * harmlessly compatible and retain one authoritative rollback switch. */
+    return getenv("DS4_ROCM_DISABLE_Q4_PREFILL_TILE8") == NULL;
 }
 
 static int rocm_q4_K_prefill_tile8_required(void) {
@@ -298,6 +321,43 @@ static uint64_t g_rocm_q4_prefill_tile8_pair_calls;
 static uint64_t g_rocm_q4_prefill_tile8_attention_batch_calls;
 static uint64_t g_rocm_q4_prefill_tile8_tokens;
 static int g_rocm_q4_prefill_tile8_report_registered;
+
+static uint64_t g_rocm_q4_grouped_attn_a_calls;
+static uint64_t g_rocm_q4_grouped_attn_a_dispatches;
+static uint64_t g_rocm_q4_grouped_attn_a_groups;
+static uint64_t g_rocm_q4_grouped_attn_a_fallbacks;
+static uint64_t g_rocm_q4_grouped_attn_a_failures;
+static int g_rocm_q4_grouped_attn_a_report_registered;
+
+static void rocm_q4_K_grouped_attn_a_report(void) {
+    fprintf(stderr,
+            "ds4: ROCm Q4_K grouped attention-A decode stats: "
+            "calls=%llu dispatches=%llu groups=%llu fallbacks=%llu failures=%llu\n",
+            (unsigned long long)g_rocm_q4_grouped_attn_a_calls,
+            (unsigned long long)g_rocm_q4_grouped_attn_a_dispatches,
+            (unsigned long long)g_rocm_q4_grouped_attn_a_groups,
+            (unsigned long long)g_rocm_q4_grouped_attn_a_fallbacks,
+            (unsigned long long)g_rocm_q4_grouped_attn_a_failures);
+}
+
+static int rocm_q4_K_grouped_attn_a_result(int rc, uint32_t n_groups) {
+    if (getenv("DS4_ROCM_Q4_GROUPED_ATTN_A_STATS") != NULL) {
+        if (!g_rocm_q4_grouped_attn_a_report_registered) {
+            g_rocm_q4_grouped_attn_a_report_registered = 1;
+            (void)atexit(rocm_q4_K_grouped_attn_a_report);
+        }
+        g_rocm_q4_grouped_attn_a_calls++;
+        if (rc > 0) {
+            g_rocm_q4_grouped_attn_a_dispatches++;
+            g_rocm_q4_grouped_attn_a_groups += n_groups;
+        } else if (rc < 0) {
+            g_rocm_q4_grouped_attn_a_failures++;
+        } else {
+            g_rocm_q4_grouped_attn_a_fallbacks++;
+        }
+    }
+    return rc;
+}
 
 static void rocm_q4_K_prefill_tile8_report(void) {
     fprintf(stderr,
@@ -502,6 +562,83 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
             reinterpret_cast<float *>(out1->ptr), w1, xq, row_bytes1,
             (uint32_t)blocks1, (uint32_t)out1_dim, (uint32_t)n_tok);
     return cuda_ok(cudaGetLastError(), "q4_K dense pair1 matmul launch");
+}
+
+extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t group0, uint32_t group_cnt,
+        const ds4_gpu_tensor *heads) {
+    const int disabled =
+        getenv("DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A") != NULL;
+    const int required =
+        getenv("DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A") != NULL;
+    const int enabled =
+        getenv("DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A") != NULL;
+    /* DISABLE is authoritative; REQUIRE reports that rollback as a failure
+     * instead of allowing the graph to false-green through its fallback. */
+    if (disabled) {
+        if (required) {
+            fprintf(stderr,
+                    "ds4: required ROCm Q4_K grouped attention-A decode "
+                    "is disabled\n");
+        }
+        return rocm_q4_K_grouped_attn_a_result(required ? -1 : 0, 0u);
+    }
+    if (!enabled && !required) {
+        return rocm_q4_K_grouped_attn_a_result(0, 0u);
+    }
+    const int pre_enqueue_failure = required ? -1 : 0;
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        group_cnt == 0u || group_dim > UINT32_MAX || rank > UINT32_MAX ||
+        group_cnt > UINT16_MAX || (group_dim % CUDA_QK_K) != 0u ||
+        group0 > UINT32_MAX - group_cnt) {
+        return rocm_q4_K_grouped_attn_a_result(pre_enqueue_failure, 0u);
+    }
+
+    const uint64_t blocks = group_dim / CUDA_QK_K;
+    uint64_t row_bytes = 0, group_weight_bytes = 0, group_skip = 0;
+    uint64_t selected_weight_bytes = 0, selected_offset = 0;
+    if (blocks == 0u ||
+        !cuda_u64_mul_checked(blocks, sizeof(cuda_block_q4_K), &row_bytes) ||
+        !cuda_u64_mul_checked(rank, row_bytes, &group_weight_bytes) ||
+        !cuda_u64_mul_checked(group0, group_weight_bytes, &group_skip) ||
+        !cuda_u64_mul_checked(group_cnt, group_weight_bytes,
+                              &selected_weight_bytes) ||
+        !cuda_u64_add_checked(out_a_offset, group_skip, &selected_offset) ||
+        !cuda_model_range_fits(model_size, selected_offset,
+                               selected_weight_bytes) ||
+        !cuda_tensor_has_elems2(heads, group_cnt, group_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(low, group_cnt, rank, sizeof(float))) {
+        return rocm_q4_K_grouped_attn_a_result(pre_enqueue_failure, 0u);
+    }
+
+    const char *w = cuda_model_range_ptr(
+        model_map, selected_offset, selected_weight_bytes,
+        "q4_K grouped attention output A decode");
+    cuda_block_q8_K *xq = rocm_q4_K_prequant_alloc(
+        group_cnt, blocks, "q4_K grouped attention output A decode prequant");
+    if (!w || !xq) {
+        return rocm_q4_K_grouped_attn_a_result(pre_enqueue_failure, 0u);
+    }
+
+    const dim3 qgrid((unsigned)blocks, group_cnt, 1u);
+    q8_K_quantize_kernel<<<qgrid, 256>>>(
+        xq, reinterpret_cast<const float *>(heads->ptr),
+        (uint32_t)group_dim, group_cnt);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4_K grouped attention output A decode quantize launch")) {
+        return rocm_q4_K_grouped_attn_a_result(-1, 0u);
+    }
+    const dim3 grid((unsigned)((rank - 1u) / 32u + 1u), 1u, group_cnt);
+    rocm_matmul_q4_K_dense_grouped_decode_kernel<<<grid, 256>>>(
+        reinterpret_cast<float *>(low->ptr), w, xq, row_bytes,
+        (uint32_t)blocks, (uint32_t)rank, group_cnt);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4_K grouped attention output A decode matmul launch")) {
+        return rocm_q4_K_grouped_attn_a_result(-1, 0u);
+    }
+    return rocm_q4_K_grouped_attn_a_result(1, group_cnt);
 }
 
 /* Quantize token-major [token][group][K] rows once, then apply group-major
