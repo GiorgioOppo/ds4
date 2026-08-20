@@ -64874,7 +64874,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
-#ifndef DS4_NO_GPU
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
 /* Small fail-closed policy shared by runtime admission and its test hook.
  * Detailed graph/layout checks remain below; this layer owns the externally
  * controllable arm and the state classes that must never reach multi-queue
