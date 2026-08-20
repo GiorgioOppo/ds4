@@ -10,16 +10,6 @@
 #include <random>
 #include <vector>
 
-extern "C" int ds4_cuda_q8_fold_take_q81(
-        const void *src, uint64_t in_dim, cudaStream_t stream,
-        const void **q81) {
-    (void)src;
-    (void)in_dim;
-    (void)stream;
-    if (q81) *q81 = nullptr;
-    return 0;
-}
-
 namespace {
 
 constexpr int QK = 32;

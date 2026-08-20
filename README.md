@@ -80,6 +80,8 @@ next sections.
   guide for contributors. **Read this before sending a pull request**.
 - [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
   matrix, including the remote Metal, CUDA, and ROCm machines.
+- [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md): curated rollback,
+  fail-closed, and diagnostic environment switches for Metal, CUDA, and ROCm.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
@@ -650,20 +652,21 @@ top-k implementation is now used instead and has no runtime re-enable switch.
 Use a previous binary only as a performance control, and require identical
 selected ids on tie-heavy inputs before comparing timing.
 
-Apple M1 has an opt-in SSD-streaming decode experiment for the exact
+Apple M1 defaults to a specialized SSD-streaming decode path for the exact
 IQ2_XXS/Q2_K routed-MoE shape with 256 experts, top-6 routing, and a
-4096-to-2048 gate/up projection. Set
-`DS4_METAL_ENABLE_M1_IQ2_MID_ONLY=1` to replace the IQ2 address-table
-pair-SwiGLU producer, including complementary resident/missing cache masks.
+4096-to-2048 gate/up projection. It replaces the IQ2 address-table pair-SwiGLU
+producer, including complementary resident/missing cache masks.
 It preserves the canonical dot-product,
 reduction, clamp, activation, and route-weight order but writes `mid` directly
 instead of materializing the otherwise unused gate/up rows. Every other
 device, shape, streaming mode, unsupported mask/accumulate mode, or unavailable
-pipeline keeps the canonical producer; `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` takes precedence as
-the kill switch. For fail-closed model coverage,
-`DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` implies the enable gate and rejects an
-ineligible supported address-table dispatch; the kill switch still takes
-precedence. `make test-metal-iq2-midonly` compares all 12,288 top-6
+pipeline keeps the canonical producer. Set
+`DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` to restore the canonical producer.
+For fail-closed model coverage, `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` rejects
+an ineligible supported address-table dispatch; the kill switch still takes
+precedence. The former `DS4_METAL_ENABLE_M1_IQ2_MID_ONLY=1` opt-in is accepted
+as a harmless compatibility setting because the path is now automatic.
+`make test-metal-iq2-midonly` compares all 12,288 top-6
 output words bitwise at full shape for both unmasked and complementary masked
 address tables, verifies that the candidates leave gate/up sentinels untouched,
 and checks output guards. The routed-MoE stage profiler reports
