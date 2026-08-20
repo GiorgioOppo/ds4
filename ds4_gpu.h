@@ -2656,6 +2656,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
+/* Q4_K grouped low projection: positive is success, zero is a clean
+ * pre-enqueue fallback, and negative is a required/possibly-enqueued failure. */
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,

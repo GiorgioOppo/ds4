@@ -42555,9 +42555,9 @@ extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         (int)rank, (int)group_dim, (int)group_cnt, stream);
     if (rc != 0) {
         /* NOT_APPLICABLE is pre-enqueue and cleanly retries the established
-         * per-group loop. A negative result may follow a launch; returning
-         * zero still avoids consuming a possibly incomplete candidate. */
-        return 0;
+         * per-group loop. A negative result may follow a launch and must
+         * propagate so the graph cannot replay work over a partial result. */
+        return rc < 0 ? -1 : 0;
     }
 
     if (!oracle) return 1;

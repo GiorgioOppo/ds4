@@ -27488,20 +27488,22 @@ static bool metal_graph_attention_output_dense_quant_low(
                                                       group_cnt,
                                                       heads) != 0;
     }
-    /* Specialized Q4_K low projection where the backend has it (Metal); a
-     * zero return (the CUDA/ROCm stub) falls through to the generic
-     * per-group dense-quant loop below instead of failing the layer. */
-    if (out_a->type == DS4_TENSOR_Q4_K &&
-        ds4_gpu_attention_output_low_q4_K_slice_tensor(low,
-                                                       model->map,
-                                                       model->size,
-                                                       out_a->abs_offset,
-                                                       group_dim,
-                                                       rank,
-                                                       group0,
-                                                       group_cnt,
-                                                       heads) != 0) {
-        return true;
+    /* Specialized Q4_K low projection where the backend has it.  Zero falls
+     * through to the generic per-group loop; a negative REQUIRE/error result
+     * fails closed after a backend may have submitted work. */
+    if (out_a->type == DS4_TENSOR_Q4_K) {
+        const int q4_slice_rc =
+            ds4_gpu_attention_output_low_q4_K_slice_tensor(low,
+                                                           model->map,
+                                                           model->size,
+                                                           out_a->abs_offset,
+                                                           group_dim,
+                                                           rank,
+                                                           group0,
+                                                           group_cnt,
+                                                           heads);
+        if (q4_slice_rc > 0) return true;
+        if (q4_slice_rc < 0) return false;
     }
     uint64_t row_bytes = 0;
     if (!metal_graph_dense_quant_row_bytes(out_a, group_dim, &row_bytes)) return false;

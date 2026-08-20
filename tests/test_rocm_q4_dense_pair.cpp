@@ -44,6 +44,11 @@ constexpr uint32_t kAttnRank = 32u;
 constexpr uint32_t kAttnGroups = 8u;
 constexpr uint32_t kAttnLowDim = kAttnGroups * kAttnRank;
 constexpr uint32_t kAttnOutDim = 65u;
+constexpr uint32_t kDecodeAttnGroupDim = 4096u;
+constexpr uint32_t kDecodeAttnRank = 1024u;
+constexpr uint32_t kDecodeAttnGroups = 8u;
+constexpr uint32_t kDecodeAttnLowDim =
+    kDecodeAttnGroups * kDecodeAttnRank;
 constexpr size_t kOutputGuardFloats = 257u;
 constexpr float kCpuAbsTolerance = 2.0e-3f;
 constexpr float kCpuRelTolerance = 3.0e-5f;
@@ -55,6 +60,14 @@ constexpr const char *kPrefillDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_TILE8";
 constexpr const char *kPrefillRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8";
+constexpr const char *kGroupedDecodeEnable =
+    "DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A";
+constexpr const char *kGroupedDecodeDisable =
+    "DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A";
+constexpr const char *kGroupedDecodeRequire =
+    "DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A";
+constexpr const char *kGroupedDecodeStats =
+    "DS4_ROCM_Q4_GROUPED_ATTN_A_STATS";
 
 struct block_q4_K_test {
     uint16_t d;
@@ -98,6 +111,7 @@ struct aligned_model {
     uint64_t weight0_offset = 0;
     uint64_t weight1_offset = 0;
     uint64_t attn_a_offset = 0;
+    uint64_t decode_attn_a_offset = 0;
     uint64_t attn_b_offset = 0;
     uint64_t attn_b_q8_offset = 0;
     uint64_t tail_k1024_offset = 0;
@@ -253,6 +267,12 @@ bool make_model(aligned_model *model) {
         (kAttnGroupDim / kQkK) * sizeof(block_q4_K_test);
     const uint64_t attn_a_bytes =
         (uint64_t)kAttnGroups * kAttnRank * attn_a_row_bytes;
+    const uint64_t decode_attn_a_row_bytes =
+        (kDecodeAttnGroupDim / kQkK) * sizeof(block_q4_K_test);
+    const uint64_t decode_attn_a_group_bytes =
+        (uint64_t)kDecodeAttnRank * decode_attn_a_row_bytes;
+    const uint64_t decode_attn_a_bytes =
+        (uint64_t)kDecodeAttnGroups * decode_attn_a_group_bytes;
     const uint64_t attn_b_row_bytes =
         (kAttnLowDim / kQkK) * sizeof(block_q4_K_test);
     const uint64_t attn_b_bytes =
@@ -268,8 +288,10 @@ bool make_model(aligned_model *model) {
     model->weight1_offset = round_up(weight0_bytes, page);
     model->attn_a_offset = round_up(
         model->weight1_offset + weight1_bytes, page);
-    model->attn_b_offset = round_up(
+    model->decode_attn_a_offset = round_up(
         model->attn_a_offset + attn_a_bytes, page);
+    model->attn_b_offset = round_up(
+        model->decode_attn_a_offset + decode_attn_a_bytes, page);
     model->tail_k1024_offset = round_up(
         model->attn_b_offset + attn_b_bytes, page);
     model->attn_b_q8_offset = round_up(
@@ -291,6 +313,13 @@ bool make_model(aligned_model *model) {
     fill_q4_rows(reinterpret_cast<block_q4_K_test *>(
                      model->data + model->attn_a_offset),
                  kAttnGroups * kAttnRank, kAttnGroupDim, 0x243f6a88u);
+    for (uint32_t group = 0; group < kDecodeAttnGroups; group++) {
+        fill_q4_rows(reinterpret_cast<block_q4_K_test *>(
+                         model->data + model->decode_attn_a_offset +
+                         (uint64_t)group * decode_attn_a_group_bytes),
+                     kDecodeAttnRank, kDecodeAttnGroupDim,
+                     0xd1b54a35u ^ (group * 0x9e3779b9u));
+    }
     fill_q4_rows(reinterpret_cast<block_q4_K_test *>(
                      model->data + model->attn_b_offset),
                  kAttnOutDim, kAttnLowDim, 0x85a308d3u);
@@ -635,8 +664,8 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
     env_snapshot disable(kPrefillDisable);
     env_snapshot require(kPrefillRequire);
 
-    // The authoritative rollback is the reference even after a future
-    // default-on promotion of the tiled path.
+    // The authoritative rollback remains the reference now that the tiled
+    // path is default-on.
     (void)unsetenv(kPrefillEnable);
     (void)setenv(kPrefillDisable, "1", 1);
     (void)unsetenv(kPrefillRequire);
@@ -644,9 +673,10 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
         legacy_gpu.ptr, model.data, model.size, offset, kQ4Type,
         in_dim, out_dim, x_gpu.ptr, n_tokens);
 
-    // REQUIRE makes a silently ineligible candidate a test failure instead
-    // of comparing the legacy kernel with itself.
-    (void)setenv(kPrefillEnable, "1", 1);
+    // TILE8 is default-on.  Leave the legacy ENABLE unset and use REQUIRE so
+    // a silently ineligible default cannot compare the legacy kernel with
+    // itself.
+    (void)unsetenv(kPrefillEnable);
     (void)unsetenv(kPrefillDisable);
     (void)setenv(kPrefillRequire, "1", 1);
     const int candidate_rc = ds4_gpu_matmul_quant_tensor(
@@ -706,13 +736,35 @@ bool run_prefill_gate_guards(const aligned_model &model) {
     env_snapshot enable(kPrefillEnable);
     env_snapshot disable(kPrefillDisable);
     env_snapshot require(kPrefillRequire);
+
+    /* REQUIRE with neither ENABLE nor DISABLE proves that TILE8 is selected
+     * by the default policy. */
+    (void)unsetenv(kPrefillEnable);
+    (void)unsetenv(kPrefillDisable);
+    (void)setenv(kPrefillRequire, "1", 1);
+    const int default_rc = ds4_gpu_matmul_quant_tensor(
+        out_gpu.ptr, model.data, model.size, model.weight1_offset, kQ4Type,
+        kK, kM1, x_gpu.ptr, n_tokens);
+    bool ok = default_rc != 0;
+    if (default_rc == 0) {
+        std::fprintf(stderr,
+                     "prefill default-on REQUIRE: expected success got=%d FAIL\n",
+                     default_rc);
+    }
+    std::vector<float> default_out(output_count);
+    if (!read_tensor(out_gpu.ptr, &default_out)) return false;
+    ok = output_guard_unchanged(
+             default_out, sentinel, (size_t)n_tokens * kM1,
+             "prefill default-on output canary") && ok;
+    if (!write_tensor(out_gpu.ptr, sentinel)) return false;
+
     (void)setenv(kPrefillEnable, "1", 1);
     (void)setenv(kPrefillDisable, "1", 1);
     (void)setenv(kPrefillRequire, "1", 1);
     const int rc = ds4_gpu_matmul_quant_tensor(
         out_gpu.ptr, model.data, model.size, model.weight1_offset, kQ4Type,
         kK, kM1, x_gpu.ptr, n_tokens);
-    bool ok = rc == 0;
+    ok = rc == 0 && ok;
     if (rc != 0) {
         std::fprintf(stderr,
                      "prefill DISABLE+REQUIRE: expected rc=0 got=%d FAIL\n",
@@ -768,7 +820,7 @@ bool run_prefill_pair_case(const aligned_model &model) {
 
     // The prefill pair is a distinct path: it must not depend on the legacy
     // decode-pair opt-in, whose <=8-token behavior is tested separately.
-    (void)setenv(kPrefillEnable, "1", 1);
+    (void)unsetenv(kPrefillEnable);
     (void)unsetenv(kPrefillDisable);
     (void)setenv(kPrefillRequire, "1", 1);
     (void)unsetenv("DS4_ROCM_ENABLE_Q4_DENSE_PAIR");
@@ -937,7 +989,7 @@ bool run_attention_prefill_case(const aligned_model &model,
         return false;
     }
 
-    (void)setenv(kPrefillEnable, "1", 1);
+    (void)unsetenv(kPrefillEnable);
     (void)unsetenv(kPrefillDisable);
     (void)setenv(kPrefillRequire, "1", 1);
     const int candidate_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
@@ -1020,6 +1072,227 @@ bool run_attention_prefill_case(const aligned_model &model,
     std::fprintf(stderr,
                  "%s: candidate_rc=%d rejected_rc=%d %s\n",
                  label, candidate_rc, rejected_rc, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_grouped_attention_decode_case(const aligned_model &model) {
+    const uint64_t row_bytes =
+        (kDecodeAttnGroupDim / kQkK) * sizeof(block_q4_K_test);
+    const uint64_t group_weight_bytes =
+        (uint64_t)kDecodeAttnRank * row_bytes;
+    const size_t heads_count =
+        (size_t)kDecodeAttnGroups * kDecodeAttnGroupDim;
+    const size_t logical_count = kDecodeAttnLowDim;
+    const size_t allocation_count = logical_count + kOutputGuardFloats;
+    std::vector<float> heads_host;
+    fill_activation(&heads_host, kDecodeAttnGroups, kDecodeAttnGroupDim);
+    const std::vector<float> sentinel = sentinel_values(allocation_count);
+
+    tensor_owner heads_gpu(heads_count * sizeof(float));
+    tensor_owner legacy_gpu(allocation_count * sizeof(float));
+    tensor_owner candidate_gpu(allocation_count * sizeof(float));
+    if (!heads_gpu.ptr || !legacy_gpu.ptr || !candidate_gpu.ptr ||
+        !write_tensor(heads_gpu.ptr, heads_host) ||
+        !write_tensor(legacy_gpu.ptr, sentinel) ||
+        !write_tensor(candidate_gpu.ptr, sentinel)) {
+        std::fprintf(stderr, "grouped attention-A decode: setup FAIL\n");
+        return false;
+    }
+
+    /* Eight standalone decode calls are the bitwise oracle.  Per-group seeds
+     * and activation rows make a wrong weight/input group immediately visible. */
+    for (uint32_t group = 0; group < kDecodeAttnGroups; group++) {
+        tensor_owner head_group(ds4_gpu_tensor_view(
+            heads_gpu.ptr,
+            (uint64_t)group * kDecodeAttnGroupDim * sizeof(float),
+            (uint64_t)kDecodeAttnGroupDim * sizeof(float)));
+        tensor_owner low_group(ds4_gpu_tensor_view(
+            legacy_gpu.ptr,
+            (uint64_t)group * kDecodeAttnRank * sizeof(float),
+            (uint64_t)kDecodeAttnRank * sizeof(float)));
+        if (!head_group.ptr || !low_group.ptr ||
+            ds4_gpu_matmul_quant_tensor(
+                low_group.ptr, model.data, model.size,
+                model.decode_attn_a_offset +
+                    (uint64_t)group * group_weight_bytes,
+                kQ4Type, kDecodeAttnGroupDim, kDecodeAttnRank,
+                head_group.ptr, 1u) == 0) {
+            std::fprintf(stderr,
+                         "grouped attention-A legacy group=%u FAIL\n", group);
+            return false;
+        }
+    }
+
+    env_snapshot enable(kGroupedDecodeEnable);
+    env_snapshot disable(kGroupedDecodeDisable);
+    env_snapshot require(kGroupedDecodeRequire);
+    env_snapshot stats(kGroupedDecodeStats);
+    (void)setenv(kGroupedDecodeStats, "1", 1);
+    (void)unsetenv(kGroupedDecodeEnable);
+    (void)unsetenv(kGroupedDecodeDisable);
+    (void)unsetenv(kGroupedDecodeRequire);
+
+    const int default_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
+        candidate_gpu.ptr, model.data, model.size,
+        model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+        0u, kDecodeAttnGroups, heads_gpu.ptr);
+    bool ok = default_rc == 0;
+    if (default_rc != 0) {
+        std::fprintf(stderr,
+                     "grouped attention-A default gate: expected rc=0 got=%d FAIL\n",
+                     default_rc);
+    }
+    ok = unchanged_after_rejected_call(
+             candidate_gpu.ptr, sentinel,
+             "grouped attention-A disabled-by-default preserves output") && ok;
+
+    (void)setenv(kGroupedDecodeEnable, "1", 1);
+    (void)setenv(kGroupedDecodeDisable, "1", 1);
+    const int disabled_only_rc =
+        ds4_gpu_attention_output_low_q4_K_slice_tensor(
+            candidate_gpu.ptr, model.data, model.size,
+            model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+            0u, kDecodeAttnGroups, heads_gpu.ptr);
+    if (disabled_only_rc != 0) {
+        std::fprintf(stderr,
+                     "grouped attention-A ENABLE+DISABLE: expected rc=0 got=%d FAIL\n",
+                     disabled_only_rc);
+        ok = false;
+    }
+    ok = unchanged_after_rejected_call(
+             candidate_gpu.ptr, sentinel,
+             "grouped attention-A DISABLE dominates ENABLE") && ok;
+
+    (void)setenv(kGroupedDecodeRequire, "1", 1);
+    const int disabled_rc =
+        ds4_gpu_attention_output_low_q4_K_slice_tensor(
+            candidate_gpu.ptr, model.data, model.size,
+            model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+            0u, kDecodeAttnGroups, heads_gpu.ptr);
+    if (disabled_rc != -1) {
+        std::fprintf(stderr,
+                     "grouped attention-A DISABLE+REQUIRE: expected rc=-1 got=%d FAIL\n",
+                     disabled_rc);
+        ok = false;
+    }
+    ok = unchanged_after_rejected_call(
+             candidate_gpu.ptr, sentinel,
+             "grouped attention-A DISABLE dominates REQUIRE") && ok;
+
+    (void)unsetenv(kGroupedDecodeDisable);
+    const int invalid_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
+        candidate_gpu.ptr, model.data, model.size, model.size - 16u,
+        kDecodeAttnGroupDim, kDecodeAttnRank, 0u, kDecodeAttnGroups,
+        heads_gpu.ptr);
+    if (invalid_rc != -1) {
+        std::fprintf(stderr,
+                     "grouped attention-A REQUIRE range guard: expected rc=-1 got=%d FAIL\n",
+                     invalid_rc);
+        ok = false;
+    }
+    ok = unchanged_after_rejected_call(
+             candidate_gpu.ptr, sentinel,
+             "grouped attention-A rejected range preserves output") && ok;
+
+    const int candidate_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
+        candidate_gpu.ptr, model.data, model.size,
+        model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+        0u, kDecodeAttnGroups, heads_gpu.ptr);
+    std::vector<float> legacy_host(allocation_count);
+    std::vector<float> candidate_host(allocation_count);
+    if (candidate_rc != 1 || !read_tensor(legacy_gpu.ptr, &legacy_host) ||
+        !read_tensor(candidate_gpu.ptr, &candidate_host)) {
+        std::fprintf(stderr,
+                     "grouped attention-A candidate dispatch/read rc=%d FAIL\n",
+                     candidate_rc);
+        return false;
+    }
+    ok = output_guard_unchanged(
+             legacy_host, sentinel, logical_count,
+             "grouped attention-A legacy output canary") && ok;
+    ok = output_guard_unchanged(
+             candidate_host, sentinel, logical_count,
+             "grouped attention-A candidate output canary") && ok;
+    legacy_host.resize(logical_count);
+    candidate_host.resize(logical_count);
+    ok = bitwise_equal(candidate_host, legacy_host,
+                       "grouped attention-A candidate vs 8 legacy calls") && ok;
+
+    /* A non-zero weight-group origin consumes a compact input/output slice.
+     * Reuse groups 3 and 4 from the full fixture to verify both the weight
+     * skip and local grouped layout. */
+    constexpr uint32_t subset_group0 = 3u;
+    constexpr uint32_t subset_group_cnt = 2u;
+    const size_t subset_logical_count =
+        (size_t)subset_group_cnt * kDecodeAttnRank;
+    const std::vector<float> subset_sentinel =
+        sentinel_values(subset_logical_count + kOutputGuardFloats);
+    tensor_owner subset_heads(ds4_gpu_tensor_view(
+        heads_gpu.ptr,
+        (uint64_t)subset_group0 * kDecodeAttnGroupDim * sizeof(float),
+        (uint64_t)subset_group_cnt * kDecodeAttnGroupDim * sizeof(float)));
+    tensor_owner subset_legacy(subset_sentinel.size() * sizeof(float));
+    tensor_owner subset_candidate(subset_sentinel.size() * sizeof(float));
+    if (!subset_heads.ptr || !subset_legacy.ptr || !subset_candidate.ptr ||
+        !write_tensor(subset_legacy.ptr, subset_sentinel) ||
+        !write_tensor(subset_candidate.ptr, subset_sentinel)) {
+        std::fprintf(stderr, "grouped attention-A subset: setup FAIL\n");
+        return false;
+    }
+    for (uint32_t i = 0; i < subset_group_cnt; i++) {
+        tensor_owner head_group(ds4_gpu_tensor_view(
+            subset_heads.ptr,
+            (uint64_t)i * kDecodeAttnGroupDim * sizeof(float),
+            (uint64_t)kDecodeAttnGroupDim * sizeof(float)));
+        tensor_owner low_group(ds4_gpu_tensor_view(
+            subset_legacy.ptr,
+            (uint64_t)i * kDecodeAttnRank * sizeof(float),
+            (uint64_t)kDecodeAttnRank * sizeof(float)));
+        if (!head_group.ptr || !low_group.ptr ||
+            ds4_gpu_matmul_quant_tensor(
+                low_group.ptr, model.data, model.size,
+                model.decode_attn_a_offset +
+                    (uint64_t)(subset_group0 + i) * group_weight_bytes,
+                kQ4Type, kDecodeAttnGroupDim, kDecodeAttnRank,
+                head_group.ptr, 1u) == 0) {
+            std::fprintf(stderr,
+                         "grouped attention-A subset legacy group=%u FAIL\n",
+                         subset_group0 + i);
+            return false;
+        }
+    }
+    const int subset_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
+        subset_candidate.ptr, model.data, model.size,
+        model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+        subset_group0, subset_group_cnt, subset_heads.ptr);
+    std::vector<float> subset_legacy_host(subset_sentinel.size());
+    std::vector<float> subset_candidate_host(subset_sentinel.size());
+    if (subset_rc != 1 ||
+        !read_tensor(subset_legacy.ptr, &subset_legacy_host) ||
+        !read_tensor(subset_candidate.ptr, &subset_candidate_host)) {
+        std::fprintf(stderr,
+                     "grouped attention-A subset dispatch/read rc=%d FAIL\n",
+                     subset_rc);
+        return false;
+    }
+    ok = output_guard_unchanged(
+             subset_legacy_host, subset_sentinel, subset_logical_count,
+             "grouped attention-A subset legacy canary") && ok;
+    ok = output_guard_unchanged(
+             subset_candidate_host, subset_sentinel, subset_logical_count,
+             "grouped attention-A subset candidate canary") && ok;
+    subset_legacy_host.resize(subset_logical_count);
+    subset_candidate_host.resize(subset_logical_count);
+    ok = bitwise_equal(
+             subset_candidate_host, subset_legacy_host,
+             "grouped attention-A subset group0=3 count=2 vs legacy") && ok;
+    std::fprintf(stderr,
+                 "grouped attention-A decode groups=8 K=4096 rank=1024: "
+                 "default=%d disabled=%d disabled_required=%d invalid=%d "
+                 "candidate=%d subset=%d %s\n",
+                 default_rc, disabled_only_rc, disabled_rc, invalid_rc,
+                 candidate_rc, subset_rc,
+                 ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -1156,25 +1429,36 @@ int main(int argc, char **argv) {
     bool run_dense = true;
     bool run_pair = true;
     bool run_prefill = true;
+    bool run_grouped_decode = true;
     bool run_prefill_long = false;
     if (argc == 2 && std::strcmp(argv[1], "--dense") == 0) {
         run_pair = false;
         run_prefill = false;
+        run_grouped_decode = false;
     } else if (argc == 2 && std::strcmp(argv[1], "--pair") == 0) {
         run_dense = false;
         run_prefill = false;
+        run_grouped_decode = false;
     } else if (argc == 2 && std::strcmp(argv[1], "--prefill") == 0) {
         run_dense = false;
         run_pair = false;
+        run_grouped_decode = false;
+    } else if (argc == 2 &&
+               std::strcmp(argv[1], "--grouped-decode") == 0) {
+        run_dense = false;
+        run_pair = false;
+        run_prefill = false;
     } else if (argc == 2 &&
                std::strcmp(argv[1], "--prefill-long") == 0) {
         run_dense = false;
         run_pair = false;
+        run_grouped_decode = false;
         run_prefill_long = true;
     } else if (argc > 1 &&
                !(argc == 2 && std::strcmp(argv[1], "--all") == 0)) {
         std::fprintf(stderr,
-                     "usage: %s [--all|--dense|--pair|--prefill|--prefill-long]\n",
+                     "usage: %s [--all|--dense|--pair|--grouped-decode|"
+                     "--prefill|--prefill-long]\n",
                      argv[0]);
         return 2;
     }
@@ -1182,9 +1466,17 @@ int main(int argc, char **argv) {
     env_snapshot prefill_enable(kPrefillEnable);
     env_snapshot prefill_disable(kPrefillDisable);
     env_snapshot prefill_require(kPrefillRequire);
+    env_snapshot grouped_enable(kGroupedDecodeEnable);
+    env_snapshot grouped_disable(kGroupedDecodeDisable);
+    env_snapshot grouped_require(kGroupedDecodeRequire);
+    env_snapshot grouped_stats(kGroupedDecodeStats);
     (void)unsetenv(kPrefillEnable);
     (void)unsetenv(kPrefillDisable);
     (void)unsetenv(kPrefillRequire);
+    (void)unsetenv(kGroupedDecodeEnable);
+    (void)unsetenv(kGroupedDecodeDisable);
+    (void)unsetenv(kGroupedDecodeRequire);
+    (void)unsetenv(kGroupedDecodeStats);
 
     if (detect_rocm_device() <= 0) {
         const char *require_device =
@@ -1238,10 +1530,16 @@ int main(int argc, char **argv) {
         ok = pair1_ok && pair3_ok && pair8_ok && pair_guard_ok &&
              pair_opt_in_ok && ok;
     }
+    if (model_ready && run_grouped_decode) {
+        std::fprintf(stderr,
+                     "ROCm Q4 grouped attention-A decode parity "
+                     "(one grouped dispatch vs eight legacy calls):\n");
+        ok = run_grouped_attention_decode_case(model) && ok;
+    }
     if (model_ready && run_prefill) {
         std::fprintf(stderr,
                      "ROCm Q4 tiled prefill parity "
-                     "(forced legacy vs ENABLE+REQUIRE):\n");
+                     "(forced DISABLE vs default+REQUIRE):\n");
         const bool prefill9_ok = run_prefill_parity_case(
             model, 9u, model.weight0_offset, kM0, true,
             "prefill K=4096 M=65 n_tok=9");
