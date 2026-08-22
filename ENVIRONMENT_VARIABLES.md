@@ -38,7 +38,7 @@ The detailed Metal A/B contracts and expected oracle counters live in
 
 ## CUDA Q4 and Q8 diagnostics
 
-| Variable | Default and purpose |
+| Variable | Default behavior and purpose |
 | --- | --- |
 | `DS4_CUDA_DISABLE_Q4_DENSE_PAIR=1` | Split the Q-A/KV Q4 pair back into two standalone projections. |
 | `DS4_CUDA_NO_Q4_GB10_FAST=1` | Umbrella rollback for the GB10-specific Q4 choices; it does not disable the older cross-CUDA dense pair. |
