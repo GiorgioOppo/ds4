@@ -2917,7 +2917,7 @@ void kernel_mul_mv_q4_K_staged_exactn_impl(
     for (int ib = ix; ib < nb; ib += 4) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
-        for (short i = 0; i < 8; ++i) {
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
             yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
             yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
             yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
