@@ -54,7 +54,7 @@ The detailed Metal A/B contracts and expected oracle counters live in
 
 ## ROCm Q4
 
-| Variable | Default and purpose |
+| Variable | Default behavior and purpose |
 | --- | --- |
 | `DS4_ROCM_DISABLE_Q4_PREFILL_TILE8=1` | Restore the legacy Q4 prefill kernel. TILE8 is automatic for validated chunks of 9 through 4096 tokens. |
 | `DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8=1` | Fail closed when an eligible Q4 prefill call cannot use TILE8. |
