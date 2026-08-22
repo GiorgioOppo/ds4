@@ -80,8 +80,9 @@ next sections.
   guide for contributors. **Read this before sending a pull request**.
 - [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
   matrix, including the remote Metal, CUDA, and ROCm machines.
-- [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md): curated rollback,
-  fail-closed, and diagnostic environment switches for Metal, CUDA, and ROCm.
+- [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md): complete runtime,
+  test, and tooling environment-variable inventory, with a curated quick
+  reference for supported rollback, fail-closed, and diagnostic switches.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
