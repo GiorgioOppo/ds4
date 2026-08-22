@@ -25,6 +25,15 @@ The C test runner is `ds4_test`. Running it without arguments is equivalent to
 make test
 ```
 
+If a change adds, renames, removes, or changes the parsing/default/effect of an
+environment variable, update `scripts/environment_variables.tsv`, regenerate
+the complete reference, and verify that it is current:
+
+```sh
+python3 scripts/generate_environment_variables.py
+make check-environment-docs
+```
+
 Useful narrower checks:
 
 ```sh

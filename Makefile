@@ -63,7 +63,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-q4-attn-exactn test-metal-exactn-oracle test-metal-dspark-capture test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-cuda test-mmq-parity-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test check-environment-docs test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-q4-attn-exactn test-metal-exactn-oracle test-metal-dspark-capture test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-cuda test-mmq-parity-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -75,6 +75,7 @@ help:
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
+	@echo "  make check-environment-docs  Verify the generated environment-variable inventory"
 	@echo "  make test-metal-session-batch-ssd  Exact-logit Metal SSD union control/candidate oracle"
 	@echo "  make test-metal-q4-streams  Check resident Q4 Metal stream overlap"
 	@echo "  make test-metal-q4-attn-exactn  Bitwise/canary oracle for M1-M4 SSD-prefill Q4 attention output"
@@ -279,6 +280,7 @@ help:
 	@echo "  make rocm-dspark-verify-depth Build ROCm and run the DSpark verifier invariant"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
+	@echo "  make check-environment-docs  Verify the generated environment-variable inventory"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
@@ -384,6 +386,9 @@ cuda/mmq/test/test_mmq_parity: cuda/mmq/test/test_mmq_parity.cu $(MMQ_OBJS)
 test-mmq-parity-cuda: cuda/mmq/test/test_mmq_parity
 	./cuda/mmq/test/test_mmq_parity
 endif
+
+check-environment-docs:
+	python3 scripts/generate_environment_variables.py --check
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
