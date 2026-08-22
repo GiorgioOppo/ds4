@@ -18,7 +18,7 @@ changing them.  Unless a row says otherwise:
 
 ## Metal
 
-| Variable | Default and purpose |
+| Variable | Default behavior and purpose |
 | --- | --- |
 | `DS4_METAL_PREFILL_CHUNK=N` | Set the prefill cap when `--prefill-chunk` is absent; the CLI option takes precedence. This historical name is consumed by the shared graph planner rather than by a Metal kernel alone. |
 | `DS4_METAL_NO_RESIDENCY=1` | Skip creation and residency requests for the model-view residency set. Diagnostic rollback for resident, non-streaming models. |
