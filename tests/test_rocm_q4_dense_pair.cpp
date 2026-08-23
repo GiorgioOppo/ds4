@@ -115,6 +115,7 @@ struct aligned_model {
     uint64_t attn_b_offset = 0;
     uint64_t attn_b_q8_offset = 0;
     uint64_t tail_k1024_offset = 0;
+    uint64_t tail_k1024_pair_offset = 0;
 
     ~aligned_model() { std::free(data); }
 
@@ -279,7 +280,8 @@ bool make_model(aligned_model *model) {
         (uint64_t)kAttnOutDim * attn_b_row_bytes;
     const uint64_t tail_row_bytes =
         (kTailK / kQkK) * sizeof(block_q4_K_test);
-    const uint64_t tail_bytes = (uint64_t)kM0 * tail_row_bytes;
+    const uint64_t tail0_bytes = (uint64_t)kM0 * tail_row_bytes;
+    const uint64_t tail1_bytes = (uint64_t)kM1 * tail_row_bytes;
     const uint64_t attn_b_q8_row_bytes =
         (kAttnLowDim / 32u) * sizeof(block_q8_0_test);
     const uint64_t attn_b_q8_bytes =
@@ -294,8 +296,10 @@ bool make_model(aligned_model *model) {
         model->decode_attn_a_offset + decode_attn_a_bytes, page);
     model->tail_k1024_offset = round_up(
         model->attn_b_offset + attn_b_bytes, page);
+    model->tail_k1024_pair_offset = round_up(
+        model->tail_k1024_offset + tail0_bytes, page);
     model->attn_b_q8_offset = round_up(
-        model->tail_k1024_offset + tail_bytes, page);
+        model->tail_k1024_pair_offset + tail1_bytes, page);
     model->size = round_up(
         model->attn_b_q8_offset + attn_b_q8_bytes, page);
     void *storage = nullptr;
@@ -326,6 +330,9 @@ bool make_model(aligned_model *model) {
     fill_q4_rows(reinterpret_cast<block_q4_K_test *>(
                      model->data + model->tail_k1024_offset),
                  kM0, kTailK, 0x13198a2eu);
+    fill_q4_rows(reinterpret_cast<block_q4_K_test *>(
+                     model->data + model->tail_k1024_pair_offset),
+                 kM1, kTailK, 0xa4093822u);
     fill_q8_0_rows(reinterpret_cast<block_q8_0_test *>(
                        model->data + model->attn_b_q8_offset),
                    kAttnOutDim, kAttnLowDim, 0x03707344u);
@@ -551,34 +558,60 @@ bool run_dense_case(const aligned_model &model, uint32_t n_tokens,
     return close_to_cpu(got, cpu, label);
 }
 
+bool output_guard_unchanged(const std::vector<float> &values,
+                            const std::vector<float> &sentinel,
+                            size_t logical_count,
+                            const char *label);
+
 bool run_pair_case(const aligned_model &model, uint32_t n_tokens,
-                   const char *label) {
+                   const char *label, bool reverse_outputs = false,
+                   uint32_t in_dim = kK) {
+    const uint32_t out0_dim = reverse_outputs ? kM1 : kM0;
+    const uint32_t out1_dim = reverse_outputs ? kM0 : kM1;
+    const uint64_t base0_offset = in_dim == kTailK
+                                ? model.tail_k1024_offset
+                                : model.weight0_offset;
+    const uint64_t base1_offset = in_dim == kTailK
+                                ? model.tail_k1024_pair_offset
+                                : model.weight1_offset;
+    const uint64_t weight0_offset = reverse_outputs
+                                  ? base1_offset : base0_offset;
+    const uint64_t weight1_offset = reverse_outputs
+                                  ? base0_offset : base1_offset;
+    const size_t count0 = (size_t)n_tokens * out0_dim;
+    const size_t count1 = (size_t)n_tokens * out1_dim;
+    const std::vector<float> sentinel0 =
+        sentinel_values(count0 + kOutputGuardFloats);
+    const std::vector<float> sentinel1 =
+        sentinel_values(count1 + kOutputGuardFloats);
     std::vector<float> x;
-    fill_activation(&x, n_tokens);
+    fill_activation(&x, n_tokens, in_dim);
     tensor_owner x_gpu(x.size() * sizeof(float));
-    tensor_owner dense0((uint64_t)n_tokens * kM0 * sizeof(float));
-    tensor_owner dense1((uint64_t)n_tokens * kM1 * sizeof(float));
-    tensor_owner pair0((uint64_t)n_tokens * kM0 * sizeof(float));
-    tensor_owner pair1((uint64_t)n_tokens * kM1 * sizeof(float));
+    tensor_owner dense0(count0 * sizeof(float));
+    tensor_owner dense1(count1 * sizeof(float));
+    tensor_owner pair0(sentinel0.size() * sizeof(float));
+    tensor_owner pair1(sentinel1.size() * sizeof(float));
     if (!x_gpu.ptr || !dense0.ptr || !dense1.ptr || !pair0.ptr || !pair1.ptr ||
-        !write_tensor(x_gpu.ptr, x)) {
+        !write_tensor(x_gpu.ptr, x) ||
+        !write_tensor(pair0.ptr, sentinel0) ||
+        !write_tensor(pair1.ptr, sentinel1)) {
         std::fprintf(stderr, "%s: tensor allocation/write FAIL\n", label);
         return false;
     }
     const int dense_rc0 = ds4_gpu_matmul_quant_tensor(
-        dense0.ptr, model.data, model.size, model.weight0_offset, kQ4Type,
-        kK, kM0, x_gpu.ptr, n_tokens);
+        dense0.ptr, model.data, model.size, weight0_offset, kQ4Type,
+        in_dim, out0_dim, x_gpu.ptr, n_tokens);
     const int dense_rc1 = ds4_gpu_matmul_quant_tensor(
-        dense1.ptr, model.data, model.size, model.weight1_offset, kQ4Type,
-        kK, kM1, x_gpu.ptr, n_tokens);
+        dense1.ptr, model.data, model.size, weight1_offset, kQ4Type,
+        in_dim, out1_dim, x_gpu.ptr, n_tokens);
     const int pair_rc = ds4_gpu_matmul_q4_K_pair_tensor(
         pair0.ptr, pair1.ptr, model.data, model.size,
-        model.weight0_offset, model.weight1_offset,
-        kK, kM0, kM1, x_gpu.ptr, n_tokens);
-    std::vector<float> dense0_host((uint64_t)n_tokens * kM0);
-    std::vector<float> dense1_host((uint64_t)n_tokens * kM1);
-    std::vector<float> pair0_host(dense0_host.size());
-    std::vector<float> pair1_host(dense1_host.size());
+        weight0_offset, weight1_offset,
+        in_dim, out0_dim, out1_dim, x_gpu.ptr, n_tokens);
+    std::vector<float> dense0_host(count0);
+    std::vector<float> dense1_host(count1);
+    std::vector<float> pair0_host(sentinel0.size());
+    std::vector<float> pair1_host(sentinel1.size());
     if (dense_rc0 == 0 || dense_rc1 == 0 || pair_rc == 0 ||
         !read_tensor(dense0.ptr, &dense0_host) ||
         !read_tensor(dense1.ptr, &dense1_host) ||
@@ -590,11 +623,17 @@ bool run_pair_case(const aligned_model &model, uint32_t n_tokens,
         return false;
     }
     const std::vector<float> cpu0 = dense_reference(
-        model.data + model.weight0_offset, x, kM0, n_tokens);
+        model.data + weight0_offset, x, out0_dim, n_tokens, in_dim);
     const std::vector<float> cpu1 = dense_reference(
-        model.data + model.weight1_offset, x, kM1, n_tokens);
+        model.data + weight1_offset, x, out1_dim, n_tokens, in_dim);
     bool ok = close_to_cpu(dense0_host, cpu0, "pair control dense0 vs CPU");
     ok = close_to_cpu(dense1_host, cpu1, "pair control dense1 vs CPU") && ok;
+    ok = output_guard_unchanged(pair0_host, sentinel0, count0,
+                                "pair0 output canary") && ok;
+    ok = output_guard_unchanged(pair1_host, sentinel1, count1,
+                                "pair1 output canary") && ok;
+    pair0_host.resize(count0);
+    pair1_host.resize(count1);
     ok = bitwise_equal(pair0_host, dense0_host, "pair0 vs standalone dense0") && ok;
     ok = bitwise_equal(pair1_host, dense1_host, "pair1 vs standalone dense1") && ok;
     std::fprintf(stderr, "%s: %s\n", label, ok ? "PASS" : "FAIL");
@@ -776,12 +815,24 @@ bool run_prefill_gate_guards(const aligned_model &model) {
     return ok;
 }
 
-bool run_prefill_pair_case(const aligned_model &model) {
-    constexpr uint32_t n_tokens = 128u;
+bool run_prefill_pair_case(const aligned_model &model, uint32_t n_tokens,
+                           bool reverse_outputs, uint32_t in_dim = kK) {
+    const uint32_t out0_dim = reverse_outputs ? kM1 : kM0;
+    const uint32_t out1_dim = reverse_outputs ? kM0 : kM1;
+    const uint64_t base0_offset = in_dim == kTailK
+                                ? model.tail_k1024_offset
+                                : model.weight0_offset;
+    const uint64_t base1_offset = in_dim == kTailK
+                                ? model.tail_k1024_pair_offset
+                                : model.weight1_offset;
+    const uint64_t weight0_offset = reverse_outputs
+                                  ? base1_offset : base0_offset;
+    const uint64_t weight1_offset = reverse_outputs
+                                  ? base0_offset : base1_offset;
     std::vector<float> x;
-    fill_activation(&x, n_tokens);
-    const size_t count0 = (size_t)n_tokens * kM0;
-    const size_t count1 = (size_t)n_tokens * kM1;
+    fill_activation(&x, n_tokens, in_dim);
+    const size_t count0 = (size_t)n_tokens * out0_dim;
+    const size_t count1 = (size_t)n_tokens * out1_dim;
     const std::vector<float> sentinel0 =
         sentinel_values(count0 + kOutputGuardFloats);
     const std::vector<float> sentinel1 =
@@ -798,7 +849,8 @@ bool run_prefill_pair_case(const aligned_model &model) {
         !write_tensor(legacy1.ptr, sentinel1) ||
         !write_tensor(pair0.ptr, sentinel0) ||
         !write_tensor(pair1.ptr, sentinel1)) {
-        std::fprintf(stderr, "prefill pair n_tok=128: setup FAIL\n");
+        std::fprintf(stderr, "prefill pair n_tok=%u reverse=%d: setup FAIL\n",
+                     n_tokens, reverse_outputs ? 1 : 0);
         return false;
     }
 
@@ -812,11 +864,11 @@ bool run_prefill_pair_case(const aligned_model &model) {
     (void)setenv(kPrefillDisable, "1", 1);
     (void)unsetenv(kPrefillRequire);
     const int legacy_rc0 = ds4_gpu_matmul_quant_tensor(
-        legacy0.ptr, model.data, model.size, model.weight0_offset, kQ4Type,
-        kK, kM0, x_gpu.ptr, n_tokens);
+        legacy0.ptr, model.data, model.size, weight0_offset, kQ4Type,
+        in_dim, out0_dim, x_gpu.ptr, n_tokens);
     const int legacy_rc1 = ds4_gpu_matmul_quant_tensor(
-        legacy1.ptr, model.data, model.size, model.weight1_offset, kQ4Type,
-        kK, kM1, x_gpu.ptr, n_tokens);
+        legacy1.ptr, model.data, model.size, weight1_offset, kQ4Type,
+        in_dim, out1_dim, x_gpu.ptr, n_tokens);
 
     // The prefill pair is a distinct path: it must not depend on the legacy
     // decode-pair opt-in, whose <=8-token behavior is tested separately.
@@ -827,8 +879,8 @@ bool run_prefill_pair_case(const aligned_model &model) {
     (void)unsetenv("DS4_ROCM_DISABLE_Q4_DENSE_PAIR");
     const int pair_rc = ds4_gpu_matmul_q4_K_pair_tensor(
         pair0.ptr, pair1.ptr, model.data, model.size,
-        model.weight0_offset, model.weight1_offset,
-        kK, kM0, kM1, x_gpu.ptr, n_tokens);
+        weight0_offset, weight1_offset,
+        in_dim, out0_dim, out1_dim, x_gpu.ptr, n_tokens);
 
     std::vector<float> legacy0_host(sentinel0.size());
     std::vector<float> legacy1_host(sentinel1.size());
@@ -840,8 +892,9 @@ bool run_prefill_pair_case(const aligned_model &model) {
         !read_tensor(pair0.ptr, &pair0_host) ||
         !read_tensor(pair1.ptr, &pair1_host)) {
         std::fprintf(stderr,
-                     "prefill pair n_tok=128: dispatch/read legacy=(%d,%d) "
-                     "pair=%d FAIL\n",
+                     "prefill pair n_tok=%u reverse=%d: dispatch/read "
+                     "legacy=(%d,%d) pair=%d FAIL\n",
+                     n_tokens, reverse_outputs ? 1 : 0,
                      legacy_rc0, legacy_rc1, pair_rc);
         return false;
     }
@@ -860,8 +913,9 @@ bool run_prefill_pair_case(const aligned_model &model) {
     ok = bitwise_equal(pair1_host, legacy1_host,
                        "prefill pair1 vs forced legacy dense1") && ok;
     std::fprintf(stderr,
-                 "prefill pair K=4096 M=(65,33) n_tok=128 "
+                 "prefill pair K=%u M=(%u,%u) n_tok=%u "
                  "legacy=(%d,%d) pair=%d %s\n",
+                 in_dim, out0_dim, out1_dim, n_tokens,
                  legacy_rc0, legacy_rc1, pair_rc, ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -1343,6 +1397,12 @@ bool run_pair_guards(const aligned_model &model) {
         std::fprintf(stderr, "pair guards: setup FAIL\n");
         return false;
     }
+    env_snapshot prefill_enable(kPrefillEnable);
+    env_snapshot prefill_disable(kPrefillDisable);
+    env_snapshot prefill_require(kPrefillRequire);
+    (void)unsetenv(kPrefillEnable);
+    (void)setenv(kPrefillDisable, "1", 1);
+    (void)unsetenv(kPrefillRequire);
     const int rc = ds4_gpu_matmul_q4_K_pair_tensor(
         out0.ptr, out1.ptr, model.data, model.size,
         model.weight0_offset, model.weight1_offset,
@@ -1355,6 +1415,32 @@ bool run_pair_guards(const aligned_model &model) {
              out0.ptr, sentinel0, "pair n_tok=9 preserves out0") && ok;
     ok = unchanged_after_rejected_call(
              out1.ptr, sentinel1, "pair n_tok=9 preserves out1") && ok;
+
+    const size_t shared_count = (size_t)kM0 + kM1;
+    const std::vector<float> shared_sentinel = sentinel_values(shared_count);
+    tensor_owner shared(shared_count * sizeof(float));
+    tensor_owner overlap0(ds4_gpu_tensor_view(
+        shared.ptr, 0u, (uint64_t)kM0 * sizeof(float)));
+    tensor_owner overlap1(ds4_gpu_tensor_view(
+        shared.ptr, (uint64_t)(kM0 - 1u) * sizeof(float),
+        (uint64_t)kM1 * sizeof(float)));
+    if (!shared.ptr || !overlap0.ptr || !overlap1.ptr ||
+        !write_tensor(shared.ptr, shared_sentinel)) {
+        std::fprintf(stderr, "pair overlap guard: setup FAIL\n");
+        return false;
+    }
+    const int overlap_rc = ds4_gpu_matmul_q4_K_pair_tensor(
+        overlap0.ptr, overlap1.ptr, model.data, model.size,
+        model.weight0_offset, model.weight1_offset,
+        kK, kM0, kM1, x_gpu.ptr, 1u);
+    ok = overlap_rc == 0 && unchanged_after_rejected_call(
+        shared.ptr, shared_sentinel,
+        "pair partial-overlap guard preserves storage") && ok;
+    if (overlap_rc != 0) {
+        std::fprintf(stderr,
+                     "pair partial-overlap guard: expected rc=0 got=%d FAIL\n",
+                     overlap_rc);
+    }
     return ok;
 }
 
@@ -1523,11 +1609,14 @@ int main(int argc, char **argv) {
         (void)setenv("DS4_ROCM_ENABLE_Q4_DENSE_PAIR", "1", 1);
         (void)unsetenv("DS4_ROCM_DISABLE_Q4_DENSE_PAIR");
         const bool pair1_ok = run_pair_case(model, 1u, "pair n_tok=1");
-        const bool pair3_ok = run_pair_case(model, 3u, "pair n_tok=3");
+        const bool pair1_tail_ok = run_pair_case(
+            model, 1u, "pair K=1024 n_tok=1", false, kTailK);
+        const bool pair3_ok = run_pair_case(
+            model, 3u, "pair n_tok=3 reverse M=(33,65)", true);
         const bool pair8_ok = run_pair_case(model, 8u, "pair n_tok=8");
         const bool pair_guard_ok = run_pair_guards(model);
         const bool pair_opt_in_ok = run_pair_opt_in_guards(model);
-        ok = pair1_ok && pair3_ok && pair8_ok && pair_guard_ok &&
+        ok = pair1_ok && pair1_tail_ok && pair3_ok && pair8_ok && pair_guard_ok &&
              pair_opt_in_ok && ok;
     }
     if (model_ready && run_grouped_decode) {
@@ -1561,7 +1650,12 @@ int main(int argc, char **argv) {
         const bool prefill_single128_ok = run_prefill_parity_case(
             model, 128u, model.attn_b_offset, kAttnOutDim, true,
             "prefill K=256 M=65 n_tok=128 (K-tail nb=1)", kAttnLowDim);
-        const bool prefill_pair_ok = run_prefill_pair_case(model);
+        const bool prefill_pair9_ok =
+            run_prefill_pair_case(model, 9u, false, kTailK);
+        const bool prefill_pair30_reverse_ok =
+            run_prefill_pair_case(model, 30u, true);
+        const bool prefill_pair128_ok =
+            run_prefill_pair_case(model, 128u, false);
         const bool attention9_ok = run_attention_prefill_case(
             model, 9u,
             "attention prefill groups=8 K=4096 rank=32 M=65 n_tok=9");
@@ -1586,7 +1680,8 @@ int main(int argc, char **argv) {
         ok = prefill9_ok && prefill30_ok && prefill128_ok &&
              prefill_tail9_ok &&
              prefill_tail128_ok && prefill_single9_ok &&
-             prefill_single128_ok && prefill_pair_ok && attention9_ok &&
+             prefill_single128_ok && prefill_pair9_ok &&
+             prefill_pair30_reverse_ok && prefill_pair128_ok && attention9_ok &&
              attention30_ok && attention128_ok && attention_q8_9_ok &&
              attention_q8_30_ok && gate_ok && ok;
         if (run_prefill_long) {

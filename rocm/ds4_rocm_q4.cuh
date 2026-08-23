@@ -36,6 +36,43 @@ __global__ static void rocm_matmul_q4_K_dense_kernel(
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
 }
 
+/* Latency-oriented pair variant of the canonical dense kernel.  Concatenating
+ * the two row-tile domains keeps exactly the same per-row dot and reduction
+ * order while sharing one launch between Q-A and KV. */
+__global__ static void rocm_matmul_q4_K_dense_pair_kernel(
+        float *out0,
+        float *out1,
+        const char *w0,
+        const char *w1,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out0_dim,
+        uint32_t out1_dim,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t out0_tiles = (out0_dim - 1u) / 32u + 1u;
+    const bool second = blockIdx.x >= out0_tiles;
+    const uint32_t row_tile = second ? blockIdx.x - out0_tiles : blockIdx.x;
+    const uint32_t row = row_tile * 32u + row_lane;
+    const uint32_t tok = blockIdx.y;
+    const uint32_t out_dim = second ? out1_dim : out0_dim;
+    if (tok >= n_tok || row >= out_dim) return;
+
+    float *const out = second ? out1 : out0;
+    const char *const w_base = second ? w1 : w0;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr = reinterpret_cast<const cuda_block_q4_K *>(
+            w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
 /* One independent activation row and Q4_K matrix per output group.  This is
  * the canonical dense decode walk with only a group grid dimension added. */
 __global__ static void rocm_matmul_q4_K_dense_grouped_decode_kernel(
@@ -245,6 +282,96 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
     }
 }
 
+/* Two independent dense projections over the same activation tile.  The
+ * row-tile ranges are concatenated in grid.x, so Q/KV prefill shares both
+ * the Q8_K quantization and a single launch without padding the smaller
+ * projection up to the larger one's row count.  Each workgroup still handles
+ * only one weight matrix: this preserves the standalone TILE8 block walk and
+ * its accumulation order while removing the second host launch. */
+__global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
+        float *out0,
+        float *out1,
+        const char *w0,
+        const char *w1,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out0_dim,
+        uint32_t out1_dim,
+        uint32_t n_tok) {
+    __shared__ cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
+                                         [ROCM_Q4_PREFILL_KBLOCK_TILE];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 7u;
+    const uint32_t row_lane = tid >> 3u;
+    const uint32_t out0_tiles = (out0_dim - 1u) / 32u + 1u;
+    const bool second = blockIdx.x >= out0_tiles;
+    const uint32_t row_tile = second ? blockIdx.x - out0_tiles : blockIdx.x;
+    const uint32_t row = row_tile * 32u + row_lane;
+    const uint32_t tok0 = blockIdx.y * ROCM_Q4_PREFILL_TOKEN_TILE;
+    const uint32_t out_dim = second ? out1_dim : out0_dim;
+    float *const out = second ? out1 : out0;
+    const char *const w_base = second ? w1 : w0;
+    const uint32_t nt = n_tok - tok0 < ROCM_Q4_PREFILL_TOKEN_TILE
+                      ? n_tok - tok0 : ROCM_Q4_PREFILL_TOKEN_TILE;
+    const bool row_valid = row < out_dim;
+    const cuda_block_q4_K *wr = row_valid
+        ? reinterpret_cast<const cuda_block_q4_K *>(
+              w_base + (uint64_t)row * row_bytes)
+        : NULL;
+    float acc[ROCM_Q4_PREFILL_TOKEN_TILE] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    };
+
+    for (uint32_t b0 = 0u; b0 < xq_blocks;
+         b0 += ROCM_Q4_PREFILL_KBLOCK_TILE) {
+        const uint32_t nb = xq_blocks - b0 < ROCM_Q4_PREFILL_KBLOCK_TILE
+                          ? xq_blocks - b0
+                          : ROCM_Q4_PREFILL_KBLOCK_TILE;
+        const uint32_t tile_words = nt * ROCM_Q4_PREFILL_KBLOCK_TILE *
+                                    ROCM_Q4_Q8K_WORDS;
+        uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
+        for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
+            const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
+            const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
+            const uint32_t p = block_slot >> 3u;
+            const uint32_t bb = block_slot & 7u;
+            if (bb < nb) {
+                const uint64_t src_block =
+                    (uint64_t)(tok0 + p) * xq_blocks + b0 + bb;
+                const uint32_t *const src_words =
+                    reinterpret_cast<const uint32_t *>(xq + src_block);
+                sxq_words[i] = src_words[word];
+            }
+        }
+        __syncthreads();
+
+        if (row_valid && lane < nb) {
+            rocm_dot_q4_K_q8_K_block8_reuse_weights(
+                wr + b0 + lane,
+                sxq[0] + lane, sxq[1] + lane,
+                sxq[2] + lane, sxq[3] + lane,
+                sxq[4] + lane, sxq[5] + lane,
+                sxq[6] + lane, sxq[7] + lane,
+                nt, acc);
+        }
+        __syncthreads();
+    }
+
+    if (row_valid) {
+        #pragma unroll
+        for (uint32_t p = 0u; p < ROCM_Q4_PREFILL_TOKEN_TILE; p++) {
+            if (p < nt) {
+                const float v = quarter_warp_sum_f32(acc[p], lane);
+                if (lane == 0u) {
+                    out[(uint64_t)(tok0 + p) * out_dim + row] = v;
+                }
+            }
+        }
+    }
+}
+
 static int rocm_q4_K_dense_validate(
         const ds4_gpu_tensor *out,
         const void *model_map,
@@ -292,6 +419,15 @@ static cuda_block_q8_K *rocm_q4_K_prequant_alloc(
         return NULL;
     }
     return reinterpret_cast<cuda_block_q8_K *>(cuda_tmp_alloc(bytes, what));
+}
+
+static int rocm_q4_K_byte_ranges_overlap(
+        const void *ptr0, uint64_t bytes0,
+        const void *ptr1, uint64_t bytes1) {
+    const uintptr_t p0 = reinterpret_cast<uintptr_t>(ptr0);
+    const uintptr_t p1 = reinterpret_cast<uintptr_t>(ptr1);
+    return p0 <= p1 ? (uint64_t)(p1 - p0) < bytes0
+                    : (uint64_t)(p0 - p1) < bytes1;
 }
 
 static int rocm_q4_K_dense_pair_requested(void) {
@@ -477,8 +613,8 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
     }
 
     /* Decode keeps its original, separately gated pair path.  Prefill uses
-     * the common tile8 gate and shares one canonical Q8_K quantization across
-     * the two projections, then issues one tiled launch per weight matrix. */
+     * the common tile8 gate and shares one canonical Q8_K quantization and
+     * one tiled launch across the two projections. */
     const int decode_pair = n_tok <= 8u &&
                             rocm_q4_K_dense_pair_requested();
     if ((!prefill_pair && !decode_pair) ||
@@ -497,6 +633,14 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
                                   in_dim, out1_dim, x, n_tok, &blocks1,
                                   &row_bytes1, &weight1_bytes) ||
         blocks0 != blocks1 || row_bytes0 != row_bytes1) {
+        return 0;
+    }
+    uint64_t out0_bytes = 0;
+    uint64_t out1_bytes = 0;
+    if (!cuda_u64_mul3_checked(n_tok, out0_dim, sizeof(float), &out0_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out1_dim, sizeof(float), &out1_bytes) ||
+        rocm_q4_K_byte_ranges_overlap(out0->ptr, out0_bytes,
+                                      out1->ptr, out1_bytes)) {
         return 0;
     }
 
@@ -518,50 +662,33 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
     }
 
     if (prefill_pair) {
-        const dim3 grid0((unsigned)((out0_dim - 1u) / 32u + 1u),
-                         (unsigned)((n_tok - 1u) /
-                                    ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
-                         1u);
-        rocm_matmul_q4_K_prefill_tile8_strided_kernel<<<grid0, 256>>>(
-                reinterpret_cast<float *>(out0->ptr), w0, xq, row_bytes0,
-                (uint32_t)blocks0, (uint32_t)out0_dim, (uint32_t)n_tok,
-                blocks0, out0_dim);
-        if (!cuda_ok(cudaGetLastError(),
-                     "q4_K dense prefill pair0 tile8 launch")) {
-            return 0;
-        }
-
-        const dim3 grid1((unsigned)((out1_dim - 1u) / 32u + 1u),
-                         (unsigned)((n_tok - 1u) /
-                                    ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
-                         1u);
-        rocm_matmul_q4_K_prefill_tile8_strided_kernel<<<grid1, 256>>>(
-                reinterpret_cast<float *>(out1->ptr), w1, xq, row_bytes1,
-                (uint32_t)blocks1, (uint32_t)out1_dim, (uint32_t)n_tok,
-                blocks1, out1_dim);
+        const uint64_t out0_tiles = (out0_dim - 1u) / 32u + 1u;
+        const uint64_t out1_tiles = (out1_dim - 1u) / 32u + 1u;
+        const dim3 grid((unsigned)(out0_tiles + out1_tiles),
+                        (unsigned)((n_tok - 1u) /
+                                   ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
+                        1u);
+        rocm_matmul_q4_K_prefill_tile8_pair_kernel<<<grid, 256>>>(
+                reinterpret_cast<float *>(out0->ptr),
+                reinterpret_cast<float *>(out1->ptr), w0, w1, xq,
+                row_bytes0, (uint32_t)blocks0, (uint32_t)out0_dim,
+                (uint32_t)out1_dim, (uint32_t)n_tok);
         const int ok = cuda_ok(cudaGetLastError(),
-                               "q4_K dense prefill pair1 tile8 launch");
+                               "q4_K dense prefill pair tile8 launch");
         if (ok) rocm_q4_K_prefill_tile8_note(0u, 1u, 0u, n_tok);
         return ok;
     }
 
-    // Use the exact standalone kernel twice. This preserves its block walk and
-    // reduction path while still eliminating the second Q8_K quantization.
-    const dim3 grid0((unsigned)((out0_dim - 1u) / 32u + 1u),
-                     (unsigned)n_tok, 1u);
-    rocm_matmul_q4_K_dense_kernel<<<grid0, 256>>>(
-            reinterpret_cast<float *>(out0->ptr), w0, xq, row_bytes0,
-            (uint32_t)blocks0, (uint32_t)out0_dim, (uint32_t)n_tok);
-    if (!cuda_ok(cudaGetLastError(), "q4_K dense pair0 matmul launch")) {
-        return 0;
-    }
-
-    const dim3 grid1((unsigned)((out1_dim - 1u) / 32u + 1u),
-                     (unsigned)n_tok, 1u);
-    rocm_matmul_q4_K_dense_kernel<<<grid1, 256>>>(
-            reinterpret_cast<float *>(out1->ptr), w1, xq, row_bytes1,
-            (uint32_t)blocks1, (uint32_t)out1_dim, (uint32_t)n_tok);
-    return cuda_ok(cudaGetLastError(), "q4_K dense pair1 matmul launch");
+    const uint64_t out0_tiles = (out0_dim - 1u) / 32u + 1u;
+    const uint64_t out1_tiles = (out1_dim - 1u) / 32u + 1u;
+    const dim3 grid((unsigned)(out0_tiles + out1_tiles),
+                    (unsigned)n_tok, 1u);
+    rocm_matmul_q4_K_dense_pair_kernel<<<grid, 256>>>(
+            reinterpret_cast<float *>(out0->ptr),
+            reinterpret_cast<float *>(out1->ptr), w0, w1, xq,
+            row_bytes0, (uint32_t)blocks0, (uint32_t)out0_dim,
+            (uint32_t)out1_dim, (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch");
 }
 
 extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
