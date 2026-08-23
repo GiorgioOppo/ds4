@@ -1090,14 +1090,15 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
     cudaMemcpyAsync(down_canary.data(), d_down_got, down_canary.size(),
                     cudaMemcpyDeviceToHost, stream);
     cudaError_t sync_err = cudaStreamSynchronize(stream);
-    const auto canary_intact = [](const std::vector<uint8_t> & bytes) {
+    const auto is_canary_intact = [](const std::vector<uint8_t> & bytes) {
         return std::all_of(bytes.begin(), bytes.end(),
                            [](uint8_t value) { return value == 0xA5; });
     };
+
     const bool na_ok = rc_na == DS4_MMQ_NOT_APPLICABLE &&
-        sync_err == cudaSuccess && canary_intact(gate_canary) &&
-        canary_intact(up_canary) && canary_intact(mid_canary) &&
-        canary_intact(down_canary);
+        sync_err == cudaSuccess && is_canary_intact(gate_canary) &&
+        is_canary_intact(up_canary) && is_canary_intact(mid_canary) &&
+        is_canary_intact(down_canary);
 
     cudaMemsetAsync(d_gate_ref, 0, mid_count * sizeof(float), stream);
     cudaMemsetAsync(d_up_ref, 0, mid_count * sizeof(float), stream);
