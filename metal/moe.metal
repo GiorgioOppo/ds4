@@ -3473,7 +3473,7 @@ void kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl(
     const int ix = tiisg;
     device const float *y4 = y + 32 * ix;
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
-        for (short i = 0; i < 32; ++i) {
+        FOR_UNROLL (short i = 0; i < 32; ++i) {
             yl[i] = y4[i];
         }
 
