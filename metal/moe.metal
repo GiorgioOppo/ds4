@@ -3464,7 +3464,7 @@ void kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl(
                     (const threadgroup uint8_t *)(svalues + aux8u[l]);
                 const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
                 const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
-                for (short j = 0; j < 8; ++j) {
+                FOR_UNROLL (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
                     sg += v * gridg[j] *
                         (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
