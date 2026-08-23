@@ -3984,10 +3984,10 @@ static inline void ds4_attn_out_low_q8_static_impl(
     device const float *yb = y + ib0 * QK8_0 + il * NQ;
     float yl[NQ];
 
-    for (int ib = ib0; ib < DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS;
+    FOR_UNROLL (int ib = ib0; ib < DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS;
          ib += NSG * NQ) {
-        for (short i = 0; i < NQ; ++i) yl[i] = yb[i];
-        for (short row = 0; row < NR0; ++row) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) yl[i] = yb[i];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
             device const int8_t *qs = ax[row][ib].qs + il * NQ;
             float sumq = 0.0f;
             FOR_UNROLL (short i = 0; i < NQ; ++i) sumq += qs[i] * yl[i];
