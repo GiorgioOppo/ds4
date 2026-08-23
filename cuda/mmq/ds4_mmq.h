@@ -172,6 +172,23 @@ int ds4_mmq_q4_K_dense(
     int           K,
     cudaStream_t  stream);
 
+// Two dense Q4_K MMQ projections that share one token-tiled Q8_1
+// activation buffer.  This is the prefill sibling of
+// ds4_mmq_q4_K_dense_pair_vec: N is not limited to the MMVQ batch ceiling,
+// M0 and M1 may differ, and each leg preserves ds4_mmq_q4_K_dense's
+// reduction and output layout. The two output ranges must be disjoint.
+int ds4_mmq_q4_K_dense_pair(
+    const void  * W0_q4_K,
+    const void  * W1_q4_K,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_mxfp4_dense(
     const void  * W_mxfp4,
     const float * X_f32,

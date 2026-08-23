@@ -496,6 +496,100 @@ bool run_q4_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.20f) {
     return ok;
 }
 
+// Prefill dense-pair verifier.  The candidate shares only the canonical
+// token-tiled Q8_1 activation; both weight legs still run the ordinary Q4_K
+// MMQ kernel, so their outputs must match two independent dense calls bitwise.
+bool run_q4_K_dense_pair_parity(
+        int M0, int M1, int N, int K, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/DENSE_PAIR  M0=%d M1=%d N=%d K=%d seed=%u ===\n",
+            M0, M1, N, K, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    std::vector<block_q4_K> W0((size_t)M0 * blocks_per_row);
+    std::vector<block_q4_K> W1((size_t)M1 * blocks_per_row);
+    for (auto &blk : W0) generate_random_block_q4_K(&blk, rng);
+    for (auto &blk : W1) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)N * K);
+    for (auto &v : X) v = nd(rng);
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    void *dW0 = nullptr;
+    void *dW1 = nullptr;
+    float *dX = nullptr;
+    float *dRef0 = nullptr;
+    float *dRef1 = nullptr;
+    float *dGot0 = nullptr;
+    float *dGot1 = nullptr;
+    cudaMalloc(&dW0, W0.size() * sizeof(block_q4_K));
+    cudaMalloc(&dW1, W1.size() * sizeof(block_q4_K));
+    cudaMalloc(&dX, X.size() * sizeof(float));
+    cudaMalloc(&dRef0, (size_t)M0 * N * sizeof(float));
+    cudaMalloc(&dRef1, (size_t)M1 * N * sizeof(float));
+    cudaMalloc(&dGot0, (size_t)M0 * N * sizeof(float));
+    cudaMalloc(&dGot1, (size_t)M1 * N * sizeof(float));
+    cudaMemcpyAsync(dW0, W0.data(), W0.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dW1, W1.data(), W1.size() * sizeof(block_q4_K),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dRef0, 0xa5, (size_t)M0 * N * sizeof(float), stream);
+    cudaMemsetAsync(dRef1, 0xa5, (size_t)M1 * N * sizeof(float), stream);
+    cudaMemsetAsync(dGot0, 0x5a, (size_t)M0 * N * sizeof(float), stream);
+    cudaMemsetAsync(dGot1, 0x5a, (size_t)M1 * N * sizeof(float), stream);
+
+    const int rc0 = ds4_mmq_q4_K_dense(
+        dW0, dX, dRef0, M0, N, K, stream);
+    const int rc1 = ds4_mmq_q4_K_dense(
+        dW1, dX, dRef1, M1, N, K, stream);
+    const int rcp = ds4_mmq_q4_K_dense_pair(
+        dW0, dW1, dX, dGot0, dGot1, M0, M1, N, K, stream);
+
+    std::vector<float> ref0((size_t)M0 * N);
+    std::vector<float> ref1((size_t)M1 * N);
+    std::vector<float> got0((size_t)M0 * N);
+    std::vector<float> got1((size_t)M1 * N);
+    cudaMemcpyAsync(ref0.data(), dRef0, ref0.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(ref1.data(), dRef1, ref1.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(got0.data(), dGot0, got0.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(got1.data(), dGot1, got1.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+    size_t bad0 = 0;
+    size_t bad1 = 0;
+    for (size_t i = 0; i < ref0.size(); i++) {
+        if (std::memcmp(&ref0[i], &got0[i], sizeof(float)) != 0) bad0++;
+    }
+    for (size_t i = 0; i < ref1.size(); i++) {
+        if (std::memcmp(&ref1[i], &got1[i], sizeof(float)) != 0) bad1++;
+    }
+
+    cudaFree(dW0);
+    cudaFree(dW1);
+    cudaFree(dX);
+    cudaFree(dRef0);
+    cudaFree(dRef1);
+    cudaFree(dGot0);
+    cudaFree(dGot1);
+    cudaStreamDestroy(stream);
+
+    const bool ok = rc0 == 0 && rc1 == 0 && rcp == 0 &&
+                    sync_err == cudaSuccess && bad0 == 0 && bad1 == 0;
+    fprintf(stderr,
+            "pair rc=%d/%d/%d sync=%s mismatches=%zu/%zu: %s\n\n",
+            rc0, rc1, rcp, cudaGetErrorString(sync_err), bad0, bad1,
+            ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // IQ2_XXS internally accumulates in int8 via SIMD intrinsics
 // (__vsub4 / __vcmpne4 in vec_dot_iq2_xxs_q8_1) and applies the scale
 // post-accumulation, while the CPU reference does per-element float
@@ -1946,6 +2040,16 @@ int main(int argc, char ** argv) {
     all_ok &= run_q4_K(/*M=*/128,  /*N=*/8,   /*K=*/512,  0xC4FE2);
     all_ok &= run_q4_K(/*M=*/256,  /*N=*/1,   /*K=*/2048, 0xC4FE3);
     all_ok &= run_q4_K(/*M=*/2048, /*N=*/16,  /*K=*/4096, 0xC4FE4);
+    // Prefill Q-A/KV pair: cover the MMVQ/MMQ boundary, token-tile tails,
+    // asymmetric output dimensions, and a full-width token tile.
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/257, /*M1=*/65,  /*N=*/9,   /*K=*/768,  0xC4FE50);
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/128, /*M1=*/73,  /*N=*/32,  /*K=*/4096, 0xC4FE51);
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/65,  /*M1=*/129, /*N=*/129, /*K=*/1024, 0xC4FE52);
+    all_ok &= run_q4_K_dense_pair_parity(
+        /*M0=*/96,  /*M1=*/33,  /*N=*/128, /*K=*/4096, 0xC4FE53);
 
     // MoE (_id) path.  Small expert counts + small shapes for fast verification.
     // Per-token-distinct routing with top_k=2 or 6.

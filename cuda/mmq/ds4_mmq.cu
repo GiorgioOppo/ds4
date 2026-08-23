@@ -1049,6 +1049,182 @@ int ds4_mmq_dense_impl(
     return 0;
 }
 
+/* Batched Q4_K pair for the prefill tier.  The two ordinary dense calls
+ * differ only in their weight/output rows; their Q8_1 MMQ activation is
+ * byte-identical.  Keep that activation alive across both established MMQ
+ * launches so Q-A and KV pay the quantize/tail-clear prelude once. */
+int ds4_mmq_q4_K_dense_pair_impl(
+        const void  * W0,
+        const void  * W1,
+        const float * X_f32,
+        float       * out0_f32,
+        float       * out1_f32,
+        int           M0,
+        int           M1,
+        int           N,
+        int           K,
+        cudaStream_t  stream) {
+    const char *tag = "ds4_mmq_q4_K_dense_pair";
+    if (!W0 || !W1 || !X_f32 || !out0_f32 || !out1_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M0 <= 0 || M1 <= 0 || N <= 0 || K <= 0 || K % 256 != 0) {
+        fprintf(stderr, "%s: bad shape M0=%d M1=%d N=%d K=%d\n",
+                tag, M0, M1, N, K);
+        return -1;
+    }
+    if ((size_t)M0 > SIZE_MAX / (size_t)N / sizeof(float) ||
+        (size_t)M1 > SIZE_MAX / (size_t)N / sizeof(float)) {
+        fprintf(stderr, "%s: output size overflow\n", tag);
+        return -1;
+    }
+    const size_t out0_bytes = (size_t)M0 * (size_t)N * sizeof(float);
+    const size_t out1_bytes = (size_t)M1 * (size_t)N * sizeof(float);
+    const uintptr_t out0_addr = (uintptr_t)out0_f32;
+    const uintptr_t out1_addr = (uintptr_t)out1_f32;
+    const bool outputs_overlap = out0_addr <= out1_addr
+        ? (size_t)(out1_addr - out0_addr) < out0_bytes
+        : (size_t)(out0_addr - out1_addr) < out1_bytes;
+    if (outputs_overlap) {
+        fprintf(stderr, "%s: output ranges overlap\n", tag);
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_k_tile_supported<GGML_TYPE_Q4_K>(tag, K, cc)) return -1;
+
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n",
+                tag, dev);
+        return -1;
+    }
+    ds4_pool_set_stream(stream);
+
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t blocks_per_col =
+        (size_t)ne10_padded / (4u * (size_t)QK8_1);
+    const size_t bytes_per_col =
+        blocks_per_col * sizeof(block_q8_1_mmq);
+    const size_t slack_blocks = (size_t)get_mmq_x_max_host(cc);
+    if ((size_t)N > SIZE_MAX / bytes_per_col ||
+        slack_blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) {
+        fprintf(stderr, "%s: activation scratch size overflow\n", tag);
+        return -1;
+    }
+    const size_t payload_bytes = (size_t)N * bytes_per_col;
+    const size_t slack_bytes = slack_blocks * sizeof(block_q8_1_mmq);
+    if (payload_bytes > SIZE_MAX - slack_bytes) {
+        fprintf(stderr, "%s: activation scratch size overflow\n", tag);
+        return -1;
+    }
+    const size_t nbytes_q8_1 = payload_bytes + slack_bytes;
+
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    ybuf_memset(src1_q8_1.get(), nbytes_q8_1, stream);
+    quantize_mmq_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        GGML_TYPE_Q4_K, /*ne00=*/K, /*s11=*/(int64_t)K,
+        /*s12=*/0, /*s13=*/0,
+        /*ne0=*/ne10_padded, /*ne1=*/(int64_t)N,
+        /*ne2=*/1, /*ne3=*/1, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const int64_t stride_row_x = (int64_t)K / QK_K;
+    const int64_t stride_channel_y =
+        (int64_t)(payload_bytes / sizeof(int));
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
+
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out0_f32, 0, out0_bytes, stream);
+    }
+    const mmq_args args0 = {
+        /*x=*/(const char *)W0,
+        /*type_x=*/GGML_TYPE_Q4_K,
+        /*y=*/(const int *)src1_q8_1.get(),
+        /*ids_dst=*/nullptr,
+        /*expert_bounds=*/nullptr,
+        /*dst=*/out0_f32,
+        /*ncols_x=*/(int64_t)K,
+        /*nrows_x=*/(int64_t)M0,
+        /*ncols_dst=*/(int64_t)N,
+        /*stride_row_x=*/stride_row_x,
+        /*ncols_y=*/(int64_t)N,
+        /*nrows_dst=*/(int64_t)M0,
+        /*nchannels_x=*/1,
+        /*nchannels_y=*/1,
+        /*stride_channel_x=*/0,
+        /*stride_channel_y=*/stride_channel_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1,
+        /*nsamples_y=*/1,
+        /*stride_sample_x=*/0,
+        /*stride_sample_y=*/stride_channel_y,
+        /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k,
+        /*ncols_max=*/(int64_t)N,
+    };
+    mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args0, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: first mul_mat_q_case launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+    ds4_mmq_sanitize_f32(
+        out0_f32, (uint64_t)M0 * (uint64_t)N, stream);
+
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out1_f32, 0, out1_bytes, stream);
+    }
+    const mmq_args args1 = {
+        /*x=*/(const char *)W1,
+        /*type_x=*/GGML_TYPE_Q4_K,
+        /*y=*/(const int *)src1_q8_1.get(),
+        /*ids_dst=*/nullptr,
+        /*expert_bounds=*/nullptr,
+        /*dst=*/out1_f32,
+        /*ncols_x=*/(int64_t)K,
+        /*nrows_x=*/(int64_t)M1,
+        /*ncols_dst=*/(int64_t)N,
+        /*stride_row_x=*/stride_row_x,
+        /*ncols_y=*/(int64_t)N,
+        /*nrows_dst=*/(int64_t)M1,
+        /*nchannels_x=*/1,
+        /*nchannels_y=*/1,
+        /*stride_channel_x=*/0,
+        /*stride_channel_y=*/stride_channel_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1,
+        /*nsamples_y=*/1,
+        /*stride_sample_x=*/0,
+        /*stride_sample_y=*/stride_channel_y,
+        /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k,
+        /*ncols_max=*/(int64_t)N,
+    };
+    mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args1, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: second mul_mat_q_case launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -4;
+    }
+    ds4_mmq_sanitize_f32(
+        out1_f32, (uint64_t)M1 * (uint64_t)N, stream);
+    return 0;
+}
+
 } // anonymous namespace
 
 extern "C" int ds4_mmq_q8_0_dense(
@@ -1267,6 +1443,14 @@ extern "C" int ds4_mmq_q4_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_pair(
+        const void * W0, const void * W1, const float * X,
+        float * out0, float * out1,
+        int M0, int M1, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_q4_K_dense_pair_impl(
+        W0, W1, X, out0, out1, M0, M1, N, K, stream);
 }
 
 extern "C" int ds4_mmq_mxfp4_dense(

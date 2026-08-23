@@ -1004,8 +1004,9 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Optional small-token dense Q4_K pair. Backends without a beneficial paired
- * kernel return zero and request separate fallback matmuls from the graph. */
+/* Optional dense Q4_K pair for decode, microbatch, and prefill. Backends
+ * without a beneficial paired kernel return zero and request separate
+ * fallback matmuls from the graph. */
 int ds4_gpu_matmul_q4_K_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

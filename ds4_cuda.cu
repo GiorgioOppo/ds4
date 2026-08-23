@@ -37118,7 +37118,8 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
         uint64_t out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
-    if (!out0 || !out1 || !x || !model_map || n_tok == 0u || n_tok > 8u ||
+    if (!out0 || !out1 || !x || !model_map || n_tok == 0u ||
+        n_tok > INT_MAX ||
         in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
         in_dim > INT_MAX || out0_dim == 0u || out1_dim == 0u ||
         out0_dim > INT_MAX || out1_dim > INT_MAX) {
@@ -37154,6 +37155,12 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
         out1->bytes < out1_bytes) {
         return 0;
     }
+    const uintptr_t out0_addr = (uintptr_t)out0->ptr;
+    const uintptr_t out1_addr = (uintptr_t)out1->ptr;
+    const bool outputs_overlap = out0_addr <= out1_addr
+        ? (uint64_t)(out1_addr - out0_addr) < out0_bytes
+        : (uint64_t)(out0_addr - out1_addr) < out1_bytes;
+    if (outputs_overlap) return 0;
 
     const int logical_tier = ds4_tensor_device_idx(out0);
     if (logical_tier < 0 || logical_tier >= g_n_gpus ||
@@ -37172,25 +37179,38 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
     const int gb10_canonical = cuda_q4_gb10_fast_path_enabled(
         logical_tier, "DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
     if (cuda_use_mmq()) {
-        /* One Q8_1 activation allocation/quantization is shared by both
-         * canonical MMVQ legs.  On GB10 a rejected launch fails closed to
-         * ds4.c's independent projections; the Q8_K pair fallback below is
-         * intentionally retained only for the pre-existing non-GB10 path. */
-        const int rc = ds4_mmq_q4_K_dense_pair_vec(
-            w0, w1, (const float *)x->ptr,
-            (float *)out0->ptr, (float *)out1->ptr,
-            (int)out0_dim, (int)out1_dim, (int)n_tok, (int)in_dim,
-            cuda_decode_stream());
+        /* Share one canonical Q8_1 activation across both projections:
+         * MMVQ covers decode/speculative widths and token-tiled MMQ covers
+         * prefill.  On GB10 a rejected launch fails closed to ds4.c's
+         * independent projections; the Q8_K fallback below remains the
+         * established non-GB10 rollback. */
+        const int rc = n_tok <= 8u
+            ? ds4_mmq_q4_K_dense_pair_vec(
+                  w0, w1, (const float *)x->ptr,
+                  (float *)out0->ptr, (float *)out1->ptr,
+                  (int)out0_dim, (int)out1_dim,
+                  (int)n_tok, (int)in_dim, cuda_decode_stream())
+            : ds4_mmq_q4_K_dense_pair(
+                  w0, w1, (const float *)x->ptr,
+                  (float *)out0->ptr, (float *)out1->ptr,
+                  (int)out0_dim, (int)out1_dim,
+                  (int)n_tok, (int)in_dim, cuda_decode_stream());
         if (rc == 0) return 1;
         fprintf(stderr,
-                "ds4: Q4_K MMVQ pair returned %d "
+                "ds4: Q4_K %s pair returned %d "
                 "(in=%llu out0=%llu out1=%llu n_tok=%llu); falling back\n",
-                rc, (unsigned long long)in_dim,
+                n_tok <= 8u ? "MMVQ" : "MMQ", rc,
+                (unsigned long long)in_dim,
                 (unsigned long long)out0_dim,
                 (unsigned long long)out1_dim,
                 (unsigned long long)n_tok);
         if (gb10_canonical) return 0;
     }
+
+    /* The Q8_K pair is the established decode/microbatch rollback only.
+     * For prefill, preserve DS4_CUDA_MMQ=0 and MMQ rejection semantics by
+     * returning control to the caller's two independent dense projections. */
+    if (n_tok > 8u) return 0;
 
     if (n_tok > UINT64_MAX / blocks ||
         n_tok * blocks > UINT64_MAX / sizeof(cuda_block_q8_K)) {
