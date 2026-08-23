@@ -3496,7 +3496,7 @@ void kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl(
 
             float sg = 0;
             float su = 0;
-            for (short l = 0; l < 4; ++l) {
+            FOR_UNROLL (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t *gridg =
                     (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t *gridu =
