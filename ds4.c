@@ -3636,6 +3636,129 @@ static void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const bl
 #endif
 }
 
+/* Evaluate two activation rows against one Q4_K weight row.  Each token keeps
+ * its own integer and floating-point accumulation order, while the packed
+ * Q4 nibbles and scale/min metadata are decoded only once. */
+static void ds4_vec_dot_q4_K_q8_K_2(
+        int n,
+        float *s0,
+        float *s1,
+        const block_q4_K *x,
+        const block_q8_K *y0,
+        const block_q8_K *y1) {
+    const int nb = n / QK_K;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    const int32x4_t zero = vdupq_n_s32(0);
+    float sumf0 = 0.0f;
+    float sumf1 = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float xd = f16_to_f32(x[i].d);
+        const float xmin = f16_to_f32(x[i].dmin);
+        const float d0 = y0[i].d * xd;
+        const float d1 = y1[i].d * xd;
+        const float dm0 = -y0[i].d * xmin;
+        const float dm1 = -y1[i].d * xmin;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t *q80 = y0[i].qs;
+        const int8_t *q81 = y1[i].qs;
+
+        int32_t summs0 = 0;
+        int32_t summs1 = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            const int32_t gsum0 = (int32_t)y0[i].bsums[j * 2] +
+                                  (int32_t)y0[i].bsums[j * 2 + 1];
+            const int32_t gsum1 = (int32_t)y1[i].bsums[j * 2] +
+                                  (int32_t)y1[i].bsums[j * 2 + 1];
+            summs0 += m_val * gsum0;
+            summs1 += m_val * gsum1;
+        }
+
+        int isum0 = 0;
+        int isum1 = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+            const int8x16x2_t q8v0 = vld1q_s8_x2(q80 + j * 32);
+            const int8x16x2_t q8v1 = vld1q_s8_x2(q81 + j * 32);
+            uint8_t q4_u[32];
+            if (shift == 0) {
+                for (int l = 0; l < 32; l++) q4_u[l] = qs[byte_off + l] & 0xF;
+            } else {
+                for (int l = 0; l < 32; l++) q4_u[l] = qs[byte_off + l] >> 4;
+            }
+            const int8x16_t q4a = vreinterpretq_s8_u8(vld1q_u8(q4_u));
+            const int8x16_t q4b = vreinterpretq_s8_u8(vld1q_u8(q4_u + 16));
+            isum0 += vaddvq_s32(vdotq_s32(zero, q4a, q8v0.val[0])) * sc_val;
+            isum0 += vaddvq_s32(vdotq_s32(zero, q4b, q8v0.val[1])) * sc_val;
+            isum1 += vaddvq_s32(vdotq_s32(zero, q4a, q8v1.val[0])) * sc_val;
+            isum1 += vaddvq_s32(vdotq_s32(zero, q4b, q8v1.val[1])) * sc_val;
+        }
+
+        sumf0 += d0 * (float)isum0 + dm0 * (float)summs0;
+        sumf1 += d1 * (float)isum1 + dm1 * (float)summs1;
+    }
+
+    *s0 = sumf0;
+    *s1 = sumf1;
+#else
+    float sumf0 = 0.0f;
+    float sumf1 = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float xd = f16_to_f32(x[i].d);
+        const float xmin = f16_to_f32(x[i].dmin);
+        const float d0 = y0[i].d * xd;
+        const float d1 = y1[i].d * xd;
+        const float dm0 = -y0[i].d * xmin;
+        const float dm1 = -y1[i].d * xmin;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t *q80 = y0[i].qs;
+        const int8_t *q81 = y1[i].qs;
+
+        int summs0 = 0;
+        int summs1 = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            const int32_t gsum0 = (int32_t)y0[i].bsums[j * 2] +
+                                  (int32_t)y0[i].bsums[j * 2 + 1];
+            const int32_t gsum1 = (int32_t)y1[i].bsums[j * 2] +
+                                  (int32_t)y1[i].bsums[j * 2 + 1];
+            summs0 += m_val * gsum0;
+            summs1 += m_val * gsum1;
+        }
+
+        int isum0 = 0;
+        int isum1 = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+            for (int l = 0; l < 32; l++) {
+                const int q4 = (qs[byte_off + l] >> shift) & 0xF;
+                isum0 += q4 * (int)q80[j * 32 + l] * sc_val;
+                isum1 += q4 * (int)q81[j * 32 + l] * sc_val;
+            }
+        }
+
+        sumf0 += d0 * (float)isum0 + dm0 * (float)summs0;
+        sumf1 += d1 * (float)isum1 + dm1 * (float)summs1;
+    }
+
+    *s0 = sumf0;
+    *s1 = sumf1;
+#endif
+}
+
 static void ds4_vec_dot_q5_K_q8_K(int n, float *s, const block_q5_K *x, const block_q8_K *y) {
     const int nb = n / QK_K;
     float sumf = 0.0f;
@@ -8117,12 +8240,60 @@ typedef struct {
     uint64_t blocks;
 } matmul_q4_K_batch_ctx;
 
+typedef struct {
+    const float *x;
+    block_q8_K *xq;
+    uint64_t row_dim;
+    uint64_t blocks;
+} quantize_q8_K_rows_ctx;
+
+static void quantize_q8_K_rows_worker(
+        void *vctx, uint64_t row0, uint64_t row1) {
+    quantize_q8_K_rows_ctx *ctx = vctx;
+    for (uint64_t row = row0; row < row1; row++) {
+        ds4_quantize_row_q8_K(ctx->x + row * ctx->row_dim,
+                              ctx->xq + row * ctx->blocks,
+                              (int64_t)ctx->row_dim);
+    }
+}
+
+static void quantize_q8_K_rows(
+        const float *x,
+        block_q8_K *xq,
+        uint64_t n_rows,
+        uint64_t row_dim) {
+    quantize_q8_K_rows_ctx ctx = {
+        .x = x,
+        .xq = xq,
+        .row_dim = row_dim,
+        .blocks = row_dim / QK_K,
+    };
+    /* A pool round-trip costs more than quantizing a handful of rows.  Match
+     * the existing F16 matvec crossover and parallelize only once the batch
+     * contains at least 256K activation elements. */
+    const bool work_overflow = row_dim != 0 && n_rows > UINT64_MAX / row_dim;
+    const uint64_t work = work_overflow ? UINT64_MAX : n_rows * row_dim;
+    const uint64_t min_parallel_rows = work >= 262144u ? 1u : 512u;
+    ds4_parallel_for_min_rows(n_rows, quantize_q8_K_rows_worker, &ctx,
+                              min_parallel_rows);
+}
+
 static void matmul_q4_K_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matmul_q4_K_batch_ctx *ctx = vctx;
     for (uint64_t r = r0; r < r1; r++) {
         const block_q4_K *row = (const block_q4_K *)
             (ctx->data + r * ctx->blocks * sizeof(block_q4_K));
-        for (uint64_t t = 0; t < ctx->n_tok; t++) {
+        uint64_t t = 0;
+        for (; t + 1 < ctx->n_tok; t += 2) {
+            ds4_vec_dot_q4_K_q8_K_2(
+                    (int)ctx->in_dim,
+                    &ctx->out[t * ctx->out_dim + r],
+                    &ctx->out[(t + 1) * ctx->out_dim + r],
+                    row,
+                    ctx->xq + t * ctx->blocks,
+                    ctx->xq + (t + 1) * ctx->blocks);
+        }
+        for (; t < ctx->n_tok; t++) {
             ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim,
                                   &ctx->out[t * ctx->out_dim + r],
                                   row,
@@ -8141,9 +8312,7 @@ static void matmul_q4_K_batch(
     const uint64_t in_dim = w->dim[0];
     const uint64_t blocks = in_dim / QK_K;
     block_q8_K *xq = xmalloc((size_t)n_tok * blocks * sizeof(block_q8_K));
-    for (uint64_t t = 0; t < n_tok; t++) {
-        ds4_quantize_row_q8_K(x + t * in_dim, xq + t * blocks, (int64_t)in_dim);
-    }
+    quantize_q8_K_rows(x, xq, n_tok, in_dim);
     matmul_q4_K_batch_ctx ctx = {
         .out = out,
         .data = tensor_data(m, w),
@@ -8174,7 +8343,17 @@ static void matmul_q4_K_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r
         const uint64_t group = idx / ctx->rank;
         const block_q4_K *row = (const block_q4_K *)
             (ctx->data + idx * ctx->blocks * sizeof(block_q4_K));
-        for (uint64_t t = 0; t < ctx->n_tok; t++) {
+        uint64_t t = 0;
+        for (; t + 1 < ctx->n_tok; t += 2) {
+            ds4_vec_dot_q4_K_q8_K_2(
+                    (int)ctx->group_dim,
+                    &ctx->out[t * ctx->n_groups * ctx->rank + idx],
+                    &ctx->out[(t + 1) * ctx->n_groups * ctx->rank + idx],
+                    row,
+                    ctx->xq + (t * ctx->n_groups + group) * ctx->blocks,
+                    ctx->xq + ((t + 1) * ctx->n_groups + group) * ctx->blocks);
+        }
+        for (; t < ctx->n_tok; t++) {
             ds4_vec_dot_q4_K_q8_K((int)ctx->group_dim,
                                   &ctx->out[t * ctx->n_groups * ctx->rank + idx],
                                   row,
@@ -8195,13 +8374,7 @@ static void matmul_q4_K_grouped_batch(
     matvec_q4_K_grouped_expect(w, n_groups, group_dim, rank);
     const uint64_t blocks = group_dim / QK_K;
     block_q8_K *xq = xmalloc((size_t)n_tok * n_groups * blocks * sizeof(block_q8_K));
-    for (uint64_t t = 0; t < n_tok; t++) {
-        for (uint32_t g = 0; g < n_groups; g++) {
-            ds4_quantize_row_q8_K(x + (t * n_groups + g) * group_dim,
-                                  xq + (t * n_groups + g) * blocks,
-                                  (int64_t)group_dim);
-        }
-    }
+    quantize_q8_K_rows(x, xq, n_tok * n_groups, group_dim);
     matmul_q4_K_grouped_batch_ctx ctx = {
         .out = out,
         .data = tensor_data(m, w),
