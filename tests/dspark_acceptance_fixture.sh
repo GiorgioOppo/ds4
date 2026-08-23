@@ -23,6 +23,15 @@ REQUIRE_CUDA_DEVICE_PROPOSER=${DS4_DSPARK_FIXTURE_REQUIRE_CUDA_DEVICE_PROPOSER:-
 REQUIRE_METAL_EXACTN_BATCH_HEAD=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_BATCH_HEAD:-0}
 REQUIRE_METAL_EXACTN_PARTIAL=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_EXACTN_PARTIAL:-0}
 REQUIRE_METAL_DEVICE_PROPOSER=${DS4_DSPARK_FIXTURE_REQUIRE_METAL_DEVICE_PROPOSER:-0}
+TEMPERATURE=${DS4_DSPARK_FIXTURE_TEMPERATURE:-0}
+TOP_P=${DS4_DSPARK_FIXTURE_TOP_P:-0.95}
+MIN_P=${DS4_DSPARK_FIXTURE_MIN_P:-0.05}
+SEED=${DS4_DSPARK_FIXTURE_SEED:-12345}
+EXACT_SAMPLING=${DS4_DSPARK_FIXTURE_EXACT_SAMPLING:-0}
+exact_sampling_arg=
+if [ "$EXACT_SAMPLING" != 0 ]; then
+    exact_sampling_arg=--mtp-exact-sampling
+fi
 partial_cases=0
 direct_partial_cases=0
 direct_commits=0
@@ -276,9 +285,10 @@ print_metadata() {
     printf '# model=%s model_bytes=%s support=%s support_bytes=%s\n' \
         "$MODEL" "$(file_bytes "$MODEL")" \
         "$SUPPORT" "$(file_bytes "$SUPPORT")"
-    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" backend=%s ssd_streaming=%s ssd_cache_experts=%s confidence=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
-        "$TOKENS" "$BACKEND" "$SSD_STREAMING" "${SSD_CACHE_EXPERTS:-auto}" \
-        "$confidence" "$PROPOSAL_QUALITY_GUARD" \
+    printf '# tokens=%s ctx=default flags="--temp %s --top-p %s --min-p %s --seed %s --nothink" backend=%s ssd_streaming=%s ssd_cache_experts=%s exact_sampling=%s confidence=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
+        "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED" \
+        "$BACKEND" "$SSD_STREAMING" "${SSD_CACHE_EXPERTS:-auto}" \
+        "$EXACT_SAMPLING" "$confidence" "$PROPOSAL_QUALITY_GUARD" \
         "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED" \
         "$REQUIRE_DIRECT" "$REQUIRE_IDENTICAL"
     printf '# exact2_cuda=%s exact2_metal=%s proposer_block_max_cuda=%s proposer_block_max_metal=%s verifier_block_max=%s require_exact2=%s\n' \
@@ -301,11 +311,12 @@ print_metadata() {
         "$REQUIRE_METAL_EXACTN_BATCH_HEAD" "$REQUIRE_METAL_EXACTN_PARTIAL" \
         "$metal_device_proposer" "$metal_device_proposer_disable" \
         "$REQUIRE_METAL_DEVICE_PROPOSER"
-    printf '# baseline_command=%s -m %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
-        "$DS4_BIN" "$MODEL" "$TOKENS"
-    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s -m %s --mtp %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
-        "$DS4_BIN" "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
-        "$MODEL" "$SUPPORT" "$TOKENS"
+    printf '# baseline_command=%s -m %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
+        "$DS4_BIN" "$MODEL" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
+    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s%s -m %s --mtp %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
+        "$DS4_BIN" "${exact_sampling_arg:+ $exact_sampling_arg}" \
+        "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
+        "$MODEL" "$SUPPORT" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
 }
 
 if [ ! -x "$DS4_BIN" ]; then
@@ -344,11 +355,16 @@ run_variant() {
     fi
     if [ "$mode" = dspark ]; then
         set -- "$@" --dspark --mtp "$SUPPORT"
+        if [ -n "$exact_sampling_arg" ]; then
+            set -- "$@" "$exact_sampling_arg"
+        fi
         if [ -n "$CONFIDENCE" ]; then
             set -- "$@" --dspark-confidence "$CONFIDENCE"
         fi
     fi
-    set -- "$@" -m "$MODEL" --tokens "$TOKENS" --temp 0 --nothink -p "$prompt"
+    set -- "$@" -m "$MODEL" --tokens "$TOKENS" \
+        --temp "$TEMPERATURE" --top-p "$TOP_P" --min-p "$MIN_P" \
+        --seed "$SEED" --nothink -p "$prompt"
 
     if [ "$mode" = dspark ]; then
         DS4_DSPARK_STATS=1 "$@" >"$stdout_file" 2>"$stderr_file"
