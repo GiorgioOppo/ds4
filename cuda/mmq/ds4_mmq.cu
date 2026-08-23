@@ -26,6 +26,7 @@
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -117,7 +118,7 @@ static constexpr bool g_q81_scratch_enabled = false;
 static bool   g_q81_grouped_enabled = false;
 static bool   g_q81_scratch_poisoned = false;
 static int    g_q81_scratch_device = -1;
-static std::mutex g_q81_scratch_mutex;
+static std::mutex g_q81_state_mutex; // Process-global state, not per-tensor.
 
 static uint64_t g_q81_grouped_candidates;
 static uint64_t g_q81_grouped_uses;
@@ -152,7 +153,15 @@ struct mmq_pair_map_scratch {
 };
 
 static mmq_pair_map_scratch g_mmq_pair_maps[GGML_CUDA_MAX_DEVICES] = {};
-static int    g_gb10_optimizations = 0;
+
+// Backend init/teardown owns transitions, but dispatch admission reads this
+// flag without taking the Q8_1 arena mutex. Keep those reads race-free while
+// retaining the mutex below for arena ownership and cleanup serialization.
+static std::atomic<bool> g_gb10_optimizations{false};
+
+static bool gb10_optimizations_enabled() {
+    return g_gb10_optimizations.load(std::memory_order_relaxed);
+}
 
 static constexpr size_t DS4_MMQ_Q81_ARENA_MIN_BYTES = 4u * 1024u * 1024u;
 
@@ -178,7 +187,7 @@ static bool q81_persistent_requested() {
 }
 
 static bool q81_is_gb10_owner(int device) {
-    if (!g_gb10_optimizations || device < 0 ||
+    if (!gb10_optimizations_enabled() || device < 0 ||
         device >= ggml_cuda_info().device_count) {
         return false;
     }
@@ -348,7 +357,7 @@ extern "C" int ds4_mmq_q81_persistent_preflight_for_test(
     char *arena = nullptr;
     {
         std::unique_lock<std::mutex> lease(
-            g_q81_scratch_mutex, std::defer_lock);
+            g_q81_state_mutex, std::defer_lock);
         arena = q81_grouped_persistent_acquire(
             device, (cudaStream_t)0, required, &lease);
     }
@@ -444,9 +453,18 @@ static bool ds4_mmq_q8_fold_oracle_bytes(
         return false;
     }
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
-        capture != cudaStreamCaptureStatusNone) {
-        fprintf(stderr, "Unable to capture CUDA stream\nERROR: %s", cudaGetErrorString(cudaGetLastError()));
+    const cudaError_t capture_err = cudaStreamIsCapturing(stream, &capture);
+    if (capture_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle stream-capture query failed: %s\n",
+                cudaGetErrorString(capture_err));
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    if (capture != cudaStreamCaptureStatusNone) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle skipped during stream capture\n");
         g_q8_fold_oracle_skips++;
         return false;
     }
@@ -457,7 +475,20 @@ static bool ds4_mmq_q8_fold_oracle_bytes(
     }
     char *fresh = nullptr;
     char *host = (char *)malloc(bytes * 2u);
-    if (!host || cudaMalloc((void **)&fresh, bytes) != cudaSuccess || !fresh) {
+    if (!host) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle host allocation (%zu B) failed\n",
+                bytes * 2u);
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    const cudaError_t fresh_alloc_err = cudaMalloc((void **)&fresh, bytes);
+    if (fresh_alloc_err != cudaSuccess || !fresh) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle device allocation (%zu B) failed: "
+                "%s%s\n",
+                bytes, cudaGetErrorString(fresh_alloc_err),
+                fresh_alloc_err == cudaSuccess ? " (null pointer)" : "");
         free(host);
         fprintf(stderr, "Unable to allocate tensor \"fresh\"\nERROR: %s", cudaGetErrorString(cudaGetLastError()));
         g_q8_fold_oracle_skips++;
@@ -695,7 +726,7 @@ extern "C" int ds4_mmq_init(int device) {
     // knows its exact maximum input/down staging requirement and resolves the
     // arena during preflight, before it submits any device operation.
     {
-        std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+        std::lock_guard<std::mutex> lock(g_q81_state_mutex);
         const bool requested = q81_persistent_requested();
         g_q81_grouped_enabled = requested && q81_is_gb10_owner(device) &&
             g_q81_scratch_ptr && !g_q81_scratch_poisoned &&
@@ -705,7 +736,7 @@ extern "C" int ds4_mmq_init(int device) {
 }
 
 extern "C" int ds4_mmq_q81_persistent_cleanup(void) {
-    std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+    std::lock_guard<std::mutex> lock(g_q81_state_mutex);
     g_q81_grouped_enabled = false;
     if (!g_q81_scratch_ptr && !g_q81_unpublished_replacement_ptr) {
         g_q81_scratch_bytes = 0;
@@ -779,7 +810,7 @@ extern "C" void ds4_mmq_q81_persistent_counters(
         uint64_t *candidates, uint64_t *uses, uint64_t *hits,
         uint64_t *pool_fallbacks, uint64_t *allocations, uint64_t *resizes,
         size_t *arena_bytes, size_t *high_water) {
-    std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+    std::lock_guard<std::mutex> lock(g_q81_state_mutex);
     if (candidates) *candidates = g_q81_grouped_candidates;
     if (uses) *uses = g_q81_grouped_uses;
     if (hits) *hits = g_q81_grouped_hits;
@@ -791,7 +822,7 @@ extern "C" void ds4_mmq_q81_persistent_counters(
 }
 
 extern "C" void ds4_mmq_q81_persistent_report(void) {
-    std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
+    std::lock_guard<std::mutex> lock(g_q81_state_mutex);
     fprintf(stderr,
             "ds4: CUDA MMQ grouped Q8_1 persistent: candidates=%llu "
             "uses=%llu hits=%llu pool_fallbacks=%llu allocations=%llu "
@@ -2058,7 +2089,7 @@ int ds4_mmq_moe_pair_impl(
     size_t grouped_down_q8_bytes = 0;
     size_t grouped_q81_required = 0;
     std::unique_lock<std::mutex> grouped_q81_lease(
-        g_q81_scratch_mutex, std::defer_lock);
+        g_q81_state_mutex, std::defer_lock);
     ggml_cuda_pool_alloc<char> grouped_q81_pool;
     char *grouped_q81_scratch = nullptr;
     if (grouped_raw_q81 && q81_persistent_requested()) {
@@ -3947,6 +3978,9 @@ q4_K_dense_vec_k1024_persistent_kernel(
     const uint32_t group_tid = warp_in_group * 32u + lane;
     const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
 
+    /* tile, row_tiles, and gridDim.x are block-uniform, and this loop has no
+     * divergent exit.  Every thread therefore reaches both barriers below on
+     * every iteration; unrolling is unrelated to their correctness. */
     for (uint64_t tile = blockIdx.x; tile < row_tiles; tile += gridDim.x) {
         const uint32_t row0 = (uint32_t)(tile * 8u) +
                               group * k_rows_per_group;
@@ -4052,7 +4086,7 @@ int ds4_mmq_dense_vec_impl(
         if (q4_k1024_exact) {
             g_q4_k1024_persistent_candidates++;
         }
-        if (q4_k1024_exact && g_gb10_optimizations &&
+        if (q4_k1024_exact && gb10_optimizations_enabled() &&
             (enable || q4_k1024_oracle) && !disable &&
             (((uintptr_t)W & 15u) == 0u)) {
             const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
@@ -4125,7 +4159,7 @@ int ds4_mmq_dense_vec_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1;
     char *x8 = nullptr;
     if constexpr (type == GGML_TYPE_Q4_K) {
-        if (g_gb10_optimizations &&
+        if (gb10_optimizations_enabled() &&
             getenv("DS4_CUDA_NO_Q4_GB10_FAST") == nullptr &&
             getenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH") == nullptr) {
             x8 = (char *)ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1);
@@ -4310,7 +4344,7 @@ int ds4_mmq_dense_pair_vec_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1;
     char *x8 = nullptr;
     if constexpr (type == GGML_TYPE_Q4_K) {
-        if (g_gb10_optimizations &&
+        if (gb10_optimizations_enabled() &&
             getenv("DS4_CUDA_NO_Q4_GB10_FAST") == nullptr &&
             getenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH") == nullptr) {
             x8 = (char *)ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1);
@@ -4430,7 +4464,7 @@ static int ds4_mmq_q4_K_grouped_batch_vec_impl(
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
-    if (!g_gb10_optimizations ||
+    if (!gb10_optimizations_enabled() ||
         getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr ||
         getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A") != nullptr ||
         M <= 0 || K <= 0 || n_tokens <= 0 || n_tokens > 8 ||
@@ -5444,8 +5478,10 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
 
 extern "C" void ds4_mmq_set_gb10_optimizations(int enabled) {
     {
-        std::lock_guard<std::mutex> lock(g_q81_scratch_mutex);
-        g_gb10_optimizations = enabled != 0;
+        // Serialize the transition with any persistent Q8_1 host lease.  The
+        // atomic also covers GB10 admission reads outside this arena lock.
+        std::lock_guard<std::mutex> lock(g_q81_state_mutex);
+        g_gb10_optimizations.store(enabled != 0, std::memory_order_relaxed);
     }
     if (!enabled) {
         // Backend teardown/reinit already funnels through this setter.  Keep
@@ -5658,7 +5694,7 @@ static cudaError_t q8_0_aligned_dense_vec_launch(
         cudaStream_t stream) {
     switch (N) {
     case 1:
-        if (g_gb10_optimizations &&
+        if (gb10_optimizations_enabled() &&
             getenv("DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT") == NULL &&
             (K == 1024 || K == 4096) && M >= 32768) {
             const uint64_t row_blocks = ((uint64_t)(unsigned)M + 7u) / 8u;
