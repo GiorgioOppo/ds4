@@ -42,7 +42,9 @@ The harness prefills two sessions and alternates both variant order and
 variant-to-session assignment. It aborts unless every full-vocabulary logit
 row is bit-identical and, with `--include-selection`, both variants select the
 same non-EOS token. Use `--candidate-env NAME` to measure a rollback control,
-or `--help` to compare explicit split schedules.
+or `--help` to compare explicit split schedules. Pass `--ssd-streaming` for a
+model larger than RAM; the harness then skips full-weight warmup while keeping
+both variants in the same engine and expert cache.
 
 To compare the default pre-M5 ratio-4 compressor pack/transpose fusion with the
 legacy decode path, including token selection, use:
