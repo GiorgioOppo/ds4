@@ -204,6 +204,7 @@ static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads16_dual_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_split_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_split_reduce_pipeline;
+static bool g_attn_out_low_q8_static_unavailable;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_simd_pipeline;
@@ -11403,6 +11404,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_indexed_attention_heads16_dual_pipeline = nil;
         g_dsv4_indexed_attention_heads8_split_pipeline = nil;
         g_dsv4_indexed_attention_heads8_split_reduce_pipeline = nil;
+        g_attn_out_low_q8_static_unavailable = false;
         g_dsv4_softplus_sqrt_pipeline = nil;
         g_dsv4_router_finalize_one_pipeline = nil;
         g_dsv4_router_finalize_one_simd_pipeline = nil;
@@ -27974,8 +27976,30 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                     .nb1 = (uint64_t)rank * sizeof(float),
                     .nr0 = 2,
                 };
-                id<MTLComputePipelineState> pipeline =
-                    ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                const bool force_flash_decode_static_for_test =
+                    (g_test_flags & DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC) != 0u;
+                const bool use_pre_m5_flash_decode_static =
+                    (ds4_gpu_device_is_pre_m5_apple_silicon() ||
+                     force_flash_decode_static_for_test) &&
+                    (!g_attn_out_low_q8_static_unavailable ||
+                     force_flash_decode_static_for_test) &&
+                    getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") == NULL &&
+                    getenv("DS4_METAL_DISABLE_PRE_M5_ATTN_OUT_LOW_Q8_STATIC") == NULL &&
+                    group_dim == 4096u && rank == 1024u && n_groups == 8u &&
+                    low_dim == 8192u && row_a_bytes == 4352u &&
+                    out_a_bytes == 35651584u;
+                id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+                    use_pre_m5_flash_decode_static ?
+                        "kernel_dsv4_attn_out_low_q8_0_flash_decode_static_f32" :
+                        "kernel_dsv4_attn_out_low_q8_0_f32",
+                    4);
+                if (!pipeline && use_pre_m5_flash_decode_static) {
+                    g_attn_out_low_q8_static_unavailable = true;
+                    if (!force_flash_decode_static_for_test) {
+                        pipeline = ds4_gpu_get_mul_mv_pipeline(
+                            "kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                    }
+                }
                 ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                              pipeline,
                                                              &args,

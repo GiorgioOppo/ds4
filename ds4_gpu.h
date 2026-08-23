@@ -275,6 +275,7 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
     DS4_GPU_TEST_STREAMING_LIVE_INDEX_FAILURE = 1u << 7,
     DS4_GPU_TEST_IQ2_SSD_GROUPED_PIPELINE_FAILURE = 1u << 8,
+    DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC = 1u << 9,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
