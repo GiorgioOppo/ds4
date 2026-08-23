@@ -29897,6 +29897,24 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         DS4_METAL_PROFILE_ATTN_STAGE("compressor");
 
+        const bool topk_prefill_needed =
+            ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
+#if defined(__APPLE__)
+        /* Before the compressed cache grows past top-k, zero-prefix prefill
+         * consumes every compressed row and never reads the transient indexer
+         * query or its per-head weights.  This is also true for the Metal SSD
+         * layer-major path: the current layer is mapped while these dispatches
+         * would run, and skipping them changes no persistent cache state. */
+        const bool prune_unused_indexer_query =
+            ratio == 4 && zero_prefix && n_tokens >= 32u &&
+            !topk_prefill_needed && !g->quality &&
+            g->placement == NULL && g->tp_world < 2u &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            getenv("DS4_METAL_DISABLE_PRE_M5_BATCH_INDEXER_QUERY_PRUNE") == NULL;
+#else
+        const bool prune_unused_indexer_query = false;
+#endif
+
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
@@ -29933,14 +29951,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   (uint64_t)index_width * n_tokens,
                                                   il,
                                                   pos0);
-            if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_indexer_q(g),
+            if (ok && !prune_unused_indexer_query) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_indexer_q(g),
                                                           model,
                                                           layer->indexer_attn_q_b,
                                                           q_rank,
                                                           (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
                                                           metal_graph_batch_qr_norm(g),
                                                           n_tokens);
-            if (ok) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_indexer_q(g),
+            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_indexer_q(g),
                                                     n_tokens,
                                                     DS4_N_INDEXER_HEAD,
                                                     DS4_N_INDEXER_HEAD_DIM,
@@ -29954,10 +29972,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                     attn_factor,
                                                     DS4_ROPE_YARN_BETA_FAST,
                                                     DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(metal_graph_batch_indexer_q(g),
+            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_dsv4_indexer_qat_tensor(metal_graph_batch_indexer_q(g),
                                                           n_tokens * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_indexer_weights(g),
+            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_indexer_weights(g),
                                                      model->map,
                                                      model->size,
                                                      layer->indexer_proj->abs_offset,
@@ -30332,7 +30350,6 @@ static bool metal_graph_encode_layer_attention_batch(
             if (ok) batch_attention_done = true;
         }
 
-        const bool topk_prefill_needed = ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
         if (ok && zero_prefix && topk_prefill_needed && n_comp != 0) {
             const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
             double index_stage_t0 = 0.0;
