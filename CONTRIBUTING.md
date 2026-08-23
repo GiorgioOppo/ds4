@@ -30,8 +30,7 @@ environment variable, update `scripts/environment_variables.tsv`, regenerate
 the complete reference, and verify that it is current:
 
 ```sh
-python3 scripts/generate_environment_variables.py
-make check-environment-docs
+make environment-docs
 ```
 
 Useful narrower checks:
