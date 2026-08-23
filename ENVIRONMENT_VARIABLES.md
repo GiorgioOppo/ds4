@@ -112,7 +112,7 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1061 `DS4_*` runtime variables** and
+Inventory totals: **1067 `DS4_*` runtime variables** and
 **6 external runtime variables**.
 The auxiliary inventories contain **112 test/test-fixture entries**
 and **19 tool/wrapper entries**.
@@ -905,7 +905,7 @@ and **19 tool/wrapper entries**.
 </details>
 
 <details>
-<summary><strong>ROCm (134)</strong></summary>
+<summary><strong>ROCm (140)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -950,6 +950,10 @@ and **19 tool/wrapper entries**.
 | `DS4_ROCM_DISABLE_STREAMING_STATIC_DECODE_MAP` | presence rollback flag; unset keeps automatic/default path | Disable/roll back rocm disable streaming static decode map. | [ds4.c:18216](ds4.c#L18216) |
 | `DS4_ROCM_DISABLE_STREAMING_STATIC_MAP_STATE_CACHE` | presence rollback flag; unset keeps automatic/default path | Disable/roll back rocm disable streaming static map state cache. | [ds4.c:18229](ds4.c#L18229) |
 | `DS4_ROCM_DSV4_PREQUANT_DECODE` | sampled once; unset: enabled; present empty or exact 0: disabled; every other present value: enabled; quality mode and GLM models force it off regardless | ROCm DeepSeek-V4 decode: quantizes one-token F32 activations to Q8 once and selects the prequantized Q8_0/DP4A projection kernels instead of the full-F32 activation paths. | [rocm/ds4_rocm_runtime.cuh:4775](rocm/ds4_rocm_runtime.cuh#L4775) |
+| `DS4_ROCM_ENABLE_MXFP4_LDSB` | presence opt-in; unset=off; any defined value including empty or 0 enables the candidate when the MXFP4 path, sorted expert tiles, token count >= 128, LDS-size limit, and dimension-alignment gates all pass | Select the ROCm MXFP4 prefill gate/up kernel that stages eight gate and eight up weight rows in LDS and reuses them across expert tiles of up to 128 tokens. | [rocm/ds4_rocm_moe_launch.cuh:782](rocm/ds4_rocm_moe_launch.cuh#L782) |
+| `DS4_ROCM_ENABLE_MXFP4_ROW64` | presence opt-in; unset=off; any defined value including empty or 0 enables the candidate when the MXFP4 sorted-tile path has at least 8 tokens and the TILE32, LDSB, and TILE4 candidates are not selected | Select the ROCm MXFP4 gate/up tile8 occupancy variant with 64 row slots and 512 threads per block. | [rocm/ds4_rocm_moe_launch.cuh:798](rocm/ds4_rocm_moe_launch.cuh#L798) |
+| `DS4_ROCM_ENABLE_MXFP4_TILE32` | presence opt-in; unset=off; any defined value including empty or 0 enables the candidate when the MXFP4 sorted-tile path has at least 32 tokens and the expert intermediate dimension is divisible by 32 | Select the ROCm MXFP4 gate/up tile32 kernel, reusing each loaded expert-weight chunk across as many as 32 tokens. | [rocm/ds4_rocm_moe_launch.cuh:786](rocm/ds4_rocm_moe_launch.cuh#L786) |
+| `DS4_ROCM_ENABLE_MXFP4_TILE4` | presence opt-in; unset=off; any defined value including empty or 0 enables the candidate when the MXFP4 sorted-tile path has at least 5 tokens and neither TILE32 nor LDSB is selected | Select the ROCm MXFP4 gate/up tile4 occupancy variant, reducing staged-activation LDS per block. | [rocm/ds4_rocm_moe_launch.cuh:794](rocm/ds4_rocm_moe_launch.cuh#L794) |
 | `DS4_ROCM_ENABLE_Q4_DENSE_PAIR` | presence opt-in; unset=off; DISABLE takes precedence | Enable rocm enable q4 dense pair. | [rocm/ds4_rocm_q4.cuh:434](rocm/ds4_rocm_q4.cuh#L434) |
 | `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A` | presence opt-in; unset=off unless REQUIRE; DISABLE wins | Enable rocm enable q4 grouped attn a. | [rocm/ds4_rocm_q4.cuh:704](rocm/ds4_rocm_q4.cuh#L704) |
 | `DS4_ROCM_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming full expert addr table. | [ds4.c:18240](ds4.c#L18240) |
@@ -1000,7 +1004,9 @@ and **19 tool/wrapper entries**.
 | `DS4_ROCM_MOE_DECODE_GATE_RPB` | sampled once; nonempty value is parsed by strtoul (a numeric prefix is sufficient), cast to uint32_t, and accepted only if 1/2/4/8/16/32; unset/empty/invalid defaults to 1 in non-quality SSD mode when DS4_ROCM_MOE_DECODE_RPB is unset/empty, otherwise inherits the resolved base RPB | Sets output rows (warps) per block for ROCm Q2_K routed-MoE decode gate/up kernels; threads per block are value * 32. | [rocm/ds4_rocm_runtime.cuh:4836](rocm/ds4_rocm_runtime.cuh#L4836) |
 | `DS4_ROCM_MOE_DECODE_PROFILE` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Collect timing/profile diagnostics for rocm moe decode profile. | [rocm/ds4_rocm_moe_launch.cuh:82](rocm/ds4_rocm_moe_launch.cuh#L82) |
 | `DS4_ROCM_MOE_DECODE_RPB` | sampled once; nonempty value is parsed by strtoul (a numeric prefix is sufficient), cast to uint32_t, and accepted only if 1/2/4/8/16/32; unset/empty/invalid default: quality=8, non-quality SSD=2, resident=1 | Sets the base ROCm Q2_K decode-MoE rows-per-block value inherited by gate/up and down controls, except the automatic SSD gate specialization defaults to 1 when this variable is unset/empty. | [rocm/ds4_rocm_runtime.cuh:4832](rocm/ds4_rocm_runtime.cuh#L4832) |
+| `DS4_ROCM_MOE_PATH_DEBUG` | presence diagnostic; unset=off; any defined value including empty or 0 enables it | Print ROCm routed-MoE path selection, sorted-tile scratch state, and MXFP4 gate/up launch diagnostics to stderr. | [rocm/ds4_rocm_moe_launch.cuh:831](rocm/ds4_rocm_moe_launch.cuh#L831) |
 | `DS4_ROCM_MOE_WRITE_CLAMPED_ACT` | Pure presence sentinel: any defined value, including empty or "0", is active; DS4_METAL_MOE_WRITE_CLAMPED_ACT is an accepted fallback alias. On ROCm the variable is only consumed as a path-admission veto: it disables selected-expert cache/address-table, selected-slot and CPU-router/fused optimized paths. No ROCm call site parses a clamp amount or directly enables a write-clamped kernel. | Force shared graph selection away from optimizations incompatible with the clamped-intermediate MoE diagnostic; on ROCm this is a compatibility/rollback gate, not itself a clamped-write implementation. | [ds4.c:18526](ds4.c#L18526) |
+| `DS4_ROCM_MXFP4_DOWN_RGROUP` | nonempty value is parsed by strtol and a numeric prefix is sufficient; integers 1..8 are accepted; unset, empty, invalid, or out-of-range values use 1 | Set how many 32-row output blocks each ROCm MXFP4 tiled down-projection block computes, reducing the first launch-grid dimension as the value increases. | [rocm/ds4_rocm_moe_launch.cuh:801](rocm/ds4_rocm_moe_launch.cuh#L801) |
 | `DS4_ROCM_Q4_GROUPED_ATTN_A_STATS` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Print counters for rocm q4 grouped attn a stats. | [rocm/ds4_rocm_q4.cuh:480](rocm/ds4_rocm_q4.cuh#L480) |
 | `DS4_ROCM_Q4_PREFILL_TILE8_STATS` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Print counters for rocm q4 prefill tile8 stats. | [rocm/ds4_rocm_q4.cuh:514](rocm/ds4_rocm_q4.cuh#L514) |
 | `DS4_ROCM_Q8_DECODE_SHAREDX_64K` | sampled once; unset: enabled; present empty or exact 0: disabled; every other present value: enabled; effective only for one-token non-prequant Q8_0 matmul with 8192 < in_dim <= 16384 | Allows the ROCm shared-input Q8 decode kernel to use up to 64 KiB dynamic LDS for wide inputs; an unsupported/failed LDS launch automatically falls back to the regular kernel. | [rocm/ds4_rocm_runtime.cuh:4805](rocm/ds4_rocm_runtime.cuh#L4805) |
