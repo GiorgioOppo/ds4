@@ -804,6 +804,9 @@ a substitute for CUDA or Metal release testing.
 - Build:
   `make clean && make strix-halo`.
 - Require the ROCm build to complete without compiler warnings.
+- After MXFP4 or ROCm routed-MoE changes, run `make test-mxfp4-rocm`. Require
+  zero `failures` for both `mid` and `out` at 1, 3, 32, 128, and 512 tokens,
+  followed by `MXFP4 ROCm routed MoE: PASS`.
 - Use the q2 Flash imatrix GGUF for release smoke tests:
   `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`.
 - Do not use the mixed q2-q4 or Q4 Flash GGUFs for routine Strix Halo QA yet.

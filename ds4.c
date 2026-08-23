@@ -53732,7 +53732,8 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
-        return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+        return (gate->type == DS4_TENSOR_Q4_K ||
+                gate->type == DS4_TENSOR_MXFP4) ? 4 : 2;
     }
     return 0;
 }

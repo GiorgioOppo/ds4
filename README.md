@@ -1043,6 +1043,12 @@ To build an initial mental model, here are the high level concepts:
 4. Each worker keeps its slice of the KV cache.
 5. Communication is worker-to-worker, there is no need to use the coordinator as relay, so if your coordinator is `A`, and you make a request, activations will flow in `A -> B -> C -> back to A`.
 
+The resident ROCm MXFP4 routed-expert path supports the same pipeline mode. A
+tested two-host Strix Halo split uses `--layers 0:21` on the coordinator and
+`--layers 22:output` on the worker. This is a capacity configuration for a
+model that does not fit on one 128 GB system; it does not add ROCm SSD
+streaming support for Flash.
+
 ### How it works and how to configure it
 
 The prefill path is pipelined (this is why it can go faster than in a single machine).
