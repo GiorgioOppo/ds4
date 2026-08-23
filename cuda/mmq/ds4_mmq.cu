@@ -427,7 +427,7 @@ static bool ds4_mmq_q8_fold_oracle_bytes(
     char *host = (char *)malloc(bytes * 2u);
     if (!host || cudaMalloc((void **)&fresh, bytes) != cudaSuccess || !fresh) {
         free(host);
-        (void)cudaGetLastError();
+        fprintf(stderr, "Unable to allocate tensor \"fresh\"\nERROR: %s", cudaGetErrorString(cudaGetLastError()));
         g_q8_fold_oracle_skips++;
         return false;
     }
