@@ -408,7 +408,8 @@ test-mmq-parity-cuda: cuda/mmq/test/test_mmq_parity
 	./cuda/mmq/test/test_mmq_parity
 endif
 
-check-environment-docs:
+environment-docs:
+	python3 scripts/generate_environment_variables.py
 	python3 scripts/generate_environment_variables.py --check
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
