@@ -29739,9 +29739,9 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         bool                 shared_pad,
         bool                *did_fuse_pad) {
     if (did_fuse_pad) *did_fuse_pad = false;
-    if (!cb || !raw || !comp || !dst || raw_cap == 0 ||
+    if (!cb || !raw || !dst || raw_cap == 0 ||
         raw_start >= raw_cap || n_raw == 0 || n_raw > raw_cap ||
-        n_comp == 0 || head_dim == 0) {
+        (n_comp != 0 && !comp) || head_dim == 0) {
         return 0;
     }
 
@@ -29827,6 +29827,9 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
                                               dst,
                                               dst_offset)) {
         return 0;
+    }
+    if (n_comp == 0) {
+        return 1;
     }
     return ds4_gpu_encode_copy_to_f16_1d(
         cb,
@@ -31536,7 +31539,9 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         ds4_gpu_ported_m5_decode_feature_enabled(
             "DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PACKED32_REDUCE",
             NULL) &&
-        !g_quality_mode && use_mask == 0u && comp_kv_f16 != 0u && n_comp != 0u &&
+        !g_quality_mode && use_mask == 0u && comp_kv_f16 != 0u &&
+        (n_comp != 0u ||
+         getenv("DS4_METAL_DISABLE_DECODE_RAW_PACKED32") == NULL) &&
         n_head == 64u && head_dim == 512u && nsg == 1u && nwg == 32u &&
         n_keys <= 1024u && g_decode_attn_rope_fuse != 0 &&
         g_decode_attn_rope_args.head_dim == 512 &&
@@ -33086,7 +33091,12 @@ int ds4_gpu_attention_decode_heads_tensor(
         id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size, sinks_offset, sink_bytes, &sinks_inner);
         if (!sinks_buf) return 0;
 
-        if (n_comp == 0) {
+        /* Raw-only layers historically used a separate five-dispatch path.
+         * The gathered path handles n_comp == 0 with the same packed
+         * attention kernel and reduction topology, but fewer dispatches. */
+        if (n_comp == 0 &&
+            (use_mask != 0 ||
+             getenv("DS4_METAL_DISABLE_DECODE_RAW_GATHERED_ATTN") != NULL)) {
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
             if (!cb) return 0;
