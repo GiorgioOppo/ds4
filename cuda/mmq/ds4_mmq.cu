@@ -414,7 +414,7 @@ static bool ds4_mmq_q8_fold_oracle_bytes(
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
         capture != cudaStreamCaptureStatusNone) {
-        (void)cudaGetLastError();
+        fprintf(stderr, "Unable to capture CUDA stream\nERROR: %s", cudaGetErrorString(cudaGetLastError()));
         g_q8_fold_oracle_skips++;
         return false;
     }
