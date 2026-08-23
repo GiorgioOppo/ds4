@@ -281,7 +281,7 @@ help:
 	@echo "  make rocm-dspark-verify-depth Build ROCm and run the DSpark verifier invariant"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
-	@echo "  make check-environment-docs  Verify the generated environment-variable inventory"
+	@echo "  make environment-docs  Generate and verify the environment variable inventory"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
