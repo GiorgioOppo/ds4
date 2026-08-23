@@ -40,17 +40,69 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
 
 constexpr int QK_K_LOCAL = 256;
+
+class scoped_env_override {
+public:
+    explicit scoped_env_override(const char *name) : name_(name) {
+        const char *value = std::getenv(name_);
+        if (value) {
+            had_original_ = true;
+            original_value_ = value;
+        }
+    }
+
+    ~scoped_env_override() {
+        (void)restore();
+    }
+
+    bool set(const char *value) {
+        if (setenv(name_, value, 1) != 0) {
+            const int saved_errno = errno;
+            fprintf(stderr, "setenv(%s=%s) failed: %s\n",
+                    name_, value, std::strerror(saved_errno));
+            return false;
+        }
+        active_ = true;
+        return true;
+    }
+
+    bool restore() {
+        if (!active_) return true;
+        const int rc = had_original_
+            ? setenv(name_, original_value_.c_str(), 1)
+            : unsetenv(name_);
+        if (rc != 0) {
+            const int saved_errno = errno;
+            fprintf(stderr, "restoring %s failed: %s\n",
+                    name_, std::strerror(saved_errno));
+            return false;
+        }
+        active_ = false;
+        return true;
+    }
+
+    scoped_env_override(const scoped_env_override &) = delete;
+    scoped_env_override &operator=(const scoped_env_override &) = delete;
+
+private:
+    const char *name_;
+    std::string original_value_;
+    bool had_original_ = false;
+    bool active_ = false;
+};
 
 // --------------------------------------------------------------------------
 // Half-precision conversion (standalone, no CUDA host fp16 needed).
@@ -959,28 +1011,6 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
             persistent_q81 ? "/PERSISTENT_Q81" : "",
             n_tokens, compact_experts, n_expert_used, seed);
 
-    int initial_arena_cleanup = 0;
-    int q81_lazy_init_rc = 0;
-    uint64_t q81_init_allocations0 = 0, q81_init_resizes0 = 0;
-    uint64_t q81_init_allocations1 = 0, q81_init_resizes1 = 0;
-    size_t q81_init_arena0 = 0, q81_init_arena1 = 0;
-    if (persistent_q81) {
-        initial_arena_cleanup = ds4_mmq_q81_persistent_cleanup();
-        ds4_mmq_set_gb10_optimizations(1);
-        ds4_mmq_q81_persistent_counters(
-            nullptr, nullptr, nullptr, nullptr,
-            &q81_init_allocations0, &q81_init_resizes0,
-            &q81_init_arena0, nullptr);
-        setenv("DS4_CUDA_MMQ_Q81_PERSISTENT", "1", 1);
-        q81_lazy_init_rc = ds4_mmq_init(persistent_device);
-        ds4_mmq_q81_persistent_counters(
-            nullptr, nullptr, nullptr, nullptr,
-            &q81_init_allocations1, &q81_init_resizes1,
-            &q81_init_arena1, nullptr);
-        // A real `=0` dispatch below is the value-aware opt-out oracle.
-        setenv("DS4_CUDA_MMQ_Q81_PERSISTENT", "0", 1);
-    }
-
     std::mt19937 rng(seed);
     std::normal_distribution<float> activation(0.0f, 0.05f);
     const size_t iq2_blocks_per_expert =
@@ -1070,32 +1100,31 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
     float *d_gate_global = nullptr, *d_up_global = nullptr,
           *d_mid_global = nullptr, *d_down_global = nullptr;
 
-    bool allocated = (persistent_q81 ||
-                      cudaStreamCreate(&stream) == cudaSuccess) &&
-        cudaMalloc(&d_gate_w, gate_compact.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
-        cudaMalloc(&d_up_w, up_compact.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
-        cudaMalloc(&d_down_w, down_compact.size() * sizeof(block_q2_K)) == cudaSuccess &&
-        cudaMalloc(&d_gate_global_w, gate_global.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
-        cudaMalloc(&d_up_global_w, up_global.size() * sizeof(block_iq2_xxs)) == cudaSuccess &&
-        cudaMalloc(&d_down_global_w, down_global.size() * sizeof(block_q2_K)) == cudaSuccess &&
-        cudaMalloc(&d_x, X.size() * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_ids, remapped_ids.size() * sizeof(int32_t)) == cudaSuccess &&
-        cudaMalloc(&d_global_ids, global_ids.size() * sizeof(int32_t)) == cudaSuccess &&
-        cudaMalloc(&d_router, router_weights.size() * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_gate_ref, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_up_ref, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_mid_ref, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_down_ref, down_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_gate_got, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_up_got, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_mid_got, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_down_got, down_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_gate_global, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_up_global, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_mid_global, mid_count * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&d_down_global, down_count * sizeof(float)) == cudaSuccess;
+    scoped_env_override q81_env("DS4_CUDA_MMQ_Q81_PERSISTENT");
+    int initial_arena_cleanup = 0;
+    int final_arena_cleanup = 0;
+    int q81_lazy_init_rc = 0;
+    uint64_t q81_init_allocations0 = 0, q81_init_resizes0 = 0;
+    uint64_t q81_init_allocations1 = 0, q81_init_resizes1 = 0;
+    size_t q81_init_arena0 = 0, q81_init_arena1 = 0;
+    bool q81_env_restore_ok = true;
+    bool persistent_active = false;
+
+    auto teardown_persistent = [&]() {
+        if (!persistent_active) return;
+        // Disable acquisition before retiring the owned arena, then restore
+        // the caller's exact environment (including an originally absent key).
+        q81_env_restore_ok = q81_env.set("0") && q81_env_restore_ok;
+        // Record the cleanup API result explicitly.  The setter repeats an
+        // idempotent cleanup while returning the runner-owned flag to false.
+        final_arena_cleanup = ds4_mmq_q81_persistent_cleanup();
+        ds4_mmq_set_gb10_optimizations(0);
+        q81_env_restore_ok = q81_env.restore() && q81_env_restore_ok;
+        persistent_active = false;
+    };
 
     auto cleanup = [&]() {
+        teardown_persistent();
         if (d_down_global) cudaFree(d_down_global);
         if (d_mid_global) cudaFree(d_mid_global);
         if (d_up_global) cudaFree(d_up_global);
@@ -1119,13 +1148,109 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
         if (d_up_w) cudaFree(d_up_w);
         if (d_gate_w) cudaFree(d_gate_w);
         if (stream) cudaStreamDestroy(stream);
-        if (persistent_q81) {
-            unsetenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
-            ds4_mmq_set_gb10_optimizations(0);
+    };
+
+    if (persistent_q81) {
+        if (!q81_env.set("1")) return false;
+        initial_arena_cleanup = ds4_mmq_q81_persistent_cleanup();
+        ds4_mmq_set_gb10_optimizations(1);
+        persistent_active = true;
+        ds4_mmq_q81_persistent_counters(
+            nullptr, nullptr, nullptr, nullptr,
+            &q81_init_allocations0, &q81_init_resizes0,
+            &q81_init_arena0, nullptr);
+        q81_lazy_init_rc = ds4_mmq_init(persistent_device);
+        ds4_mmq_q81_persistent_counters(
+            nullptr, nullptr, nullptr, nullptr,
+            &q81_init_allocations1, &q81_init_resizes1,
+            &q81_init_arena1, nullptr);
+        // A real `=0` dispatch below is the value-aware opt-out oracle.
+        if (!q81_env.set("0")) {
+            cleanup();
+            return false;
+        }
+    }
+
+    bool setup_ok = true;
+    cudaError_t setup_err = cudaSuccess;
+    const char *setup_step = nullptr;
+    size_t setup_bytes = 0;
+    bool setup_null_pointer = false;
+    if (!persistent_q81) {
+        setup_err = cudaStreamCreate(&stream);
+        if (setup_err != cudaSuccess) {
+            setup_ok = false;
+            setup_step = "cudaStreamCreate";
+        }
+    }
+    // Persistent Q8_1 admission deliberately requires the legacy default
+    // stream, represented by the null handle initialized above.
+    auto try_alloc = [&](void **ptr, size_t bytes, const char *label) {
+        if (!setup_ok) return;
+        setup_err = cudaMalloc(ptr, bytes);
+        if (setup_err != cudaSuccess || !*ptr) {
+            setup_ok = false;
+            setup_step = label;
+            setup_bytes = bytes;
+            setup_null_pointer = setup_err == cudaSuccess && !*ptr;
         }
     };
-    if (!allocated) {
-        fprintf(stderr, "fused raw parity allocation failed\nFAIL\n\n");
+    try_alloc(&d_gate_w,
+              gate_compact.size() * sizeof(block_iq2_xxs), "gate weights");
+    try_alloc(&d_up_w,
+              up_compact.size() * sizeof(block_iq2_xxs), "up weights");
+    try_alloc(&d_down_w,
+              down_compact.size() * sizeof(block_q2_K), "down weights");
+    try_alloc(&d_gate_global_w,
+              gate_global.size() * sizeof(block_iq2_xxs), "global gate weights");
+    try_alloc(&d_up_global_w,
+              up_global.size() * sizeof(block_iq2_xxs), "global up weights");
+    try_alloc(&d_down_global_w,
+              down_global.size() * sizeof(block_q2_K), "global down weights");
+    try_alloc((void **)&d_x, X.size() * sizeof(float), "activations");
+    try_alloc((void **)&d_ids,
+              remapped_ids.size() * sizeof(int32_t), "remapped ids");
+    try_alloc((void **)&d_global_ids,
+              global_ids.size() * sizeof(int32_t), "global ids");
+    try_alloc((void **)&d_router,
+              router_weights.size() * sizeof(float), "router weights");
+    try_alloc((void **)&d_gate_ref,
+              mid_count * sizeof(float), "reference gate output");
+    try_alloc((void **)&d_up_ref,
+              mid_count * sizeof(float), "reference up output");
+    try_alloc((void **)&d_mid_ref,
+              mid_count * sizeof(float), "reference mid output");
+    try_alloc((void **)&d_down_ref,
+              down_count * sizeof(float), "reference down output");
+    try_alloc((void **)&d_gate_got,
+              mid_count * sizeof(float), "candidate gate output");
+    try_alloc((void **)&d_up_got,
+              mid_count * sizeof(float), "candidate up output");
+    try_alloc((void **)&d_mid_got,
+              mid_count * sizeof(float), "candidate mid output");
+    try_alloc((void **)&d_down_got,
+              down_count * sizeof(float), "candidate down output");
+    try_alloc((void **)&d_gate_global,
+              mid_count * sizeof(float), "global gate output");
+    try_alloc((void **)&d_up_global,
+              mid_count * sizeof(float), "global up output");
+    try_alloc((void **)&d_mid_global,
+              mid_count * sizeof(float), "global mid output");
+    try_alloc((void **)&d_down_global,
+              down_count * sizeof(float), "global down output");
+
+    if (!setup_ok) {
+        if (setup_bytes != 0) {
+            fprintf(stderr,
+                    "fused raw parity %s allocation (%zu B) failed: %s%s\n",
+                    setup_step, setup_bytes, cudaGetErrorString(setup_err),
+                    setup_null_pointer ? " (null pointer)" : "");
+        } else {
+            fprintf(stderr, "fused raw parity %s failed: %s\n",
+                    setup_step, cudaGetErrorString(setup_err));
+        }
+        (void)cudaGetLastError();
+        fprintf(stderr, "FAIL\n\n");
         cleanup();
         return false;
     }
@@ -1243,7 +1368,10 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
             &q81_candidates_off, &q81_uses_off, &q81_hits_off,
             &q81_fallbacks_off, &q81_allocations_off, &q81_resizes_off,
             &q81_arena_off, &q81_high_water_off);
-        setenv("DS4_CUDA_MMQ_Q81_PERSISTENT", "1", 1);
+        if (!q81_env.set("1")) {
+            cleanup();
+            return false;
+        }
     }
     // Run the same fused path against the original global expert table and
     // unremapped ids.  Bitwise equality with the compact result validates the
@@ -1365,11 +1493,8 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
                 (unsigned long long)(q81_resizes1 - q81_resizes_off),
                 q81_arena1, q81_high_water1);
     }
-    int final_arena_cleanup = 0;
     if (persistent_q81) {
-        unsetenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
-        final_arena_cleanup = ds4_mmq_q81_persistent_cleanup();
-        ds4_mmq_set_gb10_optimizations(0);
+        teardown_persistent();
     }
 
     const auto mismatches = [](const std::vector<float> & a,
@@ -1392,7 +1517,7 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
         rc_down == 0 && rc_fused == 0 && rc_global == 0 &&
         rc_global_reuse == 0 && rc_q81_grow == 0 &&
         initial_arena_cleanup == 0 &&
-        final_arena_cleanup == 0 && q81_counters_ok &&
+        final_arena_cleanup == 0 && q81_env_restore_ok && q81_counters_ok &&
         sync_err == cudaSuccess && gate_bad == 0 && up_bad == 0 &&
         mid_bad == 0 && down_bad == 0 && gate_remap_bad == 0 &&
         up_remap_bad == 0 && mid_remap_bad == 0 && down_remap_bad == 0;
@@ -1410,6 +1535,12 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
 
     cleanup();
     return ok;
+}
+
+bool run_iq2_xxs_q2_K_fused_raw_persistent_gb10_parity(
+        int n_tokens, uint32_t seed) {
+    return run_iq2_xxs_q2_K_fused_raw_parity(
+        n_tokens, seed, /*persistent_q81=*/true);
 }
 
 bool run_q4_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
@@ -2120,8 +2251,8 @@ int main(int argc, char ** argv) {
     all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/8,   0xC2F008);
     all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/32,  0xC2F020);
     all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(/*nt=*/128, 0xC2F080);
-    all_ok &= run_iq2_xxs_q2_K_fused_raw_parity(
-        /*nt=*/32, 0xC2F021, /*persistent_q81=*/true);
+    all_ok &= run_iq2_xxs_q2_K_fused_raw_persistent_gb10_parity(
+        /*nt=*/32, 0xC2F021);
 
     // Step 6 - mmvq vector matmul tests.
     //
