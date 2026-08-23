@@ -80,7 +80,7 @@ help:
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
-	@echo "  make check-environment-docs  Verify the generated environment-variable inventory"
+	@echo "  make environment-docs  Generate and verify the environment variable inventory"
 	@echo "  make test-metal-session-batch-ssd  Exact-logit Metal SSD union control/candidate oracle"
 	@echo "  make test-metal-q4-streams  Check resident Q4 Metal stream overlap"
 	@echo "  make test-metal-q4-attn-exactn  Bitwise/canary oracle for M1-M4 SSD-prefill Q4 attention output"
