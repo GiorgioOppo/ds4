@@ -26,6 +26,10 @@
 #define HIGH_EXPERT_ID 255u
 #define CLAMP 4.0f
 #define SENTINEL 1234567.0f
+#define TAIL_CULL_ENV \
+    "DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM_ADDR_TAIL_CULL"
+#define TAIL_CULL_DISABLE_ENV \
+    "DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM_ADDR_TAIL_CULL"
 
 /* Production Flash routed-expert geometry.  Eight physical experts keep the
  * standalone fixture bounded while retaining the production top-6 routing,
@@ -445,6 +449,180 @@ static int compare_results(const char *name, const run_result *candidate,
                        candidate->pair_count, 0.08, 0.015) && ok;
     ok = compare_array(name, "out", candidate->out, control->out,
                        candidate->out_count, 0.08, 0.015) && ok;
+    return ok;
+}
+
+static void clear_tail_cull_test_env(void) {
+    unsetenv(TAIL_CULL_ENV);
+    unsetenv(TAIL_CULL_DISABLE_ENV);
+    unsetenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
+    unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+}
+
+static void configure_tail_cull_test_env(bool enable_tail_cull) {
+    unsetenv(TAIL_CULL_DISABLE_ENV);
+    unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+    setenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    setenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM", "1", 1);
+    if (enable_tail_cull) {
+        setenv(TAIL_CULL_ENV, "1", 1);
+    } else {
+        unsetenv(TAIL_CULL_ENV);
+    }
+}
+
+static int compare_array_bit_exact(const char *case_name,
+                                   const char *tensor_name,
+                                   const float *candidate,
+                                   const float *control,
+                                   uint64_t count) {
+    uint32_t sentinel_bits = 0;
+    memcpy(&sentinel_bits, &(float){ SENTINEL }, sizeof(sentinel_bits));
+    uint64_t mismatches = 0;
+    uint64_t nonfinite = 0;
+    uint64_t unwritten = 0;
+    uint64_t first_mismatch = UINT64_MAX;
+    uint32_t first_candidate = 0;
+    uint32_t first_control = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t candidate_bits = 0;
+        uint32_t control_bits = 0;
+        memcpy(&candidate_bits, candidate + i, sizeof(candidate_bits));
+        memcpy(&control_bits, control + i, sizeof(control_bits));
+        if (candidate_bits == sentinel_bits || control_bits == sentinel_bits) {
+            unwritten++;
+        }
+        if ((candidate_bits & 0x7f800000u) == 0x7f800000u ||
+            (control_bits & 0x7f800000u) == 0x7f800000u) {
+            nonfinite++;
+        }
+        if (candidate_bits != control_bits) {
+            if (first_mismatch == UINT64_MAX) {
+                first_mismatch = i;
+                first_candidate = candidate_bits;
+                first_control = control_bits;
+            }
+            mismatches++;
+        }
+    }
+    const int pass = mismatches == 0 && nonfinite == 0 && unwritten == 0;
+    fprintf(stderr,
+            "IQ2_XXS SSD tail-cull %-20s %-4s %s count=%llu "
+            "bit_mismatches=%llu nonfinite=%llu unwritten=%llu",
+            case_name, tensor_name, pass ? "PASS" : "FAIL",
+            (unsigned long long)count,
+            (unsigned long long)mismatches,
+            (unsigned long long)nonfinite,
+            (unsigned long long)unwritten);
+    if (first_mismatch != UINT64_MAX) {
+        fprintf(stderr, " first=%llu candidate=0x%08x control=0x%08x",
+                (unsigned long long)first_mismatch,
+                first_candidate, first_control);
+    }
+    fputc('\n', stderr);
+    return pass;
+}
+
+static int compare_results_bit_exact(const char *name,
+                                     const run_result *candidate,
+                                     const run_result *control) {
+    const int shape_ok =
+        candidate->pair_count == control->pair_count &&
+        candidate->out_count == control->out_count &&
+        candidate->guard_mismatches == 0 &&
+        control->guard_mismatches == 0;
+    if (!shape_ok) {
+        fprintf(stderr,
+                "IQ2_XXS SSD tail-cull %-20s shape/guard FAIL\n", name);
+        return 0;
+    }
+    int ok = compare_array_bit_exact(
+        name, "gate", candidate->gate, control->gate,
+        candidate->pair_count);
+    ok = compare_array_bit_exact(
+        name, "up", candidate->up, control->up,
+        candidate->pair_count) && ok;
+    ok = compare_array_bit_exact(
+        name, "mid", candidate->mid, control->mid,
+        candidate->pair_count) && ok;
+    ok = compare_array_bit_exact(
+        name, "out", candidate->out, control->out,
+        candidate->out_count) && ok;
+    return ok;
+}
+
+static int run_tail_cull_bit_exact(
+        const void *model,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t n_total_expert,
+        uint32_t cache_budget,
+        const float *x,
+        const int32_t *selected,
+        const float *weights) {
+    run_result control;
+    run_result candidate;
+    run_result repeat;
+    memset(&control, 0, sizeof(control));
+    memset(&candidate, 0, sizeof(candidate));
+    memset(&repeat, 0, sizeof(repeat));
+    int ok = 0;
+
+    clear_tail_cull_test_env();
+    if (!result_alloc(&control, MAX_TOKENS) ||
+        !result_alloc(&candidate, MAX_TOKENS) ||
+        !result_alloc(&repeat, MAX_TOKENS)) {
+        goto cleanup;
+    }
+
+    configure_tail_cull_test_env(false);
+    ds4_gpu_set_streaming_expert_cache_budget(cache_budget);
+    const int control_ok = run_once(
+        "tail-cull-control", &control, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        n_total_expert, x, selected, weights, false);
+
+    configure_tail_cull_test_env(true);
+    ds4_gpu_set_streaming_expert_cache_budget(cache_budget);
+    const int candidate_ok = run_once(
+        "tail-cull-candidate", &candidate, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        n_total_expert, x, selected, weights, false);
+
+    configure_tail_cull_test_env(true);
+    ds4_gpu_set_streaming_expert_cache_budget(cache_budget);
+    const int repeat_ok = run_once(
+        "tail-cull-repeat", &repeat, model, model_size,
+        gate_offset, up_offset, down_offset, gate_expert_bytes,
+        gate_row_bytes, down_expert_bytes, down_row_bytes,
+        n_total_expert, x, selected, weights, false);
+
+    ok = control_ok && candidate_ok && repeat_ok;
+    if (ok) {
+        const int candidate_exact = compare_results_bit_exact(
+            "candidate-control", &candidate, &control);
+        const int repeat_exact = compare_results_bit_exact(
+            "repeat-control", &repeat, &control);
+        ok = candidate_exact && repeat_exact;
+    }
+    fprintf(stderr,
+            "IQ2_XXS/Q2_K Metal SSD address-MM tail-cull bit-exact %s\n",
+            ok ? "PASS" : "FAIL");
+
+cleanup:
+    clear_tail_cull_test_env();
+    result_free(&control);
+    result_free(&candidate);
+    result_free(&repeat);
     return ok;
 }
 
@@ -1251,7 +1429,6 @@ static int run_256_expert_oracle(
         ok = 0;
         goto cleanup;
     }
-    uint32_t high_id_routes = 0;
     for (uint32_t token = 0; token < tokens; token++) {
         for (uint32_t k = 0; k < IN_DIM; k++) {
             const int32_t v =
@@ -1261,26 +1438,64 @@ static int run_256_expert_oracle(
         }
         for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
             const uint64_t route = (uint64_t)token * N_EXPERT + slot;
-            selected[route] = slot == 0u ? (int32_t)HIGH_EXPERT_ID :
-                                           (int32_t)(slot - 1u);
+            if (slot == 0u) {
+                /* Exactly 33 routes: one full tile plus a one-row tail. */
+                selected[route] = (int32_t)HIGH_EXPERT_ID;
+            } else if (slot == 1u && token < 15u) {
+                selected[route] = 0;
+            } else if (slot == 2u && token == 0u) {
+                /* Duplicate expert zero within token zero. Together with the
+                 * 15 routes above this makes the critical nr1 == 16 tile. */
+                selected[route] = 0;
+            } else if (slot == 1u && token < 32u) {
+                /* Exactly 17 routes exercise the first non-culled row half. */
+                selected[route] = 1;
+            } else {
+                /* Keep all remaining routes away from 0, 1, and 255 so the
+                 * three boundary counts remain exact. */
+                selected[route] =
+                    (int32_t)(2u + (token * 17u + slot * 29u) % 252u);
+            }
             weights[route] = (float)(slot + 1u) / 21.0f;
-            if (selected[route] == (int32_t)HIGH_EXPERT_ID) high_id_routes++;
+        }
+    }
+    uint32_t routes_16 = 0;
+    uint32_t routes_17 = 0;
+    uint32_t high_id_routes = 0;
+    uint32_t duplicate_routes = 0;
+    for (uint32_t token = 0; token < tokens; token++) {
+        for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
+            const int32_t id = selected[(uint64_t)token * N_EXPERT + slot];
+            if (id == 0) routes_16++;
+            if (id == 1) routes_17++;
+            if (id == (int32_t)HIGH_EXPERT_ID) high_id_routes++;
+            for (uint32_t prior = 0; prior < slot; prior++) {
+                if (id == selected[(uint64_t)token * N_EXPERT + prior]) {
+                    duplicate_routes++;
+                    break;
+                }
+            }
         }
     }
     const uint32_t high_id_work_items = (high_id_routes + 31u) / 32u;
-    if (high_id_routes < 33u || high_id_work_items < 2u) {
+    if (routes_16 != 16u || routes_17 != 17u || high_id_routes != 33u ||
+        duplicate_routes == 0u || high_id_work_items != 2u) {
         fprintf(stderr,
-                "IQ2_XXS SSD 256-expert route construction FAIL "
-                "id255_rows=%u work_items=%u\n",
-                high_id_routes, high_id_work_items);
+                "IQ2_XXS SSD tail-cull route construction FAIL "
+                "rows16=%u rows17=%u id255_rows=%u duplicates=%u "
+                "work_items=%u\n",
+                routes_16, routes_17, high_id_routes, duplicate_routes,
+                high_id_work_items);
         ok = 0;
         goto cleanup;
     }
     fprintf(stderr,
-            "IQ2_XXS SSD 256-expert address table prepared model_bytes=%llu "
-            "max_id=%u id255_rows=%u work_items=%u second_tile_r1=32\n",
-            (unsigned long long)model_size, HIGH_EXPERT_ID,
-            high_id_routes, high_id_work_items);
+            "IQ2_XXS SSD tail-cull routes PASS model_bytes=%llu "
+            "rows16=%u rows17=%u id255_rows=%u duplicates=%u "
+            "work_items=%u second_tile_r1=32\n",
+            (unsigned long long)model_size, routes_16, routes_17,
+            high_id_routes, duplicate_routes,
+            high_id_work_items);
 
     model_fd = mkstemp(tmp_path);
     if (model_fd < 0 || ftruncate(model_fd, (off_t)model_size) != 0) {
@@ -1330,12 +1545,15 @@ static int run_256_expert_oracle(
         x, selected, weights);
     const int stats_ok = read_mm_stats(&after) &&
         check_mm_stats_delta("id255-hot-33", &before, &after, tokens);
-    ok = pair_ok && stats_ok && ok;
+    const int tail_cull_ok = run_tail_cull_bit_exact(
+        model, model_size, gate_offset, up_offset, down_offset,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+        down_row_bytes, N_TOTAL_EXPERT_256, N_TOTAL_EXPERT_256,
+        x, selected, weights);
+    ok = pair_ok && stats_ok && tail_cull_ok && ok;
 
 cleanup:
-    unsetenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
-    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
-    unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+    clear_tail_cull_test_env();
     if (backend_switched) {
         ds4_gpu_set_streaming_expert_cache_budget(N_TOTAL_EXPERT);
         ds4_gpu_set_streaming_expert_cache_expert_bytes(
@@ -1456,6 +1674,7 @@ int main(void) {
     unsetenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
     unsetenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
     unsetenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    clear_tail_cull_test_env();
     setenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
     setenv("DS4_METAL_ENABLE_STREAMING_EXPERT_ADDR_TABLE", "1", 1);
     setenv("DS4_METAL_IQ2_XXS_SSD_PREFILL_MM_STATS", "1", 1);
@@ -1578,9 +1797,7 @@ int main(void) {
         ok = full_ok && ok;
     }
 
-    unsetenv("DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM");
-    unsetenv("DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM");
-    unsetenv("DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM");
+    clear_tail_cull_test_env();
     ds4_gpu_set_model_fd(-1);
     ds4_gpu_set_ssd_streaming(false);
     ds4_gpu_cleanup();

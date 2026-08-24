@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 
@@ -478,9 +479,13 @@ static ds4_gpu_stream_scratch_state
 #define g_moe_q4_down_slots_bytes DS4_STREAM_SCRATCH(moe_q4_down_slots_bytes)
 #define g_attn_out_group_ids_bytes DS4_STREAM_SCRATCH(attn_out_group_ids_bytes)
 static int g_model_fd = -1;
-/* Second model descriptor with F_NOCACHE for the streaming expert preads
- * (DS4_METAL_STREAMING_EXPERT_NOCACHE); -1 = use the cached g_model_fd. */
+/* Second model descriptor with F_NOCACHE for all streaming expert preads or
+ * only the batched-prefill requests.  Individual pread tasks carry the phase
+ * preference so decode never depends on mutable process-global phase state. */
 static int g_model_fd_nocache = -1;
+static int g_model_fd_nocache_all;
+static int g_model_fd_nocache_prefill;
+static int g_model_fd_nocache_prefill_auto;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -520,6 +525,10 @@ static uint64_t g_stream_expert_cache_evict_advise_bytes;
 static uint64_t g_stream_expert_cache_willneed_advise_bytes;
 static uint64_t g_stream_expert_cache_pread_bytes;
 static double g_stream_expert_cache_pread_ms;
+static uint64_t g_stream_expert_pread_cached_calls;
+static uint64_t g_stream_expert_pread_cached_bytes;
+static uint64_t g_stream_expert_pread_nocache_calls;
+static uint64_t g_stream_expert_pread_nocache_bytes;
 static uint64_t g_stream_expert_cache_buffer_allocs;
 static uint64_t g_stream_expert_cache_buffer_reuses;
 static uint64_t g_stream_expert_cache_decode_tokens;
@@ -4584,6 +4593,22 @@ void ds4_gpu_print_memory_report(const char *label) {
                     ds4_gpu_gib(g_stream_expert_cache_willneed_advise_bytes),
                     ds4_gpu_gib(g_stream_expert_cache_pread_bytes),
                     g_stream_expert_cache_pread_ms);
+            fprintf(stderr,
+                    "ds4:   streaming expert pread descriptors "
+                    "cached_calls=%llu cached=%.2f GiB "
+                    "nocache_calls=%llu nocache=%.2f GiB\n",
+                    (unsigned long long)__atomic_load_n(
+                        &g_stream_expert_pread_cached_calls,
+                        __ATOMIC_RELAXED),
+                    ds4_gpu_gib(__atomic_load_n(
+                        &g_stream_expert_pread_cached_bytes,
+                        __ATOMIC_RELAXED)),
+                    (unsigned long long)__atomic_load_n(
+                        &g_stream_expert_pread_nocache_calls,
+                        __ATOMIC_RELAXED),
+                    ds4_gpu_gib(__atomic_load_n(
+                        &g_stream_expert_pread_nocache_bytes,
+                        __ATOMIC_RELAXED)));
         } else {
             fprintf(stderr,
                     "ds4:   streaming expert cache budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu\n",
@@ -11539,6 +11564,9 @@ void ds4_gpu_cleanup(void) {
             close(g_model_fd_nocache);
             g_model_fd_nocache = -1;
         }
+        g_model_fd_nocache_all = 0;
+        g_model_fd_nocache_prefill = 0;
+        g_model_fd_nocache_prefill_auto = 0;
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -12614,17 +12642,41 @@ int ds4_gpu_prepare_support_model(const void *model_map,
     return ok;
 }
 
-/* DS4_METAL_STREAMING_EXPERT_NOCACHE: serve the streaming expert preads from
- * a second F_NOCACHE descriptor so the ~1 GB/token of expert churn stops
- * evicting the mapped dense weights from the page cache. On tight-RAM
- * machines the dense working set (attention projections, shared experts,
- * routing) is re-read every token through the page cache: with the default
- * cached preads the expert traffic keeps pushing it out and decode collapses
- * to SSD fault speed. Opt-in: on machines where everything fits in RAM the
- * cached preads are strictly better (second touch is free). */
+/* DS4_METAL_STREAMING_EXPERT_NOCACHE keeps its established all-phase
+ * behavior. DS4_METAL_STREAMING_EXPERT_PREFILL_NOCACHE uses the same second
+ * descriptor only for batched-prefill expert tasks, preserving the cached
+ * descriptor and readahead policy for steady decode. */
 static int ds4_gpu_stream_expert_nocache_requested(void) {
     const char *env = getenv("DS4_METAL_STREAMING_EXPERT_NOCACHE");
     return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
+static int ds4_gpu_stream_expert_prefill_nocache_auto(int fd) {
+    if (fd < 0 || !g_ssd_streaming_mode || g_glm_model_mode ||
+        !ds4_gpu_device_is_pre_m5_apple_silicon()) {
+        return 0;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) return 0;
+    const uint64_t working_set = ds4_gpu_recommended_working_set_size();
+    if (working_set == 0 || working_set > UINT64_MAX / 2u) return 0;
+    return (uint64_t)st.st_size >= 2u * working_set;
+}
+
+static int ds4_gpu_stream_expert_prefill_nocache_resolve(int fd,
+                                                          int *automatic) {
+    if (automatic) *automatic = 0;
+    if (fd < 0 || !g_ssd_streaming_mode) return 0;
+    const int enable = ds4_gpu_env_bool(
+        "DS4_METAL_STREAMING_EXPERT_PREFILL_NOCACHE");
+    const int disable = ds4_gpu_env_bool(
+        "DS4_METAL_DISABLE_STREAMING_EXPERT_PREFILL_NOCACHE");
+    if (disable == 1 || enable == 0) return 0;
+    if (enable == 1) return 1;
+    const int auto_enabled =
+        ds4_gpu_stream_expert_prefill_nocache_auto(fd);
+    if (automatic) *automatic = auto_enabled;
+    return auto_enabled;
 }
 
 int ds4_gpu_set_model_fd(int fd) {
@@ -12633,24 +12685,52 @@ int ds4_gpu_set_model_fd(int fd) {
         close(g_model_fd_nocache);
         g_model_fd_nocache = -1;
     }
-    if (fd >= 0 && ds4_gpu_stream_expert_nocache_requested()) {
+    g_model_fd_nocache_prefill_auto = 0;
+    g_model_fd_nocache_all =
+        fd >= 0 && ds4_gpu_stream_expert_nocache_requested();
+    g_model_fd_nocache_prefill =
+        !g_model_fd_nocache_all &&
+        ds4_gpu_stream_expert_prefill_nocache_resolve(
+            fd, &g_model_fd_nocache_prefill_auto);
+    if (fd >= 0 &&
+        (g_model_fd_nocache_all || g_model_fd_nocache_prefill)) {
         /* A dup() would share the file description (and its F_NOCACHE flag)
          * with the mmap-backed descriptor, so reopen the model by path. */
         char path[1024] = {0};
         int nfd = -1;
+        struct stat source_stat;
+        struct stat reopened_stat;
+        int same_file = 0;
         if (fcntl(fd, F_GETPATH, path) == 0) nfd = open(path, O_RDONLY);
-        if (nfd >= 0) {
+        if (nfd >= 0 &&
+            fstat(fd, &source_stat) == 0 &&
+            fstat(nfd, &reopened_stat) == 0 &&
+            source_stat.st_dev == reopened_stat.st_dev &&
+            source_stat.st_ino == reopened_stat.st_ino) {
+            same_file = 1;
+        } else if (nfd >= 0) {
+            errno = ESTALE;
+        }
+        if (same_file && fcntl(nfd, F_NOCACHE, 1) == 0) {
             (void)fcntl(nfd, F_SETFD, FD_CLOEXEC);
-            (void)fcntl(nfd, F_NOCACHE, 1);
             g_model_fd_nocache = nfd;
             fprintf(stderr,
-                    "ds4: Metal streaming expert preads on a F_NOCACHE descriptor; "
-                    "page cache reserved for the dense weights (readahead hints off)\n");
+                    "ds4: Metal streaming expert %s preads on a F_NOCACHE "
+                    "descriptor; page cache reserved for dense weights\n",
+                    g_model_fd_nocache_all ? "all-phase" :
+                    g_model_fd_nocache_prefill_auto ?
+                        "batched-prefill automatic" :
+                        "batched-prefill");
         } else {
+            const int saved_errno = errno;
+            if (nfd >= 0) close(nfd);
+            g_model_fd_nocache_all = 0;
+            g_model_fd_nocache_prefill = 0;
+            g_model_fd_nocache_prefill_auto = 0;
             fprintf(stderr,
                     "ds4: WARNING: F_NOCACHE expert descriptor unavailable (%s); "
                     "using cached preads\n",
-                    strerror(errno));
+                    strerror(saved_errno));
         }
     }
     return 1;
@@ -13188,12 +13268,16 @@ static void ds4_gpu_stream_expert_timing_note_cache_class(
     g_stream_expert_timing_cache_missing_experts += missing;
 }
 
+static int ds4_gpu_stream_prefill_nocache_for_tokens(uint32_t n_tokens) {
+    return g_model_fd_nocache_prefill && n_tokens >= 32u;
+}
+
 static int ds4_gpu_stream_expert_readahead_enabled(void) {
-    /* F_RDADVISE warms the PAGE CACHE: with the F_NOCACHE expert descriptor
-     * active those pages would never be consumed by the preads and only evict
-     * the dense weights — the exact pollution that mode exists to stop. */
+    /* All-phase F_NOCACHE never consumes these page-cache hints.  The
+     * prefill-only mode keeps them for decode and suppresses them explicitly
+     * in ds4_gpu_stream_prefill_expert_readahead_enabled(). */
     return g_ssd_streaming_mode &&
-           g_model_fd_nocache < 0 &&
+           !g_model_fd_nocache_all &&
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
@@ -13207,7 +13291,8 @@ static int ds4_gpu_stream_prefill_expert_readahead_enabled(
      * but require an explicit opt-in for this immediate-pread path so the old
      * policy remains available for cold-storage A/B tests.
      */
-    if (!ds4_gpu_stream_expert_readahead_enabled()) return 0;
+    if (!ds4_gpu_stream_expert_readahead_enabled() ||
+        ds4_gpu_stream_prefill_nocache_for_tokens(n_tokens)) return 0;
     if (n_tokens < 32u) return 1;
     return ds4_gpu_env_bool(
             "DS4_METAL_ENABLE_STREAMING_PREFILL_EXPERT_READAHEAD") > 0;
@@ -13251,6 +13336,7 @@ typedef struct {
     uint64_t offset;
     uint64_t len;
     uint8_t *dst;
+    int prefer_nocache;
     uint64_t read_bytes;
     double ms;
     int ok;
@@ -13359,11 +13445,16 @@ static int ds4_gpu_stream_expert_pread_into(
         uint64_t  offset,
         uint64_t  len,
         uint8_t  *dst,
+        int       prefer_nocache,
         uint64_t *read_bytes,
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    const int fd = g_model_fd_nocache >= 0 ? g_model_fd_nocache : g_model_fd;
+    const int use_nocache =
+        g_model_fd_nocache >= 0 &&
+        (g_model_fd_nocache_all ||
+         (g_model_fd_nocache_prefill && prefer_nocache));
+    const int fd = use_nocache ? g_model_fd_nocache : g_model_fd;
     if (fd < 0 ||
         !dst ||
         len == 0 ||
@@ -13389,6 +13480,21 @@ static int ds4_gpu_stream_expert_pread_into(
         pos += (uint64_t)nread;
     }
     const double dt = ds4_gpu_now_ms() - t0;
+    if (use_nocache) {
+        __atomic_add_fetch(&g_stream_expert_pread_nocache_calls,
+                           1,
+                           __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_stream_expert_pread_nocache_bytes,
+                           pos,
+                           __ATOMIC_RELAXED);
+    } else {
+        __atomic_add_fetch(&g_stream_expert_pread_cached_calls,
+                           1,
+                           __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_stream_expert_pread_cached_bytes,
+                           pos,
+                           __ATOMIC_RELAXED);
+    }
     if (read_bytes) *read_bytes = pos;
     if (ms_out) *ms_out = dt;
     if (!ok || pos != len) {
@@ -13410,6 +13516,7 @@ static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
         task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
                                                     task->len,
                                                     task->dst,
+                                                    task->prefer_nocache,
                                                     &task->read_bytes,
                                                     &task->ms);
     }
@@ -13469,6 +13576,7 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
             task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
                                                         task->len,
                                                         task->dst,
+                                                        task->prefer_nocache,
                                                         &task->read_bytes,
                                                         &task->ms);
 
@@ -13763,6 +13871,7 @@ static uint32_t ds4_gpu_stream_expert_pread_expand_tasks_bounded(
                 .offset = original[i].offset + off,
                 .len = part,
                 .dst = original[i].dst + off,
+                .prefer_nocache = original[i].prefer_nocache,
                 .read_bytes = 0,
                 .ms = 0.0,
                 .ok = 0,
@@ -13826,6 +13935,7 @@ static int ds4_gpu_stream_expert_pread_tasks(
             sub[w].offset = tasks[i].offset + off;
             sub[w].len = part;
             sub[w].dst = tasks[i].dst + off;
+            sub[w].prefer_nocache = tasks[i].prefer_nocache;
             sub[w].read_bytes = 0;
             sub[w].ms = 0.0;
             sub[w].ok = 0;
@@ -15931,6 +16041,18 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_cache_willneed_advise_bytes = 0;
         g_stream_expert_cache_pread_bytes = 0;
         g_stream_expert_cache_pread_ms = 0.0;
+        __atomic_store_n(&g_stream_expert_pread_cached_calls,
+                         0,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&g_stream_expert_pread_cached_bytes,
+                         0,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&g_stream_expert_pread_nocache_calls,
+                         0,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&g_stream_expert_pread_nocache_bytes,
+                         0,
+                         __ATOMIC_RELAXED);
         g_stream_expert_cache_mlock_bytes = 0;
         g_stream_expert_cache_mlock_fail_bytes = 0;
         g_stream_expert_cache_mlock_failures = 0;
@@ -18484,6 +18606,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         return 0;
     }
     if (n_tokens > UINT32_MAX / n_selected) return 0;
+    const int prefer_prefill_nocache =
+        ds4_gpu_stream_prefill_nocache_for_tokens(n_tokens);
 
     const uint64_t n_ids = (uint64_t)n_tokens * n_selected;
     if (n_ids > SIZE_MAX / sizeof(int32_t)) return 0;
@@ -18779,16 +18903,19 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 .offset = unique_gate_offsets[u],
                 .len = gate_expert_bytes,
                 .dst = gate_dst,
+                .prefer_nocache = prefer_prefill_nocache,
             };
             tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
                 .offset = unique_up_offsets[u],
                 .len = gate_expert_bytes,
                 .dst = up_dst,
+                .prefer_nocache = prefer_prefill_nocache,
             };
             tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
                 .offset = unique_down_offsets[u],
                 .len = down_expert_bytes,
                 .dst = down_dst,
+                .prefer_nocache = prefer_prefill_nocache,
             };
             if (load_timing) {
                 ds4_gpu_stream_expert_timing_note_prepare_task(
@@ -33771,6 +33898,20 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_addr_pipeline(uint32_t type
     }
 }
 
+static id<MTLComputePipelineState>
+ds4_gpu_routed_mm_addr_tail_cull_pipeline(uint32_t type) {
+    switch (type) {
+    case DS4_METAL_TENSOR_IQ2_XXS:
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            "kernel_mul_mm_id_addr_iq2_xxs_f32_tail_cull", false);
+    case DS4_METAL_TENSOR_Q2_K:
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            "kernel_mul_mm_id_addr_q2_K_f32_tail_cull", false);
+    default:
+        return nil;
+    }
+}
+
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_Q8_0:
@@ -45230,16 +45371,36 @@ int ds4_gpu_routed_moe_batch_tensor(
             request_iq2_batch_addr_mm &&
             iq2_batch_addr_mm_candidate &&
             use_iq2_batch_selected_addr;
+        /* Balanced full-model A/B on M1 Max is stable above the promotion
+         * gate at 512 tokens, while the shorter batches remain I/O-bound.
+         * An explicit ENABLE forces the specialization below the automatic
+         * threshold; ENABLE=0 and DISABLE=1 are rollback controls. */
+        const int enable_iq2_batch_addr_mm_tail_cull =
+            ds4_gpu_env_bool(
+                "DS4_METAL_ENABLE_IQ2_XXS_SSD_PREFILL_MM_ADDR_TAIL_CULL");
+        const int disable_iq2_batch_addr_mm_tail_cull =
+            ds4_gpu_env_bool(
+                "DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM_ADDR_TAIL_CULL");
+        const bool iq2_batch_addr_mm_tail_cull =
+            disable_iq2_batch_addr_mm_tail_cull != 1 &&
+            (enable_iq2_batch_addr_mm_tail_cull == 1 ||
+             (enable_iq2_batch_addr_mm_tail_cull == -1 &&
+              ds4_gpu_device_is_pre_m5_apple_silicon() &&
+              n_tokens >= 512u));
         id<MTLComputePipelineState> iq2_gate_addr_mm_pipeline =
             iq2_batch_addr_mm_policy &&
             (g_test_flags &
              DS4_GPU_TEST_IQ2_SSD_GROUPED_PIPELINE_FAILURE) == 0u ?
-                ds4_gpu_routed_mm_addr_pipeline(gate_type) : nil;
+                (iq2_batch_addr_mm_tail_cull ?
+                    ds4_gpu_routed_mm_addr_tail_cull_pipeline(gate_type) :
+                    ds4_gpu_routed_mm_addr_pipeline(gate_type)) : nil;
         id<MTLComputePipelineState> iq2_down_addr_mm_pipeline =
             iq2_batch_addr_mm_policy &&
             (g_test_flags &
              DS4_GPU_TEST_IQ2_SSD_GROUPED_PIPELINE_FAILURE) == 0u ?
-                ds4_gpu_routed_mm_addr_pipeline(down_type) : nil;
+                (iq2_batch_addr_mm_tail_cull ?
+                    ds4_gpu_routed_mm_addr_tail_cull_pipeline(down_type) :
+                    ds4_gpu_routed_mm_addr_pipeline(down_type)) : nil;
         const bool use_iq2_batch_addr_mm =
             iq2_batch_addr_mm_policy &&
             iq2_gate_addr_mm_pipeline != nil &&
