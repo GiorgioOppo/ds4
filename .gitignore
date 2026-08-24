@@ -40,3 +40,8 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+# Local speed benchmark outputs
+/speed-bench/*.csv
+/speed-bench/*_logprobs.json
+/speed-bench/*_logits/
