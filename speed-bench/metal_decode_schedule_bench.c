@@ -33,8 +33,11 @@ typedef struct {
     int ctx;
     int warmup;
     int measured;
+    uint32_t ssd_cache_experts;
+    uint32_t ssd_preload_experts;
     bool include_selection;
     bool ssd_streaming;
+    bool ssd_streaming_cold;
     decode_schedule control;
     decode_schedule candidate;
 } bench_config;
@@ -55,6 +58,11 @@ static void usage(FILE *fp, const char *argv0) {
             "  --candidate-second N   candidate second split (default: 32; control with --candidate-env)\n"
             "  --candidate-env NAME   unset NAME for control, set NAME=1 for candidate\n"
             "  --ssd-streaming       use the SSD-backed model path instead of full residency\n"
+            "  --ssd-streaming-cold  skip the default expert-cache preload\n"
+            "  --ssd-streaming-cache-experts N\n"
+            "                        dynamic expert-cache entry count\n"
+            "  --ssd-streaming-preload-experts N\n"
+            "                        popularity preload count\n"
             "  --include-selection    include one non-EOS argmax in each timed step\n",
             argv0);
 }
@@ -93,8 +101,11 @@ static bench_config parse_options(int argc, char **argv) {
         .ctx = DEFAULT_CTX,
         .warmup = DEFAULT_WARMUP,
         .measured = DEFAULT_MEASURED,
+        .ssd_cache_experts = 0,
+        .ssd_preload_experts = 0,
         .include_selection = false,
         .ssd_streaming = false,
+        .ssd_streaming_cold = false,
         .control = {.first = 2, .second = 32},
         .candidate = {.first = 1, .second = 32},
     };
@@ -116,6 +127,14 @@ static bench_config parse_options(int argc, char **argv) {
             cfg.include_selection = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             cfg.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            cfg.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            cfg.ssd_cache_experts = (uint32_t)parse_int_arg(
+                need_arg(&i, argc, argv, arg), arg, 1);
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            cfg.ssd_preload_experts = (uint32_t)parse_int_arg(
+                need_arg(&i, argc, argv, arg), arg, 1);
         } else if (!strcmp(arg, "--prefix-tokens")) {
             cfg.prefix_tokens =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
@@ -162,6 +181,15 @@ static bench_config parse_options(int argc, char **argv) {
         if (!candidate_second_explicit) {
             cfg.candidate.second = cfg.control.second;
         }
+    }
+
+    if (!cfg.ssd_streaming &&
+        (cfg.ssd_streaming_cold || cfg.ssd_cache_experts != 0 ||
+         cfg.ssd_preload_experts != 0)) {
+        fprintf(stderr,
+                "metal-decode-schedule-bench: SSD cache options require "
+                "--ssd-streaming\n");
+        exit(2);
     }
 
     const int64_t needed =
@@ -380,6 +408,9 @@ int main(int argc, char **argv) {
         .power_percent = 100,
         .warm_weights = !cfg.ssd_streaming,
         .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_cache_experts = cfg.ssd_cache_experts,
+        .ssd_streaming_preload_experts = cfg.ssd_preload_experts,
     };
     ds4_engine *engine = NULL;
     ds4_session *sessions[VARIANT_COUNT] = {0};
@@ -445,7 +476,8 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "metal-decode-schedule-bench: model=%s prompt=%s prefix=%d "
             "ctx=%d warmup=%d measured=%d control=%d/%d candidate=%d/%d "
-            "candidate_env=%s include_selection=%s ssd_streaming=%s\n",
+            "candidate_env=%s include_selection=%s ssd_streaming=%s "
+            "ssd_cold=%s cache_experts=%u preload_experts=%u\n",
             cfg.model_path,
             cfg.prompt_path,
             cfg.prefix_tokens,
@@ -458,7 +490,10 @@ int main(int argc, char **argv) {
             cfg.candidate.second,
             cfg.candidate_env ? cfg.candidate_env : "(none)",
             cfg.include_selection ? "yes" : "no",
-            cfg.ssd_streaming ? "yes" : "no");
+            cfg.ssd_streaming ? "yes" : "no",
+            cfg.ssd_streaming_cold ? "yes" : "no",
+            cfg.ssd_cache_experts,
+            cfg.ssd_preload_experts);
 
     const int eos = ds4_token_eos(engine);
     const int total_steps = cfg.warmup + cfg.measured;
