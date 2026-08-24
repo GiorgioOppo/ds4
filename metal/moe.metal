@@ -9128,14 +9128,6 @@ kernel void kernel_mul_mm_id_addr(
         threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
         threadgroup float4 * C4 = (threadgroup float4 *) C;
 
-        int i = tiisg;
-        for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
-        }
-
-        i = (4*(nr0/4)) + tiisg;
-        for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
         FOR_UNROLL (int i = tiisg; i < nr0/4; i += 32) {
             *(D4 + i) = *(C4 + i);
         }
