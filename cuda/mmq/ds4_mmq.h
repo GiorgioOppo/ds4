@@ -34,6 +34,18 @@ extern "C" {
 int ds4_mmq_init(int device);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
+// Producer-fold registry bridge implemented by the full CUDA runtime.
+// A hit returns the canonical Q8_1 sidecar for this exact activation pointer
+// and stream. It is valid only for single-token unpadded rows; registry slots
+// are refreshed by each producer layer and consumed once. The standalone MMQ
+// library provides a weak, fail-closed miss so its tests do not need to link
+// ds4_cuda.cu; full ds4 overrides it with the stream-aware implementation.
+int ds4_cuda_q8_fold_take_q81(
+    const void   *src,
+    uint64_t      in_dim,
+    cudaStream_t  stream,
+    const void  **q81);
+
 // Opt-in grouped-MMQ Q8_1 arena controlled by
 // DS4_CUDA_MMQ_Q81_PERSISTENT. Unset and =0 keep the stream-pool path.
 // cleanup drains the owner device before freeing and is safe across reinit;
