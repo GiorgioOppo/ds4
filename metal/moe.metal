@@ -9068,7 +9068,7 @@ kernel void kernel_mul_mm_id_addr(
     threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
+        FOR_UNROLL (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i],
                             temp_str + 8*(i%4) + 8*NR0*(i/4),
                             NR0, 0, false);
