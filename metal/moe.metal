@@ -3945,6 +3945,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
 
 #define DS4_ATTN_OUT_LOW_Q8_STATIC_K 4096
 #define DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS 1024
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUPS 8u
 #define DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS 128
 #define DS4_ATTN_OUT_LOW_Q8_STATIC_ROW_BYTES 4352
 #define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES 4456448
@@ -3962,14 +3963,16 @@ static inline void ds4_attn_out_low_q8_static_impl(
     constexpr short NQ = 8;
     constexpr short NSG = 4;
 
-    const uint group = tgpig.z;
+    // The z grid is flattened as pair = token * groups + group.
+    const uint pair = tgpig.z;
+    const uint group = pair % DS4_ATTN_OUT_LOW_Q8_STATIC_GROUPS;
     const int r0 = (int)tgpig.x * NR0;
     device const char *src0 = src0s +
         (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES;
     device const float *y = (device const float *)(src1 +
-        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_K * sizeof(float));
+        (uint64_t)pair * DS4_ATTN_OUT_LOW_Q8_STATIC_K * sizeof(float));
     device float *out = (device float *)(dst +
-        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS * sizeof(float));
+        (uint64_t)pair * DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS * sizeof(float));
 
     device const block_q8_0 *ax[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {

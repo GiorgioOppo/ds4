@@ -986,6 +986,285 @@ static void test_metal_q8_0_decode_rows_exact(void) {
     free(weights_raw);
 }
 
+static void test_fill_q8_0_constant_weights(uint8_t *weights,
+                                             uint32_t in_dim,
+                                             uint32_t out_dim,
+                                             int8_t quant) {
+    const uint32_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = (uint64_t)blocks * 34u;
+    const uint16_t scale_bits = test_float_to_f16(1.0f / 256.0f);
+    for (uint32_t row = 0; row < out_dim; row++) {
+        uint8_t *dst = weights + (uint64_t)row * row_bytes;
+        for (uint32_t block = 0; block < blocks; block++) {
+            memcpy(dst + (uint64_t)block * 34u,
+                   &scale_bits,
+                   sizeof(scale_bits));
+            memset(dst + (uint64_t)block * 34u + 2u,
+                   (unsigned char)quant,
+                   32u);
+        }
+    }
+}
+
+static bool test_metal_q8_attention_output_static_batch_exact_case(
+        uint32_t n_tokens) {
+    const int failures_before = test_failures;
+    /*
+     * The production AProjQ8 static kernel receives a flattened z coordinate:
+     *
+     *     pair = token * n_groups + group
+     *
+     * Only pair % n_groups may select Woa.  Keep a second, sign-inverted Woa
+     * immediately after the real one so the old pair-as-group bug is a safe,
+     * deterministic wrong read for token 1 instead of an out-of-bounds Metal
+     * access.  The public batch API also runs the small Q8 output projection;
+     * both its low intermediate and final output must match the generic direct
+     * kernel bit for bit.
+     */
+    const uint32_t group_dim = 4096u;
+    const uint32_t rank = 1024u;
+    const uint32_t n_groups = 8u;
+    const uint32_t low_dim = n_groups * rank;
+    const uint32_t out_dim = 32u;
+    const uint32_t alloc_tokens = n_tokens + 1u;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t row_a_bytes = (uint64_t)(group_dim / 32u) * 34u;
+    const uint64_t group_a_bytes = (uint64_t)rank * row_a_bytes;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * group_a_bytes;
+    const uint64_t shadow_a_offset = out_a_bytes;
+    const uint64_t out_b_offset = 2u * out_a_bytes;
+    const uint64_t row_b_bytes = (uint64_t)(low_dim / 32u) * 34u;
+    const uint64_t out_b_bytes = (uint64_t)out_dim * row_b_bytes;
+    const uint64_t model_bytes =
+        test_round_up_u64(out_b_offset + out_b_bytes, page);
+    const uint64_t heads_bytes =
+        (uint64_t)alloc_tokens * n_groups * group_dim * sizeof(float);
+    const uint64_t low_bytes =
+        (uint64_t)alloc_tokens * low_dim * sizeof(float);
+    const uint64_t out_bytes =
+        (uint64_t)alloc_tokens * out_dim * sizeof(float);
+    const uint64_t active_low_bytes =
+        (uint64_t)n_tokens * low_dim * sizeof(float);
+    const uint64_t active_out_bytes =
+        (uint64_t)n_tokens * out_dim * sizeof(float);
+    const char *disable_direct_env =
+        "DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT";
+    const char *disable_ports_env =
+        "DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS";
+    const char *disable_static_env =
+        "DS4_METAL_DISABLE_PRE_M5_ATTN_OUT_LOW_Q8_STATIC";
+
+    _Static_assert(4096u / 32u * 34u == 4352u,
+                   "production AProjQ8 row size changed");
+    _Static_assert(8u * 1024u * 4352u == 35651584u,
+                   "production AProjQ8 Woa size changed");
+
+    char *saved_disable_direct = test_save_env(disable_direct_env);
+    char *saved_disable_ports = test_save_env(disable_ports_env);
+    char *saved_disable_static = test_save_env(disable_static_env);
+    void *model_raw = NULL;
+    float *heads_host = NULL;
+    float *reference_low_host = NULL;
+    float *candidate_low_host = NULL;
+    float *reference_out_host = NULL;
+    float *candidate_out_host = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *reference_low = NULL;
+    ds4_gpu_tensor *candidate_low = NULL;
+    ds4_gpu_tensor *reference_out = NULL;
+    ds4_gpu_tensor *candidate_out = NULL;
+    ds4_gpu_tensor *group_tmp = NULL;
+    ds4_gpu_tensor *low_tmp = NULL;
+
+    TEST_ASSERT(row_a_bytes == 4352u);
+    TEST_ASSERT(out_a_bytes == 35651584u);
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    if (!model_raw) goto cleanup;
+    memset(model_raw, 0, (size_t)model_bytes);
+    for (uint32_t group = 0; group < n_groups; group++) {
+        test_fill_q8_0_constant_weights(
+            (uint8_t *)model_raw + (uint64_t)group * group_a_bytes,
+            group_dim,
+            rank,
+            (int8_t)(group + 1u));
+        test_fill_q8_0_constant_weights(
+            (uint8_t *)model_raw + shadow_a_offset +
+                (uint64_t)group * group_a_bytes,
+            group_dim,
+            rank,
+            (int8_t)-(int8_t)(group + 1u));
+    }
+    test_fill_q8_0_constant_weights(
+        (uint8_t *)model_raw + out_b_offset,
+        low_dim,
+        out_dim,
+        1);
+
+    heads_host = malloc((size_t)heads_bytes);
+    reference_low_host = malloc((size_t)low_bytes);
+    candidate_low_host = malloc((size_t)low_bytes);
+    reference_out_host = malloc((size_t)out_bytes);
+    candidate_out_host = malloc((size_t)out_bytes);
+    heads = ds4_gpu_tensor_alloc(heads_bytes);
+    reference_low = ds4_gpu_tensor_alloc(low_bytes);
+    candidate_low = ds4_gpu_tensor_alloc(low_bytes);
+    reference_out = ds4_gpu_tensor_alloc(out_bytes);
+    candidate_out = ds4_gpu_tensor_alloc(out_bytes);
+    group_tmp = ds4_gpu_tensor_alloc(
+        (uint64_t)n_tokens * group_dim * sizeof(float));
+    low_tmp = ds4_gpu_tensor_alloc(
+        (uint64_t)n_tokens * rank * sizeof(float));
+    TEST_ASSERT(heads_host && reference_low_host && candidate_low_host &&
+                reference_out_host && candidate_out_host && heads &&
+                reference_low && candidate_low && reference_out &&
+                candidate_out && group_tmp && low_tmp);
+    if (!heads_host || !reference_low_host || !candidate_low_host ||
+        !reference_out_host || !candidate_out_host || !heads ||
+        !reference_low || !candidate_low || !reference_out ||
+        !candidate_out || !group_tmp || !low_tmp) {
+        goto cleanup;
+    }
+
+    for (uint64_t i = 0; i < heads_bytes / sizeof(float); i++) {
+        const uint32_t token = (uint32_t)(i / ((uint64_t)n_groups * group_dim));
+        const uint32_t key =
+            (uint32_t)i * 17u + token * 131u + ((uint32_t)i >> 4u);
+        heads_host[i] = (float)(1u + key % 13u) / 128.0f;
+    }
+    memset(reference_low_host, 0xa5, (size_t)low_bytes);
+    memset(candidate_low_host, 0xa5, (size_t)low_bytes);
+    memset(reference_out_host, 0xa5, (size_t)out_bytes);
+    memset(candidate_out_host, 0xa5, (size_t)out_bytes);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    heads, 0, heads_host, heads_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    reference_low, 0, reference_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    candidate_low, 0, candidate_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    reference_out, 0, reference_out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    candidate_out, 0, candidate_out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+    ds4_gpu_set_quality(false);
+
+    TEST_ASSERT(unsetenv(disable_direct_env) == 0);
+    TEST_ASSERT(unsetenv(disable_ports_env) == 0);
+    TEST_ASSERT(unsetenv(disable_static_env) == 0);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC);
+    TEST_ASSERT(ds4_gpu_attention_output_q8_batch_tensor(
+                    candidate_out,
+                    candidate_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    n_tokens) == 1);
+
+    ds4_gpu_test_set_flags(0);
+    TEST_ASSERT(setenv(disable_static_env, "1", 1) == 0);
+    TEST_ASSERT(ds4_gpu_attention_output_q8_batch_tensor(
+                    reference_out,
+                    reference_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    n_tokens) == 1);
+
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    reference_low, 0, reference_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    candidate_low, 0, candidate_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    reference_out, 0, reference_out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    candidate_out, 0, candidate_out_host, out_bytes) != 0);
+
+    const size_t low_count = (size_t)n_tokens * low_dim;
+    const size_t out_count = (size_t)n_tokens * out_dim;
+    const test_float_compare_stats low_stats = test_compare_float_bits(
+        reference_low_host, candidate_low_host, low_count);
+    const test_float_compare_stats out_stats = test_compare_float_bits(
+        reference_out_host, candidate_out_host, out_count);
+    size_t tail_byte_mismatch = 0;
+    for (uint64_t i = active_low_bytes; i < low_bytes; i++) {
+        if (((const uint8_t *)reference_low_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+        if (((const uint8_t *)candidate_low_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+    }
+    for (uint64_t i = active_out_bytes; i < out_bytes; i++) {
+        if (((const uint8_t *)reference_out_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+        if (((const uint8_t *)candidate_out_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+    }
+    fprintf(stderr,
+            "ds4-test: Metal Q8 static attention-output exact-%u "
+            "low=%zu/%zu max_ulp=%u max_abs=%g "
+            "out=%zu/%zu max_ulp=%u max_abs=%g tail_bytes=%zu\n",
+            n_tokens,
+            low_stats.mismatch_count,
+            low_count,
+            low_stats.max_ulp,
+            low_stats.max_abs,
+            out_stats.mismatch_count,
+            out_count,
+            out_stats.max_ulp,
+            out_stats.max_abs,
+            tail_byte_mismatch);
+    TEST_ASSERT(low_stats.mismatch_count == 0 && low_stats.max_ulp == 0);
+    TEST_ASSERT(out_stats.mismatch_count == 0 && out_stats.max_ulp == 0);
+    TEST_ASSERT(tail_byte_mismatch == 0);
+
+cleanup:
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor_free(low_tmp);
+    ds4_gpu_tensor_free(group_tmp);
+    ds4_gpu_tensor_free(candidate_out);
+    ds4_gpu_tensor_free(reference_out);
+    ds4_gpu_tensor_free(candidate_low);
+    ds4_gpu_tensor_free(reference_low);
+    ds4_gpu_tensor_free(heads);
+    free(candidate_out_host);
+    free(reference_out_host);
+    free(candidate_low_host);
+    free(reference_low_host);
+    free(heads_host);
+    free(model_raw);
+    test_restore_env(disable_static_env, saved_disable_static);
+    test_restore_env(disable_ports_env, saved_disable_ports);
+    test_restore_env(disable_direct_env, saved_disable_direct);
+    return test_failures == failures_before;
+}
+
+static void test_metal_q8_attention_output_static_batch_exact(void) {
+    /* The shadow Woa makes the old bug safe at N=2; stop there on failure. */
+    if (test_metal_q8_attention_output_static_batch_exact_case(2u)) {
+        (void)test_metal_q8_attention_output_static_batch_exact_case(31u);
+    }
+}
+
 static void test_metal_q4_attention_output_tiny_batch_exact_case(
         uint32_t out_b_type) {
     /*
@@ -6474,6 +6753,7 @@ static void test_metal_kernel_group(void) {
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
     test_metal_q8_0_decode_rows_exact();
+    test_metal_q8_attention_output_static_batch_exact();
     test_metal_q4_attention_output_tiny_batch_exact();
     test_metal_dspark_device_proposer_q8();
     test_metal_f16_compressor_pair_state_store_exact();
