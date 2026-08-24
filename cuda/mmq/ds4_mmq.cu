@@ -337,16 +337,6 @@ extern "C" int ds4_mmq_q81_persistent_preflight_for_test(
     return arena ? 0 : -3;
 }
 
-// M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
-// A hit returns canonical block_q8_1 codes for this exact activation
-// pointer (bit-exact vs quantize_row_q8_1_cuda), letting the caller skip
-// its quantize prelude.  Only valid for single-token unpadded rows
-// (ne10_padded == K); the registry itself guarantees freshness (slots are
-// reset by the producing entry every layer and pops are one-shot).
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
-                                         cudaStream_t stream,
-                                         const void **q81);
-
 static uint64_t g_q8_fold_oracle_byte_calls;
 static uint64_t g_q8_fold_oracle_byte_mismatches;
 static uint64_t g_q8_fold_oracle_output_calls;

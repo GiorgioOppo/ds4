@@ -7,6 +7,7 @@
 // Phase 0: pool is plain cudaMallocAsync / cudaFreeAsync. Phase 4 swaps
 // in ds4's existing cuda_tmp_alloc slab allocator.
 
+#include "ds4_mmq.h"
 #include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
 
 #include <cuda_runtime.h>
