@@ -44,7 +44,16 @@ row is bit-identical and, with `--include-selection`, both variants select the
 same non-EOS token. Use `--candidate-env NAME` to measure a rollback control,
 or `--help` to compare explicit split schedules. Pass `--ssd-streaming` for a
 model larger than RAM; the harness then skips full-weight warmup while keeping
-both variants in the same engine and expert cache.
+both variants in the same engine and expert cache. SSD runs can use
+`--ssd-streaming-cold`, `--ssd-streaming-cache-experts N`, and
+`--ssd-streaming-preload-experts N` to hold the cache policy constant.
+
+This paired harness is the exact-logit gate. Since its two sessions share the
+expert cache, confirm SSD throughput separately with one process and engine per
+variant before promoting a scheduling change. Environment variables consumed
+while the engine opens, including the Metal streaming `F_NOCACHE` controls,
+also require separate processes: `--candidate-env` changes them too late to
+create a different model descriptor inside this harness.
 
 To compare the default pre-M5 ratio-4 compressor pack/transpose fusion with the
 legacy decode path, including token selection, use:
@@ -81,4 +90,11 @@ both variants with at least 32 tokens, alternates control/candidate order in
 ABBA and BAAB blocks, poisons host logit buffers before copying, and aborts
 unless every final full-vocabulary logit row is bit-identical. Defaults are an
 8192-token prefix, an automatically sized 8193-token context, and two repeats;
-use `--help` to override them.
+use `--help` to override them. SSD-prefill variants can add `--ssd-streaming`,
+`--ssd-streaming-cold`, `--ssd-streaming-cache-experts N`, and
+`--ssd-streaming-preload-experts N`. Since those paired runs intentionally
+share one engine and expert cache, confirm any SSD throughput win separately
+with one process and engine per variant before promotion.
+Environment variables consumed while the engine opens, including the Metal
+streaming `F_NOCACHE` controls, cannot be compared with `--candidate-env` in
+this harness and likewise require separate processes.
