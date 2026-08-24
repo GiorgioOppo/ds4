@@ -35835,7 +35835,6 @@ static int ds4_gpu_encode_router_select(
             (!pre_m5_device ||
              getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_SIMD_WEIGHTS_FUSION") == NULL);
         const bool use_pre_m5_transform_finalize_fusion_default =
-            !g_ssd_streaming_mode &&
             (pre_m5_device || ds4_gpu_device_name_contains("M5")) &&
             getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_TRANSFORM_FINALIZE_FUSION") == NULL;
         const bool use_transform_finalize_fusion =
