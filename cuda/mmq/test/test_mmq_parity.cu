@@ -1513,6 +1513,59 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
     const size_t up_remap_bad = mismatches(up_got, up_global_out);
     const size_t mid_remap_bad = mismatches(mid_got, mid_global_out);
     const size_t down_remap_bad = mismatches(down_got, down_global_out);
+
+    // The comparisons above use memcmp, i.e. bit-exact equality with no
+    // tolerance.  When a case fails, the counts alone cannot tell a last-bit
+    // rounding difference from a real divergence, which makes triage on a new
+    // architecture guesswork.  Report the magnitude next to the count: worst
+    // absolute and relative difference, ULP distance, how many differences are
+    // within a single ULP, how many exceed 1e-3, and the value pair at the
+    // worst point.  Diagnostics only - the pass/fail criterion is unchanged.
+    const auto diagnose = [](const char *tag, const std::vector<float> & a,
+                             const std::vector<float> & b) {
+        double max_abs = 0.0, max_rel = 0.0;
+        float at_max_got = 0.0f, at_max_ref = 0.0f;
+        size_t bad = 0, first = (size_t)-1, ulp1 = 0, nonfinite = 0, big = 0;
+        long long max_ulp = 0;
+        for (size_t i = 0; i < a.size(); i++) {
+            if (std::memcmp(&a[i], &b[i], sizeof(float)) == 0) continue;
+            bad++;
+            if (first == (size_t)-1) first = i;
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) nonfinite++;
+            const double d = std::fabs((double)a[i] - (double)b[i]);
+            const double den = std::fabs((double)b[i]);
+            if (d > max_abs) { max_abs = d; at_max_got = a[i]; at_max_ref = b[i]; }
+            if (den > 0.0 && d / den > max_rel) max_rel = d / den;
+            if (d > 1e-3) big++;
+            // Monotonic ordering of the float bit patterns, so the subtraction
+            // is a real ULP distance across the sign boundary as well.
+            int32_t ia = 0, ib = 0;
+            std::memcpy(&ia, &a[i], sizeof(int32_t));
+            std::memcpy(&ib, &b[i], sizeof(int32_t));
+            if (ia < 0) ia = (int32_t)0x80000000 - ia;
+            if (ib < 0) ib = (int32_t)0x80000000 - ib;
+            const long long u = std::llabs((long long)ia - (long long)ib);
+            if (u <= 1) ulp1++;
+            if (u > max_ulp) max_ulp = u;
+        }
+        if (bad == 0) { fprintf(stderr, "  diag %-11s clean\n", tag); return; }
+        fprintf(stderr,
+                "  diag %-11s bad=%zu/%zu (%.1f%%) max_abs=%.4g max_rel=%.4g "
+                "max_ulp=%lld within_1ulp=%zu nonfinite=%zu abs_gt_1e-3=%zu "
+                "at_max(got/ref)=%.9g/%.9g first=%zu got=%.9g ref=%.9g\n",
+                tag, bad, a.size(), 100.0 * (double)bad / (double)a.size(),
+                max_abs, max_rel, max_ulp, ulp1, nonfinite, big,
+                (double)at_max_got, (double)at_max_ref,
+                first, (double)a[first], (double)b[first]);
+    };
+    diagnose("gate", gate_got, gate_ref);
+    diagnose("up", up_got, up_ref);
+    diagnose("mid", mid_got, mid_ref);
+    diagnose("down", down_got, down_ref);
+    diagnose("gate/remap", gate_got, gate_global_out);
+    diagnose("up/remap", up_got, up_global_out);
+    diagnose("mid/remap", mid_got, mid_global_out);
+    diagnose("down/remap", down_got, down_global_out);
     const bool ok = na_ok && rc_pair == 0 && swiglu_err == cudaSuccess &&
         rc_down == 0 && rc_fused == 0 && rc_global == 0 &&
         rc_global_reuse == 0 && rc_q81_grow == 0 &&
