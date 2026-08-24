@@ -9043,7 +9043,7 @@ kernel void kernel_mul_mm_id_addr(
         }
 
         if (FC_mul_mm_bc_inp) {
-            for (short i = 0; i < 8; ++i) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
 
