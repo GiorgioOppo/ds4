@@ -9004,7 +9004,7 @@ kernel void kernel_mul_mm_id_addr(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
