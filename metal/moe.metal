@@ -8733,7 +8733,7 @@ kernel void kernel_mul_mm_id(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
@@ -8835,7 +8835,7 @@ kernel void kernel_mul_mm_id(
     threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
+        FOR_UNROLL (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
     }
@@ -9195,7 +9195,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     simdgroup_float8x8 mc_gate[8];
     simdgroup_float8x8 mc_up[8];
 
-    for (short i = 0; i < 8; i++) {
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc_gate[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
         mc_up[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
@@ -9276,7 +9276,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
         temp_up + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
+        FOR_UNROLL (short i = 0; i < 8; i++) {
             simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
             simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
@@ -9417,7 +9417,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     simdgroup_float8x8 mc_gate[8];
     simdgroup_float8x8 mc_up[8];
 
-    for (short i = 0; i < 8; i++) {
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc_gate[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
         mc_up[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
@@ -9501,7 +9501,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     threadgroup float * temp_up_str = temp_up + 16*sgitg*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
+        FOR_UNROLL (short i = 0; i < 8; i++) {
             simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
             simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
