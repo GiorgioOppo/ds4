@@ -8726,8 +8726,6 @@ kernel void kernel_mul_mm_id(
         /* Unowned expert under the TP split: zero this tile's output rows so
          * the downstream swiglu/sum stages stay unchanged. Each (token,slot)
          * row belongs to exactly one expert, so nothing else writes them. */
-        #pragma unroll(nr1)
-        #pragma unroll(nr1)
         for (short j = sgitg; j < nr1; j += 4) {
             const int idj = ids_i32[route_base + r1 + j];
 
@@ -8736,7 +8734,6 @@ kernel void kernel_mul_mm_id(
 
             device float * D = (device float *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
 
-            #pragma unroll(nr0)
             for (int i = tiisg; i < nr0; i += 32) {
                 D[i] = 0.0f;
             }
@@ -8903,13 +8900,6 @@ kernel void kernel_mul_mm_id(
 
         i = (4*(nr0/4)) + tiisg;
         for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
-        }
-        FOR_UNROLL (int i = tiisg; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
-        }
-
-        FOR_UNROLL (i = (4*(nr0/4)) + tiisg; i < nr0; i += 32) {
             *(D + i) = *(C + i);
         }
     }
@@ -9319,25 +9309,13 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     threadgroup float * temp_gate = (threadgroup float *) shmem;
     threadgroup float * temp_up = temp_gate + NR0*NR1;
-    threadgroup float * temp_gate_str =
-        temp_gate + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
-    threadgroup float * temp_up_str =
-        temp_up + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    const int str_index = 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    threadgroup float * temp_gate_str = temp_gate + str_index;
+    threadgroup float * temp_up_str = temp_up + str_index;
 
     if (mma_active) {
         FOR_UNROLL (short i = 0; i < 8; i++) {
-            simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-            simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-        }
-    int str_indice = 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
-    threadgroup float * temp_gate_str =
-        temp_gate + str_indice;
-    threadgroup float * temp_up_str =
-        temp_up + str_indice;
-
-    if (mma_active) {
-        FOR_UNROLL (int i = 0; i < 8; i++) {
-            int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
+            const int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
             simdgroup_store(mc_gate[i], temp_gate_str + si, NR0, 0, false);
             simdgroup_store(mc_up[i],   temp_up_str   + si, NR0, 0, false);
         }
@@ -9360,8 +9338,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
         threadgroup float *Cg = temp_gate + j*NR0;
         threadgroup float *Cu = temp_up   + j*NR0;
 
-        int i = tiisg;
-        FOR_UNROLL (int i = tiisg; i < nr0; i += 32) {
+        for (int i = tiisg; i < nr0; i += 32) {
             float g = Cg[i];
             float u = Cu[i];
             if (c > 1.0e-6f) {
@@ -9563,7 +9540,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
 
     if (mma_active) {
         FOR_UNROLL (short i = 0; i < 8; i++) {
-            int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
+            const int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
             simdgroup_store(mc_gate[i], temp_gate_str + si, NR0, 0, false);
             simdgroup_store(mc_up[i],   temp_up_str   + si, NR0, 0, false);
         }
@@ -9586,8 +9563,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
         threadgroup float *Cg = temp_gate + j*NR0;
         threadgroup float *Cu = temp_up   + j*NR0;
 
-        int i = tiisg;
-        FOR_UNROLL (int i = tiisg; i < nr0; i += 32) {
+        for (int i = tiisg; i < nr0; i += 32) {
             float g = Cg[i];
             float u = Cu[i];
             if (c > 1.0e-6f) {
