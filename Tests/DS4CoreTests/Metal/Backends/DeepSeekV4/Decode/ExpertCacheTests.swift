@@ -110,6 +110,126 @@ final class ExpertCacheTests: XCTestCase {
         func read() -> Int { lock.lock(); defer { lock.unlock() }; return value }
     }
 
+    private final class FillGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var blocking = false
+        let started = DispatchSemaphore(value: 0)
+        let proceed = DispatchSemaphore(value: 0)
+
+        func enable() { lock.lock(); blocking = true; lock.unlock() }
+        func disable() { lock.lock(); blocking = false; lock.unlock() }
+        func waitIfEnabled() {
+            lock.lock(); let shouldBlock = blocking; lock.unlock()
+            guard shouldBlock else { return }
+            started.signal()
+            proceed.wait()
+        }
+    }
+
+    func testAsyncAcquireExposesAndProtectsResidentSubset() throws {
+        let rt = try makeRuntime()
+        let gate = FillGate(), expertBytes = 64
+        let cache = ExpertSlotCache(
+            slotsPerLayer: 8, bytesPerExpert: expertBytes * 3,
+            makePool: { slots in
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes))
+            },
+            fill: { layer, id, pool, slot in
+                gate.waitIfEnabled()
+                let p = pool.gate.buffer.contents()
+                    .advanced(by: pool.gate.byteOffset + slot * expertBytes)
+                p.storeBytes(of: Int32(layer * 1000) + id, as: Int32.self)
+            })
+
+        _ = try cache.acquire(layer: 2, ids: [1, 2, 3, 4, 5, 6])
+        gate.enable()
+        let pending = cache.acquireAsync(layer: 2, ids: [1, 2, 3, 4, 5, 7])
+        XCTAssertEqual(pending.residentMask, 0b01_1111)
+        XCTAssertNotNil(pending.residentPool)
+        XCTAssertTrue(pending.residentSlots.prefix(5).allSatisfy { $0 >= 0 })
+        XCTAssertEqual(pending.residentSlots[5], -1)
+        XCTAssertEqual(gate.started.wait(timeout: .now() + 2), .success,
+                       "the missing expert must start off-thread")
+
+        gate.proceed.signal()
+        let (pool, slots) = try pending.join()
+        XCTAssertTrue(slots.allSatisfy { $0 >= 0 })
+        let p = pool.gate.buffer.contents()
+            .advanced(by: pool.gate.byteOffset + Int(slots[5]) * expertBytes)
+        XCTAssertEqual(p.load(as: Int32.self), 2007)
+        XCTAssertEqual(cache.hits, 5)
+        XCTAssertEqual(cache.misses, 7)
+
+        // The joined acquire remains leased until its GPU consumer completes:
+        // a delayed look-ahead must not write another slot of the same resource.
+        gate.disable()
+        cache.prefill(layer: 2, ids: [8])
+        XCTAssertEqual(cache.prefilled, 0)
+        pending.release()
+        cache.prefill(layer: 2, ids: [8])
+        XCTAssertEqual(cache.prefilled, 1)
+    }
+
+    func testSynchronousAcquireLeaseProtectsPoolUntilGPUCompletion() throws {
+        let rt = try makeRuntime()
+        let expertBytes = 64
+        let cache = ExpertSlotCache(
+            slotsPerLayer: 8, bytesPerExpert: expertBytes * 3,
+            makePool: { slots in
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes))
+            },
+            fill: { _, id, pool, slot in
+                pool.gate.buffer.contents()
+                    .advanced(by: pool.gate.byteOffset + slot * expertBytes)
+                    .storeBytes(of: id, as: Int32.self)
+            })
+
+        let acquired = try cache.acquireLeased(layer: 5, ids: [1, 2, 3, 4, 5, 6])
+        XCTAssertTrue(acquired.slots.allSatisfy { $0 >= 0 })
+        cache.prefill(layer: 5, ids: [7])
+        XCTAssertEqual(cache.prefilled, 0,
+                       "look-ahead must not write the pool while Metal may read it")
+
+        acquired.lease.release() // mirrors the command-buffer completion handler
+        cache.prefill(layer: 5, ids: [7])
+        XCTAssertEqual(cache.prefilled, 1)
+    }
+
+    func testDuplicateExpertIdsShareOneSlotAndOneFill() throws {
+        let rt = try makeRuntime()
+        let expertBytes = 64
+        let fills = Counter()
+        let cache = ExpertSlotCache(
+            slotsPerLayer: 8, bytesPerExpert: expertBytes * 3,
+            makePool: { slots in
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes))
+            },
+            fill: { _, id, pool, slot in
+                fills.bump()
+                pool.gate.buffer.contents()
+                    .advanced(by: pool.gate.byteOffset + slot * expertBytes)
+                    .storeBytes(of: id, as: Int32.self)
+            })
+
+        _ = try cache.acquire(layer: 1, ids: [1]) // materialize the pool
+        cache.prefill(layer: 1, ids: [7, 7, 8, 7])
+        XCTAssertEqual(cache.prefilled, 2, "only unique missing experts require I/O")
+
+        let acquired = try cache.acquire(layer: 1, ids: [7, 7, 8, 7])
+        XCTAssertEqual(acquired.slots[0], acquired.slots[1])
+        XCTAssertEqual(acquired.slots[0], acquired.slots[3])
+        XCTAssertNotEqual(acquired.slots[0], acquired.slots[2])
+        XCTAssertEqual(fills.read(), 3, "one initial fill plus two unique prefetch fills")
+        XCTAssertEqual(cache.misses, 1)
+        XCTAssertEqual(cache.hits, 4)
+    }
+
     func testSlotCacheUsesBatchFillWhenAvailable() throws {
         let rt = try makeRuntime()
         let expertBytes = 64

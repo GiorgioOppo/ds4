@@ -35,7 +35,135 @@ extension StreamingDecoder {
         drainFullLayerGather()
         drainFFN()
         lookaheadQ.sync {}
+        slotCache?.drainDemandLoads()
         teardownIODrain?()
+    }
+
+    /// Build slot-indexed GPU address tables for the indirect masked IQ2 pair.
+    /// Addresses point at the exact start of each gate/up slot, so the kernel's
+    /// selected ids remain the ordinary cache slot ids and numerics are unchanged.
+    func stageSplitAddressTables(_ pool: ExpertSlotCache.LayerPool,
+                                 fallbackStride: Int?,
+                                 gateAddresses: GPUTensor,
+                                 upAddresses: GPUTensor) throws -> Int {
+        let slots = pool.owner.count
+        guard slots > 0, slots <= 384 else {
+            throw MetalError.unsupported("expert split: slot count \(slots) outside 1...384")
+        }
+        let gateStride: Int
+        let upStride: Int
+        if let record = pool.expertStride ?? fallbackStride {
+            gateStride = record
+            upStride = record
+        } else {
+            guard pool.gate.byteLength % slots == 0, pool.up.byteLength % slots == 0 else {
+                throw MetalError.unsupported("expert split: non-integral pool stride")
+            }
+            gateStride = pool.gate.byteLength / slots
+            upStride = pool.up.byteLength / slots
+        }
+        guard gateAddresses.byteLength >= 384 * MemoryLayout<UInt64>.stride,
+              upAddresses.byteLength >= 384 * MemoryLayout<UInt64>.stride else {
+            throw MetalError.unsupported("expert split: undersized GPU-address table")
+        }
+        let gate = gateAddresses.buffer.contents()
+            .advanced(by: gateAddresses.byteOffset)
+            .bindMemory(to: UInt64.self, capacity: 384)
+        let up = upAddresses.buffer.contents()
+            .advanced(by: upAddresses.byteOffset)
+            .bindMemory(to: UInt64.self, capacity: 384)
+        for i in 0..<384 { gate[i] = 0; up[i] = 0 }
+        let gateBase = pool.gate.buffer.gpuAddress + UInt64(pool.gate.byteOffset)
+        let upBase = pool.up.buffer.gpuAddress + UInt64(pool.up.byteOffset)
+        guard gateBase != 0, upBase != 0 else {
+            throw MetalError.unsupported("expert split: GPU addresses unavailable")
+        }
+        for slot in 0..<slots {
+            gate[slot] = gateBase + UInt64(slot * gateStride)
+            up[slot] = upBase + UInt64(slot * upStride)
+        }
+        return slots
+    }
+
+    /// Snapshot only the already-resident IQ2 gate/up slabs into a dedicated
+    /// six-row staging pair. The asynchronous demand fill may write other slots
+    /// in the source pool at the same time, but the resident GPU command never
+    /// references that pool: this removes the CPU-write/GPU-read resource race
+    /// while copying only the useful resident slabs.
+    func stageSplitResidentPair(_ pool: ExpertSlotCache.LayerPool,
+                                residentSlots: [Int32], activeMask: UInt32,
+                                fallbackStride: Int?) throws -> Int {
+        let slots = pool.owner.count
+        guard slots > 0, slots <= 384, residentSlots.count >= d.k else {
+            throw MetalError.unsupported("expert split: invalid resident slot geometry")
+        }
+        let expertBytes = (d.nEmbd / 256) * MoEQuant.iq2_xxs.blockBytes * d.expertFfn
+        guard splitResidentGate.byteLength >= d.k * expertBytes,
+              splitResidentUp.byteLength >= d.k * expertBytes else {
+            throw MetalError.unsupported("expert split: undersized resident staging pair")
+        }
+
+        let gateStride: Int
+        let upStride: Int
+        if let record = pool.expertStride ?? fallbackStride {
+            gateStride = record
+            upStride = record
+        } else {
+            guard pool.gate.byteLength % slots == 0, pool.up.byteLength % slots == 0 else {
+                throw MetalError.unsupported("expert split: non-integral resident pool stride")
+            }
+            gateStride = pool.gate.byteLength / slots
+            upStride = pool.up.byteLength / slots
+        }
+
+        let gateTable = splitResidentGateAddresses.buffer.contents()
+            .advanced(by: splitResidentGateAddresses.byteOffset)
+            .bindMemory(to: UInt64.self, capacity: 384)
+        let upTable = splitResidentUpAddresses.buffer.contents()
+            .advanced(by: splitResidentUpAddresses.byteOffset)
+            .bindMemory(to: UInt64.self, capacity: 384)
+        for i in 0..<384 { gateTable[i] = 0; upTable[i] = 0 }
+
+        let stagedGateBase = splitResidentGate.buffer.gpuAddress
+            + UInt64(splitResidentGate.byteOffset)
+        let stagedUpBase = splitResidentUp.buffer.gpuAddress
+            + UInt64(splitResidentUp.byteOffset)
+        guard stagedGateBase != 0, stagedUpBase != 0 else {
+            throw MetalError.unsupported("expert split: resident GPU addresses unavailable")
+        }
+
+        let idsPtr = splitSlotsScratch.buffer.contents()
+            .advanced(by: splitSlotsScratch.byteOffset)
+            .bindMemory(to: Int32.self, capacity: d.k)
+        let sourceGateBase = pool.gate.byteOffset
+        let sourceUpBase = pool.up.byteOffset
+        let destinationGateBase = splitResidentGate.byteOffset
+        let destinationUpBase = splitResidentUp.byteOffset
+        for j in 0..<d.k {
+            idsPtr[j] = Int32(j)
+            guard (activeMask & (UInt32(1) << UInt32(j))) != 0 else { continue }
+            let slot = Int(residentSlots[j])
+            guard slot >= 0, slot < slots else {
+                throw MetalError.unsupported("expert split: invalid resident slot \(slot)")
+            }
+            let gateSource = sourceGateBase + slot * gateStride
+            let upSource = sourceUpBase + slot * upStride
+            let gateDestination = destinationGateBase + j * expertBytes
+            let upDestination = destinationUpBase + j * expertBytes
+            guard gateSource + expertBytes <= pool.gate.buffer.length,
+                  upSource + expertBytes <= pool.up.buffer.length,
+                  gateDestination + expertBytes <= splitResidentGate.buffer.length,
+                  upDestination + expertBytes <= splitResidentUp.buffer.length else {
+                throw MetalError.unsupported("expert split: resident slab outside its Metal buffer")
+            }
+            memcpy(splitResidentGate.buffer.contents() + gateDestination,
+                   pool.gate.buffer.contents() + gateSource, expertBytes)
+            memcpy(splitResidentUp.buffer.contents() + upDestination,
+                   pool.up.buffer.contents() + upSource, expertBytes)
+            gateTable[j] = stagedGateBase + UInt64(j * expertBytes)
+            upTable[j] = stagedUpBase + UInt64(j * expertBytes)
+        }
+        return d.k
     }
 
     /// Speculative look-ahead: prefill layer i+1's slot pool while the GPU
@@ -155,9 +283,95 @@ extension StreamingDecoder {
                 let hb0 = cache.hitBytes, mb0 = cache.missBytes
                 let wb0 = cache.warmedBytes, pb0 = cache.prefilledBytes
                 let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
-                do { acquired = try cache.acquire(layer: i, ids: ids) }
-                catch { c1.waitCompleted(); throw error }
+                var residentCB: GraphContext?
+                var splitDeferredMask: UInt32 = 0
+                var splitPool: ExpertSlotCache.LayerPool?
+                var splitPoolSlotCount = 0
+                var splitLease: ExpertSlotCache.PendingAcquire?
+                var ordinaryLease: ExpertSlotCache.GPUReadLease?
+                let splitEligible = asyncExpertSplit && !profileRoute
+                    && K == 6 && d.k == 6 && d.fusedMoE
+                    && w.gateQuant == .iq2_xxs && w.upQuant == .iq2_xxs
+                    && w.downQuant == .q2_K
+                if splitEligible {
+                    let pending = cache.acquireAsync(layer: i, ids: ids)
+                    splitLease = pending
+                    let fullMask = (UInt32(1) << UInt32(K)) - 1
+                    let residentMask = pending.residentMask & fullMask
+                    splitDeferredMask = fullMask ^ residentMask
+                    if residentMask != 0, splitDeferredMask != 0,
+                       let residentPool = pending.residentPool {
+                        do {
+                            let slotCount = try stageSplitResidentPair(
+                                residentPool, residentSlots: pending.residentSlots,
+                                activeMask: residentMask, fallbackStride: slotCacheStride)
+                            let c = GraphContext(rt)
+                            try c.begin()
+                            try c.decodeRoutedExpertsResidentPair(
+                                w: w, s: scratch, d: d,
+                                gateExp: splitResidentGate, upExp: splitResidentUp,
+                                gateAddresses: splitResidentGateAddresses,
+                                upAddresses: splitResidentUpAddresses,
+                                ids: splitSlotsScratch, activeMask: residentMask,
+                                slotCount: slotCount,
+                                expertStride: nil)
+                            c.commitAsync()
+                            residentCB = c
+                            splitPool = residentPool
+                            profile.expertSplitLayers += 1
+                            profile.expertSplitResidentRows += residentMask.nonzeroBitCount
+                        } catch {
+                            _ = try? pending.join()
+                            pending.release()
+                            residentCB?.waitCompleted()
+                            c1.waitCompleted()
+                            throw error
+                        }
+                    }
+                    do { acquired = try pending.join() }
+                    catch {
+                        pending.release()
+                        residentCB?.waitCompleted()
+                        c1.waitCompleted()
+                        throw error
+                    }
+                    // Fork/join boundary: the resident GPU pair and the missing
+                    // expert I/O ran concurrently, but the tail consumes all six
+                    // `mid6` rows. Do not rely on implicit inter-command-buffer
+                    // hazard ordering here; explicitly join both producers before
+                    // encoding the shared down-sum/tail. This preserves the full
+                    // overlap while making completion deterministic.
+                    residentCB?.waitCompleted()
+                } else {
+                    do {
+                        let leased = try cache.acquireLeased(layer: i, ids: ids)
+                        acquired = (leased.pool, leased.slots)
+                        ordinaryLease = leased.lease
+                    }
+                    catch { c1.waitCompleted(); throw error }
+                }
                 let (pool, slots) = acquired
+                if let splitPool {
+                    guard splitPool.gate.buffer === pool.gate.buffer,
+                          splitPool.up.buffer === pool.up.buffer,
+                          splitPool.down.buffer === pool.down.buffer else {
+                        splitLease?.release()
+                        residentCB?.waitCompleted()
+                        c1.waitCompleted()
+                        throw MetalError.unsupported("expert split: pool changed during demand fill")
+                    }
+                    do {
+                        splitPoolSlotCount = try stageSplitAddressTables(
+                            pool, fallbackStride: slotCacheStride,
+                            gateAddresses: splitPoolGateAddresses,
+                            upAddresses: splitPoolUpAddresses)
+                    } catch {
+                        splitLease?.release()
+                        residentCB?.waitCompleted()
+                        c1.waitCompleted()
+                        throw error
+                    }
+                }
                 profile.gatherS += Date().timeIntervalSince(t)
                 // Deltas, not cumulative totals: the cache counts since load,
                 // the profile since resetProfile().
@@ -188,11 +402,35 @@ extension StreamingDecoder {
                 let c2 = GraphContext(rt)
                 do {
                     try c2.begin()
-                    try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
-                                               upExp: pool.up, downExp: pool.down,
-                                               ids: slotsBuf, outHc: other, activeK: K,
-                                               expertStride: pool.expertStride ?? slotCacheStride)
-                } catch { c1.waitCompleted(); throw error }
+                    if residentCB != nil, splitDeferredMask != 0 {
+                        try c2.decodeRoutedExpertsSplitTail(
+                            w: w, s: scratch, d: d,
+                            gateExp: pool.gate, upExp: pool.up, downExp: pool.down,
+                            gateAddresses: splitPoolGateAddresses,
+                            upAddresses: splitPoolUpAddresses,
+                            ids: slotsBuf, deferredMask: splitDeferredMask,
+                            slotCount: splitPoolSlotCount, outHc: other,
+                            expertStride: pool.expertStride ?? slotCacheStride)
+                    } else {
+                        try c2.decodeRoutedExperts(w: w, s: scratch, d: d,
+                                                   gateExp: pool.gate,
+                                                   upExp: pool.up, downExp: pool.down,
+                                                   ids: slotsBuf, outHc: other, activeK: K,
+                                                   expertStride: pool.expertStride ?? slotCacheStride)
+                    }
+                } catch {
+                    splitLease?.release()
+                    ordinaryLease?.release()
+                    residentCB?.waitCompleted()
+                    c1.waitCompleted()
+                    throw error
+                }
+                if let lease = splitLease {
+                    c2.onComplete { lease.release() }
+                }
+                if let lease = ordinaryLease {
+                    c2.onComplete { lease.release() }
+                }
                 commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
             } else {

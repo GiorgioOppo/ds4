@@ -168,6 +168,11 @@ public final class StreamingDecoder {
     /// DECODE path serves hits from resident GPU pools (zero copies) and gathers
     /// only the misses; the matvec runs on the pool with slot-index ids.
     public let slotCache: ExpertSlotCache?
+    /// Exact C-style routed-expert overlap. The cache probes resident route
+    /// positions, starts the demand fill off-thread and runs the resident IQ2
+    /// pair while missing slots arrive. `=0` restores the synchronous acquire.
+    let asyncExpertSplit = DS4RuntimeEnvironment.flag(
+        .expertAsyncSplit, backend: .deepSeekV4, default: true)
     /// Exact per-step resident allocation of the dense staging ring. Zero when
     /// dense streaming is disabled.
     public let denseStagingBytesPerAheadSlot: Int
@@ -256,6 +261,16 @@ public final class StreamingDecoder {
     /// buffer would suffice — the parity keeps the invariant local instead of
     /// depending on the route-wait ordering, and costs 24 bytes.
     let slotsScratchB: GPUTensor
+    /// Dedicated ids and GPU-address tables for a resident pair command buffer.
+    /// They cannot alias slotsScratch: the CPU stages the final slot mapping
+    /// while the resident command may still be reading its provisional mapping.
+    let splitSlotsScratch: GPUTensor
+    let splitResidentGate: GPUTensor
+    let splitResidentUp: GPUTensor
+    let splitResidentGateAddresses: GPUTensor
+    let splitResidentUpAddresses: GPUTensor
+    let splitPoolGateAddresses: GPUTensor
+    let splitPoolUpAddresses: GPUTensor
     /// EXPERT PARALLELISM (coordinatore verticale): quando impostata, la FFN
     /// routed è calcolata dai worker remoti — (layer, id selezionati, pesi di
     /// route, attivazione nEmbd) → somma pesata nEmbd. Chiamata SINCRONA dal
@@ -531,6 +546,22 @@ public final class StreamingDecoder {
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         slotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
         slotsScratchB = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
+        splitSlotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
+        let splitIQ2ExpertBytes = (dims.nEmbd / 256) * MoEQuant.iq2_xxs.blockBytes
+            * dims.expertFfn
+        splitResidentGate = try GPUTensor.uninitializedBytes(
+            rt, byteLength: dims.k * splitIQ2ExpertBytes,
+            elementCount: dims.k * splitIQ2ExpertBytes)
+        splitResidentUp = try GPUTensor.uninitializedBytes(
+            rt, byteLength: dims.k * splitIQ2ExpertBytes,
+            elementCount: dims.k * splitIQ2ExpertBytes)
+        // Address kernels hard-cap their tables at 384 entries (the Pro model's
+        // expert count). Slot caches are much smaller, but a fixed table keeps
+        // staging allocation-free and validates every possible configured pool.
+        splitResidentGateAddresses = try GPUTensor.zerosBytes(rt, byteLength: 384 * 8)
+        splitResidentUpAddresses = try GPUTensor.zerosBytes(rt, byteLength: 384 * 8)
+        splitPoolGateAddresses = try GPUTensor.zerosBytes(rt, byteLength: 384 * 8)
+        splitPoolUpAddresses = try GPUTensor.zerosBytes(rt, byteLength: 384 * 8)
         remotePartialA = try GPUTensor.zeros(rt, floatCount: dims.nEmbd)
         remotePartialB = try GPUTensor.zeros(rt, floatCount: dims.nEmbd)
         embedRowStage = try GPUTensor.zerosBytes(rt, byteLength: max(2, embedTable.byteLength / max(1, dims.vocab)))

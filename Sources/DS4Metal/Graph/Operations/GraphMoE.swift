@@ -86,6 +86,69 @@ extension GraphContext {
                                threadsPerThreadgroup: MTLSize(width: 32, height: nsg, depth: 1))
     }
 
+    /// Address-table variant used by the exact resident/missing split. Only
+    /// route positions selected by `activeMask` are produced, so resident rows
+    /// can be committed while the SSD fills the other slots. Address entries
+    /// are indexed by the slot ids in `ids`; the pool buffers are declared as
+    /// indirect resources so Metal keeps them resident for the command buffer.
+    public func moePairSwiGLUAddressMasked(
+        gateExp: GPUTensor, upExp: GPUTensor,
+        gateAddresses: GPUTensor, upAddresses: GPUTensor,
+        ids: GPUTensor, activation: GPUTensor, weights: GPUTensor,
+        gateScratch: GPUTensor, upScratch: GPUTensor, mid: GPUTensor,
+        k: Int, slotCount: Int, inDim: Int, outDim: Int, clamp: Float,
+        activeMask: UInt32, expertStride: Int? = nil
+    ) throws {
+        precondition(activeMask != 0)
+        precondition(slotCount > 0 && slotCount <= 384)
+        let quant = MoEQuant.iq2_xxs
+        // Match the C split dispatcher: the generic address-table IQ2 pair
+        // cooperatively loads exactly 256 grid + 128 sign entries without the
+        // bounds guards present in the ordinary fused-id kernel. Two simdgroups
+        // provide exactly the required 64 lanes; nsg > 2 writes past the 2176-B
+        // threadgroup allocation and makes results timing-dependent. NSG only
+        // partitions output rows, so fixing it at 2 preserves each row's exact
+        // 32-lane reduction order.
+        let nsg = 2, nr0 = quant.nr0
+        let rowBytes = (inDim / 256) * quant.blockBytes
+        let args = Self.mulMVIdArgsFull(
+            nei0: k, nei1: 1, nbi1: UInt64(k * 4),
+            ne00: inDim, ne01: outDim, ne02: slotCount,
+            nb00: UInt64(quant.blockBytes), nb01: UInt64(rowBytes),
+            nb02: UInt64(expertStride ?? (rowBytes * outDim)),
+            ne10: inDim, ne11: 1, nb10: 4, nb11: UInt64(inDim * 4),
+            nb12: UInt64(inDim * 4), ne0: outDim,
+            nb1: UInt64(outDim * 4), nr0: Int32(nr0))
+        let act = MetalRuntime.moeSwiGLUWeightArgs(
+            width: outDim, rows: k, clampValue: clamp, midF16: false)
+        var split = [UInt8](repeating: 0, count: 8)
+        var maskLE = activeMask.littleEndian
+        withUnsafeBytes(of: &maskLE) { split.replaceSubrange(0..<4, with: $0) }
+
+        let pso = try rt.mulMVPipeline(
+            "kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32",
+            nsg: Int16(nsg))
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        act.withUnsafeBytes { e.setBytes($0.baseAddress!, length: act.count, index: 1) }
+        split.withUnsafeBytes { e.setBytes($0.baseAddress!, length: split.count, index: 2) }
+        e.setBuffer(gateAddresses.buffer, offset: gateAddresses.byteOffset, index: 3)
+        e.setBuffer(upAddresses.buffer, offset: upAddresses.byteOffset, index: 4)
+        e.setBuffer(activation.buffer, offset: activation.byteOffset, index: 5)
+        e.setBuffer(gateScratch.buffer, offset: gateScratch.byteOffset, index: 6)
+        e.setBuffer(upScratch.buffer, offset: upScratch.byteOffset, index: 7)
+        e.setBuffer(mid.buffer, offset: mid.byteOffset, index: 8)
+        e.setBuffer(ids.buffer, offset: ids.byteOffset, index: 9)
+        e.setBuffer(weights.buffer, offset: weights.byteOffset, index: 10)
+        e.useResource(gateExp.buffer, usage: .read)
+        if gateExp.buffer !== upExp.buffer { e.useResource(upExp.buffer, usage: .read) }
+        e.setThreadgroupMemoryLength(quant.threadgroupBytes, index: 0)
+        e.dispatchThreadgroups(
+            MTLSize(width: (outDim + nsg * nr0 - 1) / (nsg * nr0), height: 1, depth: k),
+            threadsPerThreadgroup: MTLSize(width: 32, height: nsg, depth: 1))
+    }
+
     /// FUSED routed down-projection + sum over the 6 selected experts (1 dispatch
     /// instead of 2): out[outDim] = Σ_e down_e · mid[e]. The kernel hardcodes 6
     /// expert slots, so it requires k == 6. Only q2_K/q4_K exist.
@@ -151,13 +214,14 @@ extension GraphContext {
 
     /// 120-byte ds4_metal_args_mul_mv_id with explicit ne11/nb11 (per-expert act).
     static func mulMVIdArgsFull(nei0: Int, nei1: Int, nbi1: UInt64, ne00: Int, ne01: Int,
+                                ne02: Int = 1,
                                 nb00: UInt64, nb01: UInt64, nb02: UInt64, ne10: Int, ne11: Int,
                                 nb10: UInt64, nb11: UInt64, nb12: UInt64, ne0: Int, nb1: UInt64, nr0: Int32) -> [UInt8] {
         var b = [UInt8](repeating: 0, count: 120)
         func i32(_ off: Int, _ v: Int32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
         func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
         i32(0, Int32(nei0)); i32(4, Int32(nei1)); u64(8, nbi1)
-        i32(16, Int32(ne00)); i32(20, Int32(ne01)); i32(24, 1)
+        i32(16, Int32(ne00)); i32(20, Int32(ne01)); i32(24, Int32(ne02))
         u64(32, nb00); u64(40, nb01); u64(48, nb02)
         i32(56, Int32(ne10)); i32(60, Int32(ne11)); i32(64, 1); i32(68, 1)
         u64(72, nb10); u64(80, nb11); u64(88, nb12)
@@ -165,4 +229,3 @@ extension GraphContext {
         return b
     }
 }
-

@@ -38,6 +38,7 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
     case expertCacheSlots = "DS4_EXPERT_CACHE_SLOTS"
     case expertCacheMB = "DS4_EXPERT_CACHE_MB"
     case multiQuantExpertCache = "DS4_MULTI_QUANT_CACHE"
+    case expertAsyncSplit = "DS4_EXPERT_ASYNC_SPLIT"
     case residentLayers = "DS4_RESIDENT_LAYERS"
     case streamSlots = "DS4_STREAM_SLOTS"
     case ssdStream = "DS4_SSD_STREAM"
@@ -85,7 +86,7 @@ public enum DS4RuntimeKnob: String, CaseIterable, Sendable {
         let area: DS4RuntimeKnobArea
         switch self {
         case .activeExperts, .expertCacheSlots, .expertCacheMB,
-             .multiQuantExpertCache,
+             .multiQuantExpertCache, .expertAsyncSplit,
              .sharedExpertOverlap, .partitionExpertCache:
             area = .experts
         case .prefillBatch, .prefillAttentionMultiKey, .prefillDenseMM,

@@ -41,6 +41,8 @@ public struct DecodeProfile: Sendable {
     public var expertMisses = 0   // expert slot-cache misses (changed experts)
     public var expertHitBytes = 0 // bytes not gathered because of cache hits
     public var expertMissBytes = 0 // bytes gathered for cacheable misses
+    public var expertSplitLayers = 0 // mixed hit/miss layers overlapped with GPU resident work
+    public var expertSplitResidentRows = 0 // resident route rows computed during demand I/O
     public var expertWarmed = 0    // synchronous history-driven pool warm fills
     public var expertWarmedBytes = 0 // critical-path bytes read by those fills
     /// Routed selections that could not use the slot cache (cache disabled or
@@ -122,6 +124,9 @@ public struct DecodeProfile: Sendable {
             let globalBytes = expertGlobalByteHitRate ?? cacheableBytes
             cacheLine += String(format: "\n  cache byte    %.0f%% hit sui cacheabili / %.0f%% globale",
                                 cacheableBytes * 100, globalBytes * 100)
+        }
+        if expertSplitLayers > 0 {
+            cacheLine += "\n  cache split  \(expertSplitLayers) layer misti, \(expertSplitResidentRows) righe residenti sovrapposte all'I/O"
         }
         // Effective gather bandwidth: how fast the expert slabs actually leave the
         // SSD/page cache. Compare against the raw sequential bandwidth of the disk

@@ -182,6 +182,14 @@ public final class GraphContext {
         enc = nil
     }
 
+    /// Run `handler` when this context's command buffer completes. Register
+    /// before commit; used for lifetime/lease release that must follow the GPU,
+    /// without adding a CPU wait to the normal asynchronous path.
+    public func onComplete(_ handler: @escaping @Sendable () -> Void) {
+        guard let cb else { handler(); return }
+        cb.addCompletedHandler { _ in handler() }
+    }
+
     /// Wait for a commitAsync()'d command buffer; outputs are readable after this.
     /// Safe to call more than once (idempotent).
     public func waitCompleted() {

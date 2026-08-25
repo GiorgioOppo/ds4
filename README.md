@@ -570,6 +570,7 @@ performance runs stay comparable.
 | `DS4_FUSED_ROUTER_PROBS` | `=0` disables; on | Vectorized router `sqrt(softplus(logit))` in one dispatch instead of two full probability-row passes (256 Flash or 384 Pro values). `=0` restores the two-dispatch path for parity tests. |
 | `DS4_FUSED_ROUTER_FINALIZE` | `=0` disables; on | Fuses router top-6 selection and bit-identical selected-weight normalization, removing one dispatch per routed layer (up to 43 Flash or 61 Pro layers per token). |
 | `DS4_FUSED_COMP_PROJ` | `=0` disables; on | Pairs the compressor KV+gate matvecs in one dispatch for both F16 and `DS4_COMP_Q8`, sharing activation reads. Same per-matrix reduction order; `0` restores two dispatches. |
+| `DS4_EXPERT_ASYNC_SPLIT` | `=0` disables; on | Exact C-style fork/join for mixed slot-cache layers on the Flash IQ2_XXS/Q2_K shape: missing experts load off-thread while an immutable resident gate/up snapshot runs on Metal, then one joined deferred pair + down tail completes the layer. A GPU-read lease excludes delayed look-ahead writes, and the indirect IQ2 dispatch uses the C kernel's safe fixed `NSG=2`. Costs about 25 MiB of reusable scratch; unsupported/all-hit/all-miss cases retain the ordinary path. The final 24-token A/B measured 3.77→4.06 tok/s (+7.7%) with 3,232,000/3,232,000 logits bit-identical; the reversed 12-token run also passed exactly and measured +6.6%. `=0` is the synchronous rollback/A-B arm. |
 | `DS4_ASYNC_FFN` | `=0` disables; on | Asynchronous routed-FFN commit: the next layer's route wait lands on an already-running FFN (+10% measured, token-identical). `=0` is the synchronous debug path. |
 | `DS4_ASYNC_ROUTE` | `=0` disables; on | Asynchronous decode-route commit: the shared-expert FFN is committed right behind the route, so the GPU chains route→FFN with no encode gap while the CPU waits for the expert selection, and the CPU join on the shared FFN before the routed-FFN encode is skipped (in-order queue + hazard tracking — the `DS4_ASYNC_FFN` argument). Token-identical; `DS4_PROFILE_ROUTE` forces the synchronous path. `=0` restores the fully synchronous route for A/B. |
 | `DS4_FAST_SAMPLER` | `=0` disables; on | Full-vocabulary sampler fast path (`top_k<=0` with `min_p>0`, the server/subagent default): collects only the candidates the min-p walk can reach instead of building and sorting all ~129k per token (CPU ms saved per token). Same selection and same RNG stream; only the ordering of exact logit ties (already unspecified in the full sort) may differ. `=0` restores the historical full build. |
@@ -667,7 +668,8 @@ whitelist is a **security boundary on which environment names may be set**, not
 a promise that every allowed configuration is bit-identical:
 `DS4_DENSE_STREAM`, `DS4_DENSE_AHEAD`, `DS4_MLOCK`, `DS4_EXPERT_PREAD`,
 `DS4_PREAD_SPLIT`, `DS4_WILLNEED_EXPERTS`, `DS4_ASYNC_FFN`,
-`DS4_EXPERT_LOOKAHEAD`, `DS4_Q8_NSG`, `DS4_LAZY_IDX`, `DS4_RESIDENT_COMP`,
+`DS4_EXPERT_LOOKAHEAD`, `DS4_EXPERT_ASYNC_SPLIT`, `DS4_Q8_NSG`,
+`DS4_LAZY_IDX`, `DS4_RESIDENT_COMP`,
 `DS4_FUSED_HC`, `DS4_FUSED_MOE`, `DS4_RAW_RING`, `DS4_EXPERT_CACHE_UNIFORM`,
 `DS4_POOL_INTERLEAVE`, and the five `DS4_PREFILL_*` knobs. The lossy
 `DS4_DENSE_Q4` travels as a typed ASSIGN field instead, together with its

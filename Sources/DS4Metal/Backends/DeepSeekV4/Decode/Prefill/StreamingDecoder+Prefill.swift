@@ -475,10 +475,12 @@ extension StreamingDecoder {
             let h0 = cache.hits, m0 = cache.misses, w0 = cache.warmed, p0 = cache.prefilled
             let hb0 = cache.hitBytes, mb0 = cache.missBytes
             let wb0 = cache.warmedBytes, pb0 = cache.prefilledBytes
-            let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
-            do { acquired = try cache.acquire(layer: i, ids: ids) }
+            let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32],
+                           lease: ExpertSlotCache.GPUReadLease)
+            do { acquired = try cache.acquireLeased(layer: i, ids: ids) }
             catch { c1.waitCompleted(); throw error }
-            let (pool, slots) = acquired
+            let (pool, slots, _) = acquired
+            let poolLease = acquired.lease
             profile.gatherS += Date().timeIntervalSince(t)
             profile.expertHits += cache.hits - h0
             profile.expertMisses += cache.misses - m0
@@ -503,7 +505,12 @@ extension StreamingDecoder {
                                            cur: stage.cur[j], afterAttn: stage.attn[j],
                                            split: stage.split[j], rw: stage.rw[j],
                                            expertStride: pool.expertStride ?? slotCacheStride)
-            } catch { c1.waitCompleted(); throw error }
+            } catch {
+                poolLease.release()
+                c1.waitCompleted()
+                throw error
+            }
+            c2.onComplete { poolLease.release() }
             commitFFN(c2)
             prev = c2
             profile.expertsS += Date().timeIntervalSince(t)

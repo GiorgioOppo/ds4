@@ -23,10 +23,9 @@ import Foundation
 // chunks — the speculative I/O can delay the critical path by at most ~one
 // chunk, never by a whole speculative batch. Shared bookkeeping (pools map,
 // tick, counters, epoch, demandWaiting) is guarded by `stateLock`; the GPU
-// never reads a slot that a concurrent op is writing because a slot's bytes
-// change only under its layer's lock, the decode thread encodes the layer's
-// matvec strictly after its own acquire(layer:) returned, and a speculative
-// fill never evicts the last demand-acquire's slots (lastDemand).
+// never reads a pool resource that a concurrent op is writing: every GPU
+// consumer holds a read lease through command-buffer completion, and a
+// speculative fill refuses to enter while that lease is active.
 public final class ExpertSlotCache: @unchecked Sendable {
     public struct LayerPool {
         public let gate: GPUTensor    // S x gateExpertBytes, packed by slot
@@ -52,6 +51,86 @@ public final class ExpertSlotCache: @unchecked Sendable {
         /// read by an in-flight command buffer — a late speculative prefill
         /// must never evict them (see ensureResident).
         var lastDemand: UInt64 = 0
+    }
+
+    /// Demand acquire started off the decode thread. `residentMask` describes
+    /// the route positions that were already present when the request began;
+    /// their slot ids are immediately usable by a masked GPU dispatch while
+    /// the cache fills the remaining positions. `join()` returns the ordinary
+    /// complete acquire result and propagates any fill error.
+    public final class PendingAcquire: @unchecked Sendable {
+        public let residentPool: LayerPool?
+        public let residentSlots: [Int32]
+        public let residentMask: UInt32
+
+        private let done = DispatchGroup()
+        private let resultLock = NSLock()
+        private var acquired: (pool: LayerPool, slots: [Int32])?
+        private var failure: Error?
+        private var releaseHandler: (@Sendable () -> Void)?
+
+        fileprivate init(residentPool: LayerPool?, residentSlots: [Int32],
+                         residentMask: UInt32,
+                         releaseHandler: @escaping @Sendable () -> Void) {
+            self.residentPool = residentPool
+            self.residentSlots = residentSlots
+            self.residentMask = residentMask
+            self.releaseHandler = releaseHandler
+            done.enter()
+        }
+
+        fileprivate func complete(_ result: Result<(pool: LayerPool, slots: [Int32]), Error>) {
+            resultLock.lock()
+            switch result {
+            case .success(let value): acquired = value
+            case .failure(let error): failure = error
+            }
+            resultLock.unlock()
+            done.leave()
+        }
+
+        public func join() throws -> (pool: LayerPool, slots: [Int32]) {
+            done.wait()
+            resultLock.lock(); defer { resultLock.unlock() }
+            if let failure { throw failure }
+            precondition(acquired != nil, "expert cache: async acquire completed without a result")
+            return acquired!
+        }
+
+        /// Release the pool's GPU-read lease after the command buffer that uses
+        /// the acquired slots completes. Idempotent for every error/deinit path.
+        public func release() {
+            resultLock.lock()
+            let handler = releaseHandler
+            releaseHandler = nil
+            resultLock.unlock()
+            handler?()
+        }
+
+        deinit { release() }
+    }
+
+    /// Resource-granular lease for a synchronous demand acquire. Metal hazard
+    /// tracking cannot make a CPU write to one slot safe while a command buffer
+    /// reads another slot of the same MTLBuffer, so look-ahead must stay out
+    /// until the GPU consumer completes.
+    public final class GPUReadLease: @unchecked Sendable {
+        private let lock = NSLock()
+        private var releaseHandler: (@Sendable () -> Void)?
+
+        fileprivate init(releaseHandler: @escaping @Sendable () -> Void) {
+            self.releaseHandler = releaseHandler
+        }
+
+        public func release() {
+            lock.lock()
+            let handler = releaseHandler
+            releaseHandler = nil
+            lock.unlock()
+            handler?()
+        }
+
+        deinit { release() }
     }
 
     public let slotsPerLayer: Int
@@ -92,6 +171,15 @@ public final class ExpertSlotCache: @unchecked Sendable {
     /// Layers with a demand acquire blocked on (or about to take) the layer
     /// lock: a running prefill checks this between fill chunks and yields.
     private var demandWaiting = Set<Int>()
+    /// Async demand pools retained by an in-flight Metal command buffer. A
+    /// speculative fill must not write even an unrelated slot in the same
+    /// MTLBuffer while the GPU reads it: CPU/GPU synchronization is resource,
+    /// not slot, granular. Counts keep the invariant robust to nested callers.
+    private var gpuReaders: [Int: Int] = [:]
+    /// Exact demand fills run here after the router selection is known. The
+    /// queue is serial because decode joins a layer before advancing its routed
+    /// tail; `fillAll` still fans the individual missing slots out in parallel.
+    private let demandQueue = DispatchQueue(label: "ds4.expert-demand", qos: .userInitiated)
     /// Optional per-layer slot-count override (e.g. the usage-driven allocation:
     /// same total budget, more slots where the routing concentrates). Consulted
     /// once per layer at pool creation — so also after every invalidate().
@@ -303,6 +391,8 @@ public final class ExpertSlotCache: @unchecked Sendable {
     /// use — called on agent switch, when the warm prior changes. An operation
     /// in flight against the old generation discards its result (epoch check).
     public func invalidate() {
+        // Never drop a pool whose bytes are still being filled on demand.
+        drainDemandLoads()
         stateLock.lock(); defer { stateLock.unlock() }
         pools.removeAll()
         _hits = 0
@@ -330,6 +420,108 @@ public final class ExpertSlotCache: @unchecked Sendable {
         return try ensureResident(layer: layer, ids: ids, speculative: false)
     }
 
+    /// Synchronous acquire plus a GPU-read lease. The caller must retain the
+    /// lease until the command buffer consuming `pool` has completed.
+    public func acquireLeased(layer: Int, ids: [Int32]) throws
+        -> (pool: LayerPool, slots: [Int32], lease: GPUReadLease) {
+        stateLock.lock()
+        gpuReaders[layer, default: 0] += 1
+        stateLock.unlock()
+        let lease = GPUReadLease(releaseHandler: { [weak self] in
+            self?.releaseGPURead(layer: layer)
+        })
+        do {
+            let acquired = try acquire(layer: layer, ids: ids)
+            return (acquired.pool, acquired.slots, lease)
+        } catch {
+            lease.release()
+            throw error
+        }
+    }
+
+    /// Start an exact demand acquire without blocking the decode thread. Any
+    /// already-resident route positions are touched/protected synchronously and
+    /// exposed through `PendingAcquire`; a background demand then performs the
+    /// normal acquire, preserving the existing LRU, counters and error paths.
+    ///
+    /// `demandWaiting` remains armed from the probe until the worker owns the
+    /// layer lock, closing the small window in which speculative look-ahead
+    /// could otherwise enter ahead of an exact request.
+    public func acquireAsync(layer: Int, ids: [Int32]) -> PendingAcquire {
+        let l = lockFor(layer: layer)
+        stateLock.lock()
+        demandWaiting.insert(layer)
+        gpuReaders[layer, default: 0] += 1
+        stateLock.unlock()
+        l.lock()
+        let probe = demandProbeLocked(layer: layer, ids: ids)
+        l.unlock()
+
+        let pending = PendingAcquire(residentPool: probe.pool,
+                                     residentSlots: probe.slots,
+                                     residentMask: probe.mask,
+                                     releaseHandler: { [weak self] in
+                                         self?.releaseGPURead(layer: layer)
+                                     })
+        demandQueue.async { [self, pending, ids] in
+            let layerLock = lockFor(layer: layer)
+            layerLock.lock()
+            stateLock.lock(); demandWaiting.remove(layer); stateLock.unlock()
+            let result: Result<(pool: LayerPool, slots: [Int32]), Error>
+            do {
+                result = .success(try ensureResident(layer: layer, ids: ids, speculative: false))
+            } catch {
+                result = .failure(error)
+            }
+            layerLock.unlock()
+            pending.complete(result)
+        }
+        return pending
+    }
+
+    private func releaseGPURead(layer: Int) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard let count = gpuReaders[layer] else { return }
+        if count <= 1 { gpuReaders.removeValue(forKey: layer) }
+        else { gpuReaders[layer] = count - 1 }
+    }
+
+    /// Join every queued exact demand fill (teardown/in-process A/B boundary).
+    public func drainDemandLoads() { demandQueue.sync {} }
+
+    /// Layer lock must be held and `demandWaiting` must already contain layer.
+    /// This is deliberately a probe only: the ordinary demand acquire remains
+    /// the single owner of eviction, fill, publication and accounting.
+    private func demandProbeLocked(layer: Int, ids: [Int32])
+        -> (pool: LayerPool?, slots: [Int32], mask: UInt32) {
+        var slots = [Int32](repeating: -1, count: ids.count)
+        stateLock.lock()
+        guard var pool = pools[layer] else {
+            stateLock.unlock()
+            return (nil, slots, 0)
+        }
+        let startEpoch = epoch
+        tick += 1
+        let now = tick
+        stateLock.unlock()
+
+        pool.lastDemand = now
+        var mask: UInt32 = 0
+        for (j, id) in ids.enumerated() {
+            guard let slot = pool.slotOf[id] else { continue }
+            // The worker's ordinary ensureResident call owns reuse accounting;
+            // this probe only pins the resident slots and exposes their ids.
+            pool.lastUse[slot] = now
+            slots[j] = Int32(slot)
+            if j < UInt32.bitWidth { mask |= UInt32(1) << UInt32(j) }
+        }
+
+        stateLock.lock()
+        if epoch == startEpoch { pools[layer] = pool }
+        stateLock.unlock()
+        return (pool, slots, mask)
+    }
+
     /// Speculative look-ahead fill (best-effort, never throws): make `ids`
     /// resident in `layer`'s pool so the decode thread's acquire finds hits.
     /// Runs on a background queue WHILE the GPU computes the previous layer —
@@ -341,7 +533,9 @@ public final class ExpertSlotCache: @unchecked Sendable {
     public func prefill(layer: Int, ids: [Int32]) {
         guard !ids.isEmpty else { return }
         stateLock.lock()
-        let ready = pools[layer] != nil && !demandWaiting.contains(layer)
+        let ready = pools[layer] != nil
+            && !demandWaiting.contains(layer)
+            && gpuReaders[layer, default: 0] == 0
         stateLock.unlock()
         guard ready else { return }
         let l = lockFor(layer: layer)
@@ -415,6 +609,15 @@ public final class ExpertSlotCache: @unchecked Sendable {
         var toFill: [(id: Int32, slot: Int)] = []
         for j in missIdx {
             let id = ids[j]
+            // Hash routing tables may repeat an expert in the six positions.
+            // A previous occurrence in this same acquire has already reserved
+            // and will fill its slot; reuse it instead of creating a duplicate
+            // owner entry whose stale bytes can later be served as a hit.
+            if let assigned = pool.slotOf[id] {
+                pool.lastUse[assigned] = now
+                slots[j] = Int32(assigned)
+                continue
+            }
             // Victim: a FREE slot if any, else the least-recently-used one —
             // never a slot already touched by this call. A SPECULATIVE fill
             // additionally must never evict the last demand-acquire's slots:
@@ -459,6 +662,7 @@ public final class ExpertSlotCache: @unchecked Sendable {
             while idx < toFill.count {
                 stateLock.lock()
                 let yield = demandWaiting.contains(layer)
+                    || gpuReaders[layer, default: 0] > 0
                 stateLock.unlock()
                 if yield { break }
                 let next = min(idx + 2, toFill.count)
@@ -484,11 +688,12 @@ public final class ExpertSlotCache: @unchecked Sendable {
         }
         publish(pool)
         stateLock.lock()
-        let hitCount = ids.count - missIdx.count
+        let missCount = toFill.count
+        let hitCount = ids.count - missCount
         _hits += hitCount
-        _misses += missIdx.count
+        _misses += missCount
         _hitBytes += hitCount * pool.bytesPerExpert
-        _missBytes += missIdx.count * pool.bytesPerExpert
+        _missBytes += missCount * pool.bytesPerExpert
         stateLock.unlock()
         return (pool, slots)
     }

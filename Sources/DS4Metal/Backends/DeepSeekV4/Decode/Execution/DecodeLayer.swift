@@ -467,6 +467,59 @@ extension GraphContext {
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
     }
 
+    /// Exact first half of the C-style resident/missing split. It writes only
+    /// the selected route rows in gate/up/mid; the complementary invocation in
+    /// `decodeRoutedExpertsSplitTail` completes the other rows before the single
+    /// down-sum. Restricted by the caller to the Flash IQ2_XXS pair shape.
+    public func decodeRoutedExpertsResidentPair(
+        w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+        gateExp: GPUTensor, upExp: GPUTensor,
+        gateAddresses: GPUTensor, upAddresses: GPUTensor,
+        ids: GPUTensor, activeMask: UInt32, slotCount: Int,
+        expertStride: Int? = nil
+    ) throws {
+        precondition(w.gateQuant == .iq2_xxs && w.upQuant == .iq2_xxs)
+        precondition(d.k == 6 && activeMask != 0)
+        try moePairSwiGLUAddressMasked(
+            gateExp: gateExp, upExp: upExp,
+            gateAddresses: gateAddresses, upAddresses: upAddresses,
+            ids: ids, activation: s.cur, weights: s.rw,
+            gateScratch: s.gate6, upScratch: s.up6, mid: s.mid6,
+            k: d.k, slotCount: slotCount,
+            inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp,
+            activeMask: activeMask, expertStride: expertStride)
+    }
+
+    /// Complete the route rows deferred by the resident split, then execute the
+    /// ordinary exact Q2 down-sum and FFN/HC tail once. The caller explicitly
+    /// joins the resident command buffer before encoding this consumer.
+    public func decodeRoutedExpertsSplitTail(
+        w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+        gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
+        gateAddresses: GPUTensor, upAddresses: GPUTensor,
+        ids: GPUTensor, deferredMask: UInt32, slotCount: Int,
+        outHc: GPUTensor, expertStride: Int? = nil
+    ) throws {
+        precondition(w.gateQuant == .iq2_xxs && w.upQuant == .iq2_xxs)
+        precondition(w.downQuant == .q2_K && d.k == 6 && deferredMask != 0)
+        try moePairSwiGLUAddressMasked(
+            gateExp: gateExp, upExp: upExp,
+            gateAddresses: gateAddresses, upAddresses: upAddresses,
+            ids: ids, activation: s.cur, weights: s.rw,
+            gateScratch: s.gate6, upScratch: s.up6, mid: s.mid6,
+            k: d.k, slotCount: slotCount,
+            inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp,
+            activeMask: deferredMask, expertStride: expertStride)
+        try moeDownSum6(w.downQuant, experts: downExp, ids: ids, mid: s.mid6,
+                        out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd,
+                        expertStride: expertStride)
+        try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)
+        try hcExpand4(blockOut: s.ffnOut, residual: s.afterAttn,
+                      post: s.split, comb: s.split, blockAdd: nil, out: outHc,
+                      nEmbd: d.nEmbd, nTokens: 1,
+                      postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+    }
+
     /// Expert parallelism (worker shard VERTICALE, Fase B): SOLO la somma
     /// pesata degli esperti forniti — la stessa sequenza di dispatch di
     /// decodeRoutedExperts fino a s.routed, SENZA shared-add né HC expand
