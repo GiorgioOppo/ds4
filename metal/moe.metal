@@ -8904,6 +8904,13 @@ kernel void kernel_mul_mm_id(
         for (; i < nr0; i += 32) {
             *(D + i) = *(C + i);
         }
+        FOR_UNROLL (int i = tiisg; i < nr0/4; i += 32) {
+            *(D4 + i) = *(C4 + i);
+        }
+
+        FOR_UNROLL (i = (4*(nr0/4)) + tiisg; i < nr0; i += 32) {
+            *(D + i) = *(C + i);
+        }
     }
 }
 
