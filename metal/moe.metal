@@ -9328,6 +9328,18 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
             simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
             simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
+    int str_indice = 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    threadgroup float * temp_gate_str =
+        temp_gate + str_indice;
+    threadgroup float * temp_up_str =
+        temp_up + str_indice;
+
+    if (mma_active) {
+        FOR_UNROLL (int i = 0; i < 8; i++) {
+            int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
+            simdgroup_store(mc_gate[i], temp_gate_str + si, NR0, 0, false);
+            simdgroup_store(mc_up[i],   temp_up_str   + si, NR0, 0, false);
+        }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
