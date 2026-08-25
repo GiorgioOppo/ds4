@@ -1548,7 +1548,10 @@ bool run_iq2_xxs_q2_K_fused_raw_parity(
             if (u <= 1) ulp1++;
             if (u > max_ulp) max_ulp = u;
         }
-        if (bad == 0) { fprintf(stderr, "  diag %-11s clean\n", tag); return; }
+        if (bad == 0) {
+            fprintf(stderr, "  diag %-11s clean\n", tag);
+            return;
+        }
         fprintf(stderr,
                 "  diag %-11s bad=%zu/%zu (%.1f%%) max_abs=%.4g max_rel=%.4g "
                 "max_ulp=%lld within_1ulp=%zu nonfinite=%zu abs_gt_1e-3=%zu "
