@@ -4638,20 +4638,28 @@ static void tensor_expect_plain_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
-static bool tensor_type_is_f16_or_q8_0(uint32_t type) {
-    return type == DS4_TENSOR_F16 || type == DS4_TENSOR_Q8_0;
+static bool tensor_type_is_indexer_q(uint32_t type) {
+    return type == DS4_TENSOR_F16 ||
+           type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_Q4_K;
 }
 
-static void tensor_expect_f16_or_q8_0_layout(
+#ifdef DS4_TEST_HOOKS
+int ds4_test_indexer_q_type_supported(uint32_t type) {
+    return tensor_type_is_indexer_q(type) ? 1 : 0;
+}
+#endif
+
+static void tensor_expect_indexer_q_layout(
         const ds4_tensor *t,
         uint32_t          ndim,
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (!tensor_type_is_f16_or_q8_0(t->type)) {
+    if (!tensor_type_is_indexer_q(t->type)) {
         fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected f16 or q8_0\n",
+                "ds4: tensor %.*s has type %s, expected f16, q8_0, or q4_K\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
@@ -5506,7 +5514,7 @@ static void weights_validate_layout(
         if (ratio == 4) {
             const uint64_t index_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
             const uint64_t index_width = 2u * DS4_N_INDEXER_HEAD_DIM;
-            tensor_expect_f16_or_q8_0_layout(l->indexer_attn_q_b, 2, DS4_N_LORA_Q, index_q_dim, 0);
+            tensor_expect_indexer_q_layout(l->indexer_attn_q_b, 2, DS4_N_LORA_Q, index_q_dim, 0);
             tensor_expect_layout(l->indexer_proj,              DS4_TENSOR_F16, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD, 0);
             tensor_expect_layout(l->indexer_compressor_ape,    DS4_TENSOR_F16, 2, index_width, ratio, 0);
             tensor_expect_layout(l->indexer_compressor_kv,     DS4_TENSOR_F16, 2, DS4_N_EMBD, index_width, 0);
@@ -24581,10 +24589,10 @@ static bool metal_graph_encode_decode_layer_phase(
                 g->layer_n_index_comp[il] > DS4_N_INDEXER_TOP_K) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
-                    !tensor_type_is_f16_or_q8_0(layer->indexer_attn_q_b->type) ||
+                    !tensor_type_is_indexer_q(layer->indexer_attn_q_b->type) ||
                     layer->indexer_attn_q_b->dim[0] != q_rank ||
                     layer->indexer_attn_q_b->dim[1] != indexer_q_dim) {
-                    fprintf(stderr, "ds4: Metal graph indexer q projection expects F16 or Q8_0 weights\n");
+                    fprintf(stderr, "ds4: Metal graph indexer q projection expects F16, Q8_0, or Q4_K weights\n");
                     ok = false;
                 }
                 if (ok && (!layer->indexer_proj ||

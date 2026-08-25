@@ -1189,7 +1189,7 @@ typedef struct {
 
 typedef struct {
     ds4q_type routed_w1, routed_w2, routed_w3;
-    ds4q_type attention_proj, attention, shared, embedding, output, dense;
+    ds4q_type attention_proj, indexer_q, attention, shared, embedding, output, dense;
     type_override *overrides;
     int n_overrides;
 } quant_policy;
@@ -1199,6 +1199,10 @@ static bool is_attention_projection(const char *name) {
     return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
            strstr(name, ".attn_q_b.weight") || strstr(name, ".attn_output_a.weight") ||
            strstr(name, ".attn_output_b.weight");
+}
+
+static bool is_indexer_q_projection(const char *name) {
+    return strstr(name, ".indexer.attn_q_b.weight") != NULL;
 }
 
 static bool is_attention_tensor(const char *name) {
@@ -1250,6 +1254,7 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
     if (strcmp(name, "token_embd.weight") == 0 && p->embedding != DS4Q_TYPE_COUNT) return p->embedding;
     if (is_output_tensor(name) && p->output != DS4Q_TYPE_COUNT) return p->output;
     if (is_shared_expert(name) && p->shared != DS4Q_TYPE_COUNT) return p->shared;
+    if (is_indexer_q_projection(name) && p->indexer_q != DS4Q_TYPE_COUNT) return p->indexer_q;
     if (is_attention_projection(name) && p->attention_proj != DS4Q_TYPE_COUNT) return p->attention_proj;
     if (is_attention_tensor(name) && p->attention != DS4Q_TYPE_COUNT) return p->attention;
     if (p->dense != DS4Q_TYPE_COUNT) return p->dense;
@@ -1988,23 +1993,46 @@ static void dequantize_q8_0_rows(const uint8_t *src, float *dst,
     }
 }
 
+static void dequantize_f16_rows(const uint8_t *src, float *dst,
+                                int64_t nrows, int64_t ncols) {
+    const size_t row_size = (size_t)ncols * sizeof(uint16_t);
+    for (int64_t r = 0; r < nrows; r++) {
+        const uint8_t *row = src + (size_t)r * row_size;
+        float *out = dst + (size_t)r * (size_t)ncols;
+        for (int64_t c = 0; c < ncols; c++) {
+            out[c] = ds4q_f16_to_f32(load_u16_le(row + (size_t)c * sizeof(uint16_t)));
+        }
+    }
+}
+
+static bool direct_requant_supported(const tensor_meta *src,
+                                     const tensor_meta *dst) {
+    const int64_t block_size = ds4q_block_size(DS4Q_TYPE_Q4_K);
+    return dst->type == DS4Q_TYPE_Q4_K &&
+           (src->type == DS4Q_TYPE_Q8_0 || src->type == DS4Q_TYPE_F16) &&
+           block_size > 0 && src->ne[0] > 0 && src->ne[0] % block_size == 0;
+}
+
 static void validate_requant_plan(const gguf_file *src_g,
                                   const output_context *out_ctx,
                                   const imatrix_store *imatrix) {
     size_t changed = 0;
+    size_t changed_q8 = 0;
+    size_t changed_f16 = 0;
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *src = &src_g->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         if (src->type == dst->type) continue;
         changed++;
-        if (src->type != DS4Q_TYPE_Q8_0 || dst->type != DS4Q_TYPE_Q4_K ||
-            src->ne[0] % 256 != 0) {
+        if (!direct_requant_supported(src, dst)) {
             fprintf(stderr,
                     "error: direct requantization unsupported for %s (%s -> %s)\n",
                     src->name, ds4q_type_name(src->type),
                     ds4q_type_name(dst->type));
             exit(1);
         }
+        if (src->type == DS4Q_TYPE_Q8_0) changed_q8++;
+        else changed_f16++;
         const char *names[1] = { src->name };
         (void)imatrix_find(imatrix, names, 1, src->ne[0], -1, 0);
     }
@@ -2012,8 +2040,9 @@ static void validate_requant_plan(const gguf_file *src_g,
         die("direct requantization plan does not change any tensors");
     }
     fprintf(stderr,
-            "validated direct GGUF requantization plan: %zu Q8_0 -> Q4_K tensors\n",
-            changed);
+            "validated direct GGUF requantization plan: %zu tensors -> Q4_K "
+            "(%zu Q8_0, %zu F16)\n",
+            changed, changed_q8, changed_f16);
 }
 
 static void write_requant_gguf(const gguf_file *src_g, const output_context *out_ctx,
@@ -2054,8 +2083,7 @@ static void write_requant_gguf(const gguf_file *src_g, const output_context *out
         if (src->type == dst->type) {
             copy_bytes(fp, src_fp, src->size, src_g->path);
         } else {
-            if (src->type != DS4Q_TYPE_Q8_0 || dst->type != DS4Q_TYPE_Q4_K ||
-                src->ne[0] % 256 != 0) {
+            if (!direct_requant_supported(src, dst)) {
                 fprintf(stderr, "error: direct requantization unsupported for %s (%s -> %s)\n",
                         src->name, ds4q_type_name(src->type), ds4q_type_name(dst->type));
                 exit(1);
@@ -2063,10 +2091,10 @@ static void write_requant_gguf(const gguf_file *src_g, const output_context *out
             int64_t nrows = 1;
             for (int d = 1; d < src->n_dims; d++) nrows *= src->ne[d];
             const int64_t ncols = src->ne[0];
-            const size_t q8_row = ds4q_row_size(DS4Q_TYPE_Q8_0, ncols);
+            const size_t src_row = ds4q_row_size(src->type, ncols);
             const size_t q4_row = ds4q_row_size(DS4Q_TYPE_Q4_K, ncols);
             const int64_t batch_cap = 16;
-            uint8_t *q8 = xmalloc((size_t)batch_cap * q8_row);
+            uint8_t *encoded = xmalloc((size_t)batch_cap * src_row);
             float *f32 = xmalloc((size_t)batch_cap * (size_t)ncols * sizeof(float));
             uint8_t *q4 = xmalloc((size_t)batch_cap * q4_row);
             const char *names[1] = { src->name };
@@ -2074,10 +2102,14 @@ static void write_requant_gguf(const gguf_file *src_g, const output_context *out
             ds4q_quantize_init(DS4Q_TYPE_Q4_K);
             for (int64_t row0 = 0; row0 < nrows; row0 += batch_cap) {
                 const int64_t nr = nrows - row0 < batch_cap ? nrows - row0 : batch_cap;
-                if (fread(q8, q8_row, (size_t)nr, src_fp) != (size_t)nr) {
-                    die_errno("read Q8_0 source tensor", src_g->path);
+                if (fread(encoded, src_row, (size_t)nr, src_fp) != (size_t)nr) {
+                    die_errno("read source tensor", src_g->path);
                 }
-                dequantize_q8_0_rows(q8, f32, nr, ncols);
+                if (src->type == DS4Q_TYPE_Q8_0) {
+                    dequantize_q8_0_rows(encoded, f32, nr, ncols);
+                } else {
+                    dequantize_f16_rows(encoded, f32, nr, ncols);
+                }
                 const size_t wrote = ds4q_quantize_chunk(
                     DS4Q_TYPE_Q4_K, f32, q4, 0, nr, ncols, imat);
                 if (wrote != (size_t)nr * q4_row ||
@@ -2087,7 +2119,7 @@ static void write_requant_gguf(const gguf_file *src_g, const output_context *out
             }
             free(q4);
             free(f32);
-            free(q8);
+            free(encoded);
         }
         const size_t padded = ds4q_pad(dst->size, out_ctx->alignment);
         write_padding(fp, padded - dst->size);
@@ -2855,7 +2887,7 @@ static void usage(const char *argv0) {
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
-    printf("  --source-gguf FILE     requantize directly from a GGUF (currently Q8_0 -> Q4_K)\n");
+    printf("  --source-gguf FILE     requantize Q8_0/F16 tensors directly to Q4_K\n");
     printf("  --template FILE        GGUF metadata/layout template required with --hf\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
@@ -2875,6 +2907,7 @@ static void usage(const char *argv0) {
     printf("  --routed-w2 TYPE       routed down expert tensor type\n");
     printf("  --routed-w3 TYPE       routed up expert tensor type\n");
     printf("  --attention-proj TYPE  attn_q/kv/output projection type\n");
+    printf("  --indexer-q TYPE       indexer query projection type\n");
     printf("  --attention TYPE       other 2D attention/indexer/compressor type\n");
     printf("  --shared TYPE          shared expert tensor type\n");
     printf("  --embedding TYPE       token embedding type\n");
@@ -2975,7 +3008,8 @@ static void require_complete_gguf(const gguf_file *g) {
 static params parse_args(int argc, char **argv) {
     params p = {0};
     p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = DS4Q_TYPE_COUNT;
-    p.policy.attention_proj = p.policy.attention = p.policy.shared = DS4Q_TYPE_COUNT;
+    p.policy.attention_proj = p.policy.indexer_q = DS4Q_TYPE_COUNT;
+    p.policy.attention = p.policy.shared = DS4Q_TYPE_COUNT;
     p.policy.embedding = p.policy.output = p.policy.dense = DS4Q_TYPE_COUNT;
     p.n_experts = 0;
     p.n_threads = 8;
@@ -3029,6 +3063,8 @@ static params parse_args(int argc, char **argv) {
             p.policy.routed_w3 = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--attention-proj") == 0 || strcmp(arg, "--attn-proj") == 0) {
             p.policy.attention_proj = parse_type(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--indexer-q") == 0) {
+            p.policy.indexer_q = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--attention") == 0) {
             p.policy.attention = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--shared") == 0) {

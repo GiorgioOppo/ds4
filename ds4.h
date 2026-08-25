@@ -466,6 +466,7 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
                                       float *target_probs);
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
+int ds4_test_indexer_q_type_supported(uint32_t type);
 uint64_t ds4_test_mixed_native_count(void);
 #if defined(__APPLE__)
 int ds4_test_q4_stream_overlap_policy(

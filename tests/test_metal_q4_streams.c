@@ -154,6 +154,16 @@ static void test_overlap_policy(void) {
             "count-bounds=1 resident-only=1 ssd-fallback=1 quality-fallback=1\n");
 }
 
+static void test_indexer_q_type_policy(void) {
+    if (!ds4_test_indexer_q_type_supported(1u) ||
+        !ds4_test_indexer_q_type_supported(8u) ||
+        !ds4_test_indexer_q_type_supported(Q4_K_TYPE) ||
+        ds4_test_indexer_q_type_supported(0u) ||
+        ds4_test_indexer_q_type_supported(2u)) {
+        fail("indexer query projection type policy");
+    }
+}
+
 static uint64_t env_u64(const char *name, uint64_t fallback,
                         uint64_t minimum, uint64_t maximum) {
     const char *value = getenv(name);
@@ -741,6 +751,7 @@ int main(void) {
         "DS4_TEST_Q4_STREAM_TIMING_ITERS", 20u, 1u, 10000u);
 
     test_overlap_policy();
+    test_indexer_q_type_policy();
 
     fprintf(stderr,
             "Q4 stream oracle model_untracked=%s warmup=%llu iterations=%llu "
