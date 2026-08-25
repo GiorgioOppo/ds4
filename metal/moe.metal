@@ -8727,6 +8727,7 @@ kernel void kernel_mul_mm_id(
          * the downstream swiglu/sum stages stay unchanged. Each (token,slot)
          * row belongs to exactly one expert, so nothing else writes them. */
         #pragma unroll(nr1)
+        #pragma unroll(nr1)
         for (short j = sgitg; j < nr1; j += 4) {
             const int idj = ids_i32[route_base + r1 + j];
 
