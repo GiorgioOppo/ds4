@@ -8734,6 +8734,7 @@ kernel void kernel_mul_mm_id(
 
             device float * D = (device float *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
 
+            #pragma unroll(nr0)
             for (int i = tiisg; i < nr0; i += 32) {
                 D[i] = 0.0f;
             }
