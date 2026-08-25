@@ -28204,14 +28204,20 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
     const bool scope = n_tokens >= 6u && n_tokens <= 31u;
     const bool require = scope &&
         ds4_gpu_env_bool("DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN") == 1;
-    const int failure_rc = require ? -1 : 0;
+    const bool require_scale_meta = scope &&
+        ds4_gpu_env_bool(
+            "DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META") == 1;
+    const int failure_rc = require || require_scale_meta ? -1 : 0;
     if (!scope) return 0;
     if (!g_initialized && !ds4_gpu_init()) return failure_rc;
 
     const bool disabled =
         ds4_gpu_env_bool("DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN") == 1;
-    const bool enabled = require ||
+    const bool enabled = require || require_scale_meta ||
         ds4_gpu_env_bool("DS4_METAL_ENABLE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN") == 1;
+    const bool scale_meta_disabled =
+        ds4_gpu_env_bool(
+            "DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META") == 1;
     const bool classic_q4 = getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") == NULL;
     const bool platform_ok =
         g_ssd_streaming_mode &&
@@ -28219,7 +28225,7 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
         ds4_gpu_device_is_pre_m5_apple_silicon();
     if (!enabled || disabled || !classic_q4 || !platform_ok ||
         out_b_type != DS4_METAL_TENSOR_Q4_K) {
-        if (require) {
+        if (failure_rc < 0) {
             fprintf(stderr,
                     "ds4: required Metal Q4 SSD-prefill attention exact-N "
                     "path is ineligible (rows=%u type=%u ssd=%u quality=%u "
@@ -28233,6 +28239,12 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
                     classic_q4 ? 1u : 0u);
         }
         return failure_rc;
+    }
+    if (require_scale_meta && scale_meta_disabled) {
+        fprintf(stderr,
+                "ds4: required Metal Q4 SSD-prefill attention exact-N "
+                "scale metadata is disabled\n");
+        return -1;
     }
 
     if (!out || !low || !heads || !model_map ||
@@ -28248,7 +28260,7 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
         }
         if ((group_dim % 256u) != 0 || (low_dim % 256u) != 0 ||
             low_dim == 0 || low_dim > UINT32_MAX) {
-            if (require) {
+            if (failure_rc < 0) {
                 fprintf(stderr,
                         "ds4: required Metal Q4 SSD-prefill attention exact-N "
                         "path received unaligned dimensions\n");
@@ -28280,6 +28292,10 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
         uint64_t rank_bytes = 0;
         uint64_t stage_a_bytes = 0;
         uint64_t stage_b_bytes = 0;
+        uint64_t scale_meta_a_bytes = 0;
+        uint64_t scale_meta_b_bytes = 0;
+        const uint64_t scale_meta_bytes_per_block_pair =
+            2u * 2u * sizeof(uint64_t); /* two rows, two iq records */
         if (!ds4_gpu_u64_mul_checked(rank, row_a_bytes, &group_a_bytes) ||
             !ds4_gpu_u64_mul_checked((uint64_t)n_groups,
                                      group_a_bytes,
@@ -28314,8 +28330,16 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
                                      &stage_a_bytes) ||
             !ds4_gpu_u64_mul_checked(2u,
                                      row_b_bytes,
-                                     &stage_b_bytes)) {
-            if (require) {
+                                     &stage_b_bytes) ||
+            !ds4_gpu_u64_mul_checked(group_dim / 256u,
+                                     scale_meta_bytes_per_block_pair,
+                                     &scale_meta_a_bytes) ||
+            !ds4_gpu_u64_mul_checked(low_dim / 256u,
+                                     scale_meta_bytes_per_block_pair,
+                                     &scale_meta_b_bytes) ||
+            scale_meta_a_bytes > UINT64_MAX - stage_a_bytes ||
+            scale_meta_b_bytes > UINT64_MAX - stage_b_bytes) {
+            if (failure_rc < 0) {
                 fprintf(stderr,
                         "ds4: required Metal Q4 SSD-prefill attention exact-N "
                         "shape overflows byte strides\n");
@@ -28324,7 +28348,7 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
         }
         if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
             out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) {
-            if (require) {
+            if (failure_rc < 0) {
                 fprintf(stderr,
                         "ds4: required Metal Q4 SSD-prefill attention exact-N "
                         "weights are outside the mapped model\n");
@@ -28339,7 +28363,7 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
             ds4_gpu_tensor_bytes(heads) < heads_bytes ||
             ds4_gpu_tensor_bytes(low) < low_bytes ||
             ds4_gpu_tensor_bytes(out) < out_bytes) {
-            if (require) {
+            if (failure_rc < 0) {
                 fprintf(stderr,
                         "ds4: required Metal Q4 SSD-prefill attention exact-N "
                         "path received undersized tensors\n");
@@ -28347,15 +28371,50 @@ static int ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
             return failure_rc;
         }
 
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
-            "kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_f32");
+        const uint64_t scale_meta_stage_a_bytes =
+            stage_a_bytes + scale_meta_a_bytes;
+        const uint64_t scale_meta_stage_b_bytes =
+            stage_b_bytes + scale_meta_b_bytes;
+        const uint64_t scale_meta_max_stage_bytes =
+            scale_meta_stage_a_bytes > scale_meta_stage_b_bytes ?
+                scale_meta_stage_a_bytes : scale_meta_stage_b_bytes;
+        bool scale_meta =
+            !scale_meta_disabled &&
+            scale_meta_max_stage_bytes <=
+                (uint64_t)[g_device maxThreadgroupMemoryLength] &&
+            scale_meta_max_stage_bytes <= (uint64_t)NSUIntegerMax;
+        id<MTLComputePipelineState> pipeline = nil;
+        if (scale_meta) {
+            pipeline = ds4_gpu_get_pipeline(
+                "kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_scale_meta_f32");
+            if (!pipeline || pipeline.threadExecutionWidth != 32u ||
+                pipeline.maxTotalThreadsPerThreadgroup < 512u) {
+                scale_meta = false;
+            }
+        }
+        if (!scale_meta && require_scale_meta) {
+            fprintf(stderr,
+                    "ds4: required Metal Q4 SSD-prefill attention exact-N "
+                    "scale metadata pipeline is unavailable "
+                    "(stage=%llu max_stage=%lu)\n",
+                    (unsigned long long)scale_meta_max_stage_bytes,
+                    (unsigned long)[g_device maxThreadgroupMemoryLength]);
+            return -1;
+        }
+        if (!scale_meta) {
+            pipeline = ds4_gpu_get_pipeline(
+                "kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_f32");
+        } else {
+            stage_a_bytes = scale_meta_stage_a_bytes;
+            stage_b_bytes = scale_meta_stage_b_bytes;
+        }
         const uint64_t max_stage_bytes =
             stage_a_bytes > stage_b_bytes ? stage_a_bytes : stage_b_bytes;
         if (!pipeline || pipeline.threadExecutionWidth != 32u ||
             pipeline.maxTotalThreadsPerThreadgroup < 512u ||
             max_stage_bytes > (uint64_t)[g_device maxThreadgroupMemoryLength] ||
             max_stage_bytes > (uint64_t)NSUIntegerMax) {
-            if (require) {
+            if (failure_rc < 0) {
                 fprintf(stderr,
                         "ds4: required Metal Q4 SSD-prefill attention exact-N "
                         "pipeline is unavailable (threads=%lu width=%lu "

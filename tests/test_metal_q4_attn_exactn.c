@@ -46,6 +46,10 @@ static const char *k_disable =
     "DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN";
 static const char *k_require =
     "DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN";
+static const char *k_disable_scale_meta =
+    "DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META";
+static const char *k_require_scale_meta =
+    "DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META";
 static const char *k_disable_classic = "DS4_METAL_DISABLE_Q4_MV_CLASSIC";
 
 static void fail(const char *what) {
@@ -93,9 +97,9 @@ static void fill_q4_matrix(void *raw,
             uint8_t scale[8];
             uint8_t minimum[8];
             for (uint32_t group = 0; group < 8u; group++) {
-                scale[group] = (uint8_t)(1u + (key + group * 7u) % 31u);
+                scale[group] = (uint8_t)((key + group * 7u) % 64u);
                 minimum[group] =
-                    (uint8_t)((key / 3u + group * 5u) % 17u);
+                    (uint8_t)((key / 3u + group * 5u) % 64u);
             }
             pack_scales(b->scales, scale, minimum);
             for (uint32_t i = 0; i < QK_K / 2u; i++) {
@@ -166,6 +170,10 @@ int main(void) {
     CHECK(unsetenv(k_enable) == 0, "clear enable env");
     CHECK(unsetenv(k_disable) == 0, "clear disable env");
     CHECK(unsetenv(k_require) == 0, "clear require env");
+    CHECK(unsetenv(k_disable_scale_meta) == 0,
+          "clear scale-meta disable env");
+    CHECK(unsetenv(k_require_scale_meta) == 0,
+          "clear scale-meta require env");
     CHECK(unsetenv(k_disable_classic) == 0, "clear classic kill env");
 
     CHECK(ds4_gpu_init() != 0, "Metal init");
@@ -265,70 +273,113 @@ int main(void) {
           "default-off gate");
     CHECK(setenv(k_enable, "1", 1) == 0, "enable candidate");
 
-    for (uint32_t case_i = 0;
-         case_i < sizeof(exact_rows) / sizeof(exact_rows[0]);
-         case_i++) {
-        const uint32_t n_rows = exact_rows[case_i];
-        poison(candidate_low_host, low_count, 0x7fc10000u);
-        poison(candidate_out_host, out_count, 0x7fc20000u);
-        CHECK(ds4_gpu_tensor_write(candidate_low, 0, candidate_low_host,
-                                   low_count * sizeof(float)) != 0,
-              "candidate low poison");
-        CHECK(ds4_gpu_tensor_write(candidate_out, 0, candidate_out_host,
-                                   out_count * sizeof(float)) != 0,
-              "candidate out poison");
-
-        /* Exercise the production wrapper delegation, not only the direct
-         * test entry point.  Scratch arguments are unused by this path. */
-        CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
-                  candidate_out, candidate_low, NULL, NULL,
-                  model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
-                  GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads, n_rows) == 1,
-              "candidate dispatch");
-        CHECK(ds4_gpu_tensor_read(candidate_low, 0, candidate_low_host,
-                                  low_count * sizeof(float)) != 0,
-              "candidate low read");
-        CHECK(ds4_gpu_tensor_read(candidate_out, 0, candidate_out_host,
-                                  out_count * sizeof(float)) != 0,
-              "candidate out read");
-
-        uint64_t first_low = UINT64_MAX;
-        uint64_t first_out = UINT64_MAX;
-        const uint64_t compared_low = (uint64_t)n_rows * LOW_DIM;
-        const uint64_t compared_out = (uint64_t)n_rows * OUT_DIM;
-        const uint64_t low_mismatch = count_bit_mismatches(
-            reference_low_host, candidate_low_host,
-            compared_low, &first_low);
-        const uint64_t out_mismatch = count_bit_mismatches(
-            reference_out_host, candidate_out_host,
-            compared_out, &first_out);
-        const uint64_t low_canary = count_poison_mismatches(
-            candidate_low_host, compared_low, low_count, 0x7fc10000u);
-        const uint64_t out_canary = count_poison_mismatches(
-            candidate_out_host, compared_out, out_count, 0x7fc20000u);
-        fprintf(stderr,
-                "Metal Q4 SSD-prefill exact-N=%u low=%llu/%llu "
-                "out=%llu/%llu low_canary=%llu out_canary=%llu\n",
-                n_rows,
-                (unsigned long long)low_mismatch,
-                (unsigned long long)compared_low,
-                (unsigned long long)out_mismatch,
-                (unsigned long long)compared_out,
-                (unsigned long long)low_canary,
-                (unsigned long long)out_canary);
-        if (low_mismatch != 0) {
-            fprintf(stderr, "  first low mismatch index=%llu\n",
-                    (unsigned long long)first_low);
+    for (uint32_t scale_variant = 0; scale_variant < 2u; scale_variant++) {
+        const bool use_scale_meta = scale_variant == 0u;
+        if (use_scale_meta) {
+            CHECK(unsetenv(k_disable_scale_meta) == 0,
+                  "enable shared scale metadata");
+            CHECK(setenv(k_require_scale_meta, "1", 1) == 0,
+                  "require shared scale metadata");
+        } else {
+            CHECK(unsetenv(k_require_scale_meta) == 0,
+                  "clear shared scale metadata requirement");
+            CHECK(setenv(k_disable_scale_meta, "1", 1) == 0,
+                  "select legacy scale unpack");
         }
-        if (out_mismatch != 0) {
-            fprintf(stderr, "  first out mismatch index=%llu\n",
-                    (unsigned long long)first_out);
+        for (uint32_t case_i = 0;
+             case_i < sizeof(exact_rows) / sizeof(exact_rows[0]);
+             case_i++) {
+            const uint32_t n_rows = exact_rows[case_i];
+            poison(candidate_low_host, low_count, 0x7fc10000u);
+            poison(candidate_out_host, out_count, 0x7fc20000u);
+            CHECK(ds4_gpu_tensor_write(candidate_low, 0, candidate_low_host,
+                                       low_count * sizeof(float)) != 0,
+                  "candidate low poison");
+            CHECK(ds4_gpu_tensor_write(candidate_out, 0, candidate_out_host,
+                                       out_count * sizeof(float)) != 0,
+                  "candidate out poison");
+
+            /* Exercise the production wrapper delegation, not only the direct
+             * test entry point. Scratch arguments are unused by this path. */
+            CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+                      candidate_out, candidate_low, NULL, NULL,
+                      model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+                      GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads, n_rows) == 1,
+                  "candidate dispatch");
+            CHECK(ds4_gpu_tensor_read(candidate_low, 0, candidate_low_host,
+                                      low_count * sizeof(float)) != 0,
+                  "candidate low read");
+            CHECK(ds4_gpu_tensor_read(candidate_out, 0, candidate_out_host,
+                                      out_count * sizeof(float)) != 0,
+                  "candidate out read");
+
+            uint64_t first_low = UINT64_MAX;
+            uint64_t first_out = UINT64_MAX;
+            const uint64_t compared_low = (uint64_t)n_rows * LOW_DIM;
+            const uint64_t compared_out = (uint64_t)n_rows * OUT_DIM;
+            const uint64_t low_mismatch = count_bit_mismatches(
+                reference_low_host, candidate_low_host,
+                compared_low, &first_low);
+            const uint64_t out_mismatch = count_bit_mismatches(
+                reference_out_host, candidate_out_host,
+                compared_out, &first_out);
+            const uint64_t low_canary = count_poison_mismatches(
+                candidate_low_host, compared_low, low_count, 0x7fc10000u);
+            const uint64_t out_canary = count_poison_mismatches(
+                candidate_out_host, compared_out, out_count, 0x7fc20000u);
+            fprintf(stderr,
+                    "Metal Q4 SSD-prefill exact-N=%u scale_meta=%s "
+                    "low=%llu/%llu "
+                    "out=%llu/%llu low_canary=%llu out_canary=%llu\n",
+                    n_rows,
+                    use_scale_meta ? "shared" : "legacy",
+                    (unsigned long long)low_mismatch,
+                    (unsigned long long)compared_low,
+                    (unsigned long long)out_mismatch,
+                    (unsigned long long)compared_out,
+                    (unsigned long long)low_canary,
+                    (unsigned long long)out_canary);
+            if (low_mismatch != 0) {
+                uint32_t reference_bits = 0;
+                uint32_t candidate_bits = 0;
+                memcpy(&reference_bits, &reference_low_host[first_low],
+                       sizeof(reference_bits));
+                memcpy(&candidate_bits, &candidate_low_host[first_low],
+                       sizeof(candidate_bits));
+                fprintf(stderr,
+                        "  first low mismatch index=%llu "
+                        "reference=%a (0x%08x) candidate=%a (0x%08x)\n",
+                        (unsigned long long)first_low,
+                        reference_low_host[first_low], reference_bits,
+                        candidate_low_host[first_low], candidate_bits);
+            }
+            if (out_mismatch != 0) {
+                fprintf(stderr, "  first out mismatch index=%llu\n",
+                        (unsigned long long)first_out);
+            }
+            CHECK(low_mismatch == 0, "low projection bitwise mismatch");
+            CHECK(out_mismatch == 0, "output projection bitwise mismatch");
+            CHECK(low_canary == 0, "low tail canary");
+            CHECK(out_canary == 0, "output tail canary");
         }
-        CHECK(low_mismatch == 0, "low projection bitwise mismatch");
-        CHECK(out_mismatch == 0, "output projection bitwise mismatch");
-        CHECK(low_canary == 0, "low tail canary");
-        CHECK(out_canary == 0, "output tail canary");
     }
+    CHECK(unsetenv(k_disable_scale_meta) == 0,
+          "restore shared scale metadata");
+    CHECK(unsetenv(k_require_scale_meta) == 0,
+          "clear shared scale metadata requirement");
+    CHECK(setenv(k_require_scale_meta, "1", 1) == 0,
+          "set scale-meta REQUIRE for kill-switch check");
+    CHECK(setenv(k_disable_scale_meta, "1", 1) == 0,
+          "set scale-meta disable for kill-switch check");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, NULL, NULL, model, model_bytes,
+              0, out_b_offset, Q4_K_TYPE, GROUP_DIM, RANK,
+              N_GROUPS, OUT_DIM, heads, 21u) == -1,
+          "scale-meta disable wins over REQUIRE");
+    CHECK(unsetenv(k_disable_scale_meta) == 0,
+          "clear scale-meta disable after kill-switch check");
+    CHECK(unsetenv(k_require_scale_meta) == 0,
+          "clear scale-meta REQUIRE after kill-switch check");
 
     /* REQUIRE implies enable.  Both explicit kill switches win and must
      * return -1 instead of allowing a false-green row fallback. */
@@ -368,7 +419,7 @@ int main(void) {
     free(model);
     fprintf(stderr,
             "Metal Q4 SSD-prefill exact-N oracle PASS rows=6,8,9,16,21,30,31 "
-            "bitwise=1 canary=1 gates=1\n");
+            "scale_meta=shared,legacy bitwise=1 canary=1 gates=1\n");
     return 0;
 }
 

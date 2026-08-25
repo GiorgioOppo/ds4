@@ -3186,11 +3186,12 @@ void kernel_mul_mv_q4_K_f32_impl(
 // space changed from device to threadgroup.  Its lane-to-K mapping, scalar
 // operation order and simd_sum reduction are deliberately kept identical to
 // kernel_mul_mv_q4_K_f32_impl: the exact-N oracle requires bitwise equality.
-template<int nr0>
+template<int nr0, bool use_preexpanded_scales = false>
 void kernel_mul_mv_q4_K_staged_exactn_impl(
         uint32_t in_dim,
         uint64_t weight_row_bytes,
         threadgroup const char *src0,
+        threadgroup const ushort4 *preexpanded_scales,
         device const char *src1,
         device       char *dst,
         uint32_t valid_rows,
@@ -3216,7 +3217,6 @@ void kernel_mul_mv_q4_K_staged_exactn_impl(
     device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
     uint16_t sc16[4];
-    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
 
     for (int ib = ix; ib < nb; ib += 4) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
@@ -3235,10 +3235,24 @@ void kernel_mul_mv_q4_K_staged_exactn_impl(
         threadgroup const half *dh = &x[ib].d;
 
         for (short row = 0; row < nr0 && row < valid_rows; row++) {
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            if (use_preexpanded_scales) {
+                const uint32_t meta_index =
+                    ((uint32_t)row * (uint32_t)nb + (uint32_t)ib) * 2u +
+                    (uint32_t)iq;
+                const ushort4 expanded = preexpanded_scales[meta_index];
+                sc16[0] = expanded[0];
+                sc16[1] = expanded[1];
+                sc16[2] = expanded[2];
+                sc16[3] = expanded[3];
+            } else {
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] =
+                    ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] =
+                    ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            }
+            thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
 
             threadgroup const uint16_t *q2 = q1 + 32;
 
@@ -3280,9 +3294,11 @@ void kernel_mul_mv_q4_K_staged_exactn_impl(
 }
 
 // Grid: x = output-row pairs, y = 16-token tiles, z = independent groups.
-// All 512 threads join the raw packed-row load and barrier.  Afterwards each
-// SIMDgroup owns one token and follows the classic Q4_K arithmetic above.
-kernel void kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_f32(
+// All 512 threads join the raw packed-row load and barrier.  The optimized
+// specialization also expands the integer scale/min metadata before that same
+// barrier so all token SIMDgroups can reuse it without changing FP arithmetic.
+template<bool preexpand_scales>
+kernel void kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl(
         constant ds4_metal_args_q4_attn_exactn &args,
         device const char *weights,
         device const char *input,
@@ -3306,6 +3322,34 @@ kernel void kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_f32(
         staged[args.weight_row_bytes + i] =
             valid_rows == 2u ? weights[row1_base + i] : 0;
     }
+
+    const uint32_t blocks_per_row = args.in_dim / QK_K;
+    threadgroup ushort4 *scale_meta =
+        (threadgroup ushort4 *)(staged + 2u * args.weight_row_bytes);
+    if (preexpand_scales) {
+        const uint32_t meta_count = valid_rows * blocks_per_row * 2u;
+        for (uint32_t meta_index = tiitg;
+             meta_index < meta_count;
+             meta_index += 32u * 16u) {
+            const uint32_t iq = meta_index & 1u;
+            const uint32_t block_index = meta_index >> 1u;
+            const uint32_t row = block_index / blocks_per_row;
+            const uint32_t ib = block_index - row * blocks_per_row;
+            device const block_q4_K *xb =
+                (device const block_q4_K *)(weights + row0_base +
+                    (uint64_t)row * args.weight_row_bytes) + ib;
+            device const uint16_t *sc =
+                (device const uint16_t *)xb->scales + iq;
+            const ushort4 expanded = ushort4(
+                sc[0] & 0x3f3fu,
+                sc[2] & 0x3f3fu,
+                ((sc[4] >> 0) & 0x0f0fu) |
+                    ((sc[0] & 0xc0c0u) >> 2),
+                ((sc[4] >> 4) & 0x0f0fu) |
+                    ((sc[2] & 0xc0c0u) >> 2));
+            scale_meta[meta_index] = expanded;
+        }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint32_t token = tgpig.y * 16u + sgitg;
@@ -3319,15 +3363,26 @@ kernel void kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_f32(
         (uint64_t)tgpig.z * args.output_group_bytes +
         (uint64_t)first_row * sizeof(float);
 
-    kernel_mul_mv_q4_K_staged_exactn_impl<2>(
+    kernel_mul_mv_q4_K_staged_exactn_impl<2, preexpand_scales>(
         args.in_dim,
         args.weight_row_bytes,
         staged,
+        scale_meta,
         token_input,
         token_output,
         valid_rows,
         tiisg);
 }
+
+typedef decltype(
+    kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl<false>)
+    q4_attn_ssd_prefill_exactn_t;
+template [[host_name("kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_f32")]]
+kernel q4_attn_ssd_prefill_exactn_t
+    kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl<false>;
+template [[host_name("kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_scale_meta_f32")]]
+kernel q4_attn_ssd_prefill_exactn_t
+    kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl<true>;
 
 template<int nr0, typename args_t>
 void kernel_mul_mv_mxfp4_f32_impl(

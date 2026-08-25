@@ -37,6 +37,8 @@ changing them.  Unless a row says otherwise:
 | `DS4_METAL_ENABLE_M1_IQ2_MID_ONLY=1` | Legacy spelling retained for migration notes only. The runtime does not read it; the path is automatic and this setting is ignored. |
 | `DS4_METAL_DISABLE_IQ2_XXS_SSD_PREFILL_MM=1` | Restore sparse matvec for an eligible grouped IQ2 SSD-prefill chunk. |
 | `DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM=1` | Require grouped IQ2 SSD-prefill MM for eligible chunks and reject insufficient cache instead of silently falling back. |
+| `DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META=1` | Restore per-SIMDgroup Q4_K scale/min unpacking inside the opt-in SSD-prefill attention-output exact-N path. Shared scale metadata is automatic when that path is enabled and the PSO and threadgroup memory are available. |
+| `DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META=1` | Enable the Q4_K SSD-prefill attention-output exact-N path and fail closed unless its shared scale/min metadata PSO is used. Intended for oracles and A/B tests. |
 | `DS4_METAL_ENABLE_STREAMING_PREFILL_EXPERT_READAHEAD=1` | Restore the historical `F_RDADVISE` plus parallel-`pread` sequence for cold-storage A/B tests. Normal grouped prefill skips the redundant hint. |
 
 The detailed Metal A/B contracts and expected oracle counters live in
@@ -112,13 +114,13 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1067 `DS4_*` runtime variables** and
+Inventory totals: **1069 `DS4_*` runtime variables** and
 **6 external runtime variables**.
 The auxiliary inventories contain **112 test/test-fixture entries**
 and **19 tool/wrapper entries**.
 
 <details>
-<summary><strong>Metal (440)</strong></summary>
+<summary><strong>Metal (442)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -261,6 +263,7 @@ and **19 tool/wrapper entries**.
 | `DS4_METAL_DISABLE_Q4_QKV_COMPRESSOR_FUSE` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 QKV compressor fuse. | [ds4_metal.m:22083](ds4_metal.m#L22083) |
 | `DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 selected expert views. | [ds4.c:21136](ds4.c#L21136) |
 | `DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Disables Q4 SSD prefill attn out exactn. | [ds4_metal.m:28095](ds4_metal.m#L28095) |
+| `DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Disables shared scale/min metadata in the Q4 SSD prefill attention-output exact-N kernel. | [ds4_metal.m:28220](ds4_metal.m#L28220) |
 | `DS4_METAL_DISABLE_Q4_SSD_SESSION_UNION` | nonempty boolean; unset/empty or exact 0: off; every other value: on | Disables Q4 SSD session union. | [ds4.c:65160](ds4.c#L65160) |
 | `DS4_METAL_DISABLE_Q4_STREAM_OVERLAP` | nonempty boolean; unset/empty or exact 0: off; every other value: on | Disables Q4 stream overlap. | [ds4.c:65082](ds4.c#L65082) |
 | `DS4_METAL_DISABLE_Q4_TABLE_BOUNDARY` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 table boundary. | [ds4_metal.m:42318](ds4_metal.m#L42318) |
@@ -500,6 +503,7 @@ and **19 tool/wrapper entries**.
 | `DS4_METAL_REQUIRE_OUTPUT_HC_WEIGHTS4` | presence strict check; unset: fallback allowed; any value including 0 requires the path | Requires output HC weights4 and makes eligible fallback fail closed. | [ds4_metal.m:46789](ds4_metal.m#L46789) |
 | `DS4_METAL_REQUIRE_Q4_ATTN_OUT_TINY_BATCH` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Requires Q4 attn out tiny batch and makes eligible fallback fail closed. | [ds4_metal.m:28373](ds4_metal.m#L28373) |
 | `DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Requires Q4 SSD prefill attn out exactn and makes eligible fallback fail closed. | [ds4_metal.m:28089](ds4_metal.m#L28089) |
+| `DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Requires shared scale/min metadata in the Q4 SSD prefill attention-output exact-N kernel and makes fallback fail closed. | [ds4_metal.m:28209](ds4_metal.m#L28209) |
 | `DS4_METAL_REQUIRE_Q4_SSD_SESSION_UNION` | nonempty boolean; unset/empty or exact 0: off; every other value: on | Requires Q4 SSD session union and makes eligible fallback fail closed. | [ds4.c:65164](ds4.c#L65164) |
 | `DS4_METAL_REQUIRE_Q8_QKV_COMPRESSOR_FUSE` | nonempty boolean; unset/empty/exact 0: fallback allowed; other values require and imply the streamed/union enable | Requires eligible Q8 QKV/compressor compound fusion and fails closed. | [ds4.c:23023](ds4.c#L23023) |
 | `DS4_METAL_RESUME_PREFILL_MIN` | integer token threshold; default 4; <=0 disables resume-prefill | Sets the minimum shared-prefix suffix that uses batched resume-prefill. | [ds4.c:38419](ds4.c#L38419) |
