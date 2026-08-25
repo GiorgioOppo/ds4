@@ -442,7 +442,7 @@ static inline float ds4_glm_swiglu(float gate, float up, float limit) {
         gate = min(gate, limit);
         up = clamp(up, -limit, limit);
     }
-    return (gate / (1.0f + exp(-gate))) * up;
+    return ds4_silu(gate) * up;
 }
 
 
@@ -506,7 +506,7 @@ kernel void kernel_dsv4_moe_swiglu_weight(
                 up_row[i] = u;
             }
         }
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         mid_row[i] = silu * u * route_weight;
     }
 }
@@ -544,7 +544,7 @@ kernel void kernel_dsv4_moe_swiglu_weight_f16(
                 up_row[i] = u;
             }
         }
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         mid_row[i] = (half)(silu * u * route_weight);
     }
 }
@@ -3541,7 +3541,7 @@ void kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[first_row + row] = silu * u * route_weight;
         }
     }
@@ -4330,7 +4330,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
         }
         dst_gate_f32[out_row] = gate;
         dst_up_f32[out_row] = up;
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         dst_mid_f32[out_row] = silu * u * route_weight;
     }
 
@@ -4482,7 +4482,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
         }
         dst_gate_f32[out_row] = gate;
         dst_up_f32[out_row] = up;
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         dst_mid_f32[out_row] = silu * u * route_weight;
     }
 
@@ -4578,7 +4578,7 @@ kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -4668,7 +4668,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -4969,7 +4969,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -5254,7 +5254,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
             }
             gate_f32[out_row] = gate;
             up_f32[out_row] = up;
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -5352,7 +5352,7 @@ void kernel_mul_mv_mxfp4_pair_swiglu_impl(
                 }
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
-                mid_f32[out_row] = (g / (1.0f + exp(-g))) * u * route_weight;
+                mid_f32[out_row] = ds4_silu(g) * u * route_weight;
             }
         }
     }
@@ -5533,7 +5533,7 @@ void kernel_mul_mv_mxfp4_pair_swiglu_static_impl(
                 }
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
-                mid_f32[out_row] = (g / (1.0f + exp(-g))) * u * route_weight;
+                mid_f32[out_row] = ds4_silu(g) * u * route_weight;
             }
         }
     }
@@ -5796,7 +5796,7 @@ kernel void kernel_mul_mv_table_q4_K_pair_swiglu_f32(
             }
             gate_f32[out_row] = gate;
             up_f32[out_row] = up;
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -5887,7 +5887,7 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -6034,7 +6034,7 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -6206,7 +6206,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -6330,7 +6330,7 @@ kernel void kernel_mul_mv_group8_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -6513,7 +6513,7 @@ kernel void kernel_mul_mv_group_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -8901,17 +8901,6 @@ kernel void kernel_mul_mm_id(
         i = (4*(nr0/4)) + tiisg;
         for (; i < nr0; i += 32) {
             *(D + i) = *(C + i);
-        for (int i = tiisg; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
-        }
-
-        for (int i = tiisg + nr0; i < nr0; i += 32) {
-        for (int i = tiisg; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
-        }
-
-        for (int i = tiisg + nr0; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
         }
     }
 }
@@ -9143,7 +9132,7 @@ kernel void kernel_mul_mm_id_addr(
             *(D4 + i) = *(C4 + i);
         }
 
-        FOR_UNROLL (int i = nr0 + tiisg; i < nr0; i += 32) {
+        FOR_UNROLL (int i = (4*(nr0/4)) + tiisg; i < nr0; i += 32) {
             *(D + i) = *(C + i);
         }
     }
@@ -9356,7 +9345,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             D[i] = (half)(silu * u * route_weight);
         }
     }
@@ -9581,7 +9570,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             D[i] = (half)(silu * u * route_weight);
         }
     }

@@ -445,7 +445,7 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u;
         }
     }
@@ -647,7 +647,7 @@ kernel void kernel_dsv4_router_shared_gate_up_q8_0(
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u;
         }
     }
@@ -1842,7 +1842,7 @@ void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[i01] = silu * u;
         }
     }

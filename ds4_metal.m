@@ -4941,9 +4941,11 @@ static NSString *ds4_gpu_full_source(void) {
     /*
      * Kernels are kept as separate files for review, then concatenated into one
      * Metal library.  Environment overrides are still honored so a diagnostic
-     * run can swap one source file without changing the executable.
+     * run can swap one source file without changing the executable. A one-item
+     * entry is a fixed shared source; two-item entries are [override, source].
      */
     NSArray<NSArray<NSString *> *> *required_sources = @[
+        @[@"metal/activations.metal"],
         @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
         @[@"DS4_METAL_GLM53_BF16_SOURCE", @"metal/glm53_bf16.metal"],
@@ -4970,13 +4972,16 @@ static NSString *ds4_gpu_full_source(void) {
 
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
-        const char *override_path = getenv([spec[0] UTF8String]);
+        NSString *override_name = spec.count > 1 ? spec[0] : nil;
+        NSString *source_path = spec.lastObject;
+        const char *override_path =
+            override_name ? getenv([override_name UTF8String]) : NULL;
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
         if (override_path && override_path[0]) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
         }
-        [paths addObject:spec[1]];
-        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        [paths addObject:source_path];
+        [paths addObject:[@"./" stringByAppendingString:source_path]];
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;
@@ -4997,9 +5002,14 @@ static NSString *ds4_gpu_full_source(void) {
         }
 
         if (!loaded) {
-            fprintf(stderr,
-                    "ds4: Metal source %s not found (set %s to override)\n",
-                    [spec[1] UTF8String], [spec[0] UTF8String]);
+            if (override_name) {
+                fprintf(stderr,
+                        "ds4: Metal source %s not found (set %s to override)\n",
+                        [source_path UTF8String], [override_name UTF8String]);
+            } else {
+                fprintf(stderr, "ds4: Metal source %s not found\n",
+                        [source_path UTF8String]);
+            }
             return nil;
         }
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];

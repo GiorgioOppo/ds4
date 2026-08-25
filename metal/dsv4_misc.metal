@@ -510,16 +510,6 @@ kernel void kernel_dsv4_router_weights_one(
     w[tid] = p[s[tid]] / sum * 1.5f;
 }
 
-static inline float ds4_glm_router_sigmoid(float x) {
-    if (x >= 0.0f) {
-        const float e = exp(-x);
-        return 1.0f / (1.0f + e);
-    } else {
-        const float e = exp(x);
-        return e / (1.0f + e);
-    }
-}
-
 static inline bool ds4_glm_router_better(
         threadgroup const float *scores,
         int32_t                  a,
@@ -4775,7 +4765,7 @@ kernel void kernel_glm_router_select_one(
 
     const uint n_expert = min(args.n_expert, 512u);
     const bool active = tid < n_expert;
-    const float p = active ? ds4_glm_router_sigmoid(token_logits[tid]) : 0.0f;
+    const float p = active ? ds4_sigmoid_stable(token_logits[tid]) : 0.0f;
     if (active) token_probs[tid] = p;
     sel_scores[tid] = active ? p + bias[tid] : -INFINITY;
     idx[tid] = (int32_t)tid;

@@ -33,7 +33,7 @@ kernel void kernel_swiglu_f32(
             x1 = clamp(x1, -args.limit, args.limit);
         }
 
-        const float silu = x0 / (1.0f + exp(-x0));
+        const float silu = ds4_silu(x0);
 
         dst_row[i0] = silu*x1*args.alpha;
     }
@@ -58,6 +58,6 @@ kernel void kernel_swiglu_flat_f32(
         x1 = clamp(x1, -args.limit, args.limit);
     }
 
-    const float silu = x0 / (1.0f + exp(-x0));
+    const float silu = ds4_silu(x0);
     dst_f32[i] = silu*x1*args.alpha;
 }
