@@ -9550,8 +9550,9 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
 
     if (mma_active) {
         FOR_UNROLL (short i = 0; i < 8; i++) {
-            simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-            simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+            int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
+            simdgroup_store(mc_gate[i], temp_gate_str + si, NR0, 0, false);
+            simdgroup_store(mc_up[i],   temp_up_str   + si, NR0, 0, false);
         }
     }
 
