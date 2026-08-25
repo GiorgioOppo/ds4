@@ -9132,7 +9132,7 @@ kernel void kernel_mul_mm_id_addr(
             *(D4 + i) = *(C4 + i);
         }
 
-        FOR_UNROLL (int i = (4*(nr0/4)) + tiisg; i < nr0; i += 32) {
+        FOR_UNROLL (int i = nr0 + tiisg; i < nr0; i += 32) {
             *(D + i) = *(C + i);
         }
     }
