@@ -9566,7 +9566,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
         threadgroup float *Cu = temp_up   + j*NR0;
 
         int i = tiisg;
-        for (; i < nr0; i += 32) {
+        FOR_UNROLL (int i = tiisg; i < nr0; i += 32) {
             float g = Cg[i];
             float u = Cu[i];
             if (c > 1.0e-6f) {
