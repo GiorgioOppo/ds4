@@ -30,7 +30,7 @@ enum {
     LOW_DIM = N_GROUPS * RANK,
     OUT_DIM = 67u,
     MAX_ROWS = 31u,
-    ALLOC_ROWS = 32u,
+    ALLOC_ROWS = 33u,
 };
 
 typedef struct {
@@ -51,6 +51,10 @@ static const char *k_disable_scale_meta =
 static const char *k_require_scale_meta =
     "DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META";
 static const char *k_disable_classic = "DS4_METAL_DISABLE_Q4_MV_CLASSIC";
+static const char *k_disable_f16_rhs =
+    "DS4_METAL_DISABLE_Q4_ATTN_OUT_B_F16_RHS";
+static const char *k_require_f16_rhs =
+    "DS4_METAL_REQUIRE_Q4_ATTN_OUT_B_F16_RHS";
 
 static void fail(const char *what) {
     fprintf(stderr, "Metal Q4 SSD-prefill exact-N oracle FAIL: %s\n", what);
@@ -175,6 +179,8 @@ int main(void) {
     CHECK(unsetenv(k_require_scale_meta) == 0,
           "clear scale-meta require env");
     CHECK(unsetenv(k_disable_classic) == 0, "clear classic kill env");
+    CHECK(unsetenv(k_disable_f16_rhs) == 0, "clear F16 RHS disable env");
+    CHECK(unsetenv(k_require_f16_rhs) == 0, "clear F16 RHS require env");
 
     CHECK(ds4_gpu_init() != 0, "Metal init");
     if (!ds4_gpu_device_is_pre_m5_apple_silicon()) {
@@ -363,6 +369,307 @@ int main(void) {
             CHECK(out_canary == 0, "output tail canary");
         }
     }
+
+    /* At N=32 both output-B variants execute the same legacy M64xN32xK32
+     * schedule.  The candidate differs only by materializing the staging cast
+     * once into scratch, so the complete wrapper output must remain bitwise
+     * identical.  Keep one extra output row and guards around the F16 scratch
+     * to catch either output or conversion overruns. */
+    ds4_gpu_set_ssd_streaming(false);
+    ds4_gpu_set_quality(true);
+    enum { F16_RHS_ROWS = 32u, F16_RHS_GUARD = 64u };
+    const uint64_t f16_rhs_payload =
+        (uint64_t)F16_RHS_ROWS * LOW_DIM;
+    const uint64_t f16_rhs_storage =
+        F16_RHS_GUARD + f16_rhs_payload + F16_RHS_GUARD;
+    uint16_t *f16_rhs_host = malloc(
+        (size_t)f16_rhs_storage * sizeof(uint16_t));
+    ds4_gpu_tensor *f16_rhs_base = ds4_gpu_tensor_alloc(
+        f16_rhs_storage * sizeof(uint16_t));
+    ds4_gpu_tensor *f16_rhs = ds4_gpu_tensor_view(
+        f16_rhs_base,
+        F16_RHS_GUARD * sizeof(uint16_t),
+        f16_rhs_payload * sizeof(uint16_t));
+    CHECK(f16_rhs_host && f16_rhs_base && f16_rhs,
+          "F16 RHS scratch allocation");
+    for (uint64_t i = 0; i < f16_rhs_storage; i++) {
+        f16_rhs_host[i] =
+            (uint16_t)(0x7e00u | (uint16_t)(i & 0x1ffu));
+    }
+    CHECK(ds4_gpu_tensor_write(
+              f16_rhs_base, 0, f16_rhs_host,
+              f16_rhs_storage * sizeof(uint16_t)) != 0,
+          "F16 RHS scratch poison");
+
+    poison(reference_low_host, low_count, 0x7fc30000u);
+    poison(reference_out_host, out_count, 0x7fc40000u);
+    poison(candidate_low_host, low_count, 0x7fc30000u);
+    poison(candidate_out_host, out_count, 0x7fc40000u);
+    CHECK(ds4_gpu_tensor_write(reference_low, 0, reference_low_host,
+                               low_count * sizeof(float)) != 0,
+          "F16 RHS baseline low poison");
+    CHECK(ds4_gpu_tensor_write(reference_out, 0, reference_out_host,
+                               out_count * sizeof(float)) != 0,
+          "F16 RHS baseline out poison");
+    CHECK(ds4_gpu_tensor_write(candidate_low, 0, candidate_low_host,
+                               low_count * sizeof(float)) != 0,
+          "F16 RHS candidate low poison");
+    CHECK(ds4_gpu_tensor_write(candidate_out, 0, candidate_out_host,
+                               out_count * sizeof(float)) != 0,
+          "F16 RHS candidate out poison");
+
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              reference_out, reference_low, NULL, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads,
+              F16_RHS_ROWS) == 1,
+          "F16 RHS baseline dispatch");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, f16_rhs, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads,
+              F16_RHS_ROWS) == 1,
+          "F16 RHS default-on candidate dispatch");
+    CHECK(ds4_gpu_tensor_read(reference_low, 0, reference_low_host,
+                              low_count * sizeof(float)) != 0,
+          "F16 RHS baseline low read");
+    CHECK(ds4_gpu_tensor_read(reference_out, 0, reference_out_host,
+                              out_count * sizeof(float)) != 0,
+          "F16 RHS baseline out read");
+    CHECK(ds4_gpu_tensor_read(candidate_low, 0, candidate_low_host,
+                              low_count * sizeof(float)) != 0,
+          "F16 RHS candidate low read");
+    CHECK(ds4_gpu_tensor_read(candidate_out, 0, candidate_out_host,
+                              out_count * sizeof(float)) != 0,
+          "F16 RHS candidate out read");
+    CHECK(ds4_gpu_tensor_read(
+              f16_rhs_base, 0, f16_rhs_host,
+              f16_rhs_storage * sizeof(uint16_t)) != 0,
+          "F16 RHS scratch read");
+
+    uint64_t first_low = UINT64_MAX;
+    uint64_t first_out = UINT64_MAX;
+    const uint64_t f16_low_mismatch = count_bit_mismatches(
+        reference_low_host, candidate_low_host,
+        (uint64_t)F16_RHS_ROWS * LOW_DIM, &first_low);
+    const uint64_t f16_out_mismatch = count_bit_mismatches(
+        reference_out_host, candidate_out_host,
+        (uint64_t)F16_RHS_ROWS * OUT_DIM, &first_out);
+    const uint64_t baseline_low_tail = count_poison_mismatches(
+        reference_low_host, (uint64_t)F16_RHS_ROWS * LOW_DIM,
+        low_count, 0x7fc30000u);
+    const uint64_t candidate_low_tail = count_poison_mismatches(
+        candidate_low_host, (uint64_t)F16_RHS_ROWS * LOW_DIM,
+        low_count, 0x7fc30000u);
+    const uint64_t baseline_out_tail = count_poison_mismatches(
+        reference_out_host, (uint64_t)F16_RHS_ROWS * OUT_DIM,
+        out_count, 0x7fc40000u);
+    const uint64_t candidate_out_tail = count_poison_mismatches(
+        candidate_out_host, (uint64_t)F16_RHS_ROWS * OUT_DIM,
+        out_count, 0x7fc40000u);
+    uint64_t f16_guard_mismatch = 0;
+    uint64_t f16_payload_poison = 0;
+    for (uint64_t i = 0; i < F16_RHS_GUARD; i++) {
+        const uint16_t expected =
+            (uint16_t)(0x7e00u | (uint16_t)(i & 0x1ffu));
+        if (f16_rhs_host[i] != expected) f16_guard_mismatch++;
+    }
+    for (uint64_t i = F16_RHS_GUARD;
+         i < F16_RHS_GUARD + f16_rhs_payload; i++) {
+        const uint16_t poison_value =
+            (uint16_t)(0x7e00u | (uint16_t)(i & 0x1ffu));
+        if (f16_rhs_host[i] == poison_value) f16_payload_poison++;
+    }
+    for (uint64_t i = F16_RHS_GUARD + f16_rhs_payload;
+         i < f16_rhs_storage; i++) {
+        const uint16_t expected =
+            (uint16_t)(0x7e00u | (uint16_t)(i & 0x1ffu));
+        if (f16_rhs_host[i] != expected) f16_guard_mismatch++;
+    }
+    fprintf(stderr,
+            "Metal Q4 attention output-B F16 RHS N=32 "
+            "low=%llu out=%llu low_tail=%llu/%llu "
+            "out_tail=%llu/%llu scratch_guard=%llu payload_poison=%llu\n",
+            (unsigned long long)f16_low_mismatch,
+            (unsigned long long)f16_out_mismatch,
+            (unsigned long long)baseline_low_tail,
+            (unsigned long long)candidate_low_tail,
+            (unsigned long long)baseline_out_tail,
+            (unsigned long long)candidate_out_tail,
+            (unsigned long long)f16_guard_mismatch,
+            (unsigned long long)f16_payload_poison);
+    CHECK(f16_low_mismatch == 0, "F16 RHS low bitwise mismatch");
+    CHECK(f16_out_mismatch == 0, "F16 RHS output bitwise mismatch");
+    CHECK(baseline_low_tail == 0 && candidate_low_tail == 0,
+          "F16 RHS low tail canary");
+    CHECK(baseline_out_tail == 0 && candidate_out_tail == 0,
+          "F16 RHS output tail canary");
+    CHECK(f16_guard_mismatch == 0, "F16 RHS scratch canary");
+    CHECK(f16_payload_poison == 0, "F16 RHS default-on materialization");
+
+    /* Flash uses an output dimension divisible by 64, which selects the
+     * direct full-tile store and its smaller threadgroup allocation.  Reuse
+     * the first 64 rows of the fixture so both legacy specializations remain
+     * covered without growing the model allocation. */
+    enum { F16_RHS_FULL_TILE_OUT_DIM = 64u };
+    const uint64_t f16_full_tile_count =
+        (uint64_t)F16_RHS_ROWS * F16_RHS_FULL_TILE_OUT_DIM;
+    poison(reference_out_host, out_count, 0x7fc50000u);
+    poison(candidate_out_host, out_count, 0x7fc50000u);
+    CHECK(ds4_gpu_tensor_write(reference_out, 0, reference_out_host,
+                               out_count * sizeof(float)) != 0,
+          "F16 RHS full-tile baseline poison");
+    CHECK(ds4_gpu_tensor_write(candidate_out, 0, candidate_out_host,
+                               out_count * sizeof(float)) != 0,
+          "F16 RHS full-tile candidate poison");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              reference_out, reference_low, NULL, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, F16_RHS_FULL_TILE_OUT_DIM, heads,
+              F16_RHS_ROWS) == 1,
+          "F16 RHS full-tile baseline dispatch");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, f16_rhs, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, F16_RHS_FULL_TILE_OUT_DIM, heads,
+              F16_RHS_ROWS) == 1,
+          "F16 RHS full-tile candidate dispatch");
+    CHECK(ds4_gpu_tensor_read(reference_out, 0, reference_out_host,
+                              out_count * sizeof(float)) != 0,
+          "F16 RHS full-tile baseline read");
+    CHECK(ds4_gpu_tensor_read(candidate_out, 0, candidate_out_host,
+                              out_count * sizeof(float)) != 0,
+          "F16 RHS full-tile candidate read");
+    uint64_t first_full_tile = UINT64_MAX;
+    const uint64_t f16_full_tile_mismatch = count_bit_mismatches(
+        reference_out_host, candidate_out_host,
+        f16_full_tile_count, &first_full_tile);
+    const uint64_t baseline_full_tile_tail = count_poison_mismatches(
+        reference_out_host, f16_full_tile_count,
+        out_count, 0x7fc50000u);
+    const uint64_t candidate_full_tile_tail = count_poison_mismatches(
+        candidate_out_host, f16_full_tile_count,
+        out_count, 0x7fc50000u);
+    fprintf(stderr,
+            "Metal Q4 attention output-B F16 RHS full tile N=32 "
+            "out=%llu tail=%llu/%llu\n",
+            (unsigned long long)f16_full_tile_mismatch,
+            (unsigned long long)baseline_full_tile_tail,
+            (unsigned long long)candidate_full_tile_tail);
+    CHECK(f16_full_tile_mismatch == 0,
+          "F16 RHS full-tile output bitwise mismatch");
+    CHECK(baseline_full_tile_tail == 0 && candidate_full_tile_tail == 0,
+          "F16 RHS full-tile output tail canary");
+
+    /* Restore the boundary-specialized reference consumed by the SSD
+     * fallback comparison below. */
+    poison(reference_out_host, out_count, 0x7fc40000u);
+    CHECK(ds4_gpu_tensor_write(reference_out, 0, reference_out_host,
+                               out_count * sizeof(float)) != 0,
+          "F16 RHS boundary reference poison restore");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              reference_out, reference_low, NULL, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads,
+              F16_RHS_ROWS) == 1,
+          "F16 RHS boundary reference restore dispatch");
+    CHECK(ds4_gpu_tensor_read(reference_out, 0, reference_out_host,
+                              out_count * sizeof(float)) != 0,
+          "F16 RHS boundary reference restore read");
+
+    CHECK(setenv(k_require_f16_rhs, "1", 1) == 0,
+          "require F16 RHS candidate");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, f16_rhs, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads,
+              F16_RHS_ROWS) == 1,
+          "required F16 RHS candidate dispatch");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, f16_rhs, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads, 31u) == -1,
+          "required F16 RHS rejects N below one MM tile");
+    CHECK(setenv(k_disable_f16_rhs, "1", 1) == 0,
+          "disable required F16 RHS candidate");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, f16_rhs, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads,
+              F16_RHS_ROWS) == -1,
+          "F16 RHS disable wins over REQUIRE");
+    CHECK(unsetenv(k_disable_f16_rhs) == 0,
+          "clear F16 RHS disable env");
+    ds4_gpu_set_ssd_streaming(true);
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, f16_rhs, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads,
+              F16_RHS_ROWS) == -1,
+          "required F16 RHS rejects SSD streaming");
+    CHECK(unsetenv(k_require_f16_rhs) == 0,
+          "clear F16 RHS require env");
+
+    /* In ordinary SSD mode the wrapper must use output-B's established F32
+     * path, return success, and leave the F16 scratch completely untouched. */
+    for (uint64_t i = 0; i < f16_rhs_storage; i++) {
+        f16_rhs_host[i] =
+            (uint16_t)(0x7e00u | (uint16_t)(i & 0x1ffu));
+    }
+    poison(candidate_low_host, low_count, 0x7fc30000u);
+    poison(candidate_out_host, out_count, 0x7fc40000u);
+    CHECK(ds4_gpu_tensor_write(
+              f16_rhs_base, 0, f16_rhs_host,
+              f16_rhs_storage * sizeof(uint16_t)) != 0,
+          "SSD fallback scratch poison");
+    CHECK(ds4_gpu_tensor_write(candidate_low, 0, candidate_low_host,
+                               low_count * sizeof(float)) != 0,
+          "SSD fallback low poison");
+    CHECK(ds4_gpu_tensor_write(candidate_out, 0, candidate_out_host,
+                               out_count * sizeof(float)) != 0,
+          "SSD fallback out poison");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+              candidate_out, candidate_low, f16_rhs, NULL,
+              model, model_bytes, 0, out_b_offset, Q4_K_TYPE,
+              GROUP_DIM, RANK, N_GROUPS, OUT_DIM, heads,
+              F16_RHS_ROWS) == 1,
+          "SSD fallback F32 dispatch");
+    CHECK(ds4_gpu_tensor_read(candidate_low, 0, candidate_low_host,
+                              low_count * sizeof(float)) != 0,
+          "SSD fallback low read");
+    CHECK(ds4_gpu_tensor_read(candidate_out, 0, candidate_out_host,
+                              out_count * sizeof(float)) != 0,
+          "SSD fallback out read");
+    CHECK(ds4_gpu_tensor_read(
+              f16_rhs_base, 0, f16_rhs_host,
+              f16_rhs_storage * sizeof(uint16_t)) != 0,
+          "SSD fallback scratch read");
+    const uint64_t ssd_low_mismatch = count_bit_mismatches(
+        reference_low_host, candidate_low_host,
+        (uint64_t)F16_RHS_ROWS * LOW_DIM, &first_low);
+    const uint64_t ssd_out_mismatch = count_bit_mismatches(
+        reference_out_host, candidate_out_host,
+        (uint64_t)F16_RHS_ROWS * OUT_DIM, &first_out);
+    uint64_t ssd_scratch_mismatch = 0;
+    for (uint64_t i = 0; i < f16_rhs_storage; i++) {
+        const uint16_t expected =
+            (uint16_t)(0x7e00u | (uint16_t)(i & 0x1ffu));
+        if (f16_rhs_host[i] != expected) ssd_scratch_mismatch++;
+    }
+    fprintf(stderr,
+            "Metal Q4 attention output-B SSD fallback N=32 "
+            "low=%llu out=%llu scratch=%llu\n",
+            (unsigned long long)ssd_low_mismatch,
+            (unsigned long long)ssd_out_mismatch,
+            (unsigned long long)ssd_scratch_mismatch);
+    CHECK(ssd_low_mismatch == 0, "SSD fallback low bitwise mismatch");
+    CHECK(ssd_out_mismatch == 0, "SSD fallback output bitwise mismatch");
+    CHECK(ssd_scratch_mismatch == 0, "SSD fallback touched F16 scratch");
+    ds4_gpu_set_quality(false);
+    ds4_gpu_tensor_free(f16_rhs);
+    ds4_gpu_tensor_free(f16_rhs_base);
+    free(f16_rhs_host);
+
     CHECK(unsetenv(k_disable_scale_meta) == 0,
           "restore shared scale metadata");
     CHECK(unsetenv(k_require_scale_meta) == 0,
