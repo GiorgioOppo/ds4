@@ -188,6 +188,12 @@ void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
+/* Release resident Q4 attn_q_b F16 sidecars at a quiescent lifecycle point.
+ * Returns zero only when pending Metal work could not be synchronized safely. */
+int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void);
+uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void);
+/* Evict resident sidecars before adding a graph to a live-session set. */
+int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void);
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
@@ -257,6 +263,57 @@ int ds4_gpu_test_exact_rows_persistent_policy(
         int      size_class_ok);
 void ds4_gpu_test_exact_rows_persistent_report(
         ds4_gpu_exact_rows_persistent_report *report);
+typedef struct ds4_gpu_q4_attn_q_b_f16_cache_report {
+    uint64_t entries;
+    uint64_t bytes;
+    uint64_t lookups;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t builds;
+    uint64_t build_failures;
+    uint64_t candidate_calls;
+    uint64_t fallbacks;
+    uint64_t rejects;
+    uint64_t build_circuit_open;
+} ds4_gpu_q4_attn_q_b_f16_cache_report;
+/* Test observability for the resident Metal Q4_K attn_q_b F16 sidecar. */
+void ds4_gpu_test_q4_attn_q_b_f16_cache_report(
+        ds4_gpu_q4_attn_q_b_f16_cache_report *report);
+void ds4_gpu_test_q4_attn_q_b_f16_cache_reset(void);
+int ds4_gpu_test_q4_attn_q_b_f16_projection_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok);
+int ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+        uint64_t recommended,
+        uint64_t allocated,
+        uint64_t additional);
+
+typedef struct ds4_gpu_q4_attn_q_b_f16_sidecar_desc {
+    uint64_t weight_offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint32_t weight_type;
+    uint32_t layer;
+} ds4_gpu_q4_attn_q_b_f16_sidecar_desc;
+
+/* Prepare every missing resident Q4_K attn_q_b sidecar transactionally.
+ * Returns 1 when all descriptors are READY, 0 for a policy/safety skip, and
+ * -1 when strict mode requires a specialization that cannot be prepared. */
+int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *descs,
+        uint32_t count,
+        uint32_t max_prefill_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes);
 typedef struct ds4_gpu_stream_test_stats {
     uint64_t tensor_live_bytes;
     uint64_t transient_references;
@@ -1512,12 +1569,16 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_slow,
         float             eps);
 
+/* Returns 1 when the backend-specific fused projection was encoded, 0 when
+ * the caller should use its generic projection path, and -1 when a required
+ * specialization could not be honored. */
 int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *q_half,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
+        uint32_t              weight_type,
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,

@@ -509,6 +509,131 @@ static uint64_t g_model_wrap_max_bytes;
 static uint64_t g_model_buffer_cache_bytes;
 static uint64_t g_model_buffer_cache_evictions;
 static int g_model_buffer_cache_over_limit;
+#define DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES 80u
+typedef struct {
+    const void                 *model_map;
+    uint64_t                    model_size;
+    uint64_t                    weight_offset;
+    uint64_t                    weight_bytes;
+    uint64_t                    in_dim;
+    uint64_t                    out_dim;
+    uint64_t                    f16_bytes;
+    id<MTLBuffer> __strong      buffer;
+    int                         valid;
+} ds4_gpu_q4_attn_q_b_f16_cache_entry;
+static ds4_gpu_q4_attn_q_b_f16_cache_entry
+    g_q4_attn_q_b_f16_cache[DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES];
+static pthread_mutex_t g_q4_attn_q_b_f16_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_q4_attn_q_b_f16_build_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_q4_attn_q_b_f16_cache_bytes;
+static uint64_t g_q4_attn_q_b_f16_cache_lookups;
+static uint64_t g_q4_attn_q_b_f16_cache_hits;
+static uint64_t g_q4_attn_q_b_f16_cache_misses;
+static uint64_t g_q4_attn_q_b_f16_cache_builds;
+static uint64_t g_q4_attn_q_b_f16_cache_build_failures;
+static uint64_t g_q4_attn_q_b_f16_cache_candidate_calls;
+static uint64_t g_q4_attn_q_b_f16_cache_fallbacks;
+static uint64_t g_q4_attn_q_b_f16_cache_rejects;
+static uint32_t g_q4_attn_q_b_f16_cache_entries;
+static uint64_t g_q4_attn_q_b_f16_cache_generation = 1u;
+typedef enum {
+    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED = 0,
+    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD = 1,
+    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_PRESSURE = 2,
+} ds4_gpu_q4_attn_q_b_f16_circuit_state;
+static ds4_gpu_q4_attn_q_b_f16_circuit_state
+    g_q4_attn_q_b_f16_build_circuit_state;
+static int g_initialized;
+
+static void ds4_gpu_q4_attn_q_b_f16_cache_clear(int reset_stats) {
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_build_mu);
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    for (uint32_t i = 0;
+         i < DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES;
+         i++) {
+        ds4_gpu_q4_attn_q_b_f16_cache_entry *entry =
+            &g_q4_attn_q_b_f16_cache[i];
+        entry->buffer = nil;
+        entry->model_map = NULL;
+        entry->model_size = 0;
+        entry->weight_offset = 0;
+        entry->weight_bytes = 0;
+        entry->in_dim = 0;
+        entry->out_dim = 0;
+        entry->f16_bytes = 0;
+        entry->valid = 0;
+    }
+    g_q4_attn_q_b_f16_cache_bytes = 0;
+    g_q4_attn_q_b_f16_cache_entries = 0;
+    g_q4_attn_q_b_f16_cache_generation++;
+    if (g_q4_attn_q_b_f16_cache_generation == 0u) {
+        g_q4_attn_q_b_f16_cache_generation = 1u;
+    }
+    g_q4_attn_q_b_f16_build_circuit_state =
+        DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED;
+    if (reset_stats) {
+        g_q4_attn_q_b_f16_cache_lookups = 0;
+        g_q4_attn_q_b_f16_cache_hits = 0;
+        g_q4_attn_q_b_f16_cache_misses = 0;
+        g_q4_attn_q_b_f16_cache_builds = 0;
+        g_q4_attn_q_b_f16_cache_build_failures = 0;
+        g_q4_attn_q_b_f16_cache_candidate_calls = 0;
+        g_q4_attn_q_b_f16_cache_fallbacks = 0;
+        g_q4_attn_q_b_f16_cache_rejects = 0;
+    }
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_build_mu);
+}
+
+void ds4_gpu_test_q4_attn_q_b_f16_cache_report(
+        ds4_gpu_q4_attn_q_b_f16_cache_report *report) {
+    if (!report) return;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    *report = (ds4_gpu_q4_attn_q_b_f16_cache_report) {
+        .entries = g_q4_attn_q_b_f16_cache_entries,
+        .bytes = g_q4_attn_q_b_f16_cache_bytes,
+        .lookups = g_q4_attn_q_b_f16_cache_lookups,
+        .hits = g_q4_attn_q_b_f16_cache_hits,
+        .misses = g_q4_attn_q_b_f16_cache_misses,
+        .builds = g_q4_attn_q_b_f16_cache_builds,
+        .build_failures = g_q4_attn_q_b_f16_cache_build_failures,
+        .candidate_calls = g_q4_attn_q_b_f16_cache_candidate_calls,
+        .fallbacks = g_q4_attn_q_b_f16_cache_fallbacks,
+        .rejects = g_q4_attn_q_b_f16_cache_rejects,
+        .build_circuit_open = (uint64_t)(
+            g_q4_attn_q_b_f16_build_circuit_state !=
+            DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED),
+    };
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+}
+
+void ds4_gpu_test_q4_attn_q_b_f16_cache_reset(void) {
+    if (g_initialized) (void)ds4_gpu_synchronize();
+    ds4_gpu_q4_attn_q_b_f16_cache_clear(1);
+}
+
+uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void) {
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    const uint64_t generation = g_q4_attn_q_b_f16_cache_generation;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return generation;
+}
+
+int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void) {
+    int has_entries = 0;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    has_entries = g_q4_attn_q_b_f16_cache_entries != 0u;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+
+    /* Callers use this only at session/mode lifecycle boundaries.  Finish
+     * every command that may still reference an unretained Metal buffer
+     * before dropping the cache's final strong references.  Always clear,
+     * even with zero entries: a rejected build may have left the circuit
+     * breaker open and must not poison the next resident session. */
+    if (has_entries && g_initialized && !ds4_gpu_synchronize()) return 0;
+    ds4_gpu_q4_attn_q_b_f16_cache_clear(0);
+    return 1;
+}
 static uint64_t g_stream_expert_cache_bytes;
 static uint64_t g_stream_expert_cache_expert_bytes;
 static uint64_t g_stream_expert_cache_gate_class_bytes;
@@ -685,7 +810,6 @@ static uint32_t g_glm_flash_attn_mask_pos0;
 static uint32_t g_glm_flash_attn_mask_tokens;
 static uint32_t g_glm_flash_attn_mask_cache_len;
 static int g_glm_flash_attn_mask_valid;
-static int g_initialized;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
 #define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
@@ -4508,6 +4632,10 @@ void ds4_gpu_print_memory_report(const char *label) {
     const uint64_t tensor_live_snap = g_tensor_alloc_live_bytes;
     const uint64_t tensor_peak_snap = g_tensor_alloc_peak_bytes;
     pthread_mutex_unlock(&g_tensor_mu);
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    const uint64_t q4_q_b_f16_cache_snap =
+        g_q4_attn_q_b_f16_cache_bytes;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
 
     uint64_t tracked_live = tensor_live_snap;
     if (tracked_live > UINT64_MAX - g_stream_expert_cache_bytes) {
@@ -4515,18 +4643,25 @@ void ds4_gpu_print_memory_report(const char *label) {
     } else {
         tracked_live += g_stream_expert_cache_bytes;
     }
+    if (tracked_live > UINT64_MAX - q4_q_b_f16_cache_snap) {
+        tracked_live = UINT64_MAX;
+    } else {
+        tracked_live += q4_q_b_f16_cache_snap;
+    }
 
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
     const char *bright_green = color ? "\x1b[1;32m" : "";
     const char *reset = color ? "\x1b[0m" : "";
     fprintf(stderr,
-            "%sds4: Metal memory%s%s: runtime %.2f GiB + streaming experts %.2f GiB = %s%.2f GiB tracked live%s\n",
+            "%sds4: Metal memory%s%s: runtime %.2f GiB + streaming experts %.2f GiB "
+            "+ Q4 attn_q_b F16 %.2f GiB = %s%.2f GiB tracked live%s\n",
             green,
             label && label[0] ? " " : "",
             label && label[0] ? label : "",
             ds4_gpu_gib(tensor_live_snap),
             ds4_gpu_gib(g_stream_expert_cache_bytes),
+            ds4_gpu_gib(q4_q_b_f16_cache_snap),
             bright_green,
             ds4_gpu_gib(tracked_live),
             reset);
@@ -4814,6 +4949,12 @@ void ds4_gpu_set_glm_model(bool enabled) {
 
 void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
+    if (g_ssd_streaming_mode &&
+        !ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
+        fprintf(stderr,
+                "ds4: WARNING: could not release resident Q4 attn_q_b "
+                "F16 sidecars while enabling SSD streaming\n");
+    }
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
         fprintf(stderr,
@@ -11308,6 +11449,28 @@ void ds4_gpu_cleanup(void) {
         }
         g_selected_readback_event = nil;
         g_selected_readback_event_value = 0;
+        if (getenv("DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_PROFILE") != NULL &&
+            (g_q4_attn_q_b_f16_cache_candidate_calls != 0 ||
+             g_q4_attn_q_b_f16_cache_builds != 0 ||
+             g_q4_attn_q_b_f16_cache_build_failures != 0 ||
+             g_q4_attn_q_b_f16_build_circuit_state !=
+                 DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED)) {
+            fprintf(stderr,
+                    "ds4: Metal Q4 attn_q_b F16 cache entries=%u bytes=%.2f GiB "
+                    "calls=%llu hits=%llu misses=%llu builds=%llu failures=%llu "
+                    "fallbacks=%llu rejects=%llu circuit_state=%d\n",
+                    g_q4_attn_q_b_f16_cache_entries,
+                    ds4_gpu_gib(g_q4_attn_q_b_f16_cache_bytes),
+                    (unsigned long long)g_q4_attn_q_b_f16_cache_candidate_calls,
+                    (unsigned long long)g_q4_attn_q_b_f16_cache_hits,
+                    (unsigned long long)g_q4_attn_q_b_f16_cache_misses,
+                    (unsigned long long)g_q4_attn_q_b_f16_cache_builds,
+                    (unsigned long long)g_q4_attn_q_b_f16_cache_build_failures,
+                    (unsigned long long)g_q4_attn_q_b_f16_cache_fallbacks,
+                    (unsigned long long)g_q4_attn_q_b_f16_cache_rejects,
+                    (int)g_q4_attn_q_b_f16_build_circuit_state);
+        }
+        ds4_gpu_q4_attn_q_b_f16_cache_clear(1);
         ds4_gpu_stream_expert_pread_pool_shutdown();
         ds4_gpu_stream_expert_cache_clear_all(1);
         ds4_gpu_stream_expert_cache_live_release();
@@ -24959,12 +25122,915 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
     return 1;
 }
 
+static int ds4_gpu_q4_attn_q_b_f16_cache_key_equal(
+        const ds4_gpu_q4_attn_q_b_f16_cache_entry *entry,
+        const void                                  *model_map,
+        uint64_t                                     model_size,
+        uint64_t                                     weight_offset,
+        uint64_t                                     weight_bytes,
+        uint64_t                                     in_dim,
+        uint64_t                                     out_dim) {
+    return entry->valid &&
+           entry->model_map == model_map &&
+           entry->model_size == model_size &&
+           entry->weight_offset == weight_offset &&
+           entry->weight_bytes == weight_bytes &&
+           entry->in_dim == in_dim &&
+           entry->out_dim == out_dim;
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_cache_lookup_impl(
+        const void                   *model_map,
+        uint64_t                      model_size,
+        uint64_t                      weight_offset,
+        uint64_t                      weight_bytes,
+        uint64_t                      in_dim,
+        uint64_t                      out_dim,
+        id<MTLBuffer> __strong       *buffer,
+        int                            count_stats) {
+    int found = 0;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    if (count_stats) g_q4_attn_q_b_f16_cache_lookups++;
+    for (uint32_t i = 0;
+         i < DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES;
+         i++) {
+        ds4_gpu_q4_attn_q_b_f16_cache_entry *entry =
+            &g_q4_attn_q_b_f16_cache[i];
+        if (!ds4_gpu_q4_attn_q_b_f16_cache_key_equal(
+                entry, model_map, model_size, weight_offset, weight_bytes,
+                in_dim, out_dim)) {
+            continue;
+        }
+        *buffer = entry->buffer;
+        if (count_stats) g_q4_attn_q_b_f16_cache_hits++;
+        found = 1;
+        break;
+    }
+    if (count_stats && !found) g_q4_attn_q_b_f16_cache_misses++;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return found;
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_cache_lookup(
+        const void                   *model_map,
+        uint64_t                      model_size,
+        uint64_t                      weight_offset,
+        uint64_t                      weight_bytes,
+        uint64_t                      in_dim,
+        uint64_t                      out_dim,
+        id<MTLBuffer> __strong       *buffer) {
+    return ds4_gpu_q4_attn_q_b_f16_cache_lookup_impl(
+        model_map, model_size, weight_offset, weight_bytes, in_dim,
+        out_dim, buffer, 1);
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_cache_peek(
+        const void                   *model_map,
+        uint64_t                      model_size,
+        uint64_t                      weight_offset,
+        uint64_t                      weight_bytes,
+        uint64_t                      in_dim,
+        uint64_t                      out_dim,
+        id<MTLBuffer> __strong       *buffer) {
+    return ds4_gpu_q4_attn_q_b_f16_cache_lookup_impl(
+        model_map, model_size, weight_offset, weight_bytes, in_dim,
+        out_dim, buffer, 0);
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_cache_insert(
+        const void          *model_map,
+        uint64_t             model_size,
+        uint64_t             weight_offset,
+        uint64_t             weight_bytes,
+        uint64_t             in_dim,
+        uint64_t             out_dim,
+        uint64_t             f16_bytes,
+        uint64_t             budget_bytes,
+        id<MTLBuffer>        buffer) {
+    int inserted = 0;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+
+    /* Normal graph encoding is serialized.  Recheck nevertheless so an
+     * unusual concurrent caller cannot publish a duplicate key. */
+    for (uint32_t i = 0;
+         i < DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES;
+         i++) {
+        if (ds4_gpu_q4_attn_q_b_f16_cache_key_equal(
+                &g_q4_attn_q_b_f16_cache[i], model_map, model_size,
+                weight_offset, weight_bytes, in_dim, out_dim)) {
+            pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+            return -1;
+        }
+    }
+
+    if (f16_bytes <= budget_bytes &&
+        g_q4_attn_q_b_f16_cache_bytes <= budget_bytes - f16_bytes) {
+        for (uint32_t i = 0;
+             i < DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES;
+             i++) {
+            ds4_gpu_q4_attn_q_b_f16_cache_entry *entry =
+                &g_q4_attn_q_b_f16_cache[i];
+            if (entry->valid) continue;
+            entry->model_map = model_map;
+            entry->model_size = model_size;
+            entry->weight_offset = weight_offset;
+            entry->weight_bytes = weight_bytes;
+            entry->in_dim = in_dim;
+            entry->out_dim = out_dim;
+            entry->f16_bytes = f16_bytes;
+            entry->buffer = buffer;
+            entry->valid = 1;
+            const int first_entry =
+                g_q4_attn_q_b_f16_cache_entries == 0u;
+            g_q4_attn_q_b_f16_cache_bytes += f16_bytes;
+            g_q4_attn_q_b_f16_cache_entries++;
+            g_q4_attn_q_b_f16_cache_builds++;
+            inserted = first_entry ? 2 : 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return inserted;
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_cache_insert_batch(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *descs,
+        const uint32_t *miss_indices,
+        id<MTLBuffer> __strong *buffers,
+        uint32_t miss_count,
+        uint64_t budget_bytes) {
+    uint32_t free_slots[DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES];
+    uint64_t new_bytes = 0;
+    uint32_t free_count = 0;
+    int inserted = 0;
+
+    if (!descs || !miss_indices || !buffers || miss_count == 0u ||
+        miss_count > DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    for (uint32_t i = 0;
+         i < DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES;
+         i++) {
+        if (!g_q4_attn_q_b_f16_cache[i].valid) {
+            free_slots[free_count++] = i;
+        }
+    }
+
+    for (uint32_t mi = 0; mi < miss_count; mi++) {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc =
+            &descs[miss_indices[mi]];
+        const uint64_t f16_bytes =
+            desc->in_dim * desc->out_dim * sizeof(uint16_t);
+        if (!buffers[mi] || UINT64_MAX - new_bytes < f16_bytes) {
+            goto done;
+        }
+        new_bytes += f16_bytes;
+
+        for (uint32_t i = 0;
+             i < DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES;
+             i++) {
+            if (ds4_gpu_q4_attn_q_b_f16_cache_key_equal(
+                    &g_q4_attn_q_b_f16_cache[i], model_map, model_size,
+                    desc->weight_offset, desc->weight_bytes,
+                    desc->in_dim, desc->out_dim)) {
+                goto done;
+            }
+        }
+        for (uint32_t mj = 0; mj < mi; mj++) {
+            const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *prior =
+                &descs[miss_indices[mj]];
+            if (prior->weight_offset == desc->weight_offset &&
+                prior->weight_bytes == desc->weight_bytes &&
+                prior->in_dim == desc->in_dim &&
+                prior->out_dim == desc->out_dim) {
+                goto done;
+            }
+        }
+    }
+
+    if (free_count < miss_count || new_bytes > budget_bytes ||
+        g_q4_attn_q_b_f16_cache_bytes > budget_bytes - new_bytes) {
+        goto done;
+    }
+
+    const int first_entry = g_q4_attn_q_b_f16_cache_entries == 0u;
+    for (uint32_t mi = 0; mi < miss_count; mi++) {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc =
+            &descs[miss_indices[mi]];
+        ds4_gpu_q4_attn_q_b_f16_cache_entry *entry =
+            &g_q4_attn_q_b_f16_cache[free_slots[mi]];
+        entry->model_map = model_map;
+        entry->model_size = model_size;
+        entry->weight_offset = desc->weight_offset;
+        entry->weight_bytes = desc->weight_bytes;
+        entry->in_dim = desc->in_dim;
+        entry->out_dim = desc->out_dim;
+        entry->f16_bytes =
+            desc->in_dim * desc->out_dim * sizeof(uint16_t);
+        entry->buffer = buffers[mi];
+        entry->valid = 1;
+    }
+    g_q4_attn_q_b_f16_cache_bytes += new_bytes;
+    g_q4_attn_q_b_f16_cache_entries += miss_count;
+    g_q4_attn_q_b_f16_cache_builds += miss_count;
+    inserted = first_entry ? 2 : 1;
+
+done:
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return inserted;
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_cache_has_room(
+        uint64_t f16_bytes,
+        uint64_t budget_bytes) {
+    int has_room = 0;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    has_room =
+        g_q4_attn_q_b_f16_cache_entries <
+            DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES &&
+        f16_bytes <= budget_bytes &&
+        g_q4_attn_q_b_f16_cache_bytes <= budget_bytes - f16_bytes;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return has_room;
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_cache_has_room_batch(
+        uint32_t new_entries,
+        uint64_t new_bytes,
+        uint64_t budget_bytes) {
+    int has_room = 0;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    has_room =
+        new_entries <=
+            DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES -
+                g_q4_attn_q_b_f16_cache_entries &&
+        new_bytes <= budget_bytes &&
+        g_q4_attn_q_b_f16_cache_bytes <= budget_bytes - new_bytes;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return has_room;
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_builds_suppressed(void) {
+    int suppressed = 0;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    suppressed =
+        g_q4_attn_q_b_f16_build_circuit_state !=
+        DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return suppressed;
+}
+
+static void ds4_gpu_q4_attn_q_b_f16_suppress_builds(
+        ds4_gpu_q4_attn_q_b_f16_circuit_state state) {
+    if (state == DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED) return;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    if (state == DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD ||
+        g_q4_attn_q_b_f16_build_circuit_state ==
+            DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED) {
+        g_q4_attn_q_b_f16_build_circuit_state = state;
+    }
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+}
+
+/* A working-set rejection describes the allocations present at one instant,
+ * unlike a cache-budget or build failure.  A later session can have a smaller
+ * graph or follow cleanup of a failed strict session, so let its explicit
+ * prewarm re-evaluate pressure.  Lazy per-layer misses stay suppressed to
+ * avoid retry storms.  Called only while the cold-build mutex is held. */
+static int ds4_gpu_q4_attn_q_b_f16_prewarm_hard_suppressed(void) {
+    int hard = 0;
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    hard = g_q4_attn_q_b_f16_build_circuit_state ==
+        DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD;
+    if (g_q4_attn_q_b_f16_build_circuit_state ==
+        DS4_Q4_ATTN_Q_B_F16_CIRCUIT_PRESSURE) {
+        g_q4_attn_q_b_f16_build_circuit_state =
+            DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED;
+    }
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return hard;
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_working_set_policy(
+        uint64_t recommended,
+        uint64_t allocated,
+        uint64_t additional_bytes) {
+    if (recommended == 0u) return 0;
+
+    const uint64_t reserve = recommended / 8u;
+    const uint64_t limit = recommended - reserve;
+    return allocated <= limit && additional_bytes <= limit - allocated;
+}
+
+int ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+        uint64_t recommended,
+        uint64_t allocated,
+        uint64_t additional) {
+    return ds4_gpu_q4_attn_q_b_f16_working_set_policy(
+        recommended, allocated, additional);
+}
+
+/* Keep one eighth of Metal's recommended working set free for graph
+ * activations, KV growth, command-buffer transients, and the OS.  Metal
+ * accounts both mmap-backed no-copy model buffers and private sidecars in
+ * currentAllocatedSize, so this conservative gate covers the combined Metal
+ * resource footprint rather than just the logical sidecar budget. */
+static int ds4_gpu_q4_attn_q_b_f16_working_set_has_room(
+        uint64_t additional_bytes) {
+    if (!g_device || additional_bytes > NSUIntegerMax) return 0;
+    return ds4_gpu_q4_attn_q_b_f16_working_set_policy(
+        (uint64_t)[g_device recommendedMaxWorkingSetSize],
+        (uint64_t)[g_device currentAllocatedSize],
+        additional_bytes);
+}
+
+int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void) {
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    const uint32_t entries = g_q4_attn_q_b_f16_cache_entries;
+    const uint64_t bytes = g_q4_attn_q_b_f16_cache_bytes;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    if (entries == 0u) return 1;
+
+    fprintf(stderr,
+            "ds4: evicting %.2f GiB of resident Q4 attn_q_b F16 "
+            "sidecars before allocating another live session\n",
+            ds4_gpu_gib(bytes));
+    return ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_fallback(int required,
+                                              int rejected,
+                                              int build_failure) {
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    g_q4_attn_q_b_f16_cache_fallbacks++;
+    if (rejected) g_q4_attn_q_b_f16_cache_rejects++;
+    if (build_failure) g_q4_attn_q_b_f16_cache_build_failures++;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return required ? -1 : 0;
+}
+
+/* Called only while the cold-build mutex is held.  Existing READY entries
+ * remain usable; only future misses are suppressed.  Hard failures persist
+ * until cache reset, while transient working-set pressure may be re-evaluated
+ * by the next explicit session prewarm. */
+static int ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+        int required,
+        int rejected,
+        int build_failure,
+        ds4_gpu_q4_attn_q_b_f16_circuit_state circuit_state) {
+    ds4_gpu_q4_attn_q_b_f16_suppress_builds(circuit_state);
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_build_mu);
+    return ds4_gpu_q4_attn_q_b_f16_fallback(
+        required, rejected, build_failure);
+}
+
+static int ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+        int required,
+        int rejected,
+        int build_failure,
+        ds4_gpu_q4_attn_q_b_f16_circuit_state circuit_state) {
+    ds4_gpu_q4_attn_q_b_f16_suppress_builds(circuit_state);
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_build_mu);
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    if (rejected) g_q4_attn_q_b_f16_cache_rejects++;
+    if (build_failure) g_q4_attn_q_b_f16_cache_build_failures++;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+    return required ? -1 : 0;
+}
+
+int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *descs,
+        uint32_t count,
+        uint32_t max_prefill_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes) {
+    if (prepared_bytes) *prepared_bytes = 0;
+    if (!model_map || !descs || count == 0u ||
+        count > DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES ||
+        max_prefill_rows < 32u) {
+        return 0;
+    }
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    const int required =
+        ds4_gpu_env_bool("DS4_METAL_REQUIRE_Q4_ATTN_Q_B_F16_CACHE") == 1;
+    const int disabled =
+        ds4_gpu_env_bool("DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_CACHE") == 1;
+    const uint64_t min_tokens = ds4_gpu_env_u64(
+        "DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MIN_TOKENS", 512u, 32u,
+        UINT32_MAX);
+
+    /* A session whose largest possible chunk is below the configured
+     * threshold can never be a cache candidate, even in strict mode. */
+    if (max_prefill_rows < min_tokens) return 0;
+    if (disabled || g_ssd_streaming_mode || g_quality_mode ||
+        !ds4_gpu_device_is_pre_m5_apple_silicon() ||
+        ds4_gpu_mpp_available()) {
+        return required ? -1 : 0;
+    }
+
+    uint64_t total_f16_bytes = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc = &descs[i];
+        if (desc->weight_type != DS4_METAL_TENSOR_Q4_K ||
+            desc->in_dim != 1024u || desc->out_dim != 32768u ||
+            desc->in_dim > UINT64_MAX / desc->out_dim /
+                sizeof(uint16_t)) {
+            return required ? -1 : 0;
+        }
+        const uint64_t blocks_per_row = desc->in_dim / 256u;
+        const uint64_t expected_weight_bytes =
+            desc->out_dim * blocks_per_row * 144u;
+        const uint64_t f16_bytes =
+            desc->in_dim * desc->out_dim * sizeof(uint16_t);
+        if (desc->weight_bytes != expected_weight_bytes ||
+            desc->weight_offset > model_size ||
+            desc->weight_bytes > model_size - desc->weight_offset ||
+            UINT64_MAX - total_f16_bytes < f16_bytes) {
+            return required ? -1 : 0;
+        }
+        total_f16_bytes += f16_bytes;
+    }
+
+    const uint64_t budget_mib = ds4_gpu_env_u64(
+        "DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MB", 3072u, 1u, 65536u);
+    const uint64_t budget_bytes = budget_mib * 1024u * 1024u;
+    const double build_t0 = ds4_gpu_now_ms();
+
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_build_mu);
+
+    uint32_t miss_indices[DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES];
+    uint32_t miss_count = 0;
+    uint64_t missing_bytes = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        id<MTLBuffer> hit_buffer = nil;
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc = &descs[i];
+        if (ds4_gpu_q4_attn_q_b_f16_cache_peek(
+                model_map, model_size, desc->weight_offset,
+                desc->weight_bytes, desc->in_dim, desc->out_dim,
+                &hit_buffer)) {
+            continue;
+        }
+        miss_indices[miss_count++] = i;
+        missing_bytes +=
+            desc->in_dim * desc->out_dim * sizeof(uint16_t);
+    }
+    if (miss_count == 0u) {
+        pthread_mutex_unlock(&g_q4_attn_q_b_f16_build_mu);
+        return 1;
+    }
+
+    if (ds4_gpu_q4_attn_q_b_f16_prewarm_hard_suppressed()) {
+        return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+            required, 1, 0, DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED);
+    }
+    if (!ds4_gpu_q4_attn_q_b_f16_cache_has_room_batch(
+            miss_count, missing_bytes, budget_bytes)) {
+        fprintf(stderr,
+                "ds4: Metal Q4 attn_q_b F16 prewarm skipped: "
+                "%u missing sidecars need %.2f GiB, cache budget is "
+                "%llu MiB\n",
+                miss_count,
+                (double)missing_bytes / 1073741824.0,
+                (unsigned long long)budget_mib);
+        return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+            required, 1, 0, DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+    }
+    if (UINT64_MAX - missing_bytes < working_set_reserve_bytes ||
+        !ds4_gpu_q4_attn_q_b_f16_working_set_has_room(
+            missing_bytes + working_set_reserve_bytes)) {
+        const uint64_t allocated =
+            (uint64_t)[g_device currentAllocatedSize];
+        const uint64_t recommended =
+            (uint64_t)[g_device recommendedMaxWorkingSetSize];
+        fprintf(stderr,
+                "ds4: Metal Q4 attn_q_b F16 prewarm skipped for "
+                "working-set headroom: allocated %.2f GiB + sidecars "
+                "%.2f GiB + future sessions %.2f GiB, 7/8 safety "
+                "limit %.2f GiB\n",
+                (double)allocated / 1073741824.0,
+                (double)missing_bytes / 1073741824.0,
+                (double)working_set_reserve_bytes / 1073741824.0,
+                (double)(recommended - recommended / 8u) /
+                    1073741824.0);
+        return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+            required, 1, 0, DS4_Q4_ATTN_Q_B_F16_CIRCUIT_PRESSURE);
+    }
+
+    id<MTLComputePipelineState> dequant_pipeline =
+        ds4_gpu_get_pipeline("kernel_dequantize_q4_K_f16");
+    /* Resolve both consumers before publishing any READY entry.  Exact
+     * multiples of 32 and boundary batches use distinct function-constant
+     * specializations; compiling them here keeps first-prefill PSO cost out
+     * of the measured path and makes REQUIRE genuinely fail at preparation. */
+    id<MTLComputePipelineState> mm_aligned_pipeline =
+        ds4_gpu_get_mul_mm_pipeline(
+            "kernel_mul_mm_f16_f32", false, false);
+    id<MTLComputePipelineState> mm_boundary_pipeline =
+        ds4_gpu_get_mul_mm_pipeline(
+            "kernel_mul_mm_f16_f32", false, true);
+    id<MTLCommandBuffer> build_cb =
+        [ds4_gpu_active_queue() commandBuffer];
+    if (!dequant_pipeline || !mm_aligned_pipeline ||
+        !mm_boundary_pipeline || !build_cb) {
+        return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+            required, 0, 1, DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+    }
+    build_cb.label = @"ds4 Q4 attn_q_b F16 sidecar prewarm";
+
+    __strong id<MTLBuffer>
+        sidecars[DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES] = {nil};
+    __strong id<MTLBuffer>
+        weights[DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES] = {nil};
+    uint64_t weight_inner[DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MAX_ENTRIES] = {0};
+
+    for (uint32_t mi = 0; mi < miss_count; mi++) {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc =
+            &descs[miss_indices[mi]];
+        const uint64_t f16_bytes =
+            desc->in_dim * desc->out_dim * sizeof(uint16_t);
+        weights[mi] = ds4_gpu_wrap_model_range(
+            model_map, model_size, desc->weight_offset,
+            desc->weight_bytes, &weight_inner[mi]);
+        sidecars[mi] = [g_device
+            newBufferWithLength:(NSUInteger)f16_bytes
+                        options:MTLResourceStorageModePrivate];
+        if (!weights[mi] || !sidecars[mi]) {
+            return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+                required, 0, 1, DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+        }
+        sidecars[mi].label = [NSString stringWithFormat:
+            @"ds4_attn_q_b_q4_f16_cache_layer_%u", desc->layer];
+    }
+
+    id<MTLComputeCommandEncoder> enc = [build_cb computeCommandEncoder];
+    if (!enc) {
+        return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+            required, 0, 1, DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+    }
+    [enc setComputePipelineState:dequant_pipeline];
+    for (uint32_t mi = 0; mi < miss_count; mi++) {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc =
+            &descs[miss_indices[mi]];
+        const uint32_t chunks_per_row = (uint32_t)(desc->in_dim / 16u);
+        const uint32_t row_count = (uint32_t)desc->out_dim;
+        [enc setBuffer:weights[mi]
+                offset:(NSUInteger)weight_inner[mi]
+               atIndex:0];
+        [enc setBuffer:sidecars[mi] offset:0 atIndex:1];
+        [enc setBytes:&chunks_per_row
+               length:sizeof(chunks_per_row)
+              atIndex:2];
+        [enc setBytes:&row_count length:sizeof(row_count) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                ((NSUInteger)chunks_per_row + 63u) / 64u,
+                (NSUInteger)row_count,
+                1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    }
+    [enc endEncoding];
+    [build_cb commit];
+    if (!ds4_gpu_wait_command_buffer(
+            build_cb, "Q4 attn_q_b F16 sidecar prewarm")) {
+        return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+            required, 0, 1, DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+    }
+
+    const int insert_rc = ds4_gpu_q4_attn_q_b_f16_cache_insert_batch(
+        model_map, model_size, descs, miss_indices, sidecars,
+        miss_count, budget_bytes);
+    if (insert_rc <= 0) {
+        return ds4_gpu_q4_attn_q_b_f16_abort_prewarm(
+            required, insert_rc == 0, insert_rc < 0,
+            DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+    }
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_build_mu);
+
+    if (prepared_bytes) *prepared_bytes = missing_bytes;
+    fprintf(stderr,
+            "ds4: Metal prewarmed %u resident Q4 attn_q_b F16 "
+            "sidecars (%.2f GiB) in %.3f ms; cache budget %llu MiB\n",
+            miss_count,
+            (double)missing_bytes / 1073741824.0,
+            ds4_gpu_now_ms() - build_t0,
+            (unsigned long long)budget_mib);
+    return 1;
+}
+
+static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor_impl(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *q_half,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_ctx_orig,
+        bool                  inverse,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 eps,
+        int                   apply_norm_rope) {
+    (void)q_half;
+    if (weight_type != DS4_METAL_TENSOR_Q4_K) return 0;
+    /* This path is prefill-only.  Keep decode and tiny batches off the
+     * environment parser, cache mutex, and pipeline lookup entirely. */
+    if (n_tok < 32u) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    const int required =
+        ds4_gpu_env_bool("DS4_METAL_REQUIRE_Q4_ATTN_Q_B_F16_CACHE") == 1;
+    const int disabled =
+        ds4_gpu_env_bool("DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_CACHE") == 1;
+    const uint64_t min_tokens = ds4_gpu_env_u64(
+        "DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MIN_TOKENS", 512u, 32u,
+        UINT32_MAX);
+
+    /* REQUIRE applies only to actual cache candidates.  In particular, a
+     * short final prefill chunk below the configured threshold must retain
+     * the native Q4 fallback just like decode and tiny batches. */
+    if ((uint64_t)n_tok < min_tokens) return 0;
+
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    g_q4_attn_q_b_f16_cache_candidate_calls++;
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+
+    /* The initial production arm targets DeepSeek-V4 Flash q_b exactly.
+     * Larger variants need more than 10 GiB of sidecar storage and require a
+     * separate memory/performance admission study. */
+    if (disabled || g_ssd_streaming_mode || g_quality_mode ||
+        !ds4_gpu_device_is_pre_m5_apple_silicon() ||
+        ds4_gpu_mpp_available() ||
+        in_dim != 1024u || out_dim != 32768u ||
+        n_head == 0u || head_dim == 0u ||
+        out_dim != (uint64_t)n_head * head_dim ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        n_tok > (uint32_t)INT32_MAX ||
+        pos0 > (uint32_t)INT32_MAX - n_tok) {
+        return ds4_gpu_q4_attn_q_b_f16_fallback(required, 1, 0);
+    }
+
+    if (!out || !x || !model_map ||
+        n_tok > UINT64_MAX / in_dim / sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim / sizeof(float) ||
+        ds4_gpu_tensor_bytes(x) <
+            (uint64_t)n_tok * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) <
+            (uint64_t)n_tok * out_dim * sizeof(float)) {
+        return ds4_gpu_q4_attn_q_b_f16_fallback(required, 1, 0);
+    }
+
+    const uint64_t blocks_per_row = in_dim / 256u;
+    const uint64_t row_bytes = blocks_per_row * 144u;
+    if (out_dim > UINT64_MAX / row_bytes) {
+        return ds4_gpu_q4_attn_q_b_f16_fallback(required, 1, 0);
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        out_dim > UINT64_MAX / in_dim / sizeof(uint16_t)) {
+        return ds4_gpu_q4_attn_q_b_f16_fallback(required, 1, 0);
+    }
+    const uint64_t f16_bytes = out_dim * in_dim * sizeof(uint16_t);
+    const uint64_t budget_mib = ds4_gpu_env_u64(
+        "DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MB", 3072u, 1u, 65536u);
+    const uint64_t budget_bytes = budget_mib * 1024u * 1024u;
+
+    @autoreleasepool {
+        id<MTLBuffer> f16_buffer = nil;
+        int hit = ds4_gpu_q4_attn_q_b_f16_cache_lookup(
+            model_map, model_size, weight_offset, weight_bytes, in_dim,
+            out_dim, &f16_buffer);
+
+        /* Resolve every resource used by the hot matmul before starting a
+         * cold build.  A failure can then take the native-Q4 fallback without
+         * abandoning an owned command buffer or publishing partial state. */
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const bool mm_bc_out = (n_tok & 31u) != 0u;
+        id<MTLComputePipelineState> mm_pipeline =
+            ds4_gpu_get_mul_mm_pipeline(
+                "kernel_mul_mm_f16_f32", false, mm_bc_out);
+        if (!xbuf || !outbuf || !mm_pipeline) {
+            return ds4_gpu_q4_attn_q_b_f16_fallback(required, 0, 1);
+        }
+
+        int build_lock_held = 0;
+        if (!hit) {
+            /* Serialize cold builders.  Recheck after taking the lock so
+             * another stream's completed build becomes a hit instead of a
+            * duplicate 64 MiB allocation and dequant dispatch. */
+            pthread_mutex_lock(&g_q4_attn_q_b_f16_build_mu);
+            build_lock_held = 1;
+            f16_buffer = nil;
+            hit = ds4_gpu_q4_attn_q_b_f16_cache_peek(
+                model_map, model_size, weight_offset, weight_bytes, in_dim,
+                out_dim, &f16_buffer);
+        }
+
+        if (!hit) {
+            if (ds4_gpu_q4_attn_q_b_f16_builds_suppressed()) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 1, 0,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED);
+            }
+            if (!ds4_gpu_q4_attn_q_b_f16_cache_has_room(
+                    f16_bytes, budget_bytes)) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 1, 0,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+            if (!ds4_gpu_q4_attn_q_b_f16_working_set_has_room(
+                    f16_bytes)) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 1, 0,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_PRESSURE);
+            }
+
+            id<MTLComputePipelineState> dequant_pipeline =
+                ds4_gpu_get_pipeline("kernel_dequantize_q4_K_f16");
+            if (!dequant_pipeline) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 0, 1,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+
+            uint64_t weight_inner = 0;
+            id<MTLBuffer> weight_buffer = ds4_gpu_wrap_model_range(
+                model_map, model_size, weight_offset, weight_bytes,
+                &weight_inner);
+            if (!weight_buffer || f16_bytes > NSUIntegerMax) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 0, 1,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+
+            f16_buffer = [g_device
+                newBufferWithLength:(NSUInteger)f16_bytes
+                            options:MTLResourceStorageModePrivate];
+            if (!f16_buffer) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 0, 1,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+            f16_buffer.label = @"ds4_attn_q_b_q4_f16_cache";
+
+            /* The sidecar build is deliberately isolated from g_batch_cb.
+             * It has no activation dependency, and a retained command buffer
+             * lets us verify completion before making the entry visible to
+             * any stream.  Cache entries are therefore READY by definition. */
+            id<MTLCommandBuffer> build_cb =
+                [ds4_gpu_active_queue() commandBuffer];
+            if (!build_cb) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 0, 1,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+            build_cb.label = @"ds4 Q4 attn_q_b F16 sidecar build";
+
+            const uint32_t chunks_per_row = (uint32_t)(in_dim / 16u);
+            const uint32_t row_count = (uint32_t)out_dim;
+            id<MTLComputeCommandEncoder> enc =
+                [build_cb computeCommandEncoder];
+            if (!enc) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 0, 1,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+            [enc setComputePipelineState:dequant_pipeline];
+            [enc setBuffer:weight_buffer
+                    offset:(NSUInteger)weight_inner
+                   atIndex:0];
+            [enc setBuffer:f16_buffer offset:0 atIndex:1];
+            [enc setBytes:&chunks_per_row
+                   length:sizeof(chunks_per_row)
+                  atIndex:2];
+            [enc setBytes:&row_count length:sizeof(row_count) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(
+                    ((NSUInteger)chunks_per_row + 63u) / 64u,
+                    (NSUInteger)row_count,
+                    1)
+                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+            [build_cb commit];
+            if (!ds4_gpu_wait_command_buffer(
+                    build_cb, "Q4 attn_q_b F16 sidecar build")) {
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 0, 1,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+
+            const int insert_rc = ds4_gpu_q4_attn_q_b_f16_cache_insert(
+                    model_map, model_size, weight_offset, weight_bytes,
+                    in_dim, out_dim, f16_bytes, budget_bytes, f16_buffer);
+            if (insert_rc == 0) {
+                /* Another key may have consumed the last budget slot while
+                 * this build was in flight.  Nothing has touched out yet, so
+                 * the native Q4 path remains a clean fallback. */
+                return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                    required, 1, 0,
+                    DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+            }
+
+            if (insert_rc < 0) {
+                /* A concurrent builder won.  Consume the published winner
+                 * rather than reporting a false build failure. */
+                f16_buffer = nil;
+                hit = ds4_gpu_q4_attn_q_b_f16_cache_lookup(
+                    model_map, model_size, weight_offset, weight_bytes,
+                    in_dim, out_dim, &f16_buffer);
+                if (!hit || !f16_buffer) {
+                    return ds4_gpu_q4_attn_q_b_f16_abort_cold_build(
+                        required, 0, 1,
+                        DS4_Q4_ATTN_Q_B_F16_CIRCUIT_HARD);
+                }
+            }
+
+            if (insert_rc == 2) {
+                fprintf(stderr,
+                        "ds4: Metal resident Q4 attn_q_b F16 cache enabled "
+                        "(budget %llu MiB, min batch %llu tokens)\n",
+                        (unsigned long long)budget_mib,
+                        (unsigned long long)min_tokens);
+            }
+        }
+
+        if (build_lock_held) {
+            pthread_mutex_unlock(&g_q4_attn_q_b_f16_build_mu);
+        }
+
+        if (!f16_buffer) {
+            return ds4_gpu_q4_attn_q_b_f16_fallback(required, 0, 1);
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) {
+            return ds4_gpu_q4_attn_q_b_f16_fallback(required, 0, 1);
+        }
+
+        ds4_gpu_mul_mm_args mm_args = ds4_gpu_make_mm_args(
+            in_dim, out_dim, n_tok, in_dim * sizeof(uint16_t));
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) {
+            (void)ds4_gpu_finish_command_buffer(
+                cb, owned, "Q4 attn_q_b cached F16 encoder allocation");
+            return ds4_gpu_q4_attn_q_b_f16_fallback(required, 0, 1);
+        }
+        [enc setComputePipelineState:mm_pipeline];
+        [enc setBytes:&mm_args length:sizeof(mm_args) atIndex:0];
+        [enc setBuffer:f16_buffer offset:0 atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:(mm_bc_out ? 8192u : 6144u)
+                                atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                ((NSUInteger)n_tok + 31u) / 32u,
+                (NSUInteger)out_dim / 64u,
+                1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "Q4 attn_q_b cached F16 matmul")) {
+            return ds4_gpu_q4_attn_q_b_f16_fallback(required, 0, 1);
+        }
+    }
+
+    if (!apply_norm_rope) return 1;
+    if (!ds4_gpu_head_rms_norm_rope_tail_tensor(
+            out, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+            inverse, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, eps)) {
+        return ds4_gpu_q4_attn_q_b_f16_fallback(required, 0, 1);
+    }
+    return 1;
+}
+
 int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *q_half,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
+        uint32_t              weight_type,
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
@@ -24982,13 +26048,27 @@ int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
-    (void)out; (void)q_half; (void)model_map; (void)model_size;
-    (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
-    (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot; (void)pos0;
-    (void)n_ctx_orig; (void)inverse; (void)freq_base; (void)freq_scale;
-    (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
-    (void)eps;
-    return 0;
+    return ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor_impl(
+        out, q_half, model_map, model_size, weight_offset, weight_type,
+        in_dim, out_dim, x, n_tok, n_head, head_dim, n_rot, pos0,
+        n_ctx_orig, inverse, freq_base, freq_scale, ext_factor,
+        attn_factor, beta_fast, beta_slow, eps, 1);
+}
+
+int ds4_gpu_test_q4_attn_q_b_f16_projection_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok) {
+    return ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor_impl(
+        out, NULL, model_map, model_size, weight_offset,
+        DS4_METAL_TENSOR_Q4_K, in_dim, out_dim, x, n_tok,
+        64u, 512u, 0u, 0u, 0u, false,
+        10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, 0);
 }
 
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(

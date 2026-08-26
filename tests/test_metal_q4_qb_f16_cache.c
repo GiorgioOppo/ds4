@@ -1,0 +1,1181 @@
+#define _DARWIN_C_SOURCE
+
+/* GGUF-free production-shape oracle for the resident pre-M5 Metal Q4_K
+ * attn_q_b F16 weight sidecar.  The candidate is compared bit-for-bit with
+ * the established Q4_K matmul followed by the exact same head norm/RoPE
+ * entry point used by the production fallback. */
+
+#include "ds4_gpu.h"
+
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+bool ds4_log_is_tty(FILE *fp) {
+    (void)fp;
+    return false;
+}
+
+#ifdef __APPLE__
+
+enum {
+    Q4_K_TYPE = 12u,
+    QK_K = 256u,
+    IN_DIM = 1024u,
+    OUT_DIM = 32768u,
+    N_HEAD = 64u,
+    HEAD_DIM = 512u,
+    N_ROT = 64u,
+    MAX_TOKENS = 64u,
+    BLOCKS_PER_ROW = IN_DIM / QK_K,
+    GROUPS_PER_BLOCK = 8u,
+    GROUP_SIZE = 32u,
+    GUARD_FLOATS = 256u,
+    GUARD_HALFS = 256u,
+    TIMING_SAMPLES = 5u,
+};
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[QK_K / 2u];
+} block_q4_K;
+
+static const char *k_disable =
+    "DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_CACHE";
+static const char *k_require =
+    "DS4_METAL_REQUIRE_Q4_ATTN_Q_B_F16_CACHE";
+static const char *k_min_tokens =
+    "DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MIN_TOKENS";
+static const char *k_cache_mb =
+    "DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MB";
+static const char *k_timing =
+    "DS4_TEST_METAL_Q4_QB_F16_CACHE_TIMING";
+
+static const uint32_t k_reference_poison = 0x7fc10000u;
+static const uint32_t k_candidate_poison = 0x7fc30000u;
+
+static void fail(const char *what) {
+    fprintf(stderr, "Metal Q4 attn_q_b F16 cache oracle FAIL: %s\n", what);
+    exit(1);
+}
+
+#define CHECK(expr, what) do { if (!(expr)) fail(what); } while (0)
+
+static uint64_t align_up(uint64_t value, uint64_t alignment) {
+    return (value + alignment - 1u) / alignment * alignment;
+}
+
+static void pack_scales(uint8_t packed[12],
+                        const uint8_t scales[GROUPS_PER_BLOCK],
+                        const uint8_t minima[GROUPS_PER_BLOCK]) {
+    memset(packed, 0, 12u);
+    for (uint32_t group = 0; group < 4u; group++) {
+        packed[group] = scales[group] & 63u;
+        packed[group + 4u] = minima[group] & 63u;
+    }
+    for (uint32_t group = 4u; group < GROUPS_PER_BLOCK; group++) {
+        packed[group + 4u] = (scales[group] & 15u) |
+                             ((minima[group] & 15u) << 4u);
+        packed[group - 4u] |= (scales[group] >> 4u) << 6u;
+        packed[group] |= (minima[group] >> 4u) << 6u;
+    }
+}
+
+static void fill_q4_matrix(block_q4_K *matrix) {
+    CHECK(sizeof(block_q4_K) == 144u, "unexpected Q4_K block size");
+
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        for (uint32_t block = 0; block < BLOCKS_PER_ROW; block++) {
+            block_q4_K *b = matrix +
+                (uint64_t)row * BLOCKS_PER_ROW + block;
+            const uint32_t key =
+                row * 1009u + block * 313u +
+                (row ^ (block * 17u)) + 29u;
+            uint8_t scales[GROUPS_PER_BLOCK];
+            uint8_t minima[GROUPS_PER_BLOCK];
+
+            for (uint32_t group = 0; group < GROUPS_PER_BLOCK; group++) {
+                scales[group] =
+                    (uint8_t)((key + group * 37u) & 63u);
+                minima[group] =
+                    (uint8_t)((key / 3u + group * 29u) & 63u);
+            }
+            pack_scales(b->scales, scales, minima);
+            for (uint32_t i = 0; i < QK_K / 2u; i++) {
+                b->qs[i] = (uint8_t)(
+                    key + i * 37u + (i >> 2u) * 11u);
+            }
+
+            /* Exercise non-power-of-two half scales and all packed 6-bit
+             * scale/minimum lanes, including the high bits of groups 4--7. */
+            b->d = (uint16_t)(0x1801u + (key & 0x01ffu));
+            b->dmin = (uint16_t)(0x1403u + ((key >> 3u) & 0x01ffu));
+        }
+    }
+}
+
+static uint32_t poison_bits(uint32_t base, uint64_t index) {
+    return base + (uint32_t)(index & 0xffffu);
+}
+
+static void poison_f32(float *values, uint64_t count, uint32_t base) {
+    for (uint64_t i = 0; i < count; i++) {
+        const uint32_t bits = poison_bits(base, i);
+        memcpy(&values[i], &bits, sizeof(bits));
+    }
+}
+
+static uint64_t count_poison_f32_mismatches(const float *values,
+                                            uint64_t begin,
+                                            uint64_t end,
+                                            uint32_t base) {
+    uint64_t mismatches = 0;
+    for (uint64_t i = begin; i < end; i++) {
+        uint32_t bits = 0;
+        memcpy(&bits, &values[i], sizeof(bits));
+        if (bits != poison_bits(base, i)) mismatches++;
+    }
+    return mismatches;
+}
+
+static uint16_t half_poison_bits(uint64_t index) {
+    return (uint16_t)(0x7e00u | (uint16_t)(index & 0x01ffu));
+}
+
+static void poison_f16(uint16_t *values, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        values[i] = half_poison_bits(i);
+    }
+}
+
+static uint64_t count_poison_f16_mismatches(const uint16_t *values,
+                                            uint64_t count) {
+    uint64_t mismatches = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        if (values[i] != half_poison_bits(i)) mismatches++;
+    }
+    return mismatches;
+}
+
+static void fill_inputs(float *values) {
+    for (uint32_t token = 0; token < MAX_TOKENS; token++) {
+        for (uint32_t col = 0; col < IN_DIM; col++) {
+            const uint32_t key = token * 131u + col * 17u +
+                                 ((col >> 3u) ^ (token * 29u));
+            /* The Metal MM kernels consume a half RHS. */
+            values[(uint64_t)token * IN_DIM + col] =
+                (float)((int)(key % 129u) - 64) / 64.0f;
+        }
+    }
+}
+
+static uint64_t count_bit_mismatches(const float *reference,
+                                     const float *candidate,
+                                     uint64_t count,
+                                     uint64_t *first) {
+    uint64_t mismatches = 0;
+    *first = UINT64_MAX;
+    for (uint64_t i = 0; i < count; i++) {
+        if (memcmp(&reference[i], &candidate[i], sizeof(float)) != 0) {
+            if (*first == UINT64_MAX) *first = i;
+            mismatches++;
+        }
+    }
+    return mismatches;
+}
+
+static int run_reference(ds4_gpu_tensor *out,
+                         const void *model,
+                         uint64_t model_bytes,
+                         const ds4_gpu_tensor *x,
+                         uint32_t n_tok) {
+    if (!ds4_gpu_matmul_quant_tensor(
+            out, model, model_bytes, 0, Q4_K_TYPE,
+            IN_DIM, OUT_DIM, x, n_tok)) {
+        return 0;
+    }
+    return ds4_gpu_head_rms_norm_rope_tail_tensor(
+        out, n_tok, N_HEAD, HEAD_DIM, N_ROT,
+        17u, 0u, false,
+        10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+}
+
+static int run_candidate(ds4_gpu_tensor *out,
+                         ds4_gpu_tensor *q_half,
+                         const void *model,
+                         uint64_t model_bytes,
+                         const ds4_gpu_tensor *x,
+                         uint32_t n_tok) {
+    return ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+        out, q_half, model, model_bytes, 0, Q4_K_TYPE,
+        IN_DIM, OUT_DIM, x, n_tok, N_HEAD, HEAD_DIM, N_ROT,
+        17u, 0u, false,
+        10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+}
+
+static void check_cache_storage_unchanged(
+        const ds4_gpu_q4_attn_q_b_f16_cache_report *before,
+        const ds4_gpu_q4_attn_q_b_f16_cache_report *after,
+        const char *what) {
+    if (after->entries != before->entries ||
+        after->bytes != before->bytes ||
+        after->lookups != before->lookups ||
+        after->hits != before->hits ||
+        after->misses != before->misses ||
+        after->builds != before->builds ||
+        after->build_failures != before->build_failures ||
+        after->build_circuit_open != before->build_circuit_open) {
+        fail(what);
+    }
+}
+
+static double monotonic_ms(void) {
+    struct timespec ts;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &ts) == 0, "monotonic clock");
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static int compare_double(const void *lhs, const void *rhs) {
+    const double a = *(const double *)lhs;
+    const double b = *(const double *)rhs;
+    return (a > b) - (a < b);
+}
+
+int main(void) {
+    static const uint32_t token_cases[] = {32u, 33u, 64u};
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t row_bytes =
+        (uint64_t)BLOCKS_PER_ROW * sizeof(block_q4_K);
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+    const uint64_t model_bytes = align_up(2u * weight_bytes, page);
+    const uint64_t support_model_bytes = align_up(weight_bytes, page);
+    const uint64_t f16_cache_bytes =
+        (uint64_t)OUT_DIM * IN_DIM * sizeof(uint16_t);
+    const uint64_t input_count = (uint64_t)MAX_TOKENS * IN_DIM;
+    const uint64_t input_storage_count =
+        GUARD_FLOATS + input_count + GUARD_FLOATS;
+    const uint64_t max_output_count = (uint64_t)MAX_TOKENS * OUT_DIM;
+    const uint64_t output_storage_count =
+        GUARD_FLOATS + max_output_count + GUARD_FLOATS;
+    const uint64_t q_half_storage_count =
+        GUARD_HALFS + max_output_count + GUARD_HALFS;
+
+    CHECK(Q4_K_TYPE == 12u, "Q4_K GGUF type must be 12");
+    CHECK(row_bytes == 576u, "unexpected Q4_K row size");
+    CHECK(weight_bytes == 18u * 1024u * 1024u,
+          "unexpected production q_b Q4_K size");
+    CHECK(f16_cache_bytes == 64u * 1024u * 1024u,
+          "unexpected production q_b F16 sidecar size");
+    CHECK(ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+              0u, 0u, 0u) == 0,
+          "unknown working set must reject");
+    CHECK(ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+              800u, 600u, 100u) == 1,
+          "working-set equality boundary");
+    CHECK(ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+              800u, 600u, 101u) == 0,
+          "working-set one-byte overflow");
+    CHECK(ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+              800u, 701u, 0u) == 0,
+          "allocated working set beyond safety limit");
+    CHECK(ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
+              UINT64_MAX, 0u, UINT64_MAX) == 0,
+          "working-set overflow-sized request");
+
+    CHECK(unsetenv(k_disable) == 0, "clear cache disable env");
+    CHECK(unsetenv(k_require) == 0, "clear cache require env");
+    CHECK(unsetenv(k_min_tokens) == 0, "clear cache minimum env");
+    CHECK(unsetenv(k_cache_mb) == 0, "clear cache budget env");
+    CHECK(setenv(k_min_tokens, "32", 1) == 0,
+          "set 32-token cache minimum");
+    CHECK(setenv(k_require, "1", 1) == 0,
+          "require Q4 attn_q_b F16 cache");
+
+    CHECK(ds4_gpu_init() != 0, "Metal init");
+    if (!ds4_gpu_device_is_pre_m5_apple_silicon()) {
+        fprintf(stderr,
+                "Metal Q4 attn_q_b F16 cache oracle SKIP: "
+                "requires Apple M1--M4\n");
+        ds4_gpu_cleanup();
+        return 0;
+    }
+
+    void *model = NULL;
+    CHECK(posix_memalign(&model, (size_t)page, (size_t)model_bytes) == 0,
+          "page-aligned model allocation");
+    memset(model, 0, (size_t)model_bytes);
+    fill_q4_matrix(model);
+    fill_q4_matrix((block_q4_K *)((uint8_t *)model + weight_bytes));
+    ((block_q4_K *)((uint8_t *)model + weight_bytes))[0].d ^= 0x001fu;
+
+    void *support_model = NULL;
+    CHECK(posix_memalign(&support_model, (size_t)page,
+                         (size_t)support_model_bytes) == 0,
+          "page-aligned support model allocation");
+    memset(support_model, 0, (size_t)support_model_bytes);
+    fill_q4_matrix(support_model);
+    ((block_q4_K *)support_model)[0].dmin ^= 0x003du;
+
+    float *input_host = malloc(
+        (size_t)input_storage_count * sizeof(float));
+    float *input_readback = malloc(
+        (size_t)input_storage_count * sizeof(float));
+    float *reference_host = malloc(
+        (size_t)output_storage_count * sizeof(float));
+    float *candidate_host = malloc(
+        (size_t)output_storage_count * sizeof(float));
+    uint16_t *q_half_host = malloc(
+        (size_t)q_half_storage_count * sizeof(uint16_t));
+    CHECK(input_host && input_readback && reference_host &&
+          candidate_host && q_half_host, "host tensor allocation");
+
+    poison_f32(input_host, input_storage_count, 0x7fc50000u);
+    fill_inputs(input_host + GUARD_FLOATS);
+    poison_f16(q_half_host, q_half_storage_count);
+
+    ds4_gpu_tensor *x_base = ds4_gpu_tensor_alloc(
+        input_storage_count * sizeof(float));
+    ds4_gpu_tensor *reference_base = ds4_gpu_tensor_alloc(
+        output_storage_count * sizeof(float));
+    ds4_gpu_tensor *candidate_base = ds4_gpu_tensor_alloc(
+        output_storage_count * sizeof(float));
+    ds4_gpu_tensor *q_half_base = ds4_gpu_tensor_alloc(
+        q_half_storage_count * sizeof(uint16_t));
+    CHECK(x_base && reference_base && candidate_base && q_half_base,
+          "Metal tensor allocation");
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_view(
+        x_base, GUARD_FLOATS * sizeof(float),
+        input_count * sizeof(float));
+    CHECK(x != NULL, "input tensor view");
+    CHECK(ds4_gpu_tensor_write(
+              x_base, 0, input_host,
+              input_storage_count * sizeof(float)) != 0,
+          "input upload");
+    CHECK(ds4_gpu_tensor_write(
+              q_half_base, 0, q_half_host,
+              q_half_storage_count * sizeof(uint16_t)) != 0,
+          "q_half poison upload");
+
+    /* Residency must be selected before installing the synthetic model. */
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+    CHECK(ds4_gpu_set_model_map(model, model_bytes) != 0,
+          "resident model map");
+    CHECK(ds4_gpu_prepare_support_model(
+              support_model, support_model_bytes, 0,
+              support_model_bytes, 0) != 0,
+          "resident support model map");
+    ds4_gpu_test_q4_attn_q_b_f16_cache_reset();
+
+    /* REQUIRE applies only at or above MIN_TOKENS.  A short tail must remain
+     * a non-candidate rather than failing after a successful session prewarm. */
+    {
+        CHECK(setenv(k_min_tokens, "512", 1) == 0,
+              "set short-tail cache minimum");
+        ds4_gpu_tensor *short_out = ds4_gpu_tensor_view(
+            candidate_base, GUARD_FLOATS * sizeof(float),
+            (uint64_t)32u * OUT_DIM * sizeof(float));
+        ds4_gpu_tensor *short_half = ds4_gpu_tensor_view(
+            q_half_base, GUARD_HALFS * sizeof(uint16_t),
+            (uint64_t)32u * OUT_DIM * sizeof(uint16_t));
+        CHECK(short_out && short_half, "short-tail tensor views");
+        CHECK(run_candidate(short_out, short_half, model, model_bytes,
+                            x, 32u) == 0,
+              "below-min REQUIRE batch must remain a non-candidate");
+        ds4_gpu_tensor_free(short_half);
+        ds4_gpu_tensor_free(short_out);
+
+        ds4_gpu_q4_attn_q_b_f16_cache_report short_report;
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&short_report);
+        CHECK(short_report.candidate_calls == 0u &&
+                  short_report.lookups == 0u &&
+                  short_report.fallbacks == 0u &&
+                  short_report.rejects == 0u &&
+                  short_report.build_circuit_open == 0u,
+              "below-min REQUIRE candidate accounting");
+        CHECK(setenv(k_min_tokens, "32", 1) == 0,
+              "restore 32-token cache minimum");
+    }
+
+    /* A stable admission failure opens the build circuit.  Raising the
+     * logical budget alone must not trigger repeated allocations; an
+     * explicit cache reset is required before builds may resume. */
+    {
+        const uint64_t gate_output_count = (uint64_t)32u * OUT_DIM;
+        const uint64_t gate_output_bytes =
+            gate_output_count * sizeof(float);
+        const uint64_t gate_half_bytes =
+            gate_output_count * sizeof(uint16_t);
+        CHECK(setenv(k_cache_mb, "63", 1) == 0,
+              "set undersized sidecar budget");
+        poison_f32(candidate_host, output_storage_count,
+                   k_candidate_poison);
+        poison_f16(q_half_host, q_half_storage_count);
+        CHECK(ds4_gpu_tensor_write(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "budget output poison upload");
+        CHECK(ds4_gpu_tensor_write(
+                  q_half_base, 0, q_half_host,
+                  q_half_storage_count * sizeof(uint16_t)) != 0,
+              "budget q_half poison upload");
+
+        ds4_gpu_tensor *budget_out = ds4_gpu_tensor_view(
+            candidate_base, GUARD_FLOATS * sizeof(float),
+            gate_output_bytes);
+        ds4_gpu_tensor *budget_half = ds4_gpu_tensor_view(
+            q_half_base, GUARD_HALFS * sizeof(uint16_t),
+            gate_half_bytes);
+        CHECK(budget_out && budget_half, "budget tensor views");
+        CHECK(run_candidate(budget_out, budget_half, model, model_bytes,
+                            x, 32u) == -1,
+              "undersized budget must fail required candidate");
+        ds4_gpu_tensor_free(budget_half);
+        ds4_gpu_tensor_free(budget_out);
+
+        ds4_gpu_q4_attn_q_b_f16_cache_report budget_report;
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&budget_report);
+        CHECK(budget_report.entries == 0u && budget_report.bytes == 0u &&
+                  budget_report.builds == 0u &&
+                  budget_report.build_failures == 0u &&
+                  budget_report.rejects == 1u &&
+                  budget_report.build_circuit_open == 1u,
+              "undersized budget circuit accounting");
+
+        CHECK(setenv(k_cache_mb, "3072", 1) == 0,
+              "raise sidecar budget without reset");
+        budget_out = ds4_gpu_tensor_view(
+            candidate_base, GUARD_FLOATS * sizeof(float),
+            gate_output_bytes);
+        budget_half = ds4_gpu_tensor_view(
+            q_half_base, GUARD_HALFS * sizeof(uint16_t),
+            gate_half_bytes);
+        CHECK(budget_out && budget_half,
+              "open-circuit tensor views");
+        CHECK(run_candidate(budget_out, budget_half, model, model_bytes,
+                            x, 32u) == -1,
+              "open circuit must suppress budget-only retry");
+        ds4_gpu_tensor_free(budget_half);
+        ds4_gpu_tensor_free(budget_out);
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&budget_report);
+        CHECK(budget_report.entries == 0u && budget_report.builds == 0u &&
+                  budget_report.build_failures == 0u &&
+                  budget_report.rejects == 2u &&
+                  budget_report.build_circuit_open == 1u,
+              "open circuit retry accounting");
+
+        CHECK(ds4_gpu_tensor_read(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "budget output readback");
+        CHECK(ds4_gpu_tensor_read(
+                  q_half_base, 0, q_half_host,
+                  q_half_storage_count * sizeof(uint16_t)) != 0,
+              "budget q_half readback");
+        CHECK(count_poison_f32_mismatches(
+                  candidate_host, 0, output_storage_count,
+                  k_candidate_poison) == 0,
+              "budget rejection touched output");
+        CHECK(count_poison_f16_mismatches(
+                  q_half_host, q_half_storage_count) == 0,
+              "budget rejection touched q_half");
+
+        CHECK(ds4_gpu_release_q4_attn_q_b_f16_sidecars() != 0,
+              "production lifecycle release after open circuit");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&budget_report);
+        CHECK(budget_report.entries == 0u && budget_report.bytes == 0u &&
+                  budget_report.build_circuit_open == 0u,
+              "lifecycle release did not close empty build circuit");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_reset();
+        CHECK(unsetenv(k_cache_mb) == 0,
+              "clear sidecar budget override");
+    }
+
+    /* Session creation uses the batch-prewarm API before prefill timing.
+     * Exercise its transactional publication independently from lazy use. */
+    {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc descs[2] = {
+            {
+                .weight_offset = 0,
+                .weight_bytes = weight_bytes,
+                .in_dim = IN_DIM,
+                .out_dim = OUT_DIM,
+                .weight_type = Q4_K_TYPE,
+                .layer = 0,
+            },
+            {
+                .weight_offset = weight_bytes,
+                .weight_bytes = weight_bytes,
+                .in_dim = IN_DIM,
+                .out_dim = OUT_DIM,
+                .weight_type = Q4_K_TYPE,
+                .layer = 1,
+            },
+        };
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc support_desc = {
+            .weight_offset = 0,
+            .weight_bytes = weight_bytes,
+            .in_dim = IN_DIM,
+            .out_dim = OUT_DIM,
+            .weight_type = Q4_K_TYPE,
+            .layer = 0,
+        };
+        uint64_t prepared_bytes = 0;
+        CHECK(setenv(k_cache_mb, "127", 1) == 0,
+              "set undersized transactional prewarm budget");
+        CHECK(ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+                  model, model_bytes, descs, 2u, 64u, 0u,
+                  &prepared_bytes) == -1,
+              "transactional prewarm budget rejection");
+        ds4_gpu_q4_attn_q_b_f16_cache_report prewarm_report;
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&prewarm_report);
+        CHECK(prepared_bytes == 0u && prewarm_report.entries == 0u &&
+                  prewarm_report.bytes == 0u &&
+                  prewarm_report.builds == 0u &&
+                  prewarm_report.build_circuit_open == 1u,
+              "transactional prewarm published a partial cache");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_reset();
+        CHECK(unsetenv(k_cache_mb) == 0,
+              "clear transactional prewarm budget");
+
+        CHECK(ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+                  model, model_bytes, descs, 2u, 64u, 0u,
+                  &prepared_bytes) == 1,
+              "transactional two-offset prewarm");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&prewarm_report);
+        CHECK(prepared_bytes == 2u * f16_cache_bytes &&
+                  prewarm_report.entries == 2u &&
+                  prewarm_report.bytes == 2u * f16_cache_bytes &&
+                  prewarm_report.builds == 2u &&
+                  prewarm_report.build_circuit_open == 0u,
+              "two-offset prewarm publication accounting");
+
+        prepared_bytes = 0;
+        CHECK(ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+                  support_model, support_model_bytes, &support_desc,
+                  1u, 64u, 0u, &prepared_bytes) == 1,
+              "same-offset second-model prewarm");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&prewarm_report);
+        CHECK(prepared_bytes == f16_cache_bytes &&
+                  prewarm_report.entries == 3u &&
+                  prewarm_report.bytes == 3u * f16_cache_bytes &&
+                  prewarm_report.builds == 3u &&
+                  prewarm_report.build_circuit_open == 0u,
+              "model-map cache-key isolation");
+        const uint64_t generation_before_eviction =
+            ds4_gpu_q4_attn_q_b_f16_cache_generation();
+        CHECK(ds4_gpu_make_room_for_q4_attn_q_b_f16_session() != 0,
+              "session admission cache eviction");
+        CHECK(ds4_gpu_q4_attn_q_b_f16_cache_generation() !=
+                  generation_before_eviction,
+              "session admission did not advance cache generation");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&prewarm_report);
+        CHECK(prewarm_report.entries == 0u &&
+                  prewarm_report.bytes == 0u &&
+                  prewarm_report.build_circuit_open == 0u,
+              "session admission retained resident sidecars");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_reset();
+    }
+
+    for (uint32_t case_i = 0;
+         case_i < sizeof(token_cases) / sizeof(token_cases[0]);
+         case_i++) {
+        const uint32_t n_tok = token_cases[case_i];
+        const uint64_t output_count = (uint64_t)n_tok * OUT_DIM;
+        const uint64_t output_bytes = output_count * sizeof(float);
+        const uint64_t q_half_count = (uint64_t)n_tok * OUT_DIM;
+        const uint64_t q_half_bytes = q_half_count * sizeof(uint16_t);
+
+        poison_f32(reference_host, output_storage_count,
+                   k_reference_poison);
+        poison_f32(candidate_host, output_storage_count,
+                   k_candidate_poison);
+        poison_f16(q_half_host, q_half_storage_count);
+        CHECK(ds4_gpu_tensor_write(
+                  reference_base, 0, reference_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "reference poison upload");
+        CHECK(ds4_gpu_tensor_write(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "candidate poison upload");
+        CHECK(ds4_gpu_tensor_write(
+                  q_half_base, 0, q_half_host,
+                  q_half_storage_count * sizeof(uint16_t)) != 0,
+              "q_half poison refresh");
+
+        ds4_gpu_tensor *reference = ds4_gpu_tensor_view(
+            reference_base, GUARD_FLOATS * sizeof(float), output_bytes);
+        ds4_gpu_tensor *candidate = ds4_gpu_tensor_view(
+            candidate_base, GUARD_FLOATS * sizeof(float), output_bytes);
+        ds4_gpu_tensor *q_half = ds4_gpu_tensor_view(
+            q_half_base, GUARD_HALFS * sizeof(uint16_t), q_half_bytes);
+        CHECK(reference && candidate && q_half, "case tensor views");
+
+        CHECK(run_reference(reference, model, model_bytes, x, n_tok) == 1,
+              "baseline Q4 projection plus head norm/RoPE");
+        CHECK(run_candidate(
+                  candidate, q_half, model, model_bytes, x, n_tok) == 1,
+              "required cached-F16 candidate");
+
+        ds4_gpu_tensor_free(q_half);
+        ds4_gpu_tensor_free(candidate);
+        ds4_gpu_tensor_free(reference);
+
+        CHECK(ds4_gpu_tensor_read(
+                  reference_base, 0, reference_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "reference readback");
+        CHECK(ds4_gpu_tensor_read(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "candidate readback");
+        CHECK(ds4_gpu_tensor_read(
+                  q_half_base, 0, q_half_host,
+                  q_half_storage_count * sizeof(uint16_t)) != 0,
+              "q_half readback");
+
+        uint64_t first = UINT64_MAX;
+        const uint64_t bit_mismatches = count_bit_mismatches(
+            reference_host + GUARD_FLOATS,
+            candidate_host + GUARD_FLOATS,
+            output_count, &first);
+        const uint64_t reference_prefix = count_poison_f32_mismatches(
+            reference_host, 0, GUARD_FLOATS, k_reference_poison);
+        const uint64_t reference_suffix = count_poison_f32_mismatches(
+            reference_host, GUARD_FLOATS + output_count,
+            output_storage_count, k_reference_poison);
+        const uint64_t candidate_prefix = count_poison_f32_mismatches(
+            candidate_host, 0, GUARD_FLOATS, k_candidate_poison);
+        const uint64_t candidate_suffix = count_poison_f32_mismatches(
+            candidate_host, GUARD_FLOATS + output_count,
+            output_storage_count, k_candidate_poison);
+        const uint64_t q_half_mismatches =
+            count_poison_f16_mismatches(
+                q_half_host, q_half_storage_count);
+
+        fprintf(stderr,
+                "Metal Q4 attn_q_b F16 cache N=%u bitwise=%llu "
+                "ref_guard=%llu/%llu candidate_guard=%llu/%llu "
+                "q_half=%llu\n",
+                n_tok,
+                (unsigned long long)bit_mismatches,
+                (unsigned long long)reference_prefix,
+                (unsigned long long)reference_suffix,
+                (unsigned long long)candidate_prefix,
+                (unsigned long long)candidate_suffix,
+                (unsigned long long)q_half_mismatches);
+        if (first != UINT64_MAX) {
+            fprintf(stderr,
+                    "  first bitwise mismatch token=%llu row=%llu\n",
+                    (unsigned long long)(first / OUT_DIM),
+                    (unsigned long long)(first % OUT_DIM));
+        }
+        CHECK(bit_mismatches == 0, "candidate bitwise mismatch");
+        CHECK(reference_prefix == 0 && reference_suffix == 0,
+              "reference output canary");
+        CHECK(candidate_prefix == 0 && candidate_suffix == 0,
+              "candidate output canary");
+        CHECK(q_half_mismatches == 0,
+              "Q4 candidate unexpectedly touched q_half scratch");
+
+        ds4_gpu_q4_attn_q_b_f16_cache_report report;
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&report);
+        CHECK(report.entries == 1u, "one cache entry");
+        CHECK(report.bytes == f16_cache_bytes, "64 MiB cache entry");
+        CHECK(report.lookups == (uint64_t)case_i + 1u,
+              "cache lookup count");
+        CHECK(report.hits == (uint64_t)case_i,
+              "cache hit count");
+        CHECK(report.misses == 1u, "single cold cache miss");
+        CHECK(report.builds == 1u, "single cache build");
+        CHECK(report.build_failures == 0u, "no cache build failure");
+        CHECK(report.candidate_calls == (uint64_t)case_i + 1u,
+              "candidate call count");
+        CHECK(report.fallbacks == 0u && report.rejects == 0u,
+              "no correctness-case fallback");
+    }
+
+    /* Compare the raw projection before RMSNorm/RoPE so normalization cannot
+     * hide a uniform scale or dequantization error. */
+    {
+        const uint32_t n_tok = 33u;
+        const uint64_t output_count = (uint64_t)n_tok * OUT_DIM;
+        const uint64_t output_bytes = output_count * sizeof(float);
+        poison_f32(reference_host, output_storage_count,
+                   k_reference_poison);
+        poison_f32(candidate_host, output_storage_count,
+                   k_candidate_poison);
+        CHECK(ds4_gpu_tensor_write(
+                  reference_base, 0, reference_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "raw reference poison upload");
+        CHECK(ds4_gpu_tensor_write(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "raw candidate poison upload");
+        ds4_gpu_tensor *reference = ds4_gpu_tensor_view(
+            reference_base, GUARD_FLOATS * sizeof(float), output_bytes);
+        ds4_gpu_tensor *candidate = ds4_gpu_tensor_view(
+            candidate_base, GUARD_FLOATS * sizeof(float), output_bytes);
+        CHECK(reference && candidate, "raw projection tensor views");
+        CHECK(ds4_gpu_matmul_quant_tensor(
+                  reference, model, model_bytes, 0, Q4_K_TYPE,
+                  IN_DIM, OUT_DIM, x, n_tok) == 1,
+              "raw native Q4 projection");
+        CHECK(ds4_gpu_test_q4_attn_q_b_f16_projection_tensor(
+                  candidate, model, model_bytes, 0,
+                  IN_DIM, OUT_DIM, x, n_tok) == 1,
+              "raw cached-F16 projection");
+        ds4_gpu_tensor_free(candidate);
+        ds4_gpu_tensor_free(reference);
+        CHECK(ds4_gpu_tensor_read(
+                  reference_base, 0, reference_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "raw reference readback");
+        CHECK(ds4_gpu_tensor_read(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "raw candidate readback");
+        uint64_t first = UINT64_MAX;
+        CHECK(count_bit_mismatches(
+                  reference_host + GUARD_FLOATS,
+                  candidate_host + GUARD_FLOATS,
+                  output_count, &first) == 0,
+              "raw projection bitwise mismatch");
+        CHECK(count_poison_f32_mismatches(
+                  reference_host, 0, GUARD_FLOATS,
+                  k_reference_poison) == 0 &&
+              count_poison_f32_mismatches(
+                  reference_host, GUARD_FLOATS + output_count,
+                  output_storage_count, k_reference_poison) == 0,
+              "raw reference output canary");
+        CHECK(count_poison_f32_mismatches(
+                  candidate_host, 0, GUARD_FLOATS,
+                  k_candidate_poison) == 0 &&
+              count_poison_f32_mismatches(
+                  candidate_host, GUARD_FLOATS + output_count,
+                  output_storage_count, k_candidate_poison) == 0,
+              "raw candidate output canary");
+        fprintf(stderr,
+                "Metal Q4 attn_q_b F16 cache raw projection N=33: PASS\n");
+    }
+
+    /* Exercise the production command-batch lifecycle from a cold cache.
+     * The sidecar build must complete before publication even though the
+     * projection and norm/RoPE remain encoded in the caller's batch.  A
+     * second batch then proves that the published entry is a real hot hit. */
+    {
+        const uint32_t n_tok = 64u;
+        const uint64_t output_count = (uint64_t)n_tok * OUT_DIM;
+        const uint64_t output_bytes = output_count * sizeof(float);
+        const uint64_t q_half_bytes =
+            output_count * sizeof(uint16_t);
+
+        ds4_gpu_test_q4_attn_q_b_f16_cache_reset();
+        poison_f32(reference_host, output_storage_count,
+                   k_reference_poison);
+        poison_f32(candidate_host, output_storage_count,
+                   k_candidate_poison);
+        CHECK(ds4_gpu_tensor_write(
+                  reference_base, 0, reference_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "batch reference poison upload");
+        CHECK(ds4_gpu_tensor_write(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "batch candidate poison upload");
+
+        ds4_gpu_tensor *reference = ds4_gpu_tensor_view(
+            reference_base, GUARD_FLOATS * sizeof(float), output_bytes);
+        ds4_gpu_tensor *candidate = ds4_gpu_tensor_view(
+            candidate_base, GUARD_FLOATS * sizeof(float), output_bytes);
+        ds4_gpu_tensor *q_half = ds4_gpu_tensor_view(
+            q_half_base, GUARD_HALFS * sizeof(uint16_t), q_half_bytes);
+        CHECK(reference && candidate && q_half,
+              "cold batch tensor views");
+        CHECK(run_reference(reference, model, model_bytes, x, n_tok) == 1,
+              "cold batch reference");
+        CHECK(ds4_gpu_begin_commands() != 0,
+              "begin cold candidate batch");
+        CHECK(run_candidate(candidate, q_half, model, model_bytes,
+                            x, n_tok) == 1,
+              "encode cold batched candidate");
+        CHECK(ds4_gpu_end_commands() != 0,
+              "finish cold candidate batch");
+        ds4_gpu_tensor_free(q_half);
+        ds4_gpu_tensor_free(candidate);
+        ds4_gpu_tensor_free(reference);
+
+        CHECK(ds4_gpu_tensor_read(
+                  reference_base, 0, reference_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "cold batch reference readback");
+        CHECK(ds4_gpu_tensor_read(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "cold batch candidate readback");
+        uint64_t first = UINT64_MAX;
+        CHECK(count_bit_mismatches(
+                  reference_host + GUARD_FLOATS,
+                  candidate_host + GUARD_FLOATS,
+                  output_count, &first) == 0,
+              "cold batched candidate bitwise mismatch");
+
+        ds4_gpu_q4_attn_q_b_f16_cache_report report;
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&report);
+        CHECK(report.entries == 1u && report.builds == 1u &&
+                  report.misses == 1u && report.hits == 0u,
+              "cold batch cache publication");
+
+        poison_f32(candidate_host, output_storage_count,
+                   k_candidate_poison);
+        CHECK(ds4_gpu_tensor_write(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "hot batch candidate poison upload");
+        candidate = ds4_gpu_tensor_view(
+            candidate_base, GUARD_FLOATS * sizeof(float), output_bytes);
+        q_half = ds4_gpu_tensor_view(
+            q_half_base, GUARD_HALFS * sizeof(uint16_t), q_half_bytes);
+        CHECK(candidate && q_half, "hot batch tensor views");
+        CHECK(ds4_gpu_begin_commands() != 0,
+              "begin hot candidate batch");
+        CHECK(run_candidate(candidate, q_half, model, model_bytes,
+                            x, n_tok) == 1,
+              "encode hot batched candidate");
+        CHECK(ds4_gpu_end_commands() != 0,
+              "finish hot candidate batch");
+        ds4_gpu_tensor_free(q_half);
+        ds4_gpu_tensor_free(candidate);
+        CHECK(ds4_gpu_tensor_read(
+                  candidate_base, 0, candidate_host,
+                  output_storage_count * sizeof(float)) != 0,
+              "hot batch candidate readback");
+        first = UINT64_MAX;
+        CHECK(count_bit_mismatches(
+                  reference_host + GUARD_FLOATS,
+                  candidate_host + GUARD_FLOATS,
+                  output_count, &first) == 0,
+              "hot batched candidate bitwise mismatch");
+        ds4_gpu_test_q4_attn_q_b_f16_cache_report(&report);
+        CHECK(report.entries == 1u && report.builds == 1u &&
+                  report.misses == 1u && report.hits == 1u &&
+                  report.lookups == 2u,
+              "hot batch cache hit");
+        fprintf(stderr,
+                "Metal Q4 attn_q_b F16 cache cold/hot command batch: PASS\n");
+    }
+
+    /* DISABLE wins over REQUIRE, must reject before cache lookup, and must
+     * leave the entire output allocation untouched. */
+    ds4_gpu_q4_attn_q_b_f16_cache_report gate_before;
+    ds4_gpu_q4_attn_q_b_f16_cache_report gate_after;
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&gate_before);
+    poison_f32(candidate_host, output_storage_count, k_candidate_poison);
+    CHECK(ds4_gpu_tensor_write(
+              candidate_base, 0, candidate_host,
+              output_storage_count * sizeof(float)) != 0,
+          "DISABLE output poison");
+    CHECK(setenv(k_disable, "1", 1) == 0, "set cache disable env");
+    ds4_gpu_tensor *gate_out = ds4_gpu_tensor_view(
+        candidate_base, GUARD_FLOATS * sizeof(float),
+        (uint64_t)32u * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate_half = ds4_gpu_tensor_view(
+        q_half_base, GUARD_HALFS * sizeof(uint16_t),
+        (uint64_t)32u * OUT_DIM * sizeof(uint16_t));
+    CHECK(gate_out && gate_half, "DISABLE tensor views");
+    CHECK(run_candidate(
+              gate_out, gate_half, model, model_bytes, x, 32u) == -1,
+          "DISABLE must win over REQUIRE");
+    ds4_gpu_tensor_free(gate_half);
+    ds4_gpu_tensor_free(gate_out);
+    CHECK(ds4_gpu_tensor_read(
+              candidate_base, 0, candidate_host,
+              output_storage_count * sizeof(float)) != 0,
+          "DISABLE output readback");
+    CHECK(count_poison_f32_mismatches(
+              candidate_host, 0, output_storage_count,
+              k_candidate_poison) == 0,
+          "DISABLE touched output");
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&gate_after);
+    check_cache_storage_unchanged(
+        &gate_before, &gate_after, "DISABLE touched cache storage/state");
+    CHECK(gate_after.candidate_calls == gate_before.candidate_calls + 1u &&
+          gate_after.fallbacks == gate_before.fallbacks + 1u &&
+          gate_after.rejects == gate_before.rejects + 1u,
+          "DISABLE accounting");
+    CHECK(unsetenv(k_disable) == 0, "clear cache disable env");
+
+    /* Entering SSD mode must drop resident-only sidecars, then reject the
+     * optimization without rebuilding them. */
+    gate_before = gate_after;
+    poison_f32(candidate_host, output_storage_count, k_candidate_poison);
+    CHECK(ds4_gpu_tensor_write(
+              candidate_base, 0, candidate_host,
+              output_storage_count * sizeof(float)) != 0,
+          "SSD output poison");
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&gate_after);
+    CHECK(gate_after.entries == 0u && gate_after.bytes == 0u,
+          "enabling SSD mode retained resident sidecars");
+    CHECK(gate_after.build_circuit_open == 0u,
+          "enabling SSD mode retained the build circuit state");
+    CHECK(gate_after.candidate_calls == gate_before.candidate_calls &&
+          gate_after.fallbacks == gate_before.fallbacks &&
+          gate_after.rejects == gate_before.rejects,
+          "SSD transition reset cache accounting");
+    gate_before = gate_after;
+    gate_out = ds4_gpu_tensor_view(
+        candidate_base, GUARD_FLOATS * sizeof(float),
+        (uint64_t)32u * OUT_DIM * sizeof(float));
+    gate_half = ds4_gpu_tensor_view(
+        q_half_base, GUARD_HALFS * sizeof(uint16_t),
+        (uint64_t)32u * OUT_DIM * sizeof(uint16_t));
+    CHECK(gate_out && gate_half, "SSD tensor views");
+    CHECK(run_candidate(
+              gate_out, gate_half, model, model_bytes, x, 32u) == -1,
+          "SSD mode must reject required resident cache");
+    ds4_gpu_tensor_free(gate_half);
+    ds4_gpu_tensor_free(gate_out);
+    CHECK(ds4_gpu_tensor_read(
+              candidate_base, 0, candidate_host,
+              output_storage_count * sizeof(float)) != 0,
+          "SSD output readback");
+    CHECK(count_poison_f32_mismatches(
+              candidate_host, 0, output_storage_count,
+              k_candidate_poison) == 0,
+          "SSD rejection touched output");
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&gate_after);
+    CHECK(gate_after.entries == 0u && gate_after.bytes == 0u &&
+          gate_after.build_circuit_open == 0u,
+          "SSD rejection rebuilt resident cache");
+    CHECK(gate_after.candidate_calls == gate_before.candidate_calls + 1u &&
+          gate_after.fallbacks == gate_before.fallbacks + 1u &&
+          gate_after.rejects == gate_before.rejects + 1u,
+          "SSD rejection accounting");
+    ds4_gpu_set_ssd_streaming(false);
+
+    /* The input, including both guards, is immutable across every path. */
+    CHECK(ds4_gpu_tensor_read(
+              x_base, 0, input_readback,
+              input_storage_count * sizeof(float)) != 0,
+          "input readback");
+    CHECK(memcmp(input_host, input_readback,
+                 (size_t)input_storage_count * sizeof(float)) == 0,
+          "input payload/canary modified");
+
+    if (getenv(k_timing) != NULL) {
+        const char *timing_tokens_env = getenv(
+            "DS4_TEST_METAL_Q4_QB_F16_CACHE_TIMING_TOKENS");
+        char *timing_tokens_end = NULL;
+        errno = 0;
+        const unsigned long timing_tokens_value = timing_tokens_env
+            ? strtoul(timing_tokens_env, &timing_tokens_end, 10)
+            : 4096ul;
+        CHECK(!timing_tokens_env ||
+                  (timing_tokens_env[0] >= '0' &&
+                   timing_tokens_env[0] <= '9' &&
+                   errno == 0 &&
+                   timing_tokens_end != timing_tokens_env &&
+                   *timing_tokens_end == '\0'),
+              "invalid timing token count");
+        CHECK(timing_tokens_value >= 32ul &&
+                  timing_tokens_value <= 4096ul,
+              "timing tokens must be in [32, 4096]");
+        const uint32_t timing_tokens = (uint32_t)timing_tokens_value;
+        const uint64_t timing_input_count =
+            (uint64_t)timing_tokens * IN_DIM;
+        const uint64_t timing_output_count =
+            (uint64_t)timing_tokens * OUT_DIM;
+        double reference_ms[TIMING_SAMPLES];
+        double candidate_ms[TIMING_SAMPLES];
+        float *timing_input = malloc(
+            (size_t)timing_input_count * sizeof(float));
+        CHECK(timing_input != NULL, "timing input host allocation");
+        for (uint32_t token = 0; token < timing_tokens; token++) {
+            for (uint32_t col = 0; col < IN_DIM; col++) {
+                const uint32_t key = token * 131u + col * 17u +
+                                     ((col >> 3u) ^ (token * 29u));
+                timing_input[(uint64_t)token * IN_DIM + col] =
+                    (float)((int)(key % 129u) - 64) / 64.0f;
+            }
+        }
+
+        /* Timing allocations are independent from the guarded correctness
+         * tensors.  A single output is sufficient because each projection
+         * overwrites it completely before the in-place norm/RoPE stage. */
+        ds4_gpu_tensor *timing_x = ds4_gpu_tensor_alloc(
+            timing_input_count * sizeof(float));
+        ds4_gpu_tensor *timing_out = ds4_gpu_tensor_alloc(
+            timing_output_count * sizeof(float));
+        ds4_gpu_tensor *timing_q_half = ds4_gpu_tensor_alloc(
+            timing_output_count * sizeof(uint16_t));
+        CHECK(timing_x && timing_out && timing_q_half,
+              "timing Metal tensor allocation");
+        CHECK(ds4_gpu_tensor_write(
+                  timing_x, 0, timing_input,
+                  timing_input_count * sizeof(float)) != 0,
+              "timing input upload");
+        free(timing_input);
+
+        ds4_gpu_test_q4_attn_q_b_f16_cache_reset();
+        CHECK(ds4_gpu_synchronize() != 0, "pre-cold synchronize");
+        const double cold_t0 = monotonic_ms();
+        CHECK(run_candidate(timing_out, timing_q_half, model, model_bytes,
+                            timing_x, timing_tokens) == 1,
+              "timing cold candidate");
+        CHECK(ds4_gpu_synchronize() != 0, "cold synchronize");
+        const double cold_ms = monotonic_ms() - cold_t0;
+
+        CHECK(run_reference(timing_out, model, model_bytes, timing_x,
+                            timing_tokens) == 1,
+              "timing reference warmup");
+        CHECK(run_candidate(timing_out, timing_q_half, model, model_bytes,
+                            timing_x, timing_tokens) == 1,
+              "timing candidate warmup");
+
+        for (uint32_t i = 0; i < TIMING_SAMPLES; i++) {
+            if ((i & 1u) == 0u) {
+                double t0 = monotonic_ms();
+                CHECK(run_reference(timing_out, model, model_bytes,
+                                    timing_x, timing_tokens) == 1,
+                      "timing reference");
+                reference_ms[i] = monotonic_ms() - t0;
+                t0 = monotonic_ms();
+                CHECK(run_candidate(timing_out, timing_q_half, model,
+                                    model_bytes, timing_x,
+                                    timing_tokens) == 1,
+                      "timing candidate");
+                candidate_ms[i] = monotonic_ms() - t0;
+            } else {
+                double t0 = monotonic_ms();
+                CHECK(run_candidate(timing_out, timing_q_half, model,
+                                    model_bytes, timing_x,
+                                    timing_tokens) == 1,
+                      "timing candidate");
+                candidate_ms[i] = monotonic_ms() - t0;
+                t0 = monotonic_ms();
+                CHECK(run_reference(timing_out, model, model_bytes,
+                                    timing_x, timing_tokens) == 1,
+                      "timing reference");
+                reference_ms[i] = monotonic_ms() - t0;
+            }
+        }
+        qsort(reference_ms, TIMING_SAMPLES, sizeof(double), compare_double);
+        qsort(candidate_ms, TIMING_SAMPLES, sizeof(double), compare_double);
+        const double reference_median = reference_ms[TIMING_SAMPLES / 2u];
+        const double candidate_median = candidate_ms[TIMING_SAMPLES / 2u];
+        fprintf(stderr,
+                "Metal Q4 attn_q_b F16 cache timing N=%u: "
+                "cold=%.3f ms reference=%.3f ms steady=%.3f ms "
+                "speedup=%.3fx\n",
+                timing_tokens, cold_ms, reference_median, candidate_median,
+                reference_median / candidate_median);
+
+        /* Verify the exact timing geometry after sampling so readback and the
+         * second output allocation cannot perturb the measured resident path.
+         * Chunked reads bound host memory even for N=4096. */
+        ds4_gpu_tensor *timing_reference = ds4_gpu_tensor_alloc(
+            timing_output_count * sizeof(float));
+        CHECK(timing_reference != NULL,
+              "timing verification output allocation");
+        CHECK(run_reference(timing_reference, model, model_bytes, timing_x,
+                            timing_tokens) == 1,
+              "timing verification reference");
+        CHECK(run_candidate(timing_out, timing_q_half, model, model_bytes,
+                            timing_x, timing_tokens) == 1,
+              "timing verification candidate");
+
+        const uint64_t verify_bytes =
+            timing_output_count * sizeof(float);
+        const uint64_t verify_chunk_bytes = 4u * 1024u * 1024u;
+        float *verify_reference = malloc((size_t)verify_chunk_bytes);
+        float *verify_candidate = malloc((size_t)verify_chunk_bytes);
+        CHECK(verify_reference && verify_candidate,
+              "timing verification host chunks");
+        uint64_t verify_mismatches = 0;
+        uint64_t verify_first = UINT64_MAX;
+        for (uint64_t offset = 0; offset < verify_bytes;
+             offset += verify_chunk_bytes) {
+            const uint64_t chunk_bytes =
+                verify_bytes - offset < verify_chunk_bytes
+                    ? verify_bytes - offset
+                    : verify_chunk_bytes;
+            CHECK(ds4_gpu_tensor_read(timing_reference, offset,
+                                      verify_reference, chunk_bytes) != 0,
+                  "timing verification reference readback");
+            CHECK(ds4_gpu_tensor_read(timing_out, offset,
+                                      verify_candidate, chunk_bytes) != 0,
+                  "timing verification candidate readback");
+            uint64_t chunk_first = UINT64_MAX;
+            verify_mismatches += count_bit_mismatches(
+                verify_reference, verify_candidate,
+                chunk_bytes / sizeof(float), &chunk_first);
+            if (verify_first == UINT64_MAX && chunk_first != UINT64_MAX) {
+                verify_first = offset / sizeof(float) + chunk_first;
+            }
+        }
+        fprintf(stderr,
+                "Metal Q4 attn_q_b F16 cache timing oracle N=%u "
+                "bitwise=%llu\n",
+                timing_tokens,
+                (unsigned long long)verify_mismatches);
+        if (verify_first != UINT64_MAX) {
+            fprintf(stderr,
+                    "  first timing mismatch token=%llu row=%llu\n",
+                    (unsigned long long)(verify_first / OUT_DIM),
+                    (unsigned long long)(verify_first % OUT_DIM));
+        }
+        CHECK(verify_mismatches == 0,
+              "timing geometry candidate bitwise mismatch");
+        free(verify_candidate);
+        free(verify_reference);
+        ds4_gpu_tensor_free(timing_reference);
+
+        ds4_gpu_tensor_free(timing_q_half);
+        ds4_gpu_tensor_free(timing_out);
+        ds4_gpu_tensor_free(timing_x);
+    }
+
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(q_half_base);
+    ds4_gpu_tensor_free(candidate_base);
+    ds4_gpu_tensor_free(reference_base);
+    ds4_gpu_tensor_free(x_base);
+    ds4_gpu_cleanup();
+
+    free(q_half_host);
+    free(candidate_host);
+    free(reference_host);
+    free(input_readback);
+    free(input_host);
+    free(support_model);
+    free(model);
+
+    CHECK(unsetenv(k_require) == 0, "clear cache require env at exit");
+    CHECK(unsetenv(k_min_tokens) == 0,
+          "clear cache minimum env at exit");
+    fprintf(stderr,
+            "Metal Q4 attn_q_b F16 cache production geometry "
+            "1024x32768 N=32/33/64: PASS\n");
+    return 0;
+}
+
+#else
+
+int main(void) {
+    fprintf(stderr,
+            "Metal Q4 attn_q_b F16 cache oracle SKIP: requires macOS\n");
+    return 0;
+}
+
+#endif

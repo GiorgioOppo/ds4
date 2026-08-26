@@ -42144,13 +42144,14 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
 extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *q_half,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t weight_type,
         uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
         uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
         uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
     (void)out; (void)q_half; (void)model_map; (void)model_size;
-    (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
+    (void)weight_offset; (void)weight_type; (void)in_dim; (void)out_dim; (void)x;
     (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot; (void)pos0;
     (void)n_ctx_orig; (void)inverse; (void)freq_base; (void)freq_scale;
     (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;

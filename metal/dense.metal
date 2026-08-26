@@ -1540,6 +1540,44 @@ void dequantize_dense_q4_K(device const ds4_dense_block_q4_K *xb, short il, thre
 }
 
 /*
+ * One-shot resident Q4_K -> F16 materialization used by the attn_q_b
+ * prefill cache.  Keeping the production dequantizer here is intentional:
+ * kernel_mul_mm_q4_K_f32 computes the same float4x4 values and rounds them
+ * while storing into its half threadgroup tile.  Instantiating the helper
+ * with half4x4 performs that same single rounding here, so the cached matrix
+ * contains exactly the half values the native Q4 kernel would otherwise
+ * rebuild for every 64x32 output tile.
+ *
+ * Each thread expands one consecutive 16-value chunk.  Four explicit half4
+ * stores preserve the half4x4 layout without relying on device-address-space
+ * matrix stores, which are not accepted by every supported Metal compiler.
+ */
+kernel void kernel_dequantize_q4_K_f16(
+        device const ds4_dense_block_q4_K *src [[buffer(0)]],
+        device       half4                *dst [[buffer(1)]],
+        constant     uint                 &chunks_per_row [[buffer(2)]],
+        constant     uint                 &row_count [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= chunks_per_row || gid.y >= row_count) return;
+
+    const uint block = gid.x >> 4;
+    const short il = (short)(gid.x & 15u);
+    const uint blocks_per_row = chunks_per_row >> 4;
+    device const ds4_dense_block_q4_K *xb =
+        src + (uint64_t)gid.y * blocks_per_row + block;
+
+    half4x4 values;
+    dequantize_dense_q4_K(xb, il, values);
+
+    const uint64_t out4 =
+        ((uint64_t)gid.y * chunks_per_row + gid.x) * 4u;
+    dst[out4 + 0u] = values[0];
+    dst[out4 + 1u] = values[1];
+    dst[out4 + 2u] = values[2];
+    dst[out4 + 3u] = values[3];
+}
+
+/*
  * Bit-identical twin of dequantize_q8_0 for the MPP staging loop: same
  * half(float(qs[i]) * d) per element, but the 16 consecutive int8 lanes are
  * fetched as eight aligned 16-bit loads instead of sixteen byte loads.

@@ -535,6 +535,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
+        uint32_t              weight_type,
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
@@ -552,7 +553,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
-    if (!g_cublas_ready || !out || !q_half || !x || !model_map || n_tok == 0 ||
+    if (weight_type != 8u || !g_cublas_ready || !out || !q_half || !x || !model_map || n_tok == 0 ||
         n_rot > head_dim || (n_rot & 1u) || out_dim != (uint64_t)n_head * head_dim ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
