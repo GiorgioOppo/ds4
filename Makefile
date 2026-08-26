@@ -97,8 +97,8 @@ help:
 	@echo "  make test-metal-q4-streams  Check resident Q4 Metal stream overlap"
 	@echo "  make test-metal-indexer-q4  Check the production-shape Q4_K indexer projection"
 	@echo "  make test-metal-q4-attn-exactn  Bitwise/canary oracle for M1-M4 SSD-prefill Q4 attention output"
-	@echo "  make test-metal-q4-qb-f16-cache  Bitwise/canary oracle for the resident M1-M4 Q4 q_b F16 cache"
-	@echo "  make test-metal-q4-qb-f16-cache-timing  Time the Q4 q_b F16 cache at N=4096"
+	@echo "  make test-metal-q4-qb-f16-cache  Oracle for M1-M4 Q4 q_b sidecar and transient F16 paths"
+	@echo "  make test-metal-q4-qb-f16-cache-timing  Compare Q4 direct, sidecar, and transient production at N=4096"
 	@echo "  make test-metal-dspark-capture  Check fused DSpark HC capture bitwise"
 	@echo "  make test-metal-iq2-midonly  Check M1 IQ2 addr mid-only output and sentinels"
 	@echo "  make test-metal-iq2-live-index  Check IQ2 SSD live-cache index policy and fallback"
@@ -208,6 +208,10 @@ tests/test_metal_q4_qb_f16_cache: tests/test_metal_q4_qb_f16_cache.o ds4_metal.o
 
 test-metal-q4-qb-f16-cache: tests/test_metal_q4_qb_f16_cache
 	env -u DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_CACHE \
+		-u DS4_METAL_ENABLE_Q4_ATTN_Q_B_F16_CACHE_WITH_SSD_STREAMING \
+		-u DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_RHS \
+		-u DS4_METAL_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16 \
+		-u DS4_METAL_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS \
 		-u DS4_TEST_METAL_Q4_QB_F16_CACHE_TIMING \
 		-u DS4_TEST_METAL_Q4_QB_F16_CACHE_TIMING_TOKENS \
 		DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MIN_TOKENS=32 \
@@ -216,6 +220,10 @@ test-metal-q4-qb-f16-cache: tests/test_metal_q4_qb_f16_cache
 
 test-metal-q4-qb-f16-cache-timing: tests/test_metal_q4_qb_f16_cache
 	env -u DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_CACHE \
+		-u DS4_METAL_ENABLE_Q4_ATTN_Q_B_F16_CACHE_WITH_SSD_STREAMING \
+		-u DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_RHS \
+		-u DS4_METAL_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16 \
+		-u DS4_METAL_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS \
 		DS4_METAL_Q4_ATTN_Q_B_F16_CACHE_MIN_TOKENS=32 \
 		DS4_METAL_REQUIRE_Q4_ATTN_Q_B_F16_CACHE=1 \
 		DS4_TEST_METAL_Q4_QB_F16_CACHE_TIMING=1 \

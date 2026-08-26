@@ -49,6 +49,8 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | Variable | Default behavior and purpose |
 | --- | --- |
 | `DS4_CUDA_DECODE_GRAPHS=0` | Disable CUDA decode graph capture. Unset, `1`, `on`, `yes`, or `true` enables capture; `0`, `off`, `no`, or `false` disables it. Oracle modes may also suppress capture. |
+| `DS4_CUDA_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16=1` | Restore native Q4_K `attn_q_b` for automatic long resident prefills. The transient path is otherwise eligible from 4096 tokens when the single-GPU model image is physically device-resident and retains only one reusable expanded matrix; explicit persistent-cache controls remain independent. |
+| `DS4_CUDA_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS=N` | Override the automatic transient Q4_K-to-F16 crossover (default 4096 tokens) for single-GPU, device-image-resident, non-SSD, non-quality prefills. |
 | `DS4_CUDA_DISABLE_Q4_DENSE_PAIR=1` | Split the Q-A/KV Q4 pair back into two standalone projections. |
 | `DS4_CUDA_NO_Q4_GB10_FAST=1` | Umbrella rollback for the GB10-specific Q4 choices; it does not disable the older cross-CUDA dense pair. |
 | `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH=1` | Enable grouped attention-A for two-to-eight-token GB10 verifier batches. |
@@ -65,6 +67,8 @@ The detailed Metal A/B contracts and expected oracle counters live in
 
 | Variable | Default behavior and purpose |
 | --- | --- |
+| `DS4_ROCM_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16=1` | Restore native Q4_K `attn_q_b` for automatic long resident prefills. The transient path is otherwise eligible from 4096 tokens when every `attn_q_b` source is already in a device image or device-backed resident range and retains only one reusable expanded matrix; explicit persistent-cache controls remain independent. |
+| `DS4_ROCM_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS=N` | Override the automatic transient Q4_K-to-F16 crossover (default 4096 tokens) for device-resident, non-SSD, non-quality prefills. |
 | `DS4_ROCM_DISABLE_Q4_PREFILL_TILE8=1` | Restore the legacy Q4 prefill kernel. TILE8 is automatic for validated chunks of 9 through 4096 tokens. |
 | `DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8=1` | Fail closed when an eligible Q4 prefill call cannot use TILE8. |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_TILE8=1` | Legacy spelling retained for migration notes only. The runtime does not read it; TILE8 is automatic and this setting is ignored. |
