@@ -55422,6 +55422,7 @@ static int generate_metal_graph_raw_swa(
         uint32_t            ssd_streaming_preload_experts,
         uint64_t            ssd_streaming_cache_bytes,
         uint64_t            ssd_streaming_prefill_headroom_bytes,
+        uint64_t            q4_sidecar_working_set_reserve_bytes,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
@@ -55501,17 +55502,18 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
-    /* This frontend knows the real prompt width.  Prepare only when that
-     * workload can use the resident sidecars, after graph allocation is
-     * visible to the backend but before warmup and the measured prefill
-     * window. */
+    /* This frontend knows the real prompt width.  Let the backend prepare
+     * either its reusable transient scratch or explicit resident sidecars
+     * after graph allocation is visible, but before warmup and the measured
+     * prefill window. */
     const uint32_t q4_sidecar_rows =
         (uint32_t)prompt->len < prefill_cap ?
             (uint32_t)prompt->len : prefill_cap;
     if (ds4_prepare_q4_attn_q_b_sidecars(
-            model, weights, q4_sidecar_rows, 0u) < 0) {
+            model, weights, q4_sidecar_rows,
+            q4_sidecar_working_set_reserve_bytes) < 0) {
         fprintf(stderr,
-                "ds4: required GPU Q4 attn_q_b F16 sidecar prewarm "
+                "ds4: required GPU Q4 attn_q_b F16 acceleration preflight "
                 "could not be completed\n");
         metal_graph_free(&g);
         return 1;
@@ -56442,6 +56444,7 @@ struct ds4_session {
     bool engine_session_counted;
 #ifndef DS4_NO_GPU
     uint64_t q4_attn_q_b_f16_sidecars_generation;
+    uint32_t q4_attn_q_b_f16_prepared_rows;
 #endif
     bool checkpoint_valid;
     bool mtp_draft_valid;
@@ -60779,13 +60782,17 @@ int ds4_engine_generate_argmax(
             e->ssd_streaming, e->ssd_streaming_cold,
             e->ssd_streaming_preload_experts,
             e->ssd_streaming_cache_bytes,
-            e->ssd_streaming_prefill_headroom_bytes, e->power_percent,
+            e->ssd_streaming_prefill_headroom_bytes,
+            ds4_engine_streaming_transient_guard_bytes(e),
+            e->power_percent,
             e->prefill_chunk, e->directional_steering_file,
             e->directional_steering_attn_scale,
             e->directional_steering_ffn_scale, emit, done, emit_ud,
             progress, progress_ud);
         /* The legacy frontend owns a temporary graph rather than a session.
-         * Do not leave its 2.69 GiB resident sidecars pinned after return. */
+         * Do not leave explicitly requested resident sidecars pinned after
+         * return.  Each backend may either retain reusable scratch for its
+         * lifecycle or release it at this quiescent boundary. */
         if (__atomic_load_n(
                 &e->live_session_count, __ATOMIC_RELAXED) == 0u &&
             !ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
@@ -67101,7 +67108,8 @@ static int ds4_session_prepare_q4_attn_q_b_sidecars(
     const uint64_t cache_generation =
         ds4_gpu_q4_attn_q_b_f16_cache_generation();
     if (s->q4_attn_q_b_f16_sidecars_generation ==
-        cache_generation) {
+            cache_generation &&
+        max_batch_rows <= s->q4_attn_q_b_f16_prepared_rows) {
         return 1;
     }
     ds4_engine *e = s->engine;
@@ -67131,11 +67139,16 @@ static int ds4_session_prepare_q4_attn_q_b_sidecars(
                 : memory.total_bytes * remaining;
     }
 
+    const uint64_t streaming_reserve_bytes =
+        ds4_engine_streaming_transient_guard_bytes(e);
+    const uint64_t working_set_reserve_bytes =
+        ds4_add_sat_u64(future_session_bytes, streaming_reserve_bytes);
     const int rc = ds4_prepare_q4_attn_q_b_sidecars(
-        &e->model, &e->weights, max_batch_rows, future_session_bytes);
+        &e->model, &e->weights, max_batch_rows,
+        working_set_reserve_bytes);
     if (rc < 0) {
         fprintf(stderr,
-                "ds4: required %s Q4 attn_q_b F16 sidecar prewarm "
+                "ds4: required %s Q4 attn_q_b F16 acceleration preflight "
                 "could not be completed\n",
                 ds4_backend_name(e->backend));
         return 0;
@@ -67143,6 +67156,7 @@ static int ds4_session_prepare_q4_attn_q_b_sidecars(
     if (rc > 0) {
         s->q4_attn_q_b_f16_sidecars_generation =
             ds4_gpu_q4_attn_q_b_f16_cache_generation();
+        s->q4_attn_q_b_f16_prepared_rows = max_batch_rows;
     }
     return 1;
 }
@@ -68929,7 +68943,7 @@ int ds4_session_prepare_sync(ds4_session *s,
             s, max_batch_rows, false)) {
         if (err && errlen) {
             snprintf(err, errlen,
-                     "required %s Q4 attn_q_b F16 sidecar prewarm failed",
+                     "required %s Q4 attn_q_b F16 acceleration preflight failed",
                      ds4_backend_name(s->engine->backend));
         }
         return 1;

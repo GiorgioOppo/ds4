@@ -197,10 +197,11 @@ typedef struct ds4_gpu_q4_attn_q_b_f16_sidecar_desc {
     uint32_t layer;
 } ds4_gpu_q4_attn_q_b_f16_sidecar_desc;
 
-/* Backend-neutral lifecycle for optional resident Q4_K attn_q_b F16
- * sidecars.  Each graph backend owns its storage and admission policy.
- * Prepare returns 1 when all descriptors are READY, 0 for a policy/safety
- * skip, and -1 when strict mode requires an unavailable specialization. */
+/* Backend-neutral prefill preflight for optional Q4_K attn_q_b F16
+ * acceleration.  A backend may prepare resident sidecars or reusable
+ * transient scratch/pipelines according to its policy.  Prepare returns 1
+ * when the selected path is ready, 0 for a policy/safety skip, and -1 when
+ * strict mode requires an unavailable specialization. */
 int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         const void *model_map,
         uint64_t model_size,
@@ -312,6 +313,33 @@ int ds4_gpu_test_q4_attn_q_b_f16_projection_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_tok);
+typedef enum ds4_gpu_test_q4_qb_mm_arm {
+    DS4_GPU_TEST_Q4_QB_MM_Q4_F32 = 0,
+    DS4_GPU_TEST_Q4_QB_MM_Q4_F16 = 1,
+    DS4_GPU_TEST_Q4_QB_MM_F16_F32 = 2,
+    DS4_GPU_TEST_Q4_QB_MM_F16_F16 = 3,
+    DS4_GPU_TEST_Q4_QB_MM_Q4_TRANSIENT_F16_F16 = 4,
+    DS4_GPU_TEST_Q4_QB_MM_ARM_COUNT = 5,
+} ds4_gpu_test_q4_qb_mm_arm;
+/* Runtime capability probe for test-only matmul arms. */
+int ds4_gpu_test_q4_attn_q_b_mm_arm_supported(
+        ds4_gpu_test_q4_qb_mm_arm arm);
+/* Strict projection-only resident benchmark hook.  F16-weight arms require
+ * a READY sidecar; F16-RHS arms optionally include the production copy.  The
+ * transient arm rebuilds its F16 weight matrix for every benchmark/oracle
+ * projection and may consume either a prepacked or freshly copied F16 RHS. */
+int ds4_gpu_test_q4_attn_q_b_mm_variant_tensor(
+        ds4_gpu_tensor              *out_f32,
+        ds4_gpu_tensor              *rhs_f16,
+        const void                  *model_map,
+        uint64_t                     model_size,
+        uint64_t                     weight_offset,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        const ds4_gpu_tensor        *x_f32,
+        uint32_t                     n_tok,
+        ds4_gpu_test_q4_qb_mm_arm    arm,
+        bool                         materialize_rhs);
 int ds4_gpu_test_q4_attn_q_b_f16_working_set_policy(
         uint64_t recommended,
         uint64_t allocated,
@@ -1571,9 +1599,13 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_slow,
         float             eps);
 
-/* Returns 1 when the backend-specific fused projection was encoded, 0 when
- * the caller should use its generic projection path, and -1 when a required
- * specialization could not be honored. */
+/* Returns 1 when the backend-specific fused projection and its consumers were
+ * accepted/encoded successfully, 0 only while the caller may safely use its
+ * generic projection path, and -1 when a required specialization could not be
+ * honored or work failed after an output writer was encoded (so replay is
+ * unsafe). Completion is established by the enclosing backend synchronization.
+ * q_half is optional: backends whose graph owns F16 projection staging may use
+ * it, while CUDA/ROCm can emit F32 directly into out. */
 int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *q_half,
