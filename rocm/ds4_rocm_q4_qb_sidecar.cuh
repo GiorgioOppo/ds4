@@ -50,9 +50,19 @@ static uint64_t g_rocm_q4_attn_q_b_f16_fallbacks;
 static uint64_t g_rocm_q4_attn_q_b_f16_rejects;
 static int g_rocm_q4_attn_q_b_f16_hard_failure;
 static int g_rocm_q4_attn_q_b_f16_pending_evict;
+/* The resident default rebuilds one layer at a time into this combined
+ * allocation.  The first 64 MiB hold W_F16 and the suffix holds the largest
+ * preflighted X_F16 batch.  ROCm currently submits graph work on stream 0, but
+ * keep the mutex through the complete dequant/copy/GEMM/epilogue enqueue
+ * sequence so two host callers cannot interleave reuse of either region. */
+static void *g_rocm_q4_attn_q_b_transient_f16_scratch;
+static uint64_t g_rocm_q4_attn_q_b_transient_f16_scratch_bytes;
+static uint64_t g_rocm_q4_attn_q_b_transient_f16_weight_bytes;
 static pthread_mutex_t g_rocm_q4_attn_q_b_f16_cache_mu =
     PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_rocm_q4_attn_q_b_f16_build_mu =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_rocm_q4_attn_q_b_transient_f16_mu =
     PTHREAD_MUTEX_INITIALIZER;
 
 static int rocm_q4_attn_q_b_env_value_eq(
@@ -130,6 +140,17 @@ static int rocm_q4_attn_q_b_f16_disabled(void) {
         "DS4_ROCM_DISABLE_Q4_ATTN_Q_B_F16_CACHE") == 1;
 }
 
+static int rocm_q4_attn_q_b_transient_f16_disabled(void) {
+    return rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16") == 1;
+}
+
+static uint64_t rocm_q4_attn_q_b_transient_f16_min_tokens(void) {
+    return rocm_q4_attn_q_b_env_u64(
+        "DS4_ROCM_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS",
+        4096u, 32u, UINT32_MAX);
+}
+
 static uint64_t rocm_q4_attn_q_b_f16_min_tokens(void) {
     return rocm_q4_attn_q_b_env_u64(
         "DS4_ROCM_Q4_ATTN_Q_B_F16_CACHE_MIN_TOKENS",
@@ -150,6 +171,53 @@ static int rocm_q4_attn_q_b_f16_policy_allowed(void) {
            !g_ssd_streaming_mode &&
            !g_quality_mode &&
            !g_q8_f16_disabled_for_multi_model;
+}
+
+static int rocm_q4_attn_q_b_transient_f16_policy_allowed(void) {
+    return !rocm_q4_attn_q_b_transient_f16_disabled() &&
+           !g_ssd_streaming_mode &&
+           !g_quality_mode &&
+           !g_q8_f16_disabled_for_multi_model;
+}
+
+/* Read-only lookup for the automatic path.  Normal full-model ROCm loading
+ * may use either a contiguous device image or hipMalloc-backed range arenas.
+ * Accept both, but never mapped/registered host memory and never populate the
+ * range cache here: that would move I/O or page migration into prefill.  Model
+ * cache construction is complete before session preflight begins. */
+static const char *rocm_q4_attn_q_b_device_resident_source(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes) {
+    const char *image =
+        cuda_model_image_range_ptr(model_map, offset, bytes);
+    if (image) return image;
+    if (!model_map || bytes == 0u || offset > UINT64_MAX - bytes) {
+        return NULL;
+    }
+    const uint64_t end = offset + bytes;
+    const auto exact = g_model_range_by_offset.find(offset);
+    if (exact != g_model_range_by_offset.end() &&
+        exact->second < g_model_ranges.size()) {
+        const cuda_model_range &range = g_model_ranges[exact->second];
+        if (range.host_base == model_map && !range.host_registered &&
+            range.device_ptr && range.offset == offset &&
+            bytes <= range.bytes) {
+            return range.device_ptr;
+        }
+    }
+    for (const cuda_model_range &range : g_model_ranges) {
+        if (range.host_base != model_map || range.host_registered ||
+            !range.device_ptr || offset < range.offset ||
+            range.offset > UINT64_MAX - range.bytes) {
+            continue;
+        }
+        const uint64_t range_end = range.offset + range.bytes;
+        if (end <= range_end) {
+            return range.device_ptr + (offset - range.offset);
+        }
+    }
+    return NULL;
 }
 
 static int rocm_q4_attn_q_b_f16_key_equal(
@@ -288,33 +356,49 @@ rocm_q4_attn_q_b_get_scale_min(
     }
 }
 
-/* One block expands one canonical 256-value GGUF Q4_K block.  The output is
- * row-major [out_dim, in_dim], the same storage consumed as W^T by hipBLAS. */
+/* Expand one contiguous 16-value chunk per thread.  Compared with launching a
+ * 256-thread workgroup for every Q4_K block, this cuts the logical thread count
+ * by 16x while preserving the row-major [out_dim, in_dim] layout consumed as
+ * W^T by hipBLAS. */
 __global__ static void rocm_dequant_q4_K_attn_q_b_f16_kernel(
         __half *dst,
         const cuda_block_q4_K *src,
-        uint64_t block_count) {
-    const uint64_t block = (uint64_t)blockIdx.x;
-    const uint32_t i = threadIdx.x;
-    if (block >= block_count || i >= CUDA_QK_K) return;
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks_per_row) {
+    const uint64_t chunk =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t chunks_per_row = in_dim / 16u;
+    const uint64_t total_chunks = out_dim * chunks_per_row;
+    if (chunk >= total_chunks) return;
 
-    const cuda_block_q4_K *xb = src + block;
-    const uint32_t group = i >> 5u;
-    const uint32_t within_group = i & 31u;
-    const uint32_t byte_offset = (group >> 1u) * 32u + within_group;
-    const uint32_t shift = (group & 1u) * 4u;
-    const uint32_t q = (xb->qs[byte_offset] >> shift) & 0x0fu;
-    uint8_t scale = 0;
-    uint8_t minimum = 0;
-    rocm_q4_attn_q_b_get_scale_min(
-        group, xb->scales, &scale, &minimum);
+    const uint64_t row = chunk / chunks_per_row;
+    const uint64_t col0 = (chunk - row * chunks_per_row) * 16u;
+    const uint64_t block_in_row = col0 / CUDA_QK_K;
+    const uint32_t within0 = (uint32_t)(col0 % CUDA_QK_K);
+    const cuda_block_q4_K *xb =
+        src + row * blocks_per_row + block_in_row;
     const float d = __half2float(
         __ushort_as_half((unsigned short)xb->d));
     const float dmin = __half2float(
         __ushort_as_half((unsigned short)xb->dmin));
-    dst[block * CUDA_QK_K + i] =
-        __float2half(d * (float)scale * (float)q -
-                     dmin * (float)minimum);
+
+#pragma unroll
+    for (uint32_t k = 0; k < 16u; k++) {
+        const uint32_t within = within0 + k;
+        const uint32_t group = within >> 5u;
+        uint8_t scale = 0;
+        uint8_t minimum = 0;
+        rocm_q4_attn_q_b_get_scale_min(
+            group, xb->scales, &scale, &minimum);
+        const uint8_t packed =
+            xb->qs[(group >> 1u) * 32u + (within & 31u)];
+        const uint32_t q =
+            (group & 1u) ? (packed >> 4u) : (packed & 0x0fu);
+        dst[row * in_dim + col0 + k] =
+            __float2half(d * (float)scale * (float)q -
+                         dmin * (float)minimum);
+    }
 }
 
 static int rocm_q4_attn_q_b_f16_desc_valid(
@@ -377,6 +461,133 @@ static int rocm_q4_attn_q_b_f16_memory_has_room(
     return required_free <= free_bytes;
 }
 
+static int rocm_q4_attn_q_b_transient_f16_layout(
+        uint64_t rows,
+        uint64_t *weight_bytes_out,
+        uint64_t *x_bytes_out,
+        uint64_t *total_bytes_out) {
+    uint64_t weight_elems = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t x_elems = 0;
+    uint64_t x_bytes = 0;
+    uint64_t total_bytes = 0;
+    if (rows == 0u ||
+        !cuda_u64_mul_checked(DS4_ROCM_Q4_ATTN_Q_B_IN_DIM,
+                              DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM,
+                              &weight_elems) ||
+        !cuda_u64_mul_checked(weight_elems, sizeof(__half),
+                              &weight_bytes) ||
+        !cuda_u64_mul_checked(rows, DS4_ROCM_Q4_ATTN_Q_B_IN_DIM,
+                              &x_elems) ||
+        !cuda_u64_mul_checked(x_elems, sizeof(__half), &x_bytes) ||
+        !cuda_u64_add_checked(weight_bytes, x_bytes, &total_bytes) ||
+        total_bytes > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    if (weight_bytes_out) *weight_bytes_out = weight_bytes;
+    if (x_bytes_out) *x_bytes_out = x_bytes;
+    if (total_bytes_out) *total_bytes_out = total_bytes;
+    return 1;
+}
+
+/* Caller holds g_rocm_q4_attn_q_b_transient_f16_mu.  Growth is a preflight
+ * operation. Allocate the replacement first, then synchronize and retire the
+ * old arena: an allocation failure must not silently destroy the capacity
+ * already advertised by the current cache generation. */
+static int rocm_q4_attn_q_b_transient_f16_ensure_locked(
+        uint64_t required_bytes,
+        uint64_t weight_bytes,
+        uint64_t working_set_reserve_bytes,
+        int *allocated_out) {
+    if (allocated_out) *allocated_out = 0;
+    if (required_bytes == 0u || weight_bytes == 0u ||
+        required_bytes > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    if (g_rocm_q4_attn_q_b_transient_f16_scratch &&
+        g_rocm_q4_attn_q_b_transient_f16_weight_bytes == weight_bytes &&
+        g_rocm_q4_attn_q_b_transient_f16_scratch_bytes >= required_bytes) {
+        return 1;
+    }
+
+    if (!rocm_q4_attn_q_b_f16_memory_has_room(
+            required_bytes, working_set_reserve_bytes,
+            NULL, NULL, NULL)) {
+        return 0;
+    }
+    void *scratch = NULL;
+    cudaError_t err = cudaMalloc(&scratch, (size_t)required_bytes);
+    if (err != cudaSuccess || !scratch) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "Q4 attn_q_b transient scratch allocation failed "
+                "(%.2f MiB): %s\n",
+                (double)required_bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    if (g_rocm_q4_attn_q_b_transient_f16_scratch) {
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4 attn_q_b transient scratch growth sync failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            (void)cudaFree(scratch);
+            return 0;
+        }
+        err = cudaFree(g_rocm_q4_attn_q_b_transient_f16_scratch);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4 attn_q_b transient scratch free failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            (void)cudaFree(scratch);
+            return 0;
+        }
+    }
+    g_rocm_q4_attn_q_b_transient_f16_scratch = scratch;
+    g_rocm_q4_attn_q_b_transient_f16_scratch_bytes = required_bytes;
+    g_rocm_q4_attn_q_b_transient_f16_weight_bytes = weight_bytes;
+    if (allocated_out) *allocated_out = 1;
+    return 1;
+}
+
+/* Success leaves the transient mutex held through the caller's complete GPU
+ * enqueue sequence.  No allocation or synchronization is permitted here. */
+static int rocm_q4_attn_q_b_transient_f16_acquire(
+        uint64_t rows,
+        __half **weight_f16_out,
+        __half **x_f16_out) {
+    uint64_t weight_bytes = 0;
+    uint64_t total_bytes = 0;
+    if (!weight_f16_out || !x_f16_out ||
+        !rocm_q4_attn_q_b_transient_f16_layout(
+            rows, &weight_bytes, NULL, &total_bytes)) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_rocm_q4_attn_q_b_transient_f16_mu);
+    if (!g_rocm_q4_attn_q_b_transient_f16_scratch ||
+        g_rocm_q4_attn_q_b_transient_f16_weight_bytes != weight_bytes ||
+        g_rocm_q4_attn_q_b_transient_f16_scratch_bytes < total_bytes) {
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
+        return 0;
+    }
+    *weight_f16_out =
+        (__half *)g_rocm_q4_attn_q_b_transient_f16_scratch;
+    *x_f16_out = (__half *)(
+        (char *)g_rocm_q4_attn_q_b_transient_f16_scratch + weight_bytes);
+    return 1;
+}
+
+static void rocm_q4_attn_q_b_transient_f16_release_acquired(void) {
+    pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
+}
+
 static void rocm_q4_attn_q_b_f16_clear_locked(
         int reset_stats, int reset_circuit) {
     for (uint32_t i = 0;
@@ -406,15 +617,16 @@ static void rocm_q4_attn_q_b_f16_clear_locked(
     }
 }
 
-/* The caller owns build_mu. Keeping this separate lets make_room serialize
- * against an unpublished build without recursively locking through the public
- * release API. cache_mu remains held across synchronization and frees, so a
- * successful lookup cannot race the last reference to its arena. */
+/* The caller owns build_mu. Keep both dispatch mutexes through synchronization
+ * and free: a persistent lookup cannot lose its arena, and a transient enqueue
+ * cannot lose the combined scratch while its final consumer is being queued. */
 static int rocm_q4_attn_q_b_f16_release_with_build_lock(
         int reset_circuit) {
+    pthread_mutex_lock(&g_rocm_q4_attn_q_b_transient_f16_mu);
     pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_cache_mu);
 
-    if (g_rocm_q4_attn_q_b_f16_arena_count != 0u) {
+    if (g_rocm_q4_attn_q_b_f16_arena_count != 0u ||
+        g_rocm_q4_attn_q_b_transient_f16_scratch) {
         const cudaError_t sync_err = cudaDeviceSynchronize();
         if (sync_err != cudaSuccess) {
             fprintf(stderr,
@@ -425,6 +637,7 @@ static int rocm_q4_attn_q_b_f16_release_with_build_lock(
             g_rocm_q4_attn_q_b_f16_hard_failure = 1;
             g_rocm_q4_attn_q_b_f16_pending_evict = 1;
             pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+            pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
             return 0;
         }
     }
@@ -447,14 +660,32 @@ static int rocm_q4_attn_q_b_f16_release_with_build_lock(
             }
         }
     }
+    if (g_rocm_q4_attn_q_b_transient_f16_scratch) {
+        const cudaError_t free_err =
+            cudaFree(g_rocm_q4_attn_q_b_transient_f16_scratch);
+        if (free_err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4 attn_q_b transient scratch free failed: %s\n",
+                    cudaGetErrorString(free_err));
+            (void)cudaGetLastError();
+            ok = 0;
+        } else {
+            g_rocm_q4_attn_q_b_transient_f16_scratch = NULL;
+            g_rocm_q4_attn_q_b_transient_f16_scratch_bytes = 0;
+            g_rocm_q4_attn_q_b_transient_f16_weight_bytes = 0;
+        }
+    }
     if (!ok) {
         g_rocm_q4_attn_q_b_f16_hard_failure = 1;
         g_rocm_q4_attn_q_b_f16_pending_evict = 1;
         pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
         return 0;
     }
     rocm_q4_attn_q_b_f16_clear_locked(0, reset_circuit);
     pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+    pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
     return 1;
 }
 
@@ -481,14 +712,17 @@ extern "C" uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void) {
 
 extern "C" int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void) {
     pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_build_mu);
+    pthread_mutex_lock(&g_rocm_q4_attn_q_b_transient_f16_mu);
     pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_cache_mu);
     const uint32_t entries = g_rocm_q4_attn_q_b_f16_entry_count;
     const uint64_t bytes = g_rocm_q4_attn_q_b_f16_bytes;
     const int needs_reset =
         entries != 0u || g_rocm_q4_attn_q_b_f16_arena_count != 0u ||
+        g_rocm_q4_attn_q_b_transient_f16_scratch != NULL ||
         g_rocm_q4_attn_q_b_f16_hard_failure ||
         g_rocm_q4_attn_q_b_f16_pending_evict;
     pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+    pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
     if (!needs_reset) {
         pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
         return 1;
@@ -503,6 +737,98 @@ extern "C" int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void) {
     const int ok = rocm_q4_attn_q_b_f16_release_with_build_lock(1);
     pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
     return ok;
+}
+
+static int rocm_q4_attn_q_b_prepare_transient_f16(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *descs,
+        uint32_t count,
+        uint32_t max_prefill_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes) {
+    const uint64_t min_tokens =
+        rocm_q4_attn_q_b_transient_f16_min_tokens();
+    if ((uint64_t)max_prefill_rows < min_tokens ||
+        !rocm_q4_attn_q_b_transient_f16_policy_allowed() ||
+        rocm_q4_attn_q_b_f16_circuit_open() ||
+        !g_cublas_ready ||
+        model_map != g_model_host_base ||
+        model_size != g_model_registered_size) {
+        return 0;
+    }
+
+    /* Serialize prompt-aware preparation with cache construction, lifecycle
+     * release, and model-range teardown.  The automatic path is deliberately
+     * stricter than the explicit persistent experiment: every q_b source must
+     * already belong to a device image or device-backed resident range, so
+     * preflight never registers host pages or populates the mutable cache. */
+    pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_build_mu);
+    if (!rocm_q4_attn_q_b_transient_f16_policy_allowed() ||
+        rocm_q4_attn_q_b_f16_circuit_open() ||
+        !g_cublas_ready ||
+        model_map != g_model_host_base ||
+        model_size != g_model_registered_size) {
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+        return 0;
+    }
+
+    uint64_t weight_f16_bytes = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t desc_f16_bytes = 0;
+        if (!rocm_q4_attn_q_b_f16_desc_valid(
+                &descs[i], model_size, &desc_f16_bytes) ||
+            (weight_f16_bytes != 0u &&
+             weight_f16_bytes != desc_f16_bytes)) {
+            pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+            return 0;
+        }
+        weight_f16_bytes = desc_f16_bytes;
+
+        if (!rocm_q4_attn_q_b_device_resident_source(
+                model_map, descs[i].weight_offset,
+                descs[i].weight_bytes)) {
+            pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+            return 0;
+        }
+    }
+
+    uint64_t layout_weight_bytes = 0;
+    uint64_t total_bytes = 0;
+    if (!rocm_q4_attn_q_b_transient_f16_layout(
+            max_prefill_rows, &layout_weight_bytes, NULL, &total_bytes) ||
+        layout_weight_bytes != weight_f16_bytes) {
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+        return 0;
+    }
+
+    int allocated = 0;
+    pthread_mutex_lock(&g_rocm_q4_attn_q_b_transient_f16_mu);
+    const int ready = rocm_q4_attn_q_b_transient_f16_ensure_locked(
+        total_bytes, layout_weight_bytes, working_set_reserve_bytes,
+        &allocated);
+    if (ready && allocated) {
+        pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+        if (++g_rocm_q4_attn_q_b_f16_generation == 0u) {
+            g_rocm_q4_attn_q_b_f16_generation = 1u;
+        }
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+    }
+    pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
+    pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+    if (!ready) return 0;
+
+    if (allocated) {
+        if (prepared_bytes) *prepared_bytes = total_bytes;
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "prepared %.2f MiB Q4 attn_q_b transient F16 scratch "
+                "for up to %u rows (min batch %llu tokens)\n",
+                (double)total_bytes / 1048576.0,
+                max_prefill_rows,
+                (unsigned long long)min_tokens);
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
@@ -521,6 +847,18 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
     }
 
     const int required = rocm_q4_attn_q_b_f16_required();
+    const int persistent_requested =
+        required ||
+        (rocm_q4_attn_q_b_f16_enabled() &&
+         !rocm_q4_attn_q_b_f16_disabled());
+    /* ENABLE and REQUIRE deliberately select the multi-GiB persistent cache.
+     * DISABLE cancels a non-strict ENABLE back to transient, while REQUIRE
+     * still enters the persistent policy and reports DISABLE as a hard skip. */
+    if (!persistent_requested) {
+        return rocm_q4_attn_q_b_prepare_transient_f16(
+            model_map, model_size, descs, count, max_prefill_rows,
+            working_set_reserve_bytes, prepared_bytes);
+    }
     const uint64_t min_tokens = rocm_q4_attn_q_b_f16_min_tokens();
     if ((uint64_t)max_prefill_rows < min_tokens) return 0;
     if (!rocm_q4_attn_q_b_f16_policy_allowed() || !g_cublas_ready ||
@@ -539,6 +877,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
     }
 
     pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_build_mu);
+
     pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_cache_mu);
     const int pending_evict = g_rocm_q4_attn_q_b_f16_pending_evict;
     pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_cache_mu);
@@ -554,6 +893,41 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
     if (!rocm_q4_attn_q_b_f16_policy_allowed() || !g_cublas_ready ||
         model_map != g_model_host_base ||
         model_size != g_model_registered_size) {
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+        return required ? -1 : 0;
+    }
+    if (rocm_q4_attn_q_b_f16_circuit_open()) {
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+        return required ? -1 : 0;
+    }
+
+    /* The persistent sidecar still needs private X_F16 staging.  Reuse the
+     * dedicated combined arena instead of the backend-global cuda_tmp buffer;
+     * dispatch holds transient_mu through conversion, GEMM, and epilogue.
+     * Keep the global lock order build -> transient -> cache. */
+    uint64_t scratch_weight_bytes = 0;
+    uint64_t scratch_bytes = 0;
+    if (!rocm_q4_attn_q_b_transient_f16_layout(
+            max_prefill_rows, &scratch_weight_bytes, NULL, &scratch_bytes) ||
+        scratch_weight_bytes != desc_f16_bytes[0]) {
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
+        return required ? -1 : 0;
+    }
+    int scratch_allocated = 0;
+    pthread_mutex_lock(&g_rocm_q4_attn_q_b_transient_f16_mu);
+    const int scratch_ready =
+        rocm_q4_attn_q_b_transient_f16_ensure_locked(
+            scratch_bytes, scratch_weight_bytes,
+            working_set_reserve_bytes, &scratch_allocated);
+    if (scratch_ready && scratch_allocated) {
+        pthread_mutex_lock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+        if (++g_rocm_q4_attn_q_b_f16_generation == 0u) {
+            g_rocm_q4_attn_q_b_f16_generation = 1u;
+        }
+        pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_cache_mu);
+    }
+    pthread_mutex_unlock(&g_rocm_q4_attn_q_b_transient_f16_mu);
+    if (!scratch_ready) {
         pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
         return required ? -1 : 0;
     }
@@ -703,13 +1077,14 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc =
             &descs[miss_indices[mi]];
         sidecar_ptrs[mi] = (__half *)((char *)arena + arena_offset);
-        const uint64_t block_count =
-            (desc->in_dim / CUDA_QK_K) * desc->out_dim;
+        const uint64_t blocks_per_row = desc->in_dim / CUDA_QK_K;
+        const uint64_t total_chunks =
+            desc->out_dim * (desc->in_dim / 16u);
         rocm_dequant_q4_K_attn_q_b_f16_kernel<<<
-            (uint32_t)block_count, CUDA_QK_K>>>(
+            (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
                 sidecar_ptrs[mi],
                 (const cuda_block_q4_K *)weight_ptrs[mi],
-                block_count);
+                desc->in_dim, desc->out_dim, blocks_per_row);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr,

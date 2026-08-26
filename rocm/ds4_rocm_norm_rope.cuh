@@ -553,6 +553,7 @@ static int rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
+    (void)q_half;
     /* Decode and tiny/final chunks retain the native Q4_K path without even
      * taking the cache mutex. REQUIRE applies only to configured candidates. */
     if (n_tok < 32u) return 0;
@@ -568,7 +569,7 @@ static int rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
     uint64_t head_rows = 0;
     if (!rocm_q4_attn_q_b_f16_policy_allowed() ||
         rocm_q4_attn_q_b_f16_circuit_open() ||
-        !g_cublas_ready || !out || !q_half || !x || !model_map ||
+        !g_cublas_ready || !out || !x || !model_map ||
         model_map != g_model_host_base ||
         model_size != g_model_registered_size ||
         in_dim != DS4_ROCM_Q4_ATTN_Q_B_IN_DIM ||
@@ -585,8 +586,7 @@ static int rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
         (x_elems + 255u) / 256u > UINT32_MAX ||
         !cuda_u64_mul_checked(x_elems, sizeof(float), &x_bytes) ||
         !cuda_u64_mul_checked(out_elems, sizeof(float), &out_bytes) ||
-        x->bytes < x_bytes || out->bytes < out_bytes ||
-        q_half->bytes < out_elems * sizeof(__half)) {
+        x->bytes < x_bytes || out->bytes < out_bytes) {
         return rocm_q4_attn_q_b_f16_fallback(required, 1, 0);
     }
 
@@ -600,22 +600,25 @@ static int rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
         return rocm_q4_attn_q_b_f16_fallback(required, 1, 0);
     }
 
+    __half *unused_weight_f16 = NULL;
+    __half *xh = NULL;
+    if (!rocm_q4_attn_q_b_transient_f16_acquire(
+            n_tok, &unused_weight_f16, &xh)) {
+        return rocm_q4_attn_q_b_f16_fallback(required, 0, 0);
+    }
+    (void)unused_weight_f16;
+
     const __half *w_f16 = rocm_q4_attn_q_b_f16_acquire(
         model_map, model_size, weight_offset, weight_bytes, in_dim, out_dim,
         DS4_ROCM_Q4_K_TYPE);
     if (!w_f16) {
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
         return rocm_q4_attn_q_b_f16_fallback(required, 0, 0);
     }
 
-    /* Keep the cache mutex through GEMM submission. A concurrent lifecycle
-     * release cannot synchronize and free the sidecar between lookup and the
-     * first command that references it. */
-    __half *xh = (__half *)cuda_tmp_alloc(
-        x_elems * sizeof(__half), "Q4 attn q_b F16 activations");
-    if (!xh) {
-        rocm_q4_attn_q_b_f16_release_acquired();
-        return rocm_q4_attn_q_b_f16_fallback(required, 0, 1);
-    }
+    /* Keep both the persistent weight pin and the dedicated X staging lock
+     * through the complete enqueue sequence. Lifecycle release takes the same
+     * locks before synchronizing, so it cannot miss the final F32 epilogue. */
     f32_to_f16_kernel<<<(x_elems + 255u) / 256u, 256>>>(
         xh, (const float *)x->ptr, x_elems);
     cudaError_t launch_err = cudaGetLastError();
@@ -626,6 +629,7 @@ static int rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
                 cudaGetErrorString(launch_err));
         (void)cudaGetLastError();
         rocm_q4_attn_q_b_f16_release_acquired();
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
         return rocm_q4_attn_q_b_f16_fallback(required, 0, 1);
     }
 
@@ -646,34 +650,194 @@ static int rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
         CUDA_R_16F,
         (int)in_dim,
         &beta,
-        q_half->ptr,
-        CUDA_R_16F,
+        out->ptr,
+        CUDA_R_32F,
         (int)out_dim,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT);
-    rocm_q4_attn_q_b_f16_release_acquired();
     if (st != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX
                 DS4_GPU_BLAS_NAME
-                " cached Q4 attn q_b F16-out matmul failed: status %d\n",
+                " cached Q4 attn q_b F16/F16-to-F32 matmul failed: "
+                "status %d\n",
                 (int)st);
+        rocm_q4_attn_q_b_f16_release_acquired();
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
         return rocm_q4_attn_q_b_f16_fallback(required, 0, 1);
     }
 
-    head_rms_norm_rope_tail_from_half_kernel<<<(uint32_t)head_rows, 256>>>(
-        (float *)out->ptr, (const __half *)q_half->ptr,
-        n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
-        inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
-        beta_fast, beta_slow, eps);
+    const int tail_ok = ds4_gpu_head_rms_norm_rope_tail_tensor(
+            out, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+            inverse, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, eps);
+    rocm_q4_attn_q_b_f16_release_acquired();
+    rocm_q4_attn_q_b_transient_f16_release_acquired();
+    if (!tail_ok) {
+        /* GEMM has already accepted the output writer.  Never authorize the
+         * caller to replay native Q4 over an asynchronous/partial result. */
+        return rocm_q4_attn_q_b_f16_fallback(1, 0, 1);
+    }
+    return 1;
+}
+
+/* Resident default: expand only the current Q4_K q_b matrix into the shared
+ * 64 MiB W_F16 region, convert X into the adjacent preflighted region, consume
+ * both immediately with hipBLAS, and enqueue the F32 epilogue before allowing
+ * another host caller to reuse the allocation. */
+static int rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *q_half,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_ctx_orig,
+        bool                  inverse,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 eps) {
+    (void)q_half;
+    if ((uint64_t)n_tok <
+            rocm_q4_attn_q_b_transient_f16_min_tokens()) {
+        return 0;
+    }
+    rocm_q4_attn_q_b_f16_note_candidate();
+
+    uint64_t x_elems = 0;
+    uint64_t out_elems = 0;
+    uint64_t head_rows = 0;
+    uint64_t x_bytes = 0;
+    uint64_t out_bytes = 0;
+    if (!rocm_q4_attn_q_b_transient_f16_policy_allowed() ||
+        rocm_q4_attn_q_b_f16_circuit_open() ||
+        !g_cublas_ready || !out || !x || !model_map ||
+        model_map != g_model_host_base ||
+        model_size != g_model_registered_size ||
+        in_dim != DS4_ROCM_Q4_ATTN_Q_B_IN_DIM ||
+        out_dim != DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM ||
+        n_head == 0u || head_dim == 0u ||
+        out_dim != (uint64_t)n_head * head_dim ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        n_tok > (uint32_t)INT_MAX ||
+        pos0 > (uint32_t)INT_MAX - n_tok ||
+        !cuda_u64_mul_checked(n_tok, in_dim, &x_elems) ||
+        !cuda_u64_mul_checked(n_tok, out_dim, &out_elems) ||
+        !cuda_u64_mul_checked(n_tok, n_head, &head_rows) ||
+        head_rows > UINT32_MAX ||
+        (x_elems + 255u) / 256u > UINT32_MAX ||
+        !cuda_u64_mul_checked(x_elems, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul_checked(out_elems, sizeof(float), &out_bytes) ||
+        x->bytes < x_bytes || out->bytes < out_bytes) {
+        return rocm_q4_attn_q_b_f16_fallback(0, 1, 0);
+    }
+
+    uint64_t row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    const uint64_t blocks_per_row = in_dim / CUDA_QK_K;
+    if (!cuda_u64_mul_checked(blocks_per_row,
+                              sizeof(cuda_block_q4_K), &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes)) {
+        return rocm_q4_attn_q_b_f16_fallback(0, 1, 0);
+    }
+
+    __half *w_f16 = NULL;
+    __half *x_f16 = NULL;
+    if (!rocm_q4_attn_q_b_transient_f16_acquire(
+            n_tok, &w_f16, &x_f16)) {
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 0);
+    }
+
+    const char *w_q4 = rocm_q4_attn_q_b_device_resident_source(
+        model_map, weight_offset, weight_bytes);
+    if (!w_q4) {
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    const uint64_t total_chunks = out_dim * (in_dim / 16u);
+    rocm_dequant_q4_K_attn_q_b_f16_kernel<<<
+        (uint32_t)((total_chunks + 255u) / 256u), 256>>>(
+            w_f16, (const cuda_block_q4_K *)w_q4,
+            in_dim, out_dim, blocks_per_row);
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "Q4 attn_q_b transient dequant launch failed: %s\n",
+                cudaGetErrorString(launch_err));
+        (void)cudaGetLastError();
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    f32_to_f16_kernel<<<(x_elems + 255u) / 256u, 256>>>(
+        x_f16, (const float *)x->ptr, x_elems);
     launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX
-                "cached Q4 attn q_b head RMS/RoPE launch failed: %s\n",
+                "Q4 attn_q_b transient activation conversion failed: %s\n",
                 cudaGetErrorString(launch_err));
         (void)cudaGetLastError();
-        return rocm_q4_attn_q_b_f16_fallback(required, 0, 1);
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+        g_cublas,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        (int)out_dim,
+        (int)n_tok,
+        (int)in_dim,
+        &alpha,
+        w_f16,
+        CUDA_R_16F,
+        (int)in_dim,
+        x_f16,
+        CUDA_R_16F,
+        (int)in_dim,
+        &beta,
+        out->ptr,
+        CUDA_R_32F,
+        (int)out_dim,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                DS4_GPU_BLAS_NAME
+                " transient Q4 attn q_b F16/F16-to-F32 matmul failed: "
+                "status %d\n",
+                (int)st);
+        rocm_q4_attn_q_b_transient_f16_release_acquired();
+        return rocm_q4_attn_q_b_f16_fallback(0, 0, 1);
+    }
+
+    const int tail_ok = ds4_gpu_head_rms_norm_rope_tail_tensor(
+        out, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+        inverse, freq_base, freq_scale, ext_factor, attn_factor,
+        beta_fast, beta_slow, eps);
+    rocm_q4_attn_q_b_transient_f16_release_acquired();
+    if (!tail_ok) {
+        /* GEMM was accepted and may already be executing.  Returning zero
+         * would make the graph replay native Q4 over an in-flight writer. */
+        return rocm_q4_attn_q_b_f16_fallback(1, 0, 1);
     }
     return 1;
 }
@@ -703,7 +867,19 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_slow,
         float                 eps) {
     if (weight_type == DS4_ROCM_Q4_K_TYPE) {
-        return rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
+        const int required = rocm_q4_attn_q_b_f16_required();
+        const int persistent_requested =
+            required ||
+            (rocm_q4_attn_q_b_f16_enabled() &&
+             !rocm_q4_attn_q_b_f16_disabled());
+        if (persistent_requested) {
+            return rocm_q4_attn_q_b_f16_head_rms_rope_tail_tensor(
+                out, q_half, model_map, model_size, weight_offset,
+                in_dim, out_dim, x, n_tok, n_head, head_dim, n_rot, pos0,
+                n_ctx_orig, inverse, freq_base, freq_scale, ext_factor,
+                attn_factor, beta_fast, beta_slow, eps);
+        }
+        return rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
             out, q_half, model_map, model_size, weight_offset,
             in_dim, out_dim, x, n_tok, n_head, head_dim, n_rot, pos0,
             n_ctx_orig, inverse, freq_base, freq_scale, ext_factor,

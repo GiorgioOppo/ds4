@@ -550,6 +550,17 @@ static uint64_t g_q4_attn_q_b_f16_generation = 1u;
 static int g_q4_attn_q_b_f16_hard_disabled;
 static int g_q4_attn_q_b_f16_dispatch_disabled;
 static int g_q4_attn_q_b_f16_pending_evict;
+/* The long-prefill transient path expands exactly one q_b matrix at a time.
+ * Keep its weight and activation staging in one dedicated allocation so it
+ * cannot alias the legacy global CUDA scratch used by unrelated projections.
+ * A single mutex covers both ownership and the complete enqueue sequence: the
+ * NULL stream orders GPU work, while the mutex prevents two host threads from
+ * interleaving dequantize -> GEMM sequences that reuse this storage. */
+static __half *g_q4_attn_q_b_transient_f16_scratch;
+static uint64_t g_q4_attn_q_b_transient_f16_scratch_bytes;
+static int g_q4_attn_q_b_transient_f16_scratch_device = -1;
+static int g_q4_attn_q_b_transient_f16_runtime_disabled;
+static std::mutex g_q4_attn_q_b_transient_f16_mutex;
 /* Support-model residency means two independent GGUF mappings coexist.
  * Keep the large q_b expansion disabled in that conservative mode. */
 static int g_q4_attn_q_b_f16_multi_model_active;
@@ -2484,6 +2495,64 @@ static int cuda_q4_attn_q_b_f16_disabled(void) {
         getenv("DS4_CUDA_DISABLE_Q4_ATTN_Q_B_F16_CACHE"));
 }
 
+static uint32_t cuda_q4_attn_q_b_transient_f16_min_tokens(void) {
+    int present = 0;
+    return cuda_parse_u32_env_clamped(
+        "DS4_CUDA_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS",
+        4096u, 32u, UINT32_MAX, &present);
+}
+
+static int cuda_q4_attn_q_b_transient_f16_disabled(void) {
+    return cuda_env_value_enabled(
+        getenv("DS4_CUDA_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16"));
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_size(
+        uint32_t max_rows,
+        uint64_t *weight_bytes,
+        uint64_t *activation_offset,
+        uint64_t *scratch_bytes) {
+    const uint64_t wh_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM *
+        CUDA_Q4_ATTN_Q_B_OUT_DIM * sizeof(__half);
+    const uint64_t xh_off = (wh_bytes + 255u) & ~UINT64_C(255);
+    const uint64_t row_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM * sizeof(__half);
+    if (max_rows == 0u ||
+        (uint64_t)max_rows > (UINT64_MAX - xh_off) / row_bytes) {
+        return 0;
+    }
+    const uint64_t total = xh_off + (uint64_t)max_rows * row_bytes;
+    if (total > SIZE_MAX) return 0;
+    if (weight_bytes) *weight_bytes = wh_bytes;
+    if (activation_offset) *activation_offset = xh_off;
+    if (scratch_bytes) *scratch_bytes = total;
+    return 1;
+}
+
+/* The automatic path is intentionally limited to physical device storage.
+ * cuda_model_range_ptr may also expose managed/HMM or mapped host memory; a
+ * per-layer dequantization from either source would fold migration/PCIe cost
+ * into prefill and could be much slower than the native Q4 kernel. */
+static int cuda_q4_attn_q_b_source_is_device_resident(
+        const void *ptr,
+        int expected_device) {
+    if (!ptr) return 0;
+    cudaPointerAttributes attr = {};
+    const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+#if CUDART_VERSION >= 10000
+    return attr.type == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#else
+    return attr.memoryType == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#endif
+}
+
 /* Match the existing CUDA weight-cache safety floor without coupling this
  * cache to the Q8-specific reserve environment variable.  The explicit
  * future-session reserve supplied by ds4.c is added independently. */
@@ -2499,6 +2568,165 @@ static uint64_t cuda_q4_attn_q_b_f16_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 4096ull * 1048576ull;
     const uint64_t pct_reserve = total_bytes / 20u;
     return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_release(void) {
+    std::lock_guard<std::mutex> lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    if (!g_q4_attn_q_b_transient_f16_scratch) {
+        g_q4_attn_q_b_transient_f16_scratch_bytes = 0;
+        g_q4_attn_q_b_transient_f16_scratch_device = -1;
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+        return 1;
+    }
+
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    const int owner = g_q4_attn_q_b_transient_f16_scratch_device;
+    if (owner < 0 || cudaSetDevice(owner) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    if (cudaFree(g_q4_attn_q_b_transient_f16_scratch) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    g_q4_attn_q_b_transient_f16_scratch = NULL;
+    g_q4_attn_q_b_transient_f16_scratch_bytes = 0;
+    g_q4_attn_q_b_transient_f16_scratch_device = -1;
+    g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+    {
+        std::lock_guard<std::mutex> cache_lock(
+            g_q4_attn_q_b_f16_cache_mutex);
+        if (++g_q4_attn_q_b_f16_generation == 0u) {
+            g_q4_attn_q_b_f16_generation = 1u;
+        }
+    }
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_ensure(
+        uint32_t max_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes) {
+    uint64_t scratch_bytes = 0;
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
+            max_rows, NULL, NULL, &scratch_bytes)) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    const int target_device = g_gpu[0].device_id;
+    if (g_q4_attn_q_b_transient_f16_scratch &&
+        g_q4_attn_q_b_transient_f16_scratch_device == target_device &&
+        g_q4_attn_q_b_transient_f16_scratch_bytes >= scratch_bytes) {
+        return 1;
+    }
+    /* A CUDA backend instance does not migrate its single-GPU arena between
+     * physical devices. Cleanup/reinit owns that transition; preserving the
+     * old allocation is safer than partially replacing it here. */
+    if (g_q4_attn_q_b_transient_f16_scratch &&
+        g_q4_attn_q_b_transient_f16_scratch_device != target_device) {
+        return 0;
+    }
+
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess ||
+        cudaSetDevice(target_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    const uint64_t effective_free = (uint64_t)free_bytes;
+    const uint64_t reserve =
+        cuda_q4_attn_q_b_f16_reserve_bytes((uint64_t)total_bytes);
+    uint64_t required_free = scratch_bytes;
+    if (required_free > UINT64_MAX - reserve) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    required_free += reserve;
+    if (required_free > UINT64_MAX - working_set_reserve_bytes) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    required_free += working_set_reserve_bytes;
+    if (required_free > effective_free) {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 attn_q_b transient F16 preflight skipped: "
+                    "need %.2f MiB scratch + %.2f GiB reserve + %.2f GiB "
+                    "future sessions, only %.2f GiB currently free\n",
+                    (double)scratch_bytes / 1048576.0,
+                    (double)reserve / 1073741824.0,
+                    (double)working_set_reserve_bytes / 1073741824.0,
+                    (double)effective_free / 1073741824.0);
+        }
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Allocate first so a failed grow cannot invalidate the capacity published
+     * by the current generation. The conservative admission above intentionally
+     * does not count the old arena as reclaimable. */
+    __half *scratch = NULL;
+    if (cudaMalloc((void **)&scratch, (size_t)scratch_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Any old arena can still be referenced by stream work queued by a previous
+     * command batch. Drain before replacing it; this synchronization happens in
+     * prompt-aware preflight, never in the timed layer loop. */
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFree(scratch);
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    if (g_q4_attn_q_b_transient_f16_scratch) {
+        if (cudaFree(g_q4_attn_q_b_transient_f16_scratch) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFree(scratch);
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return 0;
+        }
+    }
+    g_q4_attn_q_b_transient_f16_scratch = scratch;
+    g_q4_attn_q_b_transient_f16_scratch_bytes = scratch_bytes;
+    g_q4_attn_q_b_transient_f16_scratch_device = target_device;
+    g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+    /* Session preflight caches the backend generation.  Capacity is part of
+     * readiness: after a grow, sessions prepared for a smaller prompt must
+     * revisit preflight before their next larger sync. */
+    {
+        std::lock_guard<std::mutex> cache_lock(
+            g_q4_attn_q_b_f16_cache_mutex);
+        if (++g_q4_attn_q_b_f16_generation == 0u) {
+            g_q4_attn_q_b_f16_generation = 1u;
+        }
+    }
+    if (prepared_bytes) *prepared_bytes = scratch_bytes;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    fprintf(stderr,
+            "ds4: CUDA prepared reusable Q4 attn_q_b transient F16 scratch "
+            "(%.2f MiB, max batch %u tokens)\n",
+            (double)scratch_bytes / 1048576.0, max_rows);
+    return 1;
 }
 
 static int cuda_q4_attn_q_b_f16_key_equal(
@@ -2632,17 +2860,20 @@ extern "C" int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void) {
     return cuda_q4_attn_q_b_f16_release_under_build_lock();
 }
 
-/* Called after a fast-path launch/runtime failure while cache_use_lock is
- * held.  Block future dispatch/build attempts, drop the use lock, then
- * serialize with cold builders and synchronously evict.  Re-arm the circuit
- * breaker after eviction so this session cannot rebuild and repeat the same
- * failure; an explicit lifecycle release/make_room resets it later. */
+/* Called after a persistent fast-path failure while both use locks are held.
+ * Block future dispatch/build attempts, drop cache then scratch ownership, and
+ * only then take build_mutex for synchronous eviction. This preserves the
+ * global build -> scratch -> cache lifecycle order. Re-arm the circuit breaker
+ * after eviction so this session cannot rebuild and repeat the same failure;
+ * an explicit lifecycle release/make_room resets it later. */
 static void cuda_q4_attn_q_b_f16_runtime_failure_evict(
-        std::unique_lock<std::mutex> *cache_use_lock) {
+        std::unique_lock<std::mutex> *cache_use_lock,
+        std::unique_lock<std::mutex> *scratch_use_lock) {
     g_q4_attn_q_b_f16_hard_disabled = 1;
     g_q4_attn_q_b_f16_dispatch_disabled = 1;
     g_q4_attn_q_b_f16_pending_evict = 1;
     cache_use_lock->unlock();
+    scratch_use_lock->unlock();
 
     std::lock_guard<std::mutex> build_lock(
         g_q4_attn_q_b_f16_build_mutex);
@@ -2686,6 +2917,9 @@ static int cuda_q4_attn_q_b_f16_consume_pending_evict(void) {
 
 extern "C" int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void) {
     std::lock_guard<std::mutex> build_lock(g_q4_attn_q_b_f16_build_mutex);
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_release()) {
+        return 0;
+    }
     uint64_t bytes = 0;
     int needs_reset = 0;
     {
@@ -2715,17 +2949,45 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         uint64_t *prepared_bytes) {
     if (prepared_bytes) *prepared_bytes = 0;
     const int required = cuda_q4_attn_q_b_f16_required();
-    if (!cuda_q4_attn_q_b_f16_requested() ||
-        max_prefill_rows < cuda_q4_attn_q_b_f16_min_tokens()) {
+    const int persistent_requested =
+        cuda_q4_attn_q_b_f16_requested();
+    const int persistent_disabled =
+        cuda_q4_attn_q_b_f16_disabled();
+    const int persistent_selected =
+        required || (persistent_requested && !persistent_disabled);
+    const uint32_t persistent_min_tokens =
+        cuda_q4_attn_q_b_f16_min_tokens();
+    /* An explicit persistent selection owns its configured candidate domain.
+     * Below that domain, preserve native Q4 exactly like Metal and ROCm.
+     * A non-strict ENABLE+DISABLE pair cancels the selection and may still
+     * use the independent automatic transient policy. */
+    if (persistent_selected &&
+        max_prefill_rows < persistent_min_tokens) {
         return 0;
     }
-    if (cuda_q4_attn_q_b_f16_disabled() || g_ssd_streaming_mode ||
-        g_quality_mode || g_n_gpus != 1 || !g_cublas_ready ||
+    const int persistent_candidate =
+        persistent_selected &&
+        max_prefill_rows >= persistent_min_tokens;
+    /* REQUIRE is strict only for batches that are actually eligible for the
+     * persistent cache.  A long transient-only batch below CACHE_MIN_TOKENS
+     * must retain the same native-Q4 fallback as Metal and ROCm. */
+    const int strict = required && persistent_candidate;
+    const int transient_candidate =
+        !cuda_q4_attn_q_b_transient_f16_disabled() &&
+        max_prefill_rows >=
+            cuda_q4_attn_q_b_transient_f16_min_tokens();
+    if (!persistent_candidate && !transient_candidate) {
+        return 0;
+    }
+    if ((strict && persistent_disabled) ||
+        g_ssd_streaming_mode || g_quality_mode || g_n_gpus != 1 ||
+        !g_cublas_ready ||
         !g_gpu[0].cublas_ready || !g_gpu[0].cublas ||
         cuda_q4_attn_q_b_f16_multi_model_policy_active() ||
+        g_decode_graph_capturing ||
         !model_map || !descs || count == 0u ||
         count > CUDA_Q4_ATTN_Q_B_MAX_ENTRIES) {
-        return required ? -1 : 0;
+        return strict ? -1 : 0;
     }
 
     const uint64_t expected_weight_bytes =
@@ -2743,11 +3005,61 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
             desc.weight_bytes != expected_weight_bytes ||
             desc.weight_offset > model_size ||
             desc.weight_bytes > model_size - desc.weight_offset) {
-            return required ? -1 : 0;
+            return strict ? -1 : 0;
         }
     }
 
-    std::lock_guard<std::mutex> build_lock(g_q4_attn_q_b_f16_build_mutex);
+    /* Serialize scratch capacity publication with sidecar construction and
+     * lifecycle eviction. The global order is build -> scratch -> cache. */
+    std::lock_guard<std::mutex> build_lock(
+        g_q4_attn_q_b_f16_build_mutex);
+
+    /* Without an explicit resident-cache request, the default long-prefill
+     * specialization retains only one expanded matrix. Verify every source in
+     * the already-owned device image now; the automatic path never populates a
+     * range cache or registers host pages. DISABLE_CACHE rolls an optional
+     * persistent request over to this path; REQUIRE remains strict only for
+     * persistent-cache candidates. */
+    const int use_persistent =
+        persistent_candidate && !persistent_disabled;
+    if (!use_persistent) {
+        if (!transient_candidate) return strict ? -1 : 0;
+        int previous_device = -1;
+        if (cudaGetDevice(&previous_device) != cudaSuccess ||
+            cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
+            (void)cudaGetLastError();
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return strict ? -1 : 0;
+        }
+        int resident =
+            model_map == g_model_host_base &&
+            g_model_device_owned && g_model_device_base;
+        for (uint32_t i = 0; i < count; i++) {
+            if (!resident) break;
+            const char *source =
+                g_model_device_base + descs[i].weight_offset;
+            if (!cuda_q4_attn_q_b_source_is_device_resident(
+                    source, g_gpu[0].device_id)) {
+                resident = 0;
+                break;
+            }
+        }
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        if (!resident ||
+            !cuda_q4_attn_q_b_transient_f16_scratch_ensure(
+                max_prefill_rows, working_set_reserve_bytes,
+                prepared_bytes)) {
+            return strict ? -1 : 0;
+        }
+        return 1;
+    }
+
+    /* The persistent path also stages its F16 RHS in the dedicated arena. */
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_ensure(
+            max_prefill_rows, working_set_reserve_bytes, prepared_bytes)) {
+        return strict ? -1 : 0;
+    }
+
     uint32_t miss_indices[CUDA_Q4_ATTN_Q_B_MAX_ENTRIES];
     uint32_t miss_count = 0;
     uint64_t missing_bytes = 0;
@@ -2755,7 +3067,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         std::lock_guard<std::mutex> cache_lock(
             g_q4_attn_q_b_f16_cache_mutex);
         if (g_q4_attn_q_b_f16_multi_model_active) {
-            return required ? -1 : 0;
+            return strict ? -1 : 0;
         }
         /* One cache generation belongs to one mmap identity.  Do not let a
          * second live model consume the remaining budget or poison READY
@@ -2764,7 +3076,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         if (!g_q4_attn_q_b_f16_ranges.empty() &&
             (g_q4_attn_q_b_f16_ranges[0].host_base != model_map ||
              g_q4_attn_q_b_f16_ranges[0].model_size != model_size)) {
-            return required ? -1 : 0;
+            return strict ? -1 : 0;
         }
         for (uint32_t i = 0; i < count; i++) {
             int found = 0;
@@ -2794,14 +3106,14 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
             if (!found) {
                 miss_indices[miss_count++] = i;
                 if (UINT64_MAX - missing_bytes < one_f16_bytes) {
-                    return required ? -1 : 0;
+                    return strict ? -1 : 0;
                 }
                 missing_bytes += one_f16_bytes;
             }
         }
         if (miss_count != 0u) {
             if (g_q4_attn_q_b_f16_hard_disabled) {
-                return required ? -1 : 0;
+                return strict ? -1 : 0;
             }
             const uint64_t limit =
                 cuda_q4_attn_q_b_f16_cache_limit_bytes();
@@ -2809,7 +3121,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
                     CUDA_Q4_ATTN_Q_B_MAX_ENTRIES - miss_count ||
                 g_q4_attn_q_b_f16_bytes > limit ||
                 missing_bytes > limit - g_q4_attn_q_b_f16_bytes) {
-                return required ? -1 : 0;
+                return strict ? -1 : 0;
             }
         }
     }
@@ -2818,12 +3130,12 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
     int previous_device = -1;
     if (cudaGetDevice(&previous_device) != cudaSuccess) {
         (void)cudaGetLastError();
-        return required ? -1 : 0;
+        return strict ? -1 : 0;
     }
     if (cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
         (void)cudaGetLastError();
         if (previous_device >= 0) (void)cudaSetDevice(previous_device);
-        return required ? -1 : 0;
+        return strict ? -1 : 0;
     }
 
     const cuda_block_q4_K *sources[CUDA_Q4_ATTN_Q_B_MAX_ENTRIES] = {};
@@ -2867,7 +3179,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         } else if (!build_failed) {
             required_free += working_set_reserve_bytes;
             if (required_free > (uint64_t)free_bytes) {
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL || required) {
+                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL || strict) {
                     fprintf(stderr,
                             "ds4: CUDA Q4 attn_q_b F16 prewarm skipped: "
                             "need %.2f GiB sidecars + %.2f GiB reserve + "
@@ -2878,7 +3190,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
                             (double)free_bytes / 1073741824.0);
                 }
                 if (previous_device >= 0) (void)cudaSetDevice(previous_device);
-                return required ? -1 : 0;
+                return strict ? -1 : 0;
             }
         }
     }
@@ -2926,7 +3238,7 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
             g_q4_attn_q_b_f16_hard_disabled = 1;
         }
         if (previous_device >= 0) (void)cudaSetDevice(previous_device);
-        return required ? -1 : 0;
+        return strict ? -1 : 0;
     }
 
     {
@@ -7372,6 +7684,9 @@ extern "C" void ds4_gpu_cleanup(void) {
      * Retire them while the tier contexts and physical-device mapping are
      * intact; release performs its own quiescence check. */
     (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+    /* The transient arena is backend-owned rather than graph-owned.  Release
+     * it only after quiescence and before tearing down the device contexts. */
+    (void)cuda_q4_attn_q_b_transient_f16_scratch_release();
     cuda_q4_attn_q_b_f16_set_multi_model_policy(0);
     cuda_decode_graphs_shutdown();
     cuda_q8_fold_release_all();
@@ -42661,6 +42976,12 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
                 "ds4: CUDA could not safely release Q4 attn_q_b F16 "
                 "sidecars while enabling SSD streaming\n");
     }
+    if (enabled && !g_ssd_streaming_mode &&
+        !cuda_q4_attn_q_b_transient_f16_scratch_release()) {
+        fprintf(stderr,
+                "ds4: CUDA could not safely release Q4 attn_q_b transient "
+                "F16 scratch while enabling SSD streaming\n");
+    }
     cuda_stream_selected_writer_guard writer;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     if (!g_ssd_streaming_mode) {
@@ -42879,27 +43200,45 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
     /* The pre-existing CUDA Q8 specialization was a stub.  Preserve that
-     * fallback behavior and arm only the explicit resident-Q4 experiment. */
+     * fallback behavior and arm only resident Q4_K.  CUDA writes the GEMM
+     * directly to the canonical F32 graph tensor, so the Metal-only q_half
+     * workspace is deliberately optional here. */
+    (void)q_half;
     if (weight_type != CUDA_Q4_ATTN_Q_B_TYPE) return 0;
-    if (n_tok < 32u ||
-        n_tok < cuda_q4_attn_q_b_f16_min_tokens() ||
-        !cuda_q4_attn_q_b_f16_requested()) {
-        return 0;
-    }
+    if (n_tok < 32u) return 0;
     const int required = cuda_q4_attn_q_b_f16_required();
-    const int fallback = required ? -1 : 0;
+    const int persistent_requested =
+        cuda_q4_attn_q_b_f16_requested();
+    const int persistent_disabled =
+        cuda_q4_attn_q_b_f16_disabled();
+    const int persistent_selected =
+        required || (persistent_requested && !persistent_disabled);
+    const uint32_t persistent_min_tokens =
+        cuda_q4_attn_q_b_f16_min_tokens();
+    if (persistent_selected && n_tok < persistent_min_tokens) return 0;
+    const int persistent_candidate =
+        persistent_selected && n_tok >= persistent_min_tokens;
+    const int strict = required && persistent_candidate;
+    const int use_persistent =
+        persistent_candidate && !persistent_disabled;
+    const int fallback = strict ? -1 : 0;
+    const int transient_candidate =
+        !cuda_q4_attn_q_b_transient_f16_disabled() &&
+        n_tok >= cuda_q4_attn_q_b_transient_f16_min_tokens();
+    if (!persistent_candidate && !transient_candidate) return 0;
 
-    if (cuda_q4_attn_q_b_f16_disabled() || g_ssd_streaming_mode ||
-        g_quality_mode || g_n_gpus != 1 || !g_cublas_ready ||
+    if ((strict && persistent_disabled) ||
+        g_ssd_streaming_mode || g_quality_mode || g_n_gpus != 1 ||
+        !g_cublas_ready ||
         !g_gpu[0].cublas_ready || !g_gpu[0].cublas ||
-        g_decode_graph_capturing || !out || !q_half || !x || !model_map ||
-        !out->ptr || !q_half->ptr || !x->ptr || n_head == 0u ||
+        cuda_q4_attn_q_b_f16_multi_model_policy_active() ||
+        g_decode_graph_capturing || !out || !x || !model_map ||
+        !out->ptr || !x->ptr || n_head == 0u ||
         head_dim == 0u || in_dim != CUDA_Q4_ATTN_Q_B_IN_DIM ||
         out_dim != CUDA_Q4_ATTN_Q_B_OUT_DIM ||
         out_dim != (uint64_t)n_head * head_dim || n_rot > head_dim ||
         (n_rot & 1u) != 0u ||
         ds4_tensor_device_idx(out) != 0 ||
-        ds4_tensor_device_idx(q_half) != 0 ||
         ds4_tensor_device_idx(x) != 0 ||
         n_tok > (uint32_t)INT_MAX ||
         (uint64_t)n_tok * in_dim > (uint64_t)UINT32_MAX * 256u ||
@@ -42912,10 +43251,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         (uint64_t)n_tok * in_dim * sizeof(float);
     const uint64_t out_bytes =
         (uint64_t)n_tok * out_dim * sizeof(float);
-    const uint64_t q_half_bytes =
-        (uint64_t)n_tok * out_dim * sizeof(__half);
-    if (x->bytes < x_bytes || out->bytes < out_bytes ||
-        q_half->bytes < q_half_bytes) {
+    if (x->bytes < x_bytes || out->bytes < out_bytes) {
         return fallback;
     }
 
@@ -42927,19 +43263,57 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     const uint64_t weight_bytes = out_dim * row_bytes;
     if (weight_bytes > model_size - weight_offset) return fallback;
 
-    /* Keep the cache lock until the final consumer is enqueued.  A lifecycle
-     * release can then acquire the lock, synchronize all work queued before
-     * it, and free the sidecars without a lookup/free/launch race. */
-    std::unique_lock<std::mutex> cache_use_lock(
-        g_q4_attn_q_b_f16_cache_mutex);
-    if (g_q4_attn_q_b_f16_dispatch_disabled ||
-        g_q4_attn_q_b_f16_multi_model_active) {
+    uint64_t transient_weight_bytes = 0;
+    uint64_t xh_offset = 0;
+    uint64_t required_scratch_bytes = 0;
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
+            n_tok, &transient_weight_bytes, &xh_offset,
+            &required_scratch_bytes)) {
         return fallback;
     }
-    const __half *w_f16 = cuda_q4_attn_q_b_f16_cache_lookup_locked(
-        model_map, model_size, weight_offset, weight_bytes,
-        in_dim, out_dim, g_gpu[0].device_id);
-    if (!w_f16) return fallback;
+
+    /* Protect the shared W/X arena for the entire enqueue sequence.  Stream
+     * ordering protects reuse after this function returns; host serialization
+     * protects the sequence itself from interleaving with another session. */
+    std::unique_lock<std::mutex> scratch_use_lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    if (!g_q4_attn_q_b_transient_f16_scratch ||
+        g_q4_attn_q_b_transient_f16_scratch_device != g_gpu[0].device_id ||
+        g_q4_attn_q_b_transient_f16_scratch_bytes <
+            required_scratch_bytes) {
+        return fallback;
+    }
+    __half *const scratch =
+        g_q4_attn_q_b_transient_f16_scratch;
+    __half *const xh = reinterpret_cast<__half *>(
+        reinterpret_cast<char *>(scratch) + xh_offset);
+
+    /* Prefer an explicitly prepared persistent sidecar.  Keep its cache lock
+     * until the epilogue is enqueued so lifecycle release cannot free the
+     * matrix between lookup and its final consumer.  An optional cache miss
+     * may still use the default transient path. */
+    std::unique_lock<std::mutex> cache_use_lock(
+        g_q4_attn_q_b_f16_cache_mutex);
+    const __half *w_f16 = NULL;
+    int using_persistent = 0;
+    if (g_q4_attn_q_b_f16_multi_model_active) return fallback;
+    if (use_persistent) {
+        if (!g_q4_attn_q_b_f16_dispatch_disabled) {
+            w_f16 = cuda_q4_attn_q_b_f16_cache_lookup_locked(
+                model_map, model_size, weight_offset, weight_bytes,
+                in_dim, out_dim, g_gpu[0].device_id);
+        }
+        if (w_f16) {
+            using_persistent = 1;
+        } else {
+            if (strict) return -1;
+        }
+    }
+    if (!using_persistent &&
+        (!transient_candidate ||
+         g_q4_attn_q_b_transient_f16_runtime_disabled)) {
+        return fallback;
+    }
 
     int previous_device = -1;
     if (cudaGetDevice(&previous_device) != cudaSuccess) {
@@ -42965,19 +43339,38 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     }
 
     const uint64_t xh_count = (uint64_t)n_tok * in_dim;
-    __half *xh = (__half *)cuda_tmp_alloc_on(
-        0, xh_count * sizeof(__half),
-        "Q4 attn_q_b cached F16 activations");
-    if (!xh) {
-        cuda_q4_attn_q_b_f16_runtime_failure_evict(&cache_use_lock);
-        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
-        return fallback;
+    if (!using_persistent) {
+        const char *source =
+            model_map == g_model_host_base &&
+            g_model_device_owned && g_model_device_base
+                ? g_model_device_base + weight_offset : NULL;
+        if (!cuda_q4_attn_q_b_source_is_device_resident(
+                source, g_gpu[0].device_id)) {
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return fallback;
+        }
+        w_f16 = scratch;
+        const uint64_t chunks = transient_weight_bytes / (16u * sizeof(__half));
+        dequant_q4_K_to_f16_kernel<<<
+            (unsigned)((chunks + 255u) / 256u), 256, 0, stream>>>(
+                scratch,
+                reinterpret_cast<const cuda_block_q4_K *>(source),
+                in_dim, out_dim, blocks);
+        const cudaError_t dequant_err = cudaGetLastError();
+        if (dequant_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 attn_q_b transient dequantization failed: "
+                    "%s\n",
+                    cudaGetErrorString(dequant_err));
+            g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return fallback;
+        }
     }
 
     /* Prefill is deliberately excluded from decode-graph capture above, so
-     * both kernels and the tier-0 cuBLAS handle use the legacy default
-     * stream.  Avoid retargeting the shared handle on this hot per-layer
-     * path, which could race other launchers and adds measurable overhead. */
+     * dequantization, activation conversion, cuBLAS, and the epilogue all ride
+     * one stream.  Avoid retargeting the shared handle on this hot path. */
     f32_to_f16_kernel<<<
         (unsigned)((xh_count + 255u) / 256u), 256, 0, stream>>>(
             xh, (const float *)x->ptr, xh_count);
@@ -42986,7 +43379,12 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         fprintf(stderr,
                 "ds4: CUDA Q4 attn_q_b activation conversion failed: %s\n",
                 cudaGetErrorString(launch_err));
-        cuda_q4_attn_q_b_f16_runtime_failure_evict(&cache_use_lock);
+        if (using_persistent) {
+            cuda_q4_attn_q_b_f16_runtime_failure_evict(
+                &cache_use_lock, &scratch_use_lock);
+        } else {
+            g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        }
         if (previous_device >= 0) (void)cudaSetDevice(previous_device);
         return fallback;
     }
@@ -43001,21 +43399,28 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         w_f16, CUDA_R_16F, (int)in_dim,
         xh, CUDA_R_16F, (int)in_dim,
         &beta,
-        q_half->ptr, CUDA_R_16F, (int)out_dim,
-        CUBLAS_COMPUTE_32F,
+        out->ptr, CUDA_R_32F, (int)out_dim,
+        CUDA_R_32F,
         CUBLAS_GEMM_DEFAULT);
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr,
-                "ds4: CUDA Q4 attn_q_b cached F16 GEMM failed: status %d\n",
+                "ds4: CUDA Q4 attn_q_b F16 GEMM failed: status %d\n",
                 (int)status);
-        cuda_q4_attn_q_b_f16_runtime_failure_evict(&cache_use_lock);
+        if (using_persistent) {
+            cuda_q4_attn_q_b_f16_runtime_failure_evict(
+                &cache_use_lock, &scratch_use_lock);
+        } else {
+            g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        }
         if (previous_device >= 0) (void)cudaSetDevice(previous_device);
         return fallback;
     }
 
-    head_rms_norm_rope_tail_from_half_kernel<<<
+    /* cuBLAS has accepted the first output writer.  From this point onward a
+     * native-Q4 replay is unsafe even when the specialization was optional. */
+    head_rms_norm_rope_tail_kernel<<<
         n_tok * n_head, 256, 0, stream>>>(
-            (float *)out->ptr, (const __half *)q_half->ptr,
+            (float *)out->ptr,
             n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
             inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
             attn_factor, beta_fast, beta_slow, eps);
@@ -43024,9 +43429,14 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         fprintf(stderr,
                 "ds4: CUDA Q4 attn_q_b F16 RMS/RoPE epilogue failed: %s\n",
                 cudaGetErrorString(launch_err));
-        cuda_q4_attn_q_b_f16_runtime_failure_evict(&cache_use_lock);
+        if (using_persistent) {
+            cuda_q4_attn_q_b_f16_runtime_failure_evict(
+                &cache_use_lock, &scratch_use_lock);
+        } else {
+            g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        }
         if (previous_device >= 0) (void)cudaSetDevice(previous_device);
-        return fallback;
+        return -1;
     }
 
     if (previous_device >= 0) (void)cudaSetDevice(previous_device);
