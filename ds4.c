@@ -30267,15 +30267,10 @@ static bool metal_graph_encode_layer_attention_batch(
         ok = false;
     }
     bool q_b_f16_out = false;
-#if defined(__APPLE__)
     const bool q_b_f16_weight =
         layer->attn_q_b->type == DS4_TENSOR_Q8_0 ||
         (layer->attn_q_b->type == DS4_TENSOR_Q4_K &&
          tp_rows >= 32u);
-#else
-    const bool q_b_f16_weight =
-        layer->attn_q_b->type == DS4_TENSOR_Q8_0;
-#endif
     if (ok && !q_path_debug && q_b_f16_weight) {
         const int q_b_f16_rc =
             ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
@@ -55405,13 +55400,11 @@ static int generate_glm_metal_argmax(
     return 0;
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-static int ds4_prepare_metal_q4_attn_q_b_sidecars(
+static int ds4_prepare_q4_attn_q_b_sidecars(
         const ds4_model *model,
         const ds4_weights *weights,
         uint32_t max_batch_rows,
         uint64_t working_set_reserve_bytes);
-#endif
 
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
@@ -55508,22 +55501,21 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* This frontend knows the real prompt width.  Prepare only when that
      * workload can use the resident sidecars, after graph allocation is
-     * visible to Metal but before warmup and the measured prefill window. */
+     * visible to the backend but before warmup and the measured prefill
+     * window. */
     const uint32_t q4_sidecar_rows =
         (uint32_t)prompt->len < prefill_cap ?
             (uint32_t)prompt->len : prefill_cap;
-    if (ds4_prepare_metal_q4_attn_q_b_sidecars(
+    if (ds4_prepare_q4_attn_q_b_sidecars(
             model, weights, q4_sidecar_rows, 0u) < 0) {
         fprintf(stderr,
-                "ds4: required Metal Q4 attn_q_b F16 sidecar prewarm "
+                "ds4: required GPU Q4 attn_q_b F16 sidecar prewarm "
                 "could not be completed\n");
         metal_graph_free(&g);
         return 1;
     }
-#endif
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
@@ -56448,8 +56440,8 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool engine_session_counted;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    uint64_t metal_q4_attn_q_b_f16_sidecars_generation;
+#ifndef DS4_NO_GPU
+    uint64_t q4_attn_q_b_f16_sidecars_generation;
 #endif
     bool checkpoint_valid;
     bool mtp_draft_valid;
@@ -60792,17 +60784,16 @@ int ds4_engine_generate_argmax(
             e->directional_steering_attn_scale,
             e->directional_steering_ffn_scale, emit, done, emit_ud,
             progress, progress_ud);
-#if defined(__APPLE__)
         /* The legacy frontend owns a temporary graph rather than a session.
          * Do not leave its 2.69 GiB resident sidecars pinned after return. */
         if (__atomic_load_n(
                 &e->live_session_count, __ATOMIC_RELAXED) == 0u &&
             !ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
             fprintf(stderr,
-                    "ds4: WARNING: could not release resident Metal Q4 "
-                    "attn_q_b F16 sidecars after legacy generation\n");
+                    "ds4: WARNING: could not release resident %s Q4 "
+                    "attn_q_b F16 sidecars after legacy generation\n",
+                    ds4_backend_name(e->backend));
         }
-#endif
         return rc;
 #else
         fprintf(stderr, "ds4: %s generation requested but this build has no graph backend support\n",
@@ -67064,8 +67055,8 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-static int ds4_prepare_metal_q4_attn_q_b_sidecars(
+#ifndef DS4_NO_GPU
+static int ds4_prepare_q4_attn_q_b_sidecars(
         const ds4_model *model,
         const ds4_weights *weights,
         uint32_t max_batch_rows,
@@ -67098,17 +67089,18 @@ static int ds4_prepare_metal_q4_attn_q_b_sidecars(
         working_set_reserve_bytes, &prepared_bytes);
 }
 
-static int ds4_session_prepare_metal_q4_attn_q_b_sidecars(
+static int ds4_session_prepare_q4_attn_q_b_sidecars(
         ds4_session *s,
         uint32_t max_batch_rows,
         bool reserve_future_sessions) {
     if (!s || !s->engine ||
-        s->engine->backend != DS4_BACKEND_METAL) {
+        !ds4_backend_uses_graph(s->engine->backend) ||
+        ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         return 1;
     }
     const uint64_t cache_generation =
         ds4_gpu_q4_attn_q_b_f16_cache_generation();
-    if (s->metal_q4_attn_q_b_f16_sidecars_generation ==
+    if (s->q4_attn_q_b_f16_sidecars_generation ==
         cache_generation) {
         return 1;
     }
@@ -67118,8 +67110,13 @@ static int ds4_session_prepare_metal_q4_attn_q_b_sidecars(
     const uint32_t session_count = engine_placement_session_count(e);
     const uint32_t live_sessions = __atomic_load_n(
         &e->live_session_count, __ATOMIC_RELAXED);
-    const uint32_t including_current =
-        live_sessions == UINT32_MAX ? UINT32_MAX : live_sessions + 1u;
+    uint32_t including_current = live_sessions;
+    /* Eager preparation runs before session registration, while the ordinary
+     * prompt-aware preflight runs after it.  Count the current session only
+     * in the former case instead of under-reserving one future graph. */
+    if (!s->engine_session_counted && including_current != UINT32_MAX) {
+        including_current++;
+    }
     const uint32_t remaining =
         session_count > including_current ?
             session_count - including_current : 0u;
@@ -67134,16 +67131,17 @@ static int ds4_session_prepare_metal_q4_attn_q_b_sidecars(
                 : memory.total_bytes * remaining;
     }
 
-    const int rc = ds4_prepare_metal_q4_attn_q_b_sidecars(
+    const int rc = ds4_prepare_q4_attn_q_b_sidecars(
         &e->model, &e->weights, max_batch_rows, future_session_bytes);
     if (rc < 0) {
         fprintf(stderr,
-                "ds4: required Metal Q4 attn_q_b F16 sidecar prewarm "
-                "could not be completed\n");
+                "ds4: required %s Q4 attn_q_b F16 sidecar prewarm "
+                "could not be completed\n",
+                ds4_backend_name(e->backend));
         return 0;
     }
     if (rc > 0) {
-        s->metal_q4_attn_q_b_f16_sidecars_generation =
+        s->q4_attn_q_b_f16_sidecars_generation =
             ds4_gpu_q4_attn_q_b_f16_cache_generation();
     }
     return 1;
@@ -67335,8 +67333,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         e->shared_prefill_workspace_ready
             ? &e->shared_prefill_workspace
             : NULL;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (e->backend == DS4_BACKEND_METAL &&
+    if (ds4_backend_uses_graph(e->backend) &&
         __atomic_load_n(
             &e->live_session_count, __ATOMIC_RELAXED) != 0u) {
         /* The graph estimator intentionally omits several large prefill
@@ -67345,12 +67342,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * nothing.  Cache generations make existing sessions re-prewarm. */
         if (!ds4_gpu_make_room_for_q4_attn_q_b_f16_session()) {
             fprintf(stderr,
-                    "ds4: could not make room for the Metal session graph\n");
+                    "ds4: could not make room for the %s session graph\n",
+                    ds4_backend_name(e->backend));
             free(s);
             return 1;
         }
     }
-#endif
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
@@ -67442,14 +67439,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "\n");
         }
     }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* Remote workers do not necessarily enter the local sync preflight before
      * their first mirrored/layer-slice batch, so keep eager preparation for
      * TP/distributed sessions.  Local sessions defer until the real prompt is
      * known, avoiding a 2.69 GiB decode-only allocation. */
     if ((e->tp.active ||
          e->distributed.role != DS4_DISTRIBUTED_NONE) &&
-        !ds4_session_prepare_metal_q4_attn_q_b_sidecars(
+        !ds4_session_prepare_q4_attn_q_b_sidecars(
             s, s->prefill_cap, true)) {
         if (__atomic_load_n(&e->live_session_count, __ATOMIC_RELAXED) == 0u) {
             (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
@@ -67458,7 +67454,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
-#endif
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     s->sample_probs =
         xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -67495,12 +67490,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr,
                     "ds4: failed to create distributed coordinator session: %s\n",
                     err[0] ? err : "unknown error");
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
             if (__atomic_load_n(
                     &e->live_session_count, __ATOMIC_RELAXED) == 0u) {
                 (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
             }
-#endif
             metal_graph_free(&s->graph);
             free(s->logits);
             free(s->sample_probs);
@@ -67524,29 +67517,29 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    bool release_metal_q4_sidecars = false;
+#ifndef DS4_NO_GPU
+    bool release_gpu_q4_sidecars = false;
 #endif
     if (s->engine && s->engine_session_counted) {
         const uint32_t remaining_sessions = __atomic_sub_fetch(
             &s->engine->live_session_count, 1u, __ATOMIC_RELAXED);
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        release_metal_q4_sidecars =
+#ifndef DS4_NO_GPU
+        release_gpu_q4_sidecars =
             remaining_sessions == 0u &&
-            s->engine->backend == DS4_BACKEND_METAL;
+            ds4_backend_uses_graph(s->engine->backend);
 #else
         (void)remaining_sessions;
 #endif
         s->engine_session_counted = false;
     }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    else if (s->engine && s->engine->backend == DS4_BACKEND_METAL &&
+#ifndef DS4_NO_GPU
+    else if (s->engine && ds4_backend_uses_graph(s->engine->backend) &&
              __atomic_load_n(
                  &s->engine->live_session_count, __ATOMIC_RELAXED) == 0u) {
         /* An eager TP/distributed prewarm may have succeeded before session
          * registration failed, so this uncounted session can still own the
          * process-global sidecars. */
-        release_metal_q4_sidecars = true;
+        release_gpu_q4_sidecars = true;
     }
 #endif
     if (ds4_session_tp_leader(s) && s->tp_session_id != 0 &&
@@ -67571,14 +67564,13 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-#if defined(__APPLE__)
-        if (release_metal_q4_sidecars &&
+        if (release_gpu_q4_sidecars &&
             !ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
             fprintf(stderr,
-                    "ds4: WARNING: could not release resident Metal Q4 "
-                    "attn_q_b F16 sidecars at session teardown\n");
+                    "ds4: WARNING: could not release resident %s Q4 "
+                    "attn_q_b F16 sidecars at session teardown\n",
+                    ds4_backend_name(s->engine->backend));
         }
-#endif
         if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
@@ -68913,8 +68905,8 @@ int ds4_session_prepare_sync(ds4_session *s,
         return 1;
     }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (!s->engine || s->engine->backend != DS4_BACKEND_METAL ||
+#ifndef DS4_NO_GPU
+    if (!s->engine || !ds4_backend_uses_graph(s->engine->backend) ||
         ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         return 0;
     }
@@ -68933,11 +68925,12 @@ int ds4_session_prepare_sync(ds4_session *s,
     const uint32_t max_batch_rows = metal_graph_prefill_max_chunk_rows(
         &s->graph, start, rows);
     if (max_batch_rows == 0u) return 0;
-    if (!ds4_session_prepare_metal_q4_attn_q_b_sidecars(
+    if (!ds4_session_prepare_q4_attn_q_b_sidecars(
             s, max_batch_rows, false)) {
         if (err && errlen) {
             snprintf(err, errlen,
-                     "required Metal Q4 attn_q_b F16 sidecar prewarm failed");
+                     "required %s Q4 attn_q_b F16 sidecar prewarm failed",
+                     ds4_backend_name(s->engine->backend));
         }
         return 1;
     }

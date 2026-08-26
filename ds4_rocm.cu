@@ -131,6 +131,8 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
     return ds4_rocm_is_gfx1151();
 }
 
+#include "rocm/ds4_rocm_q4_qb_sidecar.cuh"
+
 #include "rocm/ds4_rocm_q8.cuh"
 
 #include "rocm/ds4_rocm_norm_rope.cuh"

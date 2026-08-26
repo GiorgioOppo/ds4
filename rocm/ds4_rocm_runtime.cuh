@@ -5882,6 +5882,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
@@ -6140,6 +6141,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     const int multi_model =
         g_model_host_base != NULL &&
         (g_model_host_base != model_map || g_model_registered_size != model_size);
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -6259,6 +6261,7 @@ extern "C" int ds4_gpu_prepare_support_model(
     const uint64_t saved_registered_size = g_model_registered_size;
     const int saved_device_owned = g_model_device_owned;
 
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_for_multi_model = 1;
     const int ok = cuda_model_copy_chunked(model_map,
@@ -6476,6 +6479,9 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
     const int new_quality_mode = quality ? 1 : 0;
+    if (new_quality_mode && !g_quality_mode) {
+        (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+    }
     if (g_quality_mode != new_quality_mode) {
         g_rocm_cfg.initialized = 0;
     }
