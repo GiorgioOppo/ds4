@@ -4840,7 +4840,7 @@ __device__ __forceinline__ static void iq2_xxs_dequant_dual_pair_tile_half_rowwi
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool OUT_F16=false, bool X_F16=false>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool OUT_F16=false, bool X_F16=false, bool TAIL_WAVE_CULL=false>
 __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
         float *mid_out,
         half *mid_out_h,
@@ -4859,6 +4859,10 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
         uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes,
         float clamp) {
+    /* rocWMMA is collective over the hardware wave.  The host selector keeps
+     * this kernel off wave64 devices so the scalar launch remains the complete
+     * fallback; retain a uniform device-side guard as a final safety net. */
+    if (warpSize != 32) return;
     extern __shared__ unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shBg0 = shA + MTILES * BM * BK;
@@ -4892,7 +4896,10 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
     frag_a a;
     frag_b bg0, bu0, bg1, bu1;
     frag_c accg0, accu0, accg1, accu1;
-    if (wave < MTILES) {
+    const bool wmma_active =
+        wave < MTILES &&
+        (!TAIL_WAVE_CULL || wave * (uint32_t)BM < count - m_group0);
+    if (wmma_active) {
         rocwmma::fill_fragment(accg0, 0.0f);
         rocwmma::fill_fragment(accu0, 0.0f);
         rocwmma::fill_fragment(accg1, 0.0f);
@@ -4928,7 +4935,7 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
         iq2_xxs_dequant_dual_pair_tile_half_rowwise<BN, BK>(
                 shBg0, shBu0, shBg1, shBu1, gew, uew, gate_row_bytes, n0, k0, expert_mid_dim, tid);
         __syncthreads();
-        if (wave < MTILES) {
+        if (wmma_active) {
             rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
             rocwmma::load_matrix_sync(bg0, shBg0, BN);
             rocwmma::load_matrix_sync(bu0, shBu0, BN);
@@ -4942,7 +4949,7 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
         __syncthreads();
     }
 
-    if (wave < MTILES) {
+    if (wmma_active) {
         rocwmma::store_matrix_sync(shCg0 + wave * BM * BN, accg0, BN, rocwmma::mem_row_major);
         rocwmma::store_matrix_sync(shCu0 + wave * BM * BN, accu0, BN, rocwmma::mem_row_major);
         rocwmma::store_matrix_sync(shCg1 + wave * BM * BN, accg1, BN, rocwmma::mem_row_major);
@@ -5225,7 +5232,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false, bool TAIL_WAVE_CULL=false>
 __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         float *down_out,
         half *down_out_h,
@@ -5243,6 +5250,9 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         uint64_t down_row_bytes,
         uint32_t n_expert,
         uint32_t n_tokens = 0u) {
+    /* See the IQ2 gate/up hot-list kernel above.  Correct wave64 fallback is
+     * selected on the host before scalar_max excludes any routed rows. */
+    if (warpSize != 32) return;
     extern __shared__ unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shB0 = shA + MTILES * BM * BK;
@@ -5276,7 +5286,10 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     frag_b b1;
     frag_c acc0;
     frag_c acc1;
-    if (wave < MTILES) {
+    const bool wmma_active =
+        wave < MTILES &&
+        (!TAIL_WAVE_CULL || wave * (uint32_t)BM < count - m_group0);
+    if (wmma_active) {
         rocwmma::fill_fragment(acc0, 0.0f);
         rocwmma::fill_fragment(acc1, 0.0f);
     }
@@ -5328,7 +5341,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
             q2_K_dequant_pair_tile_half_rowwise_staged<BN, BK>(
                     shB0, shB1, shW, krel, tid);
             __syncthreads();
-            if (wave < MTILES) {
+            if (wmma_active) {
                 rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
                 rocwmma::load_matrix_sync(b0, shB0, BN);
                 rocwmma::load_matrix_sync(b1, shB1, BN);
@@ -5339,7 +5352,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         }
     }
 
-    if (wave < MTILES) {
+    if (wmma_active) {
         rocwmma::store_matrix_sync(shC + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
     }
     __syncthreads();
@@ -5368,7 +5381,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     }
     __syncthreads();
 
-    if (wave < MTILES) {
+    if (wmma_active) {
         rocwmma::store_matrix_sync(shC + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
     }
     __syncthreads();
