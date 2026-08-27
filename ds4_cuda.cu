@@ -30712,6 +30712,137 @@ extern "C" int ds4_cuda_test_iq2_ssd_grouped_raw_layout(
         expert_in_dim, expert_mid_dim, out_dim);
 }
 
+enum { CUDA_MOE_FAST_PROFILE_MAX_EVENTS = 5 };
+
+static std::atomic<uint64_t> g_cuda_moe_fast_profile_reports{0};
+
+extern "C" uint64_t ds4_cuda_test_moe_fast_profile_report_count(void) {
+    return g_cuda_moe_fast_profile_reports.load(std::memory_order_relaxed);
+}
+
+typedef struct {
+    cudaEvent_t events[CUDA_MOE_FAST_PROFILE_MAX_EVENTS];
+    cudaStream_t stream;
+    uint32_t event_count;
+    int active;
+} cuda_moe_fast_profile;
+
+/* The legacy routed-MoE profiler is below the IQ2 MMQ early returns.  Keep a
+ * small event-only recorder for those paths so profiling never adds a stream
+ * synchronization (or even a CUDA call) unless DS4_CUDA_MOE_PROFILE is set.
+ * Destroying a recorded event is non-blocking; this makes failed MMQ entries
+ * safe to abandon before the established fallback is entered. */
+static void cuda_moe_fast_profile_destroy(cuda_moe_fast_profile *profile) {
+    if (!profile || (!profile->active && profile->event_count == 0u)) return;
+    for (uint32_t i = 0; i < CUDA_MOE_FAST_PROFILE_MAX_EVENTS; i++) {
+        if (profile->events[i]) {
+            (void)cudaEventDestroy(profile->events[i]);
+        }
+    }
+    memset(profile, 0, sizeof(*profile));
+}
+
+static void cuda_moe_fast_profile_begin(
+        cuda_moe_fast_profile *profile,
+        cudaStream_t stream,
+        uint32_t event_count) {
+    if (!profile) return;
+    memset(profile, 0, sizeof(*profile));
+    if (getenv("DS4_CUDA_MOE_PROFILE") == NULL) return;
+    if (event_count < 2u ||
+        event_count > CUDA_MOE_FAST_PROFILE_MAX_EVENTS) {
+        return;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const cudaError_t capture_err =
+        cudaStreamIsCapturing(stream, &capture);
+    if (capture_err != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        if (capture_err != cudaSuccess) (void)cudaGetLastError();
+        return;
+    }
+    profile->stream = stream;
+    profile->event_count = event_count;
+    for (uint32_t i = 0; i < event_count; i++) {
+        cudaEvent_t event = NULL;
+        if (cudaEventCreate(&event) != cudaSuccess) {
+            cuda_moe_fast_profile_destroy(profile);
+            return;
+        }
+        profile->events[i] = event;
+    }
+    if (cudaEventRecord(profile->events[0], stream) != cudaSuccess) {
+        cuda_moe_fast_profile_destroy(profile);
+        return;
+    }
+    profile->active = 1;
+}
+
+static void cuda_moe_fast_profile_mark(
+        cuda_moe_fast_profile *profile,
+        uint32_t event_index) {
+    if (!profile || !profile->active ||
+        event_index >= profile->event_count ||
+        cudaEventRecord(profile->events[event_index], profile->stream) !=
+            cudaSuccess) {
+        if (profile && profile->active) {
+            cuda_moe_fast_profile_destroy(profile);
+        }
+    }
+}
+
+static void cuda_moe_fast_profile_report(
+        cuda_moe_fast_profile *profile,
+        const char *path,
+        uint32_t n_tokens,
+        uint64_t assignments,
+        const char *const *stage_names) {
+    if (!profile || !profile->active) return;
+    const uint32_t event_count = profile->event_count;
+    float stage_ms[CUDA_MOE_FAST_PROFILE_MAX_EVENTS - 1] = {};
+    float total_ms = 0.0f;
+    int ok = cudaEventSynchronize(profile->events[event_count - 1u]) ==
+        cudaSuccess;
+    for (uint32_t i = 1; ok && i < event_count; i++) {
+        ok = cudaEventElapsedTime(
+                 &stage_ms[i - 1u], profile->events[i - 1u],
+                 profile->events[i]) == cudaSuccess;
+    }
+    if (ok) {
+        ok = cudaEventElapsedTime(
+                 &total_ms, profile->events[0],
+                 profile->events[event_count - 1u]) == cudaSuccess;
+    }
+    if (ok) {
+        char line[512] = {};
+        int written = snprintf(
+            line, sizeof(line),
+            "ds4: CUDA MoE profile path=%s tokens=%u assignments=%llu",
+            path, n_tokens, (unsigned long long)assignments);
+        size_t used = written > 0 ? (size_t)written : 0u;
+        if (used >= sizeof(line)) used = sizeof(line) - 1u;
+        for (uint32_t i = 1; i < event_count && used < sizeof(line); i++) {
+            written = snprintf(
+                line + used, sizeof(line) - used, " %s=%.3f",
+                stage_names[i - 1u], stage_ms[i - 1u]);
+            if (written < 0) break;
+            const size_t appended = (size_t)written;
+            used += appended < sizeof(line) - used
+                ? appended : sizeof(line) - used - 1u;
+        }
+        if (used < sizeof(line)) {
+            (void)snprintf(
+                line + used, sizeof(line) - used,
+                " total=%.3f ms (cudaEvent)", total_ms);
+        }
+        if (fprintf(stderr, "%s\n", line) >= 0) {
+            g_cuda_moe_fast_profile_reports.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+    cuda_moe_fast_profile_destroy(profile);
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -30790,12 +30921,22 @@ static int routed_moe_launch(
         if (gate_aligned && up_aligned && down_aligned) {
             const cudaStream_t aligned_stream =
                 n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
+            cuda_moe_fast_profile aligned_profile;
+            if (n_tokens > 1u) {
+                memset(&aligned_profile, 0, sizeof(aligned_profile));
+            }
+            const char *aligned_profile_path = NULL;
             const int dspark_tiny_aligned_vec =
                 n_tokens >= 2u && n_tokens <= 5u &&
                 cuda_env_flag_enabled(
                     "DS4_CUDA_DSPARK_TINY_ALIGNED_VEC", 0);
             int rc = -1;
             if (n_tokens == 1u || dspark_tiny_aligned_vec) {
+                if (dspark_tiny_aligned_vec) {
+                    aligned_profile_path = "iq2_aligned_tiny_vec";
+                    cuda_moe_fast_profile_begin(
+                        &aligned_profile, aligned_stream, 4u);
+                }
                 rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
                     gate_aligned, up_aligned,
                     (const float *)x->ptr,
@@ -30806,6 +30947,9 @@ static int routed_moe_launch(
                     (int)n_tokens, (int)n_total_expert, (int)n_expert,
                     clamp, aligned_stream);
                 if (rc == 0) {
+                    if (dspark_tiny_aligned_vec) {
+                        cuda_moe_fast_profile_mark(&aligned_profile, 1u);
+                    }
                     const uint32_t assignments = n_tokens * n_expert;
                     rc = ds4_mmq_q2_K_aligned_moe_vec(
                         down_aligned, (const float *)mid->ptr,
@@ -30815,6 +30959,9 @@ static int routed_moe_launch(
                         (int)assignments, (int)n_total_expert,
                         /*n_expert_used=*/1,
                         aligned_stream);
+                    if (rc == 0 && dspark_tiny_aligned_vec) {
+                        cuda_moe_fast_profile_mark(&aligned_profile, 2u);
+                    }
                 }
                 if (rc == 0 && dspark_tiny_aligned_vec) {
                     static int logged_dspark_tiny_aligned_vec = 0;
@@ -30846,6 +30993,17 @@ static int routed_moe_launch(
                 const int direct_applicable =
                     g_cuda_direct_q2_prefill && direct_shape_fits &&
                     (assignments >= 1024u || direct_gb10);
+                /* A failed tiny-vector experiment may enter this path. Its
+                 * partial profile must not leak into the independent fused
+                 * attempt or the legacy fallback. */
+                if (aligned_profile.event_count > 0u) {
+                    cuda_moe_fast_profile_destroy(&aligned_profile);
+                }
+                aligned_profile_path = direct_applicable
+                    ? "iq2_aligned_direct_d2r"
+                    : "iq2_aligned_soa";
+                cuda_moe_fast_profile_begin(
+                    &aligned_profile, aligned_stream, 3u);
                 if (direct_applicable) {
                     size_t input_q8_bytes = 0;
                     size_t down_q8_bytes = 0;
@@ -30885,6 +31043,14 @@ static int routed_moe_launch(
                 /* Only a pre-enqueue NOT_APPLICABLE result may retry the
                  * materialized SoA path. Other failures may follow enqueue. */
                 if (rc == DS4_MMQ_NOT_APPLICABLE) {
+                    aligned_profile_path = "iq2_aligned_soa";
+                    if (direct_applicable) {
+                        if (aligned_profile.event_count > 0u) {
+                            cuda_moe_fast_profile_destroy(&aligned_profile);
+                        }
+                        cuda_moe_fast_profile_begin(
+                            &aligned_profile, aligned_stream, 3u);
+                    }
                     rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
                         gate_aligned, up_aligned, down_aligned,
                         (const float *)x->ptr,
@@ -30897,6 +31063,9 @@ static int routed_moe_launch(
                         (int)n_total_expert, (int)n_expert,
                         clamp, aligned_stream);
                 }
+                if (rc == 0) {
+                    cuda_moe_fast_profile_mark(&aligned_profile, 1u);
+                }
             }
             if (rc == 0) {
                 const uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -30906,6 +31075,24 @@ static int routed_moe_launch(
                     NULL, out_dim, n_expert, n_tokens,
                     /*guard_nonfinite=*/1);
                 if (cuda_ok(cudaGetLastError(), "aligned moe sum launch")) {
+                    if (n_tokens > 1u &&
+                        aligned_profile.event_count > 0u) {
+                        static const char *const vector_stage_names[] = {
+                            "iq2_gateup_swiglu", "q2_down", "sum"
+                        };
+                        static const char *const fused_stage_names[] = {
+                            "fused_iq2_gateup_swiglu_q2_down", "sum"
+                        };
+                        const uint32_t aligned_profile_events =
+                            aligned_profile.event_count;
+                        cuda_moe_fast_profile_mark(
+                            &aligned_profile, aligned_profile_events - 1u);
+                        cuda_moe_fast_profile_report(
+                            &aligned_profile, aligned_profile_path,
+                            n_tokens, (uint64_t)n_tokens * n_expert,
+                            aligned_profile_events == 4u
+                                ? vector_stage_names : fused_stage_names);
+                    }
                     static int logged = 0;
                     if (!logged) {
                         logged = 1;
@@ -30915,6 +31102,9 @@ static int routed_moe_launch(
                     return 1;
                 }
                 rc = -1;
+            }
+            if (n_tokens > 1u && aligned_profile.event_count > 0u) {
+                cuda_moe_fast_profile_destroy(&aligned_profile);
             }
             fprintf(stderr,
                     "ds4: aligned routed-MoE returned %d "
@@ -31191,6 +31381,9 @@ static int routed_moe_launch(
             }
             g_iq2_ssd_grouped_attempts.fetch_add(
                 1, std::memory_order_relaxed);
+            cuda_moe_fast_profile grouped_profile = {};
+            cuda_moe_fast_profile_begin(
+                &grouped_profile, grouped_stream, 3u);
             int rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
                 gate_w, up_w, down_w,
                 (const float *)x->ptr,
@@ -31202,6 +31395,7 @@ static int routed_moe_launch(
                 (int)n_tokens, (int)stream_binding.weight_domain,
                 (int)n_expert, clamp, grouped_stream);
             if (rc == DS4_MMQ_NOT_APPLICABLE) {
+                cuda_moe_fast_profile_destroy(&grouped_profile);
                 g_iq2_ssd_grouped_not_applicable.fetch_add(
                     1, std::memory_order_relaxed);
                 if (grouped_required) {
@@ -31219,6 +31413,7 @@ static int routed_moe_launch(
                     1, std::memory_order_relaxed);
             } else {
                 if (rc == 0) {
+                    cuda_moe_fast_profile_mark(&grouped_profile, 1u);
                     const uint64_t n = (uint64_t)n_tokens * out_dim;
                     moe_mmq_sum_kernel<<<
                         (uint32_t)((n + 255u) / 256u), 256, 0,
@@ -31228,8 +31423,19 @@ static int routed_moe_launch(
                         /*guard_nonfinite=*/1);
                     rc = cuda_ok(cudaGetLastError(),
                                  "IQ2 SSD grouped moe sum launch") ? 0 : -1;
+                    if (rc == 0) {
+                        static const char *const grouped_stage_names[] = {
+                            "fused_iq2_gateup_swiglu_q2_down", "sum"
+                        };
+                        cuda_moe_fast_profile_mark(&grouped_profile, 2u);
+                        cuda_moe_fast_profile_report(
+                            &grouped_profile, "iq2_ssd_grouped_raw",
+                            n_tokens, (uint64_t)n_tokens * n_expert,
+                            grouped_stage_names);
+                    }
                 }
                 if (rc != 0) {
+                    cuda_moe_fast_profile_destroy(&grouped_profile);
                     g_iq2_ssd_grouped_failures.fetch_add(
                         1, std::memory_order_relaxed);
                     if (grouped_required) {
@@ -31266,6 +31472,9 @@ static int routed_moe_launch(
         }
         if (down_w) {
             const uint64_t n_assignments = (uint64_t)n_tokens * n_expert;
+            cuda_moe_fast_profile resident_profile = {};
+            cuda_moe_fast_profile_begin(
+                &resident_profile, (cudaStream_t)0, 5u);
             int rc = ds4_mmq_iq2_xxs_moe_pair(
                     gate_w, up_w, (const float *)x->ptr,
                     (const int32_t *)selected->ptr,
@@ -31274,6 +31483,7 @@ static int routed_moe_launch(
                     (int)n_tokens, (int)n_total_expert, (int)n_expert,
                     (cudaStream_t)0);
             if (rc == 0) {
+                cuda_moe_fast_profile_mark(&resident_profile, 1u);
                 const uint64_t mid_floats = n_assignments * expert_mid_dim;
                 moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256>>>(
                         (float *)mid->ptr,
@@ -31281,6 +31491,9 @@ static int routed_moe_launch(
                         (const float *)weights->ptr,
                         expert_mid_dim, n_tokens, n_expert, clamp);
                 rc = cuda_ok(cudaGetLastError(), "mmq moe swiglu launch") ? 0 : -1;
+                if (rc == 0) {
+                    cuda_moe_fast_profile_mark(&resident_profile, 2u);
+                }
             }
             if (rc == 0) {
                 rc = ds4_mmq_q2_K_moe(
@@ -31291,6 +31504,9 @@ static int routed_moe_launch(
                         (int)n_assignments, (int)n_total_expert,
                         /*n_expert_used=*/1,
                         (cudaStream_t)0);
+                if (rc == 0) {
+                    cuda_moe_fast_profile_mark(&resident_profile, 3u);
+                }
             }
             if (rc == 0) {
                 const uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -31298,9 +31514,19 @@ static int routed_moe_launch(
                         (float *)out->ptr, (const float *)down->ptr,
                         NULL, out_dim, n_expert, n_tokens,
                         /*guard_nonfinite=*/1);
-                if (cuda_ok(cudaGetLastError(), "mmq moe sum launch")) return 1;
+                if (cuda_ok(cudaGetLastError(), "mmq moe sum launch")) {
+                    static const char *const resident_stage_names[] = {
+                        "iq2_pair", "swiglu", "q2_down", "sum"
+                    };
+                    cuda_moe_fast_profile_mark(&resident_profile, 4u);
+                    cuda_moe_fast_profile_report(
+                        &resident_profile, "iq2_mmq_resident",
+                        n_tokens, n_assignments, resident_stage_names);
+                    return 1;
+                }
                 rc = -1;
             }
+            cuda_moe_fast_profile_destroy(&resident_profile);
             fprintf(stderr, "ds4: mmq routed-MoE tier rc=%d (layer=%u n_tokens=%u); falling back\n",
                     rc, layer_index, n_tokens);
         }

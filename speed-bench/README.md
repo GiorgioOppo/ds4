@@ -98,3 +98,49 @@ with one process and engine per variant before promotion.
 Environment variables consumed while the engine opens, including the Metal
 streaming `F_NOCACHE` controls, cannot be compared with `--candidate-env` in
 this harness and likewise require separate processes.
+
+### Resident IQ2/Q2 MoE prefill on ROCm and CUDA
+
+The backend-neutral fixture uses the production `N=4096`, 256-expert, top-6
+IQ2_XXS/Q2_K geometry and a deterministic routing distribution containing
+every 32-row tail from 1 through 31. Weights and tensors are resident and SSD
+streaming is disabled, so the reported GPU-event intervals isolate kernel
+work rather than storage throughput. The fixture needs roughly 4 GiB of
+explicit host/device storage in addition to backend runtime overhead.
+
+On a wave32 ROCm host, build and run the real balanced A/B with:
+
+```
+make rocm-iq2-moe-prefill-bench ROCM_ARCH=gfx1151
+./speed-bench/gpu_iq2_moe_prefill_bench_rocm
+```
+
+The baseline sets the dominant rollback
+`DS4_ROCM_DISABLE_IQ2_MOE_WMMA_TAIL_CULL=1`; the candidate sets
+`DS4_ROCM_ENABLE_IQ2_MOE_WMMA_TAIL_CULL=1`. The harness alternates ABBA/BAAB,
+requires bit-exact intermediate scratch and final tensors, verifies allocation
+canaries, and prints `cudaEvent` time for only the IQ2 gate/up and Q2 down
+rocWMMA kernels. The candidate remains opt-in until real-hardware results show
+a repeatable win. A wave64 device takes the scalar fallback and therefore
+cannot produce a valid candidate timing.
+
+On CUDA, build and run the measurement-only current path with an explicit
+architecture:
+
+```
+make cuda-iq2-moe-prefill-bench CUDA_ARCH=sm_121
+./speed-bench/gpu_iq2_moe_prefill_bench_cuda
+```
+
+CUDA prints `DS4_CUDA_MOE_PROFILE` stage times for the resident IQ2 MMQ path
+and performs a structural/canary oracle. Every marked call must produce exactly
+one completed fast-path profile record or the harness fails. It intentionally
+does not claim an A/B result: CUDA's cooperative D2R CTA has different
+synchronization and tail semantics, so the ROCm/Metal wave-cull selector cannot
+be copied safely.
+On a discrete CUDA GPU with enough VRAM, prefix the run with
+`DS4_CUDA_COPY_MODEL=1` to keep the raw expert weights in device memory and
+remove mapped-host/PCIe stalls from the measured kernel interval; this adds
+about 1.7 GiB of device storage. Leave it unset on GB10/UMA when measuring the
+normal aligned-artifact production selector, because forcing a raw model copy
+changes that residency path.

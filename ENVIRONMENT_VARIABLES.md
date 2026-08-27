@@ -70,8 +70,9 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_CUDA_ENABLE_Q8_FOLD=1` | Enable the experimental one-shot Q8_1 producer-to-consumer fold. |
 | `DS4_CUDA_NO_Q8_FOLD=1` | Dominant rollback for the Q8_1 fold. |
 | `DS4_CUDA_Q8_FOLD_ORACLE=1` | Compare fresh canonical Q8_1 bytes and consumer outputs. Use with `DS4_CUDA_DECODE_GRAPHS=0`; require nonzero calls and zero mismatches/skips. |
+| `DS4_CUDA_MOE_PROFILE=1` | Print `cudaEvent` stage timings for routed-MoE launches, including resident IQ2 pair/SwiGLU/Q2-down/sum and aligned SoA/direct-D2R fast paths. Profiling is diagnostic and synchronizes the measured stream; the added aligned-IQ2 recorder deliberately excludes one-token graph-captured decode. |
 
-## ROCm Q4
+## ROCm Q4 and IQ2/Q2 diagnostics
 
 | Variable | Default behavior and purpose |
 | --- | --- |
@@ -87,6 +88,9 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A=1` | Dominant rollback to eight standalone Q4 attention-A projections, including for the resident default. |
 | `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A=1` | Request grouped attention-A for eligible non-default shapes and fail closed on fallback; `DISABLE` remains authoritative. |
 | `DS4_ROCM_Q4_GROUPED_ATTN_A_STATS=1` | Report grouped calls, dispatches, groups, fallbacks, and failures. |
+| `DS4_ROCM_ENABLE_IQ2_MOE_WMMA_TAIL_CULL=1` | Opt into inactive-tail wave culling in the resident IQ2 gate/up and Q2 down hot-list rocWMMA prefill kernels. Requires a runtime wave width of 32; default is off pending hardware benchmarks. |
+| `DS4_ROCM_DISABLE_IQ2_MOE_WMMA_TAIL_CULL=1` | Dominant value-aware rollback for the IQ2/Q2 rocWMMA tail-wave candidate. Use as the baseline arm even though the candidate is currently off by default. |
+| `DS4_ROCM_IQ2_MOE_WMMA_PROFILE=1` | Measure only the affected IQ2 gate/up and Q2 down rocWMMA kernels with GPU events. A profiled eligible call fails rather than reporting a partial or scalar-fallback measurement. |
 
 Run `make test-strix-rocm-q4-parity` and
 `make test-strix-rocm-q4-prefill` on a `gfx1151` Strix Halo host before making
