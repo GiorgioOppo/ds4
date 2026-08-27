@@ -43869,7 +43869,8 @@ extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t group0, uint32_t group_cnt,
-        const ds4_gpu_tensor *heads) {
+        const ds4_gpu_tensor *heads, int resident_decode) {
+    (void)resident_decode;
     const int oracle = cuda_env_flag_enabled(
         "DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE", 0);
     if (oracle) cuda_q4_grouped_attn_a_oracle_register_report();

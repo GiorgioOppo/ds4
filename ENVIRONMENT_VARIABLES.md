@@ -22,6 +22,12 @@ changing them.  Unless a row says otherwise:
 - `STATS`, `PROFILE`, and `ORACLE` are diagnostic and may perturb timing;
 - benchmark controls and candidates in separate processes.
 
+## Greedy top-1 readback
+
+| Variable | Default behavior and purpose |
+| --- | --- |
+| `DS4_DISABLE_GREEDY_TOP1_READBACK=1` | Restore the legacy full-logits readback and CPU argmax. Unset uses device top-1 plus a four-byte readback for eligible single-tier greedy generation, including SSD streaming, on Metal, CUDA, and ROCm. |
+
 ## Metal
 
 | Variable | Default behavior and purpose |
@@ -29,6 +35,8 @@ changing them.  Unless a row says otherwise:
 | `DS4_METAL_PREFILL_CHUNK=N` | Set the prefill cap when `--prefill-chunk` is absent; the CLI option takes precedence. This historical name is consumed by the shared graph planner rather than by a Metal kernel alone. |
 | `DS4_METAL_NO_RESIDENCY=1` | Skip creation and residency requests for the model-view residency set. Diagnostic rollback for resident, non-streaming models. |
 | `DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET=1` | Still create, commit, and request the model residency set, but do not attach it to Metal command queues. This isolates queue-residency behavior without disabling the complete residency policy. |
+| `DS4_METAL_DISABLE_DECODE_ARGMAX_TOP1=1` | Restore the generic full argsort used by Metal argmax. Unset uses the dedicated two-stage top-1 reduction for eligible large decode rows. |
+| `DS4_METAL_REQUIRE_DECODE_ARGMAX_TOP1=1` | Fail closed instead of using generic argsort when a row of at least 4096 logits cannot execute the dedicated top-1 path. Intended for correctness and performance oracles. |
 | `DS4_METAL_STREAMING_EXPERT_NOCACHE=1` | Reopen the Metal SSD expert file with `F_NOCACHE` so streamed experts do not displace the dense working set from the page cache. Leave unset for cached `pread`. |
 | `DS4_METAL_STREAMING_EXPERT_PREAD_SPLIT=N` | Split each expert read into 1–8 aligned requests. The automatic value is 1 below 64 configured cache experts and 4 at 64 or more. |
 | `DS4_METAL_DISABLE_Q4_DENSE_PAIR=1` | Split the default Metal Q-A/KV Q4 pair back into two standalone projections. |
@@ -75,9 +83,9 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_ROCM_Q4_PREFILL_TILE8_STATS=1` | Report dense, pair, attention-batch, and token counters at process exit. |
 | `DS4_ROCM_ENABLE_Q4_DENSE_PAIR=1` | Share one Q8_K activation quantization between the two Q4 dense projections. This pair remains opt-in. |
 | `DS4_ROCM_DISABLE_Q4_DENSE_PAIR=1` | Dominant rollback for the ROCm Q4 dense pair. |
-| `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A=1` | Enable the two-launch grouped attention-A decode path. This path remains opt-in pending model A/B results. |
-| `DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A=1` | Dominant rollback for grouped attention-A decode. |
-| `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A=1` | Fail closed if grouped attention-A decode is disabled or ineligible. |
+| `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A=1` | Extend the two-launch grouped attention-A path outside its default scope. The exact caller-marked resident decode shape `groups=8, N=1, K=4096, M=1024` is automatic; row-at-a-time batch fallbacks are not. |
+| `DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A=1` | Dominant rollback to eight standalone Q4 attention-A projections, including for the resident default. |
+| `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A=1` | Request grouped attention-A for eligible non-default shapes and fail closed on fallback; `DISABLE` remains authoritative. |
 | `DS4_ROCM_Q4_GROUPED_ATTN_A_STATS=1` | Report grouped calls, dispatches, groups, fallbacks, and failures. |
 
 Run `make test-strix-rocm-q4-parity` and
@@ -118,13 +126,13 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1069 `DS4_*` runtime variables** and
+Inventory totals: **1072 `DS4_*` runtime variables** and
 **6 external runtime variables**.
-The auxiliary inventories contain **112 test/test-fixture entries**
+The auxiliary inventories contain **118 test/test-fixture entries**
 and **19 tool/wrapper entries**.
 
 <details>
-<summary><strong>Metal (442)</strong></summary>
+<summary><strong>Metal (444)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -152,6 +160,7 @@ and **19 tool/wrapper entries**.
 | `DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables compressor store one. | [ds4_metal.m:23249](ds4_metal.m#L23249) |
 | `DS4_METAL_DISABLE_CONTIG_F16_F16_COPY` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Disables contig F16 F16 copy. | [ds4_metal.m:29562](ds4_metal.m#L29562) |
 | `DS4_METAL_DISABLE_CONTIG_F32_F16_COPY` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Disables contig F32 F16 copy. | [ds4_metal.m:29338](ds4_metal.m#L29338) |
+| `DS4_METAL_DISABLE_DECODE_ARGMAX_TOP1` | presence rollback; unset uses the dedicated two-dispatch top-1 reduction for eligible large Metal rows; any defined value including empty or 0 restores the generic full argsort | Restore the generic indexer argsort for decode argmax A/B and emergency rollback. | [ds4_metal.m:21517](ds4_metal.m#L21517) |
 | `DS4_METAL_DISABLE_DECODE_NORM_EXACT_VIEWS` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables decode norm exact views. | [ds4_metal.m:36207](ds4_metal.m#L36207) |
 | `DS4_METAL_DISABLE_DECODE_RAW_GATHERED_ATTN` | presence rollback; unset: raw-only decode uses gathered attention; any value including 0 restores the legacy raw path | Restores the separate raw-only attention path instead of gathered staging and attention. | [ds4_metal.m:32968](ds4_metal.m#L32968) |
 | `DS4_METAL_DISABLE_DECODE_RAW_PACKED32` | presence rollback; unset: raw-only gathered attention may use packed32; any value including 0 disables it for raw-only layers | Disables the packed32 reduce kernel for raw-only gathered attention while leaving compressed layers unchanged. | [ds4_metal.m:31464](ds4_metal.m#L31464) |
@@ -500,6 +509,7 @@ and **19 tool/wrapper entries**.
 | `DS4_METAL_Q_STAGE_PROFILE` | presence diagnostic; unset: off; any value including 0 enables | Prints timing/profile diagnostics for q stage. | [ds4.c:29270](ds4.c#L29270) |
 | `DS4_METAL_REPEAT_SOURCE` | file path; unset/empty: use the in-tree Metal source file | Overrides the repeat Metal kernel source file loaded at runtime. | [ds4_metal.m:4949](ds4_metal.m#L4949) |
 | `DS4_METAL_REQUIRE_COMPRESSOR_EXACT_POOL_RATIO4` | presence strict check; unset: fallback allowed; any value including 0 requires the path | Requires compressor exact pool ratio4 and makes eligible fallback fail closed. | [ds4_metal.m:26387](ds4_metal.m#L26387) |
+| `DS4_METAL_REQUIRE_DECODE_ARGMAX_TOP1` | presence fail-closed assertion for rows of at least 4096 logits; unset permits generic fallback; any defined value including empty or 0 rejects disabled, ineligible, or failed dedicated top-1 preflight | Require the dedicated Metal top-1 reduction so correctness and performance oracles cannot silently exercise generic argsort. | [ds4_metal.m:21515](ds4_metal.m#L21515) |
 | `DS4_METAL_REQUIRE_EXACT_ROWS_PERSISTENT_CACHE` | nonempty boolean; unset/empty or exact 0: off; every other value: on | Requires exact rows persistent cache and makes eligible fallback fail closed. | [ds4_metal.m:13002](ds4_metal.m#L13002) |
 | `DS4_METAL_REQUIRE_GATHERED_KV_STAGE` | presence strict check; unset: fallback allowed; any value including 0 requires the path | Requires gathered KV stage and makes eligible fallback fail closed. | [ds4_metal.m:29680](ds4_metal.m#L29680) |
 | `DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM` | value-aware boolean; default implicit fail-closed only with complete selected-address domain; explicit 1 is strict, 0 permits fallback | Makes eligible IQ2_XXS/Q2_K grouped SSD-prefill MM fail closed. | [ds4_metal.m:44782](ds4_metal.m#L44782) |
@@ -926,7 +936,7 @@ and **19 tool/wrapper entries**.
 | `DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS` | presence rollback flag; unset keeps automatic/default path | Disable/roll back rocm disable iq2 selected expert views. | [ds4.c:21079](ds4.c#L21079) |
 | `DS4_ROCM_DISABLE_IQ2_STREAM_ADDR_TABLE` | presence rollback flag; unset keeps automatic/default path | Disable/roll back rocm disable iq2 stream addr table. | [ds4.c:6548](ds4.c#L6548) |
 | `DS4_ROCM_DISABLE_Q4_DENSE_PAIR` | presence rollback; unset leaves opt-in policy unchanged | Disable/roll back rocm disable q4 dense pair. | [rocm/ds4_rocm_q4.cuh:435](rocm/ds4_rocm_q4.cuh#L435) |
-| `DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A` | presence rollback; DISABLE wins over enable/require | Disable/roll back rocm disable q4 grouped attn a. | [rocm/ds4_rocm_q4.cuh:700](rocm/ds4_rocm_q4.cuh#L700) |
+| `DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A` | presence rollback; unset permits the caller-marked resident decode production-shape default and explicit ENABLE/REQUIRE; any defined value including empty or 0 disables all grouped attention-A paths and wins over ENABLE/REQUIRE | Restore eight standalone Q4 attention-A projections instead of the two-dispatch grouped path. | [rocm/ds4_rocm_q4.cuh:868](rocm/ds4_rocm_q4.cuh#L868) |
 | `DS4_ROCM_DISABLE_Q4_PREFILL_TILE8` | presence rollback; TILE8 is default for 9..4096 tokens | Disable/roll back rocm disable q4 prefill tile8. | [rocm/ds4_rocm_q4.cuh:448](rocm/ds4_rocm_q4.cuh#L448) |
 | `DS4_ROCM_DISABLE_Q4_SELECTED_EXPERT_VIEWS` | presence rollback flag; unset keeps automatic/default path | Disable/roll back rocm disable q4 selected expert views. | [ds4.c:21135](ds4.c#L21135) |
 | `DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED` | presence rollback flag; unset keeps automatic/default path | Disable/roll back rocm disable resident iq2 sorted. | [rocm/ds4_rocm_moe_launch.cuh:747](rocm/ds4_rocm_moe_launch.cuh#L747) |
@@ -963,19 +973,19 @@ and **19 tool/wrapper entries**.
 | `DS4_ROCM_ENABLE_MXFP4_TILE32` | presence opt-in; unset=off; any defined value including empty or 0 enables the candidate when the MXFP4 sorted-tile path has at least 32 tokens and the expert intermediate dimension is divisible by 32 | Select the ROCm MXFP4 gate/up tile32 kernel, reusing each loaded expert-weight chunk across as many as 32 tokens. | [rocm/ds4_rocm_moe_launch.cuh:786](rocm/ds4_rocm_moe_launch.cuh#L786) |
 | `DS4_ROCM_ENABLE_MXFP4_TILE4` | presence opt-in; unset=off; any defined value including empty or 0 enables the candidate when the MXFP4 sorted-tile path has at least 5 tokens and neither TILE32 nor LDSB is selected | Select the ROCm MXFP4 gate/up tile4 occupancy variant, reducing staged-activation LDS per block. | [rocm/ds4_rocm_moe_launch.cuh:794](rocm/ds4_rocm_moe_launch.cuh#L794) |
 | `DS4_ROCM_ENABLE_Q4_DENSE_PAIR` | presence opt-in; unset=off; DISABLE takes precedence | Enable rocm enable q4 dense pair. | [rocm/ds4_rocm_q4.cuh:434](rocm/ds4_rocm_q4.cuh#L434) |
-| `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A` | presence opt-in; unset=off unless REQUIRE; DISABLE wins | Enable rocm enable q4 grouped attn a. | [rocm/ds4_rocm_q4.cuh:704](rocm/ds4_rocm_q4.cuh#L704) |
-| `DS4_ROCM_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming full expert addr table. | [ds4.c:18240](ds4.c#L18240) |
-| `DS4_ROCM_ENABLE_STREAMING_MADVISE_WILLNEED` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming madvise willneed. | [ds4.c:18209](ds4.c#L18209) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill batch selected addr. | [ds4.c:18569](ds4.c#L18569) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_CACHE_SEED` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill cache seed. | [ds4.c:21258](ds4.c#L21258) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill layer pagein. | [ds4.c:18431](ds4.c#L18431) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_READAHEAD` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill layer readahead. | [ds4.c:18441](ds4.c#L18441) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_MADVISE` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected madvise. | [ds4.c:18421](ds4.c#L18421) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_PAGEIN` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected pagein. | [ds4.c:18411](ds4.c#L18411) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected readahead. | [ds4.c:19955](ds4.c#L19955) |
-| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected readahead shared. | [ds4.c:19957](ds4.c#L19957) |
-| `DS4_ROCM_ENABLE_STREAMING_READAHEAD` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming readahead. | [ds4.c:18202](ds4.c#L18202) |
-| `DS4_ROCM_ENABLE_STREAMING_STATIC_DECODE_MAP` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming static decode map. | [ds4.c:18221](ds4.c#L18221) |
+| `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A` | presence opt-in outside the default scope; the exact caller-marked resident decode shape groups=8, N=1, K=4096, M=1024 is automatic, while row-at-a-time batch fallbacks are not; DISABLE wins | Enable grouped Q4 attention-A for eligible slices, non-production shapes, or explicit experiments in addition to the resident decode default. | [rocm/ds4_rocm_q4.cuh:872](rocm/ds4_rocm_q4.cuh#L872) |
+| `DS4_ROCM_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming full expert addr table. | [ds4.c:18255](ds4.c#L18255) |
+| `DS4_ROCM_ENABLE_STREAMING_MADVISE_WILLNEED` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming madvise willneed. | [ds4.c:18224](ds4.c#L18224) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill batch selected addr. | [ds4.c:18584](ds4.c#L18584) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_CACHE_SEED` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill cache seed. | [ds4.c:21273](ds4.c#L21273) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill layer pagein. | [ds4.c:18446](ds4.c#L18446) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_READAHEAD` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill layer readahead. | [ds4.c:18456](ds4.c#L18456) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_MADVISE` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected madvise. | [ds4.c:18436](ds4.c#L18436) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_PAGEIN` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected pagein. | [ds4.c:18426](ds4.c#L18426) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected readahead. | [ds4.c:19970](ds4.c#L19970) |
+| `DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming prefill selected readahead shared. | [ds4.c:19972](ds4.c#L19972) |
+| `DS4_ROCM_ENABLE_STREAMING_READAHEAD` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming readahead. | [ds4.c:18217](ds4.c#L18217) |
+| `DS4_ROCM_ENABLE_STREAMING_STATIC_DECODE_MAP` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming static decode map. | [ds4.c:18236](ds4.c#L18236) |
 | `DS4_ROCM_GLM_CAUSAL_ATTN_GEMM` | Enabled by default when unset. Exact "0" or an empty value disables; every other nonempty value enables (including false/off/no), because cuda_env_present only tests nonempty and != "0". Eligibility still requires causal_range && !has_selected; a failed GEMM helper falls through to the scalar attention kernel. | Use FP16 BLAS GEMMs for dense causal GLM indexed prefill; =0 is the correctness/performance rollback to the scalar attention kernel. | [rocm/ds4_rocm_glm.cuh:3283](rocm/ds4_rocm_glm.cuh#L3283) |
 | `DS4_ROCM_GLM_DISABLE_STREAMING_EXPERT_CACHE` | Pure presence flag: any defined value, including empty or "0", disables. Unset leaves automatic GLM streaming expert-cache eligibility enabled for supported model/quant/quality/SSD configurations. On ROCm builds DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE is an accepted fallback alias. | Disable selected/resident streamed-expert cache paths and force generic/full-layer expert handling for GLM SSD streaming. | [ds4.c:21197](ds4.c#L21197) |
 | `DS4_ROCM_GLM_DISABLE_STREAMING_SEED_BEFORE_PREFILL` | Pure presence flag: any defined value, including empty or "0", disables. Unset seeds before prefill whenever SSD streaming is active. On ROCm builds DS4_METAL_GLM_DISABLE_STREAMING_SEED_BEFORE_PREFILL is an accepted fallback alias. | Skip the pre-prefill hotlist seed of the streaming expert cache in both one-shot GLM generation and session setup. | [ds4.c:51073](ds4.c#L51073) |
@@ -1015,11 +1025,11 @@ and **19 tool/wrapper entries**.
 | `DS4_ROCM_MOE_PATH_DEBUG` | presence diagnostic; unset=off; any defined value including empty or 0 enables it | Print ROCm routed-MoE path selection, sorted-tile scratch state, and MXFP4 gate/up launch diagnostics to stderr. | [rocm/ds4_rocm_moe_launch.cuh:831](rocm/ds4_rocm_moe_launch.cuh#L831) |
 | `DS4_ROCM_MOE_WRITE_CLAMPED_ACT` | Pure presence sentinel: any defined value, including empty or "0", is active; DS4_METAL_MOE_WRITE_CLAMPED_ACT is an accepted fallback alias. On ROCm the variable is only consumed as a path-admission veto: it disables selected-expert cache/address-table, selected-slot and CPU-router/fused optimized paths. No ROCm call site parses a clamp amount or directly enables a write-clamped kernel. | Force shared graph selection away from optimizations incompatible with the clamped-intermediate MoE diagnostic; on ROCm this is a compatibility/rollback gate, not itself a clamped-write implementation. | [ds4.c:18526](ds4.c#L18526) |
 | `DS4_ROCM_MXFP4_DOWN_RGROUP` | nonempty value is parsed by strtol and a numeric prefix is sufficient; integers 1..8 are accepted; unset, empty, invalid, or out-of-range values use 1 | Set how many 32-row output blocks each ROCm MXFP4 tiled down-projection block computes, reducing the first launch-grid dimension as the value increases. | [rocm/ds4_rocm_moe_launch.cuh:801](rocm/ds4_rocm_moe_launch.cuh#L801) |
-| `DS4_ROCM_Q4_GROUPED_ATTN_A_STATS` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Print counters for rocm q4 grouped attn a stats. | [rocm/ds4_rocm_q4.cuh:480](rocm/ds4_rocm_q4.cuh#L480) |
+| `DS4_ROCM_Q4_GROUPED_ATTN_A_STATS` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Print counters for rocm q4 grouped attn a stats. | [rocm/ds4_rocm_q4.cuh:614](rocm/ds4_rocm_q4.cuh#L614) |
 | `DS4_ROCM_Q4_PREFILL_TILE8_STATS` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Print counters for rocm q4 prefill tile8 stats. | [rocm/ds4_rocm_q4.cuh:514](rocm/ds4_rocm_q4.cuh#L514) |
 | `DS4_ROCM_Q8_DECODE_SHAREDX_64K` | sampled once; unset: enabled; present empty or exact 0: disabled; every other present value: enabled; effective only for one-token non-prequant Q8_0 matmul with 8192 < in_dim <= 16384 | Allows the ROCm shared-input Q8 decode kernel to use up to 64 KiB dynamic LDS for wide inputs; an unsupported/failed LDS launch automatically falls back to the regular kernel. | [rocm/ds4_rocm_runtime.cuh:4805](rocm/ds4_rocm_runtime.cuh#L4805) |
-| `DS4_ROCM_Q_STAGE_PROFILE` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Collect timing/profile diagnostics for rocm q stage profile. | [ds4.c:29269](ds4.c#L29269) |
-| `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A` | presence fail-closed assertion; also requests candidate unless disabled | Require rocm require q4 grouped attn a and fail instead of silently falling back. | [rocm/ds4_rocm_q4.cuh:702](rocm/ds4_rocm_q4.cuh#L702) |
+| `DS4_ROCM_Q_STAGE_PROFILE` | presence/nonempty diagnostic; unset=off (path-valued DUMP names are noted by purpose) | Collect timing/profile diagnostics for rocm q stage profile. | [ds4.c:29284](ds4.c#L29284) |
+| `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A` | presence fail-closed assertion; also requests the candidate outside the caller-marked resident decode default; DISABLE remains authoritative and causes failure | Require grouped Q4 attention-A and fail instead of silently falling back. | [rocm/ds4_rocm_q4.cuh:870](rocm/ds4_rocm_q4.cuh#L870) |
 | `DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8` | presence fail-closed assertion for eligible TILE8 calls | Require rocm require q4 prefill tile8 and fail instead of silently falling back. | [rocm/ds4_rocm_q4.cuh:452](rocm/ds4_rocm_q4.cuh#L452) |
 | `DS4_ROCM_STREAMING_DECODE_PREFILL_MAX` | primary nonempty value over the Metal alias; parsed by strtol when it has a numeric prefix (trailing text is accepted); <= 0 disables, values > UINT32_MAX clamp, no numeric prefix uses automatic default: 64 for Flash with uniform Q4_K/MXFP4 experts, 18 for other Pro/Flash, otherwise 0; the disable flag dominates | Sets the largest short, non-quality SSD-streaming prefill batch routed through the decode-style path instead of canonical layer-major prefill. | [ds4.c:31961](ds4.c#L31961) |
 | `DS4_ROCM_STREAMING_EXPERT_AUTO_PRELOAD_CAP` | primary nonempty value over the Metal alias; strict full-string strtoul; valid values > UINT32_MAX clamp, invalid uses 4096, and 0 means no cap (not disabled); when CLI preload is auto/0, unset defaults to cap 4096 except ROCm GLM52, where absent/empty disables automatic preload entirely | Caps the number of hot experts synchronously seeded into the SSD-streaming expert cache in automatic preload mode; an explicit CLI preload count bypasses this cap, and setting this variable opts ROCm GLM52 back into auto preload. | [ds4.c:21454](ds4.c#L21454) |
@@ -1165,7 +1175,7 @@ and **19 tool/wrapper entries**.
 </details>
 
 <details>
-<summary><strong>General and shared (76)</strong></summary>
+<summary><strong>General and shared (77)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -1180,8 +1190,9 @@ and **19 tool/wrapper entries**.
 | `DS4_CPU_DUMP_LOGITS` | filesystem path; unset disables read/write | Dump or select diagnostic data for cpu dump logits. | [ds4.c:39086](ds4.c#L39086) |
 | `DS4_CPU_DUMP_PREFILL_LOGITS` | filesystem path; unset disables read/write | Dump or select diagnostic data for cpu dump prefill logits. | [ds4.c:41606](ds4.c#L41606) |
 | `DS4_DECODE_PROFILE_DETAIL` | presence flag; unset=off | Print per-stage timing for the single-token CPU FFN path. | [ds4.c:12209](ds4.c#L12209) |
-| `DS4_EXPERT_HOTLIST` | nonempty filesystem path; unset=off; currently Metal-only | Load an expert hotlist for Metal expert profiling/streaming. | [ds4.c:60369](ds4.c#L60369) |
-| `DS4_EXPERT_PROFILE` | presence diagnostic flag; unset=off | Collect timing/profile diagnostics for expert profile. | [ds4.c:60367](ds4.c#L60367) |
+| `DS4_DISABLE_GREEDY_TOP1_READBACK` | presence rollback; unset uses device top-1 plus a 4-byte readback for eligible single-tier greedy generation, including SSD streaming; any defined value including empty or 0 restores full-logits readback and CPU argmax | Restore the legacy per-token full-logits host readback for greedy generation A/B and emergency rollback. | [ds4.c:51964](ds4.c#L51964) |
+| `DS4_EXPERT_HOTLIST` | nonempty filesystem path; unset=off; currently Metal-only | Load an expert hotlist for Metal expert profiling/streaming. | [ds4.c:60637](ds4.c#L60637) |
+| `DS4_EXPERT_PROFILE` | presence diagnostic flag; unset=off | Collect timing/profile diagnostics for expert profile. | [ds4.c:60635](ds4.c#L60635) |
 | `DS4_FORCE_CUDA_PEER` | presence flag read once at CUDA init; unset uses automatic transfer selection; any defined value including 0 enables | Force cross-device transfers through cudaMemcpyPeerAsync for diagnostics. | [ds4_cuda.cu:364](ds4_cuda.cu#L364) |
 | `DS4_FORCE_HOST_BOUNCE` | presence flag read once at CUDA init; unset uses automatic transfer selection; any defined value including 0 enables | Force cross-device transfers through pinned host bounce buffers for diagnostics. | [ds4_cuda.cu:365](ds4_cuda.cu#L365) |
 | `DS4_LOCK_FILE` | path string; default /tmp/ds4.lock | Override the single-instance lock file. | [ds4.c:51999](ds4.c#L51999) |
@@ -1285,6 +1296,7 @@ them as part of its own test contract.
 | `DS4_TEST_LOGPROB_AUTO_METAL` | presence flag; unset forces DS4_METAL_DISABLE_METAL4=1; any presence including empty or 0 removes that rollback and permits automatic Metal selection | Runs official log-probability vectors with automatic Metal-path selection instead of the fixed pre-Metal4 baseline. | [tests/ds4_test.c:7235](tests/ds4_test.c#L7235) |
 | `DS4_TEST_LONG_PROMPT` | nonempty readable prompt-file path; unset/empty defaults to tests/long_context_story_prompt.txt | Selects the rendered story prompt for the long-context fact-recall test. | [tests/ds4_test.c:6970](tests/ds4_test.c#L6970) |
 | `DS4_TEST_LONG_WORDS` | atoi integer; unset/empty/nonnumeric defaults to 0; valid range is 0..DS4_TEST_CONTEXT-128 and numeric prefixes are accepted | Adds repeated words to alternating CUDA session-batch prompts to exercise long-prefill rows. | [tests/test_cuda_session_batch.c:135](tests/test_cuda_session_batch.c#L135) |
+| `DS4_TEST_METAL_ARGMAX_TOP1_TIMING` | presence flag; unset runs correctness only; any defined value including empty or 0 also runs the GGUF-free resident production-shape A/B | Measures generic argsort versus dedicated Metal top-1 and full-readback versus 4-byte greedy selection using resident synthetic logits, excluding model and SSD I/O. | [tests/test_metal_argmax_top1.c:545](tests/test_metal_argmax_top1.c#L545) |
 | `DS4_TEST_METAL_EXACTN_BATCH_HEAD` | nonempty value other than exact 0 enables; unset/empty/0 disables; false/off also enable | Enables the Metal exact-N batch-head path and requires its attempt/use counters for every eligible oracle case. | [tests/test_metal_exactn_oracle.c:401](tests/test_metal_exactn_oracle.c#L401) |
 | `DS4_TEST_METAL_EXACTN_ORACLE` | presence flag compiled only with DS4_TEST_HOOKS; absent from normal production builds | Force allocation of the exact-N Metal verifier/oracle workspace in tests. | [ds4.c:61991](ds4.c#L61991) |
 | `DS4_TEST_MIXED_INITIAL` | integer 128..context-1; default 128 | Set the initial prefill length for the CUDA mixed-batch oracle. | [tests/test_cuda_mixed_batch.c:111](tests/test_cuda_mixed_batch.c#L111) |

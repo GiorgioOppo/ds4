@@ -21502,7 +21502,8 @@ static bool metal_graph_attention_output_dense_quant_low(
         uint64_t                rank,
         uint32_t                group0,
         uint32_t                group_cnt,
-        const ds4_gpu_tensor *heads);
+        const ds4_gpu_tensor *heads,
+        bool                   resident_decode);
 static bool metal_graph_attention_output_dense_quant_tp(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -25204,7 +25205,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 metal_graph_attn_low(g), g, model,
                 layer->attn_output_a,
                 group_dim, rank, 0, n_groups,
-                metal_graph_heads(g));
+                metal_graph_heads(g), true);
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
         if (ok) {
             ok = ds4_gpu_matmul_q4_K_hc_expand_tensor(
@@ -25250,7 +25251,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                           rank,
                                                           0,
                                                           n_groups,
-                                                          metal_graph_heads(g));
+                                                          metal_graph_heads(g),
+                                                          true);
         if (ok) ok = metal_graph_matmul_dense_quant_tensor(attn_out_dst,
                                                            model,
                                                            layer->attn_output_b,
@@ -27653,7 +27655,8 @@ static bool metal_graph_attention_output_dense_quant_low(
         uint64_t                rank,
         uint32_t                group0,
         uint32_t                group_cnt,
-        const ds4_gpu_tensor *heads) {
+        const ds4_gpu_tensor *heads,
+        bool                   resident_decode) {
     (void)g;
     if (!low || !model || !out_a || !heads ||
         group_dim == 0 || rank == 0 || group_cnt == 0) {
@@ -27682,7 +27685,8 @@ static bool metal_graph_attention_output_dense_quant_low(
                                                            rank,
                                                            group0,
                                                            group_cnt,
-                                                           heads);
+                                                           heads,
+                                                           resident_decode ? 1 : 0);
         if (q4_slice_rc > 0) return true;
         if (q4_slice_rc < 0) return false;
     }
@@ -27756,7 +27760,8 @@ static bool metal_graph_attention_output_dense_quant_tp(
                                                      rank,
                                                      group0,
                                                      group_cnt,
-                                                     heads)) {
+                                                     heads,
+                                                     true)) {
         return false;
     }
     return metal_graph_matmul_dense_quant_kslice(out,
@@ -27849,7 +27854,8 @@ static bool metal_graph_attention_output_dense_quant_batch(
                                                           rank,
                                                           0,
                                                           n_groups,
-                                                          heads_row);
+                                                          heads_row,
+                                                          false);
         if (ok) ok = metal_graph_matmul_dense_quant_tensor(out_row,
                                                            model,
                                                            out_b,
@@ -32565,7 +32571,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         const ds4_weights     *weights,
         int                    token,
         uint32_t               pos,
-        float                 *logits) {
+        float                 *logits,
+        int                   *top_id) {
     if (g->raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
@@ -32575,6 +32582,13 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
                               "DS4_METAL_GRAPH_TOKEN_PROFILE");
     const bool throttle = graph_power_throttle_enabled(g);
+    const bool need_output = logits != NULL || top_id != NULL;
+    if (need_output && !weights_have_output_head(weights)) {
+        fprintf(stderr,
+                "ds4: SSD streaming decode requested logits/top-1 without "
+                "a complete output head\n");
+        return false;
+    }
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
@@ -32630,25 +32644,38 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 ok = metal_graph_dspark_capture_decode_layer(g, il);
             }
         }
-        if (ok && logits) {
+        if (ok && need_output) {
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        }
+        if (ok && top_id) {
+            ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
+                                       metal_graph_logits(g),
+                                       DS4_N_VOCAB) != 0;
         }
         const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = (profile || throttle) ? now_sec() : 0.0;
+        if (ok && top_id) {
+            int32_t device_top = -1;
+            ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0,
+                                     &device_top, sizeof(device_top)) != 0 &&
+                 device_top >= 0 && (uint32_t)device_top < DS4_N_VOCAB;
+            if (ok) *top_id = (int)device_top;
+        }
         if (ok && logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
         const double t_read = (profile || throttle) ? now_sec() : 0.0;
         if (profile) {
             fprintf(stderr,
-                    "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                    "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d top=%d\n",
                     pos,
                     (t_encoded - t0) * 1000.0,
                     (t_done - t_encoded) * 1000.0,
                     (t_read - t_done) * 1000.0,
                     (t_read - t0) * 1000.0,
-                    logits != NULL);
+                    logits != NULL,
+                    top_id != NULL);
         }
         if (ok && throttle) {
             graph_power_note_decode_token(g, t_read - t0);
@@ -32672,7 +32699,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
         if (!static_decode_map && il + 1 < DS4_N_LAYER) {
             metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
-        } else if (!static_decode_map && logits) {
+        } else if (!static_decode_map && need_output) {
             metal_graph_stream_readahead_output(model, weights);
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -32705,31 +32732,44 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
     }
 
-    if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
+    if (ok && need_output && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
     const double t_head0 = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
-    if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (ok && need_output) ok = ds4_gpu_begin_commands() != 0;
+    if (ok && need_output) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (ok && top_id) {
+        ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
+                                   metal_graph_logits(g),
+                                   DS4_N_VOCAB) != 0;
+    }
     const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    if (ok && need_output) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
+    if (ok && top_id) {
+        int32_t device_top = -1;
+        ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0,
+                                 &device_top, sizeof(device_top)) != 0 &&
+             device_top >= 0 && (uint32_t)device_top < DS4_N_VOCAB;
+        if (ok) *top_id = (int)device_top;
+    }
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
 
     if (profile) {
-        if (logits) {
+        if (need_output) {
             encode_s += t_head_encoded - t_head0;
             execute_s += t_done - t_head_encoded;
         }
         fprintf(stderr,
-                "ds4: metal SSD streaming token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                "ds4: metal SSD streaming token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d top=%d\n",
                 pos,
                 encode_s * 1000.0,
                 execute_s * 1000.0,
                 (t_read - t_done) * 1000.0,
                 (t_read - t0) * 1000.0,
-                logits != NULL);
+                logits != NULL,
+                top_id != NULL);
     }
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
@@ -32749,7 +32789,8 @@ static bool metal_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
     if (g && g->ssd_streaming) {
-        return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
+        return metal_graph_eval_token_raw_swa_streaming(
+                g, model, weights, token, pos, logits, NULL);
     }
 
     const bool profile =
@@ -33214,34 +33255,50 @@ typedef struct {
  * Keeping intermediate rows device-resident avoids turning verification into a
  * sequence of large CPU readbacks. */
 static bool metal_graph_eval_token_raw_swa_top(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        int                   *top_id,
-        float                 *logits,
-        bool                   allow_split_top1,
+        ds4_gpu_graph           *g,
+        const ds4_model         *model,
+        const ds4_weights       *weights,
+        int                      token,
+        uint32_t                 pos,
+        int                     *top_id,
+        float                   *logits,
+        bool                     allow_split_top1,
         metal_graph_top2_result *top2,
-        bool                   force_fast_attention) {
+        bool                     force_fast_attention) {
     if (!top_id) return false;
     if (top2) memset(top2, 0, sizeof(*top2));
+    /* SSD-backed decode must use the mapper on every backend.  CUDA's
+     * optional approximate/split helpers are resident-only; run the exact
+     * streaming path instead.  TP output owns only a vocabulary slice, so a
+     * local full-row argmax would be stale and is rejected until it has an
+     * explicit cross-rank merge. */
+    if (g && g->ssd_streaming) {
+        if (g->tp_world >= 2u) {
+            fprintf(stderr,
+                    "ds4: SSD streaming top-1 is unsupported with tensor "
+                    "parallel output\n");
+            return false;
+        }
+        return metal_graph_eval_token_raw_swa_streaming(
+                g, model, weights, token, pos, logits, top_id);
+    }
 
     const bool fast_attention =
         allow_split_top1 &&
         logits == NULL &&
         (force_fast_attention || metal_graph_cuda_greedy_splitkv_requested());
+    const bool split_top1 =
+        allow_split_top1 &&
+        logits == NULL &&
+        top2 == NULL &&
+        g &&
+        g->cuda_tp_output &&
+        metal_graph_cuda_greedy_split_top1_requested();
     if (top2) top2->fast_attention = fast_attention;
     const int old_fast_attention =
         ds4_gpu_set_decode_fast_attention(fast_attention ? 1 : 0);
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
-    const bool split_top1 =
-        allow_split_top1 &&
-        logits == NULL &&
-        top2 == NULL &&
-        g->cuda_tp_output &&
-        metal_graph_cuda_greedy_split_top1_requested();
     if (split_top1) {
         int output_tiers[DS4_MAX_GPUS] = {0};
         uint32_t output_ways = 0;
@@ -33328,7 +33385,7 @@ static bool metal_graph_eval_token_raw_swa_top(
                                  0,
                                  values,
                                  sizeof(values)) != 0;
-        if (ok && ids[0] <= (uint32_t)INT32_MAX && ids[1] <= (uint32_t)INT32_MAX) {
+        if (ok && ids[0] < DS4_N_VOCAB && ids[1] < DS4_N_VOCAB) {
             top2->id0 = (int)ids[0];
             top2->id1 = (int)ids[1];
             top2->value0 = values[0];
@@ -33339,7 +33396,11 @@ static bool metal_graph_eval_token_raw_swa_top(
             ok = false;
         }
     } else if (ok) {
-        ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0, top_id, sizeof(*top_id)) != 0;
+        int32_t device_top = -1;
+        ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0,
+                                 &device_top, sizeof(device_top)) != 0 &&
+             device_top >= 0 && (uint32_t)device_top < DS4_N_VOCAB;
+        if (ok) *top_id = (int)device_top;
     }
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
@@ -55770,7 +55831,25 @@ static int generate_metal_graph_raw_swa(
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
+    /* Greedy decode needs only the winning id after each graph evaluation.
+     * Resident and SSD-mapped paths can both reduce on the device and transfer
+     * one int32 instead of DS4_N_VOCAB floats; diagnostics retain full logits.
+     * CUDA and ROCm already have a dedicated top-1 kernel, while Metal selects
+     * its two-stage decode reduction. */
+    const bool greedy_top1_readback =
+        !quality &&
+        g.tp_world < 2u &&
+        !trace_top &&
+        !token_timing &&
+        !graph_power_throttle_enabled(&g) &&
+        getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") == NULL &&
+        getenv("DS4_ROCM_GRAPH_TOKEN_PROFILE") == NULL &&
+        getenv("DS4_DISABLE_GREEDY_TOP1_READBACK") == NULL;
     const double t_decode0 = now_sec();
+    /* Both arms need the initial CPU selection from prefill logits.  Keep it
+     * inside the same decode timing window so short rollback A/B runs have an
+     * identical perimeter. */
+    int next_token = sample_argmax(logits, DS4_N_VOCAB);
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
             char label[64];
@@ -55778,7 +55857,7 @@ static int generate_metal_graph_raw_swa(
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
 
-        int token = sample_argmax(logits, DS4_N_VOCAB);
+        const int token = next_token;
         if (vocab_token_is_generation_stop(vocab, token)) break;
 
         if (emit) emit(emit_ud, token);
@@ -55790,16 +55869,32 @@ static int generate_metal_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
-        ok = metal_graph_eval_token_raw_swa(&g,
-                                            model,
-                                            weights,
-                                            (uint32_t)token,
-                                            (uint32_t)pos,
-                                            logits);
+        if (greedy_top1_readback) {
+            ok = metal_graph_eval_token_raw_swa_top(&g,
+                                                    model,
+                                                    weights,
+                                                    token,
+                                                    (uint32_t)pos,
+                                                    &next_token,
+                                                    NULL,
+                                                    false,
+                                                    NULL,
+                                                    false);
+        } else {
+            ok = metal_graph_eval_token_raw_swa(&g,
+                                                model,
+                                                weights,
+                                                (uint32_t)token,
+                                                (uint32_t)pos,
+                                                logits);
+        }
         if (!ok) break;
         if (token_timing) {
             const double t_eval1 = now_sec();
             fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
+        }
+        if (!greedy_top1_readback) {
+            next_token = sample_argmax(logits, DS4_N_VOCAB);
         }
         n_decode_eval++;
         pos++;

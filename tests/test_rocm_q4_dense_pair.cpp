@@ -1432,32 +1432,102 @@ bool run_grouped_attention_decode_case(const aligned_model &model) {
     (void)unsetenv(kGroupedDecodeEnable);
     (void)unsetenv(kGroupedDecodeDisable);
     (void)unsetenv(kGroupedDecodeRequire);
+    ds4_gpu_set_ssd_streaming(false);
 
     const int default_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
         candidate_gpu.ptr, model.data, model.size,
         model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
-        0u, kDecodeAttnGroups, heads_gpu.ptr);
-    bool ok = default_rc == 0;
-    if (default_rc != 0) {
+        0u, kDecodeAttnGroups, heads_gpu.ptr, 1);
+    std::vector<float> resident_default_host(allocation_count);
+    std::vector<float> resident_legacy_host(allocation_count);
+    bool ok = default_rc == 1 &&
+              read_tensor(candidate_gpu.ptr, &resident_default_host) &&
+              read_tensor(legacy_gpu.ptr, &resident_legacy_host);
+    if (!ok) {
         std::fprintf(stderr,
-                     "grouped attention-A default gate: expected rc=0 got=%d FAIL\n",
+                     "grouped attention-A resident production default: "
+                     "expected rc=1 got=%d/readback FAIL\n",
                      default_rc);
     }
-    ok = unchanged_after_rejected_call(
-             candidate_gpu.ptr, sentinel,
-             "grouped attention-A disabled-by-default preserves output") && ok;
+    if (default_rc == 1) {
+        ok = output_guard_unchanged(
+                 resident_default_host, sentinel, logical_count,
+                 "grouped attention-A resident default output canary") && ok;
+        ok = bitwise_equal(
+                 resident_default_host, resident_legacy_host,
+                 "grouped attention-A resident default vs 8 legacy calls") && ok;
+    }
+    if (!write_tensor(candidate_gpu.ptr, sentinel)) {
+        std::fprintf(stderr,
+                     "grouped attention-A gate reset: tensor write FAIL\n");
+        return false;
+    }
 
-    (void)setenv(kGroupedDecodeEnable, "1", 1);
-    (void)setenv(kGroupedDecodeDisable, "1", 1);
-    const int disabled_only_rc =
+    /* The batch fallback passes one row at a time through the same low-level
+     * API.  It must not inherit the automatic one-token decode policy. */
+    const int batch_row_default_rc =
         ds4_gpu_attention_output_low_q4_K_slice_tensor(
             candidate_gpu.ptr, model.data, model.size,
             model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
-            0u, kDecodeAttnGroups, heads_gpu.ptr);
-    if (disabled_only_rc != 0) {
+            0u, kDecodeAttnGroups, heads_gpu.ptr, 0);
+    if (batch_row_default_rc != 0) {
+        std::fprintf(stderr,
+                     "grouped attention-A batch-row default: "
+                     "expected rc=0 got=%d FAIL\n",
+                     batch_row_default_rc);
+        ok = false;
+    }
+    ok = unchanged_after_rejected_call(
+             candidate_gpu.ptr, sentinel,
+             "grouped attention-A batch-row context preserves output") && ok;
+
+    /* The production shape is implicit only for a fully resident model.  This
+     * toggles policy state without opening or reading an SSD-backed model. */
+    ds4_gpu_set_ssd_streaming(true);
+    const int streaming_default_rc =
+        ds4_gpu_attention_output_low_q4_K_slice_tensor(
+            candidate_gpu.ptr, model.data, model.size,
+            model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+            0u, kDecodeAttnGroups, heads_gpu.ptr, 1);
+    ds4_gpu_set_ssd_streaming(false);
+    if (streaming_default_rc != 0) {
+        std::fprintf(stderr,
+                     "grouped attention-A streaming default: "
+                     "expected rc=0 got=%d FAIL\n",
+                     streaming_default_rc);
+        ok = false;
+    }
+    ok = unchanged_after_rejected_call(
+             candidate_gpu.ptr, sentinel,
+             "grouped attention-A streaming mode preserves output") && ok;
+
+    (void)setenv(kGroupedDecodeDisable, "1", 1);
+    const int rollback_rc =
+        ds4_gpu_attention_output_low_q4_K_slice_tensor(
+            candidate_gpu.ptr, model.data, model.size,
+            model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+            0u, kDecodeAttnGroups, heads_gpu.ptr, 1);
+    if (rollback_rc != 0) {
+        std::fprintf(stderr,
+                     "grouped attention-A resident rollback: "
+                     "expected rc=0 got=%d FAIL\n",
+                     rollback_rc);
+        ok = false;
+    }
+    ok = unchanged_after_rejected_call(
+             candidate_gpu.ptr, sentinel,
+             "grouped attention-A DISABLE rolls back resident default") && ok;
+
+    (void)setenv(kGroupedDecodeEnable, "1", 1);
+    const int disabled_enabled_rc =
+        ds4_gpu_attention_output_low_q4_K_slice_tensor(
+            candidate_gpu.ptr, model.data, model.size,
+            model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+            0u, kDecodeAttnGroups, heads_gpu.ptr, 1);
+    if (disabled_enabled_rc != 0) {
         std::fprintf(stderr,
                      "grouped attention-A ENABLE+DISABLE: expected rc=0 got=%d FAIL\n",
-                     disabled_only_rc);
+                     disabled_enabled_rc);
         ok = false;
     }
     ok = unchanged_after_rejected_call(
@@ -1469,7 +1539,7 @@ bool run_grouped_attention_decode_case(const aligned_model &model) {
         ds4_gpu_attention_output_low_q4_K_slice_tensor(
             candidate_gpu.ptr, model.data, model.size,
             model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
-            0u, kDecodeAttnGroups, heads_gpu.ptr);
+            0u, kDecodeAttnGroups, heads_gpu.ptr, 1);
     if (disabled_rc != -1) {
         std::fprintf(stderr,
                      "grouped attention-A DISABLE+REQUIRE: expected rc=-1 got=%d FAIL\n",
@@ -1484,7 +1554,7 @@ bool run_grouped_attention_decode_case(const aligned_model &model) {
     const int invalid_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
         candidate_gpu.ptr, model.data, model.size, model.size - 16u,
         kDecodeAttnGroupDim, kDecodeAttnRank, 0u, kDecodeAttnGroups,
-        heads_gpu.ptr);
+        heads_gpu.ptr, 1);
     if (invalid_rc != -1) {
         std::fprintf(stderr,
                      "grouped attention-A REQUIRE range guard: expected rc=-1 got=%d FAIL\n",
@@ -1498,7 +1568,7 @@ bool run_grouped_attention_decode_case(const aligned_model &model) {
     const int candidate_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
         candidate_gpu.ptr, model.data, model.size,
         model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
-        0u, kDecodeAttnGroups, heads_gpu.ptr);
+        0u, kDecodeAttnGroups, heads_gpu.ptr, 1);
     std::vector<float> legacy_host(allocation_count);
     std::vector<float> candidate_host(allocation_count);
     if (candidate_rc != 1 || !read_tensor(legacy_gpu.ptr, &legacy_host) ||
@@ -1562,10 +1632,32 @@ bool run_grouped_attention_decode_case(const aligned_model &model) {
             return false;
         }
     }
+
+    /* A slice is deliberately outside the implicit production scope.  It
+     * must fall back while the environment is clean, then dispatch when the
+     * existing explicit ENABLE override is restored. */
+    (void)unsetenv(kGroupedDecodeEnable);
+    (void)unsetenv(kGroupedDecodeRequire);
+    const int subset_default_rc =
+        ds4_gpu_attention_output_low_q4_K_slice_tensor(
+            subset_candidate.ptr, model.data, model.size,
+            model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
+            subset_group0, subset_group_cnt, subset_heads.ptr, 1);
+    if (subset_default_rc != 0) {
+        std::fprintf(stderr,
+                     "grouped attention-A non-standard default: "
+                     "expected rc=0 got=%d FAIL\n",
+                     subset_default_rc);
+        ok = false;
+    }
+    ok = unchanged_after_rejected_call(
+             subset_candidate.ptr, subset_sentinel,
+             "grouped attention-A non-standard default preserves output") && ok;
+    (void)setenv(kGroupedDecodeEnable, "1", 1);
     const int subset_rc = ds4_gpu_attention_output_low_q4_K_slice_tensor(
         subset_candidate.ptr, model.data, model.size,
         model.decode_attn_a_offset, kDecodeAttnGroupDim, kDecodeAttnRank,
-        subset_group0, subset_group_cnt, subset_heads.ptr);
+        subset_group0, subset_group_cnt, subset_heads.ptr, 1);
     std::vector<float> subset_legacy_host(subset_sentinel.size());
     std::vector<float> subset_candidate_host(subset_sentinel.size());
     if (subset_rc != 1 ||
@@ -1589,10 +1681,16 @@ bool run_grouped_attention_decode_case(const aligned_model &model) {
              "grouped attention-A subset group0=3 count=2 vs legacy") && ok;
     std::fprintf(stderr,
                  "grouped attention-A decode groups=8 K=4096 rank=1024: "
-                 "default=%d disabled=%d disabled_required=%d invalid=%d "
-                 "candidate=%d subset=%d %s\n",
-                 default_rc, disabled_only_rc, disabled_rc, invalid_rc,
-                 candidate_rc, subset_rc,
+                 "resident_default=%d batch_row_default=%d "
+                 "streaming_default=%d rollback=%d "
+                 "disabled_enabled=%d disabled_required=%d invalid=%d "
+                 "candidate=%d subset_default=%d subset_enabled=%d "
+                 "stats_expected=calls:10,dispatches:3,groups:18,"
+                 "fallbacks:5,failures:2 %s\n",
+                 default_rc, batch_row_default_rc,
+                 streaming_default_rc, rollback_rc,
+                 disabled_enabled_rc, disabled_rc, invalid_rc,
+                 candidate_rc, subset_default_rc, subset_rc,
                  ok ? "PASS" : "FAIL");
     return ok;
 }

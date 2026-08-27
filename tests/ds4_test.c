@@ -1764,7 +1764,8 @@ static void test_metal_q4_attention_output_tiny_batch_exact_case(
                             rank,
                             0,
                             n_groups,
-                            heads_row) != 0);
+                            heads_row,
+                            0) != 0);
             if (out_b_type == 8u) {
                 TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(
                                 out_row,

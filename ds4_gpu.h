@@ -2818,7 +2818,8 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         uint64_t                rank,
         uint32_t                group0,
         uint32_t                group_cnt,
-        const ds4_gpu_tensor *heads);
+        const ds4_gpu_tensor *heads,
+        int                    resident_decode);
 
 int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
         ds4_gpu_tensor       *low,

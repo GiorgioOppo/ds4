@@ -252,7 +252,7 @@ int main(void) {
         CHECK(heads_row && low_row && out_row, "reference views");
         CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
                   low_row, model, model_bytes, 0,
-                  GROUP_DIM, RANK, 0, N_GROUPS, heads_row) != 0,
+                  GROUP_DIM, RANK, 0, N_GROUPS, heads_row, 0) != 0,
               "reference low projection");
         CHECK(ds4_gpu_matmul_quant_tensor(
                   out_row, model, model_bytes, out_b_offset, Q4_K_TYPE,

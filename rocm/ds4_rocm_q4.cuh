@@ -520,6 +520,30 @@ static int rocm_q4_K_dense_pair_requested(void) {
            getenv("DS4_ROCM_DISABLE_Q4_DENSE_PAIR") == NULL;
 }
 
+enum {
+    ROCM_Q4_GROUPED_ATTN_A_DEFAULT_K = 4096u,
+    ROCM_Q4_GROUPED_ATTN_A_DEFAULT_M = 1024u,
+    ROCM_Q4_GROUPED_ATTN_A_DEFAULT_GROUPS = 8u,
+};
+
+static int rocm_q4_K_grouped_attn_a_resident_default_scope(
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t group0,
+        uint32_t group_cnt,
+        int resident_decode) {
+    /* A batch fallback can pass one row at a time through this same API, so
+     * the caller explicitly identifies true decode.  Default only the
+     * production decode shape after the complete model has been made
+     * resident; explicit ENABLE keeps the existing experimental surface. */
+    return resident_decode &&
+           !g_ssd_streaming_mode &&
+           group_dim == ROCM_Q4_GROUPED_ATTN_A_DEFAULT_K &&
+           rank == ROCM_Q4_GROUPED_ATTN_A_DEFAULT_M &&
+           group0 == 0u &&
+           group_cnt == ROCM_Q4_GROUPED_ATTN_A_DEFAULT_GROUPS;
+}
+
 static int rocm_q4_K_prefill_tile8_scope(uint64_t n_tok) {
     /* Keep decode/speculative micro-batches on the latency-oriented legacy
      * kernel.  4096 is DS4's largest supported prefill chunk and bounds the
@@ -839,13 +863,16 @@ extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t group0, uint32_t group_cnt,
-        const ds4_gpu_tensor *heads) {
+        const ds4_gpu_tensor *heads, int resident_decode) {
     const int disabled =
         getenv("DS4_ROCM_DISABLE_Q4_GROUPED_ATTN_A") != NULL;
     const int required =
         getenv("DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A") != NULL;
     const int enabled =
         getenv("DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A") != NULL;
+    const int resident_default =
+        rocm_q4_K_grouped_attn_a_resident_default_scope(
+            group_dim, rank, group0, group_cnt, resident_decode);
     /* DISABLE is authoritative; REQUIRE reports that rollback as a failure
      * instead of allowing the graph to false-green through its fallback. */
     if (disabled) {
@@ -856,7 +883,7 @@ extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         }
         return rocm_q4_K_grouped_attn_a_result(required ? -1 : 0, 0u);
     }
-    if (!enabled && !required) {
+    if (!resident_default && !enabled && !required) {
         return rocm_q4_K_grouped_attn_a_result(0, 0u);
     }
     const int pre_enqueue_failure = required ? -1 : 0;
