@@ -863,6 +863,185 @@ static void test_metal_store_raw_kv_batch_wrap(void) {
     ds4_gpu_tensor_free(raw);
 }
 
+#if defined(__APPLE__)
+typedef struct {
+    volatile uint32_t *sequence_count;
+    volatile uint32_t *sequence;
+    volatile uint32_t  calls;
+    uint32_t           marker;
+} test_metal_progress_callback_ctx;
+
+static void test_metal_progress_callback(void *opaque) {
+    test_metal_progress_callback_ctx *ctx = opaque;
+    const uint32_t slot = __atomic_fetch_add(
+        ctx->sequence_count, 1u, __ATOMIC_ACQ_REL);
+    if (slot < 2u) {
+        __atomic_store_n(
+            ctx->sequence + slot, ctx->marker, __ATOMIC_RELEASE);
+    }
+    (void)__atomic_fetch_add(&ctx->calls, 1u, __ATOMIC_ACQ_REL);
+}
+
+static void test_metal_flush_commands_progress_exact(void) {
+    enum {
+        n = 257,
+        guard = 19,
+        alloc_n = n + guard,
+    };
+    const uint64_t active_bytes = (uint64_t)n * sizeof(float);
+    const uint64_t alloc_bytes = (uint64_t)alloc_n * sizeof(float);
+    const uint32_t tmp_poison = 0x7fc1a500u;
+    const uint32_t out_poison = 0x7fc25a00u;
+    float a_host[alloc_n];
+    float b_host[alloc_n];
+    float c_host[alloc_n];
+    float tmp_host[alloc_n];
+    float out_host[alloc_n];
+    float expected_tmp[n];
+    float expected_out[n];
+
+    for (uint32_t i = 0; i < alloc_n; i++) {
+        a_host[i] = (float)((int)(i % 17u) - 8) * 0.5f;
+        b_host[i] = (float)((int)((i * 5u) % 23u) - 11) * 0.25f;
+        c_host[i] = (float)((int)((i * 7u) % 29u) - 14) * 0.125f;
+        const uint32_t tmp_bits = tmp_poison + (i & 0xffu);
+        const uint32_t out_bits = out_poison + (i & 0xffu);
+        memcpy(tmp_host + i, &tmp_bits, sizeof(tmp_bits));
+        memcpy(out_host + i, &out_bits, sizeof(out_bits));
+        if (i < n) {
+            expected_tmp[i] = a_host[i] + b_host[i];
+            expected_out[i] = expected_tmp[i] + c_host[i];
+        }
+    }
+
+    ds4_gpu_tensor *a = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *b = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *c = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *tmp_base = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *out_base = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *tmp = tmp_base
+        ? ds4_gpu_tensor_view(tmp_base, 0u, active_bytes) : NULL;
+    ds4_gpu_tensor *out = out_base
+        ? ds4_gpu_tensor_view(out_base, 0u, active_bytes) : NULL;
+    TEST_ASSERT(a && b && c && tmp_base && out_base && tmp && out);
+
+    volatile uint32_t sequence_count = 0u;
+    volatile uint32_t sequence[2] = {0u, 0u};
+    test_metal_progress_callback_ctx callback0 = {
+        .sequence_count = &sequence_count,
+        .sequence = sequence,
+        .calls = 0u,
+        .marker = 1u,
+    };
+    test_metal_progress_callback_ctx callback1 = {
+        .sequence_count = &sequence_count,
+        .sequence = sequence,
+        .calls = 0u,
+        .marker = 2u,
+    };
+
+    bool submitted = false;
+    if (a && b && c && tmp_base && out_base && tmp && out) {
+        TEST_ASSERT(ds4_gpu_tensor_write(a, 0u, a_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(b, 0u, b_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(c, 0u, c_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        tmp_base, 0u, tmp_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        out_base, 0u, out_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_commands_active() == 0);
+
+        const int begun = ds4_gpu_begin_commands();
+        TEST_ASSERT(begun != 0);
+        const int first = begun
+            ? ds4_gpu_add_tensor(tmp, a, b, n) : 0;
+        TEST_ASSERT(first != 0);
+        const int flushed0 = first
+            ? ds4_gpu_flush_commands_progress(
+                  test_metal_progress_callback, &callback0)
+            : 0;
+        TEST_ASSERT(flushed0 != 0);
+        const int second = flushed0
+            ? ds4_gpu_add_tensor(out, tmp, c, n) : 0;
+        TEST_ASSERT(second != 0);
+        const int flushed1 = second
+            ? ds4_gpu_flush_commands_progress(
+                  test_metal_progress_callback, &callback1)
+            : 0;
+        TEST_ASSERT(flushed1 != 0);
+        submitted = flushed1 != 0;
+
+        const int drained = ds4_gpu_commands_active()
+            ? ds4_gpu_end_commands() : 0;
+        TEST_ASSERT(drained != 0);
+        TEST_ASSERT(ds4_gpu_commands_active() == 0);
+    }
+
+    test_float_compare_stats tmp_stats = {0};
+    test_float_compare_stats out_stats = {0};
+    size_t guard_mismatches = 0u;
+    if (submitted && tmp_base && out_base) {
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        tmp_base, 0u, tmp_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        out_base, 0u, out_host, alloc_bytes) != 0);
+        tmp_stats = test_compare_float_bits(expected_tmp, tmp_host, n);
+        out_stats = test_compare_float_bits(expected_out, out_host, n);
+        for (uint32_t i = n; i < alloc_n; i++) {
+            uint32_t tmp_bits = 0u;
+            uint32_t out_bits = 0u;
+            memcpy(&tmp_bits, tmp_host + i, sizeof(tmp_bits));
+            memcpy(&out_bits, out_host + i, sizeof(out_bits));
+            if (tmp_bits != tmp_poison + (i & 0xffu) ||
+                out_bits != out_poison + (i & 0xffu)) {
+                guard_mismatches++;
+            }
+        }
+    }
+
+    const uint32_t calls0 =
+        __atomic_load_n(&callback0.calls, __ATOMIC_ACQUIRE);
+    const uint32_t calls1 =
+        __atomic_load_n(&callback1.calls, __ATOMIC_ACQUIRE);
+    const uint32_t completed =
+        __atomic_load_n(&sequence_count, __ATOMIC_ACQUIRE);
+    const uint32_t observed0 =
+        __atomic_load_n(sequence + 0u, __ATOMIC_ACQUIRE);
+    const uint32_t observed1 =
+        __atomic_load_n(sequence + 1u, __ATOMIC_ACQUIRE);
+    const bool distinct_contexts =
+        (observed0 == 1u && observed1 == 2u) ||
+        (observed0 == 2u && observed1 == 1u);
+    fprintf(stderr,
+            "ds4-test: Metal progress flush exact callbacks=%u/%u "
+            "completed=%u order=%u,%u tmp=%zu out=%zu guard=%zu\n",
+            calls0, calls1, completed, observed0, observed1,
+            tmp_stats.mismatch_count, out_stats.mismatch_count,
+            guard_mismatches);
+    TEST_ASSERT(calls0 == 1u);
+    TEST_ASSERT(calls1 == 1u);
+    TEST_ASSERT(completed == 2u);
+    /* Completion-handler ordering across different command buffers is not a
+     * public contract.  The dependent tensor result proves GPU submission
+     * order; here only prove that both distinct contexts were delivered. */
+    TEST_ASSERT(distinct_contexts);
+    TEST_ASSERT(tmp_stats.mismatch_count == 0u && tmp_stats.max_ulp == 0u);
+    TEST_ASSERT(out_stats.mismatch_count == 0u && out_stats.max_ulp == 0u);
+    TEST_ASSERT(guard_mismatches == 0u);
+
+    if (ds4_gpu_commands_active()) {
+        TEST_ASSERT(ds4_gpu_end_commands() != 0);
+    }
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(tmp);
+    ds4_gpu_tensor_free(out_base);
+    ds4_gpu_tensor_free(tmp_base);
+    ds4_gpu_tensor_free(c);
+    ds4_gpu_tensor_free(b);
+    ds4_gpu_tensor_free(a);
+}
+#endif
+
 static void test_dspark_cache_window_crop(void) {
     TEST_ASSERT(ds4_test_dspark_cache_window_crop());
 }
@@ -5630,6 +5809,516 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact(void) {
 #endif
 
 #if defined(__APPLE__)
+typedef enum {
+    TEST_METAL_ATTN_OUT_HC_Q8,
+    TEST_METAL_ATTN_OUT_HC_Q4,
+} test_metal_attn_out_hc_kind;
+
+static uint32_t test_metal_attn_out_hc_poison_bits(
+        uint32_t tag,
+        uint64_t index) {
+    return 0x7fc00000u |
+        ((tag & 0x1fu) << 16u) |
+        (uint32_t)((index + 1u) & 0xffffu);
+}
+
+static void test_metal_attn_out_hc_fill_poison(
+        float    *dst,
+        uint64_t  count,
+        uint32_t  tag) {
+    for (uint64_t i = 0; i < count; i++) {
+        const uint32_t bits = test_metal_attn_out_hc_poison_bits(tag, i);
+        memcpy(dst + i, &bits, sizeof(bits));
+    }
+}
+
+static size_t test_metal_attn_out_hc_canary_mismatches(
+        const float *values,
+        uint64_t     begin,
+        uint64_t     end,
+        uint32_t     tag) {
+    size_t mismatches = 0u;
+    for (uint64_t i = begin; i < end; i++) {
+        uint32_t bits = 0u;
+        memcpy(&bits, values + i, sizeof(bits));
+        if (bits != test_metal_attn_out_hc_poison_bits(tag, i)) {
+            mismatches++;
+        }
+    }
+    return mismatches;
+}
+
+static size_t test_metal_attn_out_hc_poisoned_values(
+        const float *values,
+        uint64_t     count,
+        uint32_t     tag) {
+    size_t poisoned = 0u;
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t bits = 0u;
+        memcpy(&bits, values + i, sizeof(bits));
+        if (bits == test_metal_attn_out_hc_poison_bits(tag, i)) {
+            poisoned++;
+        }
+    }
+    return poisoned;
+}
+
+static int test_metal_batch_attn_out_hc_fused_call(
+        test_metal_attn_out_hc_kind kind,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_b_offset,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens) {
+    const uint32_t group_dim = 4096u;
+    const uint32_t rank = 1024u;
+    const uint32_t n_groups = 8u;
+    const uint32_t out_dim = 4096u;
+    const uint32_t n_hc = 4u;
+    if (kind == TEST_METAL_ATTN_OUT_HC_Q4) {
+        return ds4_gpu_attention_output_q4_K_batch_hc_tensor(
+            out, out_hc, residual_hc, split, low, group_tmp, low_tmp,
+            model_map, model_size, 0u, out_b_offset, 12u,
+            group_dim, rank, n_groups, out_dim, heads, n_tokens, n_hc);
+    }
+    return ds4_gpu_attention_output_q8_batch_hc_tensor(
+        out, out_hc, residual_hc, split, low, group_tmp, low_tmp,
+        model_map, model_size, 0u, out_b_offset,
+        group_dim, rank, n_groups, out_dim, heads, n_tokens, n_hc);
+}
+
+static void test_metal_batch_attn_out_hc_fusion_exact_case(
+        test_metal_attn_out_hc_kind kind) {
+    const bool q4 = kind == TEST_METAL_ATTN_OUT_HC_Q4;
+    const uint32_t n_tokens = 32u;
+    const uint32_t alloc_tokens = n_tokens + 1u;
+    const uint32_t group_dim = 4096u;
+    const uint32_t rank = 1024u;
+    const uint32_t n_groups = 8u;
+    const uint32_t low_dim = n_groups * rank;
+    const uint32_t out_dim = 4096u;
+    const uint32_t n_hc = 4u;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t row_a_bytes = q4
+        ? (uint64_t)(group_dim / 256u) * 144u
+        : (uint64_t)(group_dim / 32u) * 34u;
+    const uint64_t row_b_bytes = q4
+        ? (uint64_t)(low_dim / 256u) * 144u
+        : (uint64_t)(low_dim / 32u) * 34u;
+    const uint64_t out_a_bytes = (uint64_t)low_dim * row_a_bytes;
+    const uint64_t out_b_offset = test_round_up_u64(out_a_bytes, page);
+    const uint64_t out_b_bytes = (uint64_t)out_dim * row_b_bytes;
+    const uint64_t model_bytes =
+        test_round_up_u64(out_b_offset + out_b_bytes, page);
+    const uint64_t heads_count =
+        (uint64_t)alloc_tokens * n_groups * group_dim;
+    const uint64_t low_count = (uint64_t)alloc_tokens * low_dim;
+    const uint64_t out_count = (uint64_t)alloc_tokens * out_dim;
+    const uint64_t hc_count =
+        (uint64_t)alloc_tokens * n_hc * out_dim;
+    const uint64_t split_count = (uint64_t)alloc_tokens * mix_hc;
+    const uint64_t active_heads_count =
+        (uint64_t)n_tokens * n_groups * group_dim;
+    const uint64_t active_low_count = (uint64_t)n_tokens * low_dim;
+    const uint64_t active_out_count = (uint64_t)n_tokens * out_dim;
+    const uint64_t active_hc_count =
+        (uint64_t)n_tokens * n_hc * out_dim;
+    const uint64_t active_split_count = (uint64_t)n_tokens * mix_hc;
+    const uint64_t heads_bytes = heads_count * sizeof(float);
+    const uint64_t low_bytes = low_count * sizeof(float);
+    const uint64_t out_bytes = out_count * sizeof(float);
+    const uint64_t hc_bytes = hc_count * sizeof(float);
+    const uint64_t split_bytes = split_count * sizeof(float);
+    const uint64_t active_heads_bytes = active_heads_count * sizeof(float);
+    const uint64_t active_low_bytes = active_low_count * sizeof(float);
+    const uint64_t active_out_bytes = active_out_count * sizeof(float);
+    const uint64_t active_hc_bytes = active_hc_count * sizeof(float);
+    const uint64_t active_split_bytes = active_split_count * sizeof(float);
+    const uint64_t scratch_bytes =
+        (uint64_t)alloc_tokens * low_dim * sizeof(uint16_t);
+    enum {
+        ref_low_tag = 1u,
+        fused_low_tag = 2u,
+        ref_out_tag = 3u,
+        fused_out_tag = 4u,
+        ref_hc_tag = 5u,
+        fused_hc_tag = 6u,
+    };
+
+    const char *disable_fusion_env =
+        "DS4_METAL_DISABLE_PRE_M5_BATCH_ATTN_OUT_HC_FUSION";
+    const char *require_q8_env =
+        "DS4_METAL_REQUIRE_PRE_M5_BATCH_ATTN_OUT_HC_FUSION";
+    const char *require_q4_env =
+        "DS4_METAL_REQUIRE_Q4_BATCH_ATTN_OUT_HC_FUSION";
+    const char *require_q4_rhs_env =
+        "DS4_METAL_REQUIRE_Q4_ATTN_OUT_B_F16_RHS";
+    const char *disable_q4_rhs_env =
+        "DS4_METAL_DISABLE_Q4_ATTN_OUT_B_F16_RHS";
+    const char *stage_profile_env = "DS4_METAL_ATTN_OUT_STAGE_PROFILE";
+    const char *q8_profile_env = "DS4_METAL_Q8_PREFILL_PROFILE";
+    char *saved_disable_fusion = test_save_env(disable_fusion_env);
+    char *saved_require_q8 = test_save_env(require_q8_env);
+    char *saved_require_q4 = test_save_env(require_q4_env);
+    char *saved_require_q4_rhs = test_save_env(require_q4_rhs_env);
+    char *saved_disable_q4_rhs = test_save_env(disable_q4_rhs_env);
+    char *saved_stage_profile = test_save_env(stage_profile_env);
+    char *saved_q8_profile = test_save_env(q8_profile_env);
+
+    void *model_raw = NULL;
+    float *heads_host = NULL;
+    float *residual_host = NULL;
+    float *split_host = NULL;
+    float *ref_low_host = NULL;
+    float *fused_low_host = NULL;
+    float *ref_out_host = NULL;
+    float *fused_out_host = NULL;
+    float *ref_hc_host = NULL;
+    float *fused_hc_host = NULL;
+    ds4_gpu_tensor *heads_base = NULL;
+    ds4_gpu_tensor *residual_base = NULL;
+    ds4_gpu_tensor *split_base = NULL;
+    ds4_gpu_tensor *ref_low_base = NULL;
+    ds4_gpu_tensor *fused_low_base = NULL;
+    ds4_gpu_tensor *ref_out_base = NULL;
+    ds4_gpu_tensor *fused_out_base = NULL;
+    ds4_gpu_tensor *ref_hc_base = NULL;
+    ds4_gpu_tensor *fused_hc_base = NULL;
+    ds4_gpu_tensor *group_tmp = NULL;
+    ds4_gpu_tensor *low_tmp = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *residual = NULL;
+    ds4_gpu_tensor *split = NULL;
+    ds4_gpu_tensor *ref_low = NULL;
+    ds4_gpu_tensor *fused_low = NULL;
+    ds4_gpu_tensor *ref_out = NULL;
+    ds4_gpu_tensor *fused_out = NULL;
+    ds4_gpu_tensor *ref_hc = NULL;
+    ds4_gpu_tensor *fused_hc = NULL;
+
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    if (model_raw) {
+        memset(model_raw, 0, (size_t)model_bytes);
+        if (q4) {
+            test_fill_q4_K_weights(
+                model_raw, group_dim, low_dim, 211u);
+            test_fill_q4_K_weights(
+                (uint8_t *)model_raw + out_b_offset,
+                low_dim, out_dim, 307u);
+        } else {
+            test_fill_q8_0_weights(
+                model_raw, group_dim, low_dim, 211u);
+            test_fill_q8_0_weights(
+                (uint8_t *)model_raw + out_b_offset,
+                low_dim, out_dim, 307u);
+        }
+    }
+
+    heads_host = malloc((size_t)heads_bytes);
+    residual_host = malloc((size_t)hc_bytes);
+    split_host = malloc((size_t)split_bytes);
+    ref_low_host = malloc((size_t)low_bytes);
+    fused_low_host = malloc((size_t)low_bytes);
+    ref_out_host = malloc((size_t)out_bytes);
+    fused_out_host = malloc((size_t)out_bytes);
+    ref_hc_host = malloc((size_t)hc_bytes);
+    fused_hc_host = malloc((size_t)hc_bytes);
+    heads_base = ds4_gpu_tensor_alloc(heads_bytes);
+    residual_base = ds4_gpu_tensor_alloc(hc_bytes);
+    split_base = ds4_gpu_tensor_alloc(split_bytes);
+    ref_low_base = ds4_gpu_tensor_alloc(low_bytes);
+    fused_low_base = ds4_gpu_tensor_alloc(low_bytes);
+    ref_out_base = ds4_gpu_tensor_alloc(out_bytes);
+    fused_out_base = ds4_gpu_tensor_alloc(out_bytes);
+    ref_hc_base = ds4_gpu_tensor_alloc(hc_bytes);
+    fused_hc_base = ds4_gpu_tensor_alloc(hc_bytes);
+    group_tmp = ds4_gpu_tensor_alloc(scratch_bytes);
+    low_tmp = ds4_gpu_tensor_alloc(sizeof(float));
+    heads = heads_base
+        ? ds4_gpu_tensor_view(heads_base, 0u, active_heads_bytes) : NULL;
+    residual = residual_base
+        ? ds4_gpu_tensor_view(residual_base, 0u, active_hc_bytes) : NULL;
+    split = split_base
+        ? ds4_gpu_tensor_view(split_base, 0u, active_split_bytes) : NULL;
+    ref_low = ref_low_base
+        ? ds4_gpu_tensor_view(ref_low_base, 0u, active_low_bytes) : NULL;
+    fused_low = fused_low_base
+        ? ds4_gpu_tensor_view(fused_low_base, 0u, active_low_bytes) : NULL;
+    ref_out = ref_out_base
+        ? ds4_gpu_tensor_view(ref_out_base, 0u, active_out_bytes) : NULL;
+    fused_out = fused_out_base
+        ? ds4_gpu_tensor_view(fused_out_base, 0u, active_out_bytes) : NULL;
+    ref_hc = ref_hc_base
+        ? ds4_gpu_tensor_view(ref_hc_base, 0u, active_hc_bytes) : NULL;
+    fused_hc = fused_hc_base
+        ? ds4_gpu_tensor_view(fused_hc_base, 0u, active_hc_bytes) : NULL;
+
+    const bool allocated = model_raw && heads_host && residual_host &&
+        split_host && ref_low_host && fused_low_host && ref_out_host &&
+        fused_out_host && ref_hc_host && fused_hc_host && heads_base &&
+        residual_base && split_base && ref_low_base && fused_low_base &&
+        ref_out_base && fused_out_base && ref_hc_base && fused_hc_base &&
+        group_tmp && low_tmp && heads && residual && split && ref_low &&
+        fused_low && ref_out && fused_out && ref_hc && fused_hc;
+    TEST_ASSERT(allocated);
+
+    test_float_compare_stats low_stats = {0};
+    test_float_compare_stats hc_stats = {0};
+    size_t reject_writes = 0u;
+    size_t active_poisoned = 0u;
+    size_t guard_mismatches = 0u;
+    size_t fused_out_writes = 0u;
+    if (allocated) {
+        for (uint64_t i = 0; i < heads_count; i++) {
+            const int value =
+                (int)((i * 17u + (i ^ (i >> 7u)) * 3u +
+                       (q4 ? 19u : 7u)) % 127u) - 63;
+            heads_host[i] = (float)value / 96.0f;
+        }
+        for (uint64_t i = 0; i < hc_count; i++) {
+            const int value =
+                (int)((i * 19u + (i ^ (i >> 5u)) * 7u +
+                       (q4 ? 23u : 11u)) % 149u) - 74;
+            residual_host[i] = (float)value / 80.0f;
+        }
+        for (uint32_t t = 0; t < alloc_tokens; t++) {
+            float *row = split_host + (uint64_t)t * mix_hc;
+            for (uint32_t h = 0; h < n_hc; h++) {
+                row[h] = 0.0f;
+                row[n_hc + h] =
+                    0.55f + (float)((t + h * 3u) % 11u) / 32.0f;
+            }
+            for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+                for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                    const int value =
+                        (int)((t * 5u + dst_hc * 7u + src_hc * 11u +
+                               (q4 ? 3u : 0u)) % 17u) - 8;
+                    row[2u * n_hc + dst_hc * n_hc + src_hc] =
+                        (float)value / 24.0f;
+                }
+            }
+        }
+        test_metal_attn_out_hc_fill_poison(
+            ref_low_host, low_count, ref_low_tag);
+        test_metal_attn_out_hc_fill_poison(
+            fused_low_host, low_count, fused_low_tag);
+        test_metal_attn_out_hc_fill_poison(
+            ref_out_host, out_count, ref_out_tag);
+        test_metal_attn_out_hc_fill_poison(
+            fused_out_host, out_count, fused_out_tag);
+        test_metal_attn_out_hc_fill_poison(
+            ref_hc_host, hc_count, ref_hc_tag);
+        test_metal_attn_out_hc_fill_poison(
+            fused_hc_host, hc_count, fused_hc_tag);
+
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        heads_base, 0u, heads_host, heads_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        residual_base, 0u, residual_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        split_base, 0u, split_host, split_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_low_base, 0u, ref_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_low_base, 0u, fused_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_out_base, 0u, ref_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_out_base, 0u, fused_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_hc_base, 0u, ref_hc_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_hc_base, 0u, fused_hc_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+
+        TEST_ASSERT(unsetenv(disable_fusion_env) == 0);
+        TEST_ASSERT(unsetenv(require_q8_env) == 0);
+        TEST_ASSERT(unsetenv(require_q4_env) == 0);
+        TEST_ASSERT(unsetenv(require_q4_rhs_env) == 0);
+        TEST_ASSERT(unsetenv(disable_q4_rhs_env) == 0);
+        TEST_ASSERT(unsetenv(stage_profile_env) == 0);
+        TEST_ASSERT(unsetenv(q8_profile_env) == 0);
+        TEST_ASSERT(setenv(
+                        q4 ? require_q4_env : require_q8_env,
+                        "1", 1) == 0);
+        if (q4) {
+            TEST_ASSERT(setenv(require_q4_rhs_env, "1", 1) == 0);
+        }
+        ds4_gpu_set_quality(false);
+        ds4_gpu_test_set_flags(q4
+            ? DS4_GPU_TEST_BATCH_ATTN_OUT_Q4_HC_FUSION
+            : DS4_GPU_TEST_BATCH_ATTN_OUT_Q8_HC_FUSION);
+
+        /* The force hook removes only the production minimum.  Neighbors of
+         * the 32-row tile must still fail closed and leave every destination
+         * byte untouched. */
+        TEST_ASSERT(test_metal_batch_attn_out_hc_fused_call(
+                        kind, fused_out_base, fused_hc_base, residual_base,
+                        split_base, fused_low_base, group_tmp, low_tmp,
+                        model_raw, model_bytes, out_b_offset, heads_base,
+                        n_tokens - 1u) == -1);
+        TEST_ASSERT(test_metal_batch_attn_out_hc_fused_call(
+                        kind, fused_out_base, fused_hc_base, residual_base,
+                        split_base, fused_low_base, group_tmp, low_tmp,
+                        model_raw, model_bytes, out_b_offset, heads_base,
+                        n_tokens + 1u) == -1);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_low_base, 0u, fused_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_out_base, 0u, fused_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_hc_base, 0u, fused_hc_host, hc_bytes) != 0);
+        reject_writes += test_metal_attn_out_hc_canary_mismatches(
+            fused_low_host, 0u, low_count, fused_low_tag);
+        reject_writes += test_metal_attn_out_hc_canary_mismatches(
+            fused_out_host, 0u, out_count, fused_out_tag);
+        reject_writes += test_metal_attn_out_hc_canary_mismatches(
+            fused_hc_host, 0u, hc_count, fused_hc_tag);
+
+        int reference_ok = 0;
+        if (q4) {
+            reference_ok = ds4_gpu_attention_output_q4_K_batch_tensor(
+                ref_out, ref_low, group_tmp, low_tmp,
+                model_raw, model_bytes, 0u, out_b_offset, 12u,
+                group_dim, rank, n_groups, out_dim, heads, n_tokens);
+        } else {
+            reference_ok = ds4_gpu_attention_output_q8_batch_tensor(
+                ref_out, ref_low, group_tmp, low_tmp,
+                model_raw, model_bytes, 0u, out_b_offset,
+                group_dim, rank, n_groups, out_dim, heads, n_tokens);
+        }
+        TEST_ASSERT(reference_ok == 1);
+        TEST_ASSERT(ds4_gpu_hc_expand_split_tensor(
+                        ref_hc, ref_out, residual, split,
+                        out_dim, n_hc) != 0);
+        TEST_ASSERT(test_metal_batch_attn_out_hc_fused_call(
+                        kind, fused_out, fused_hc, residual, split,
+                        fused_low, group_tmp, low_tmp,
+                        model_raw, model_bytes, out_b_offset, heads,
+                        n_tokens) == 1);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_low_base, 0u, ref_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_low_base, 0u, fused_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_out_base, 0u, ref_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_out_base, 0u, fused_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_hc_base, 0u, ref_hc_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_hc_base, 0u, fused_hc_host, hc_bytes) != 0);
+
+        low_stats = test_compare_float_bits(
+            ref_low_host, fused_low_host, (size_t)active_low_count);
+        hc_stats = test_compare_float_bits(
+            ref_hc_host, fused_hc_host, (size_t)active_hc_count);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            ref_low_host, active_low_count, ref_low_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            fused_low_host, active_low_count, fused_low_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            ref_out_host, active_out_count, ref_out_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            ref_hc_host, active_hc_count, ref_hc_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            fused_hc_host, active_hc_count, fused_hc_tag);
+        fused_out_writes = test_metal_attn_out_hc_canary_mismatches(
+            fused_out_host, 0u, out_count, fused_out_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            ref_low_host, active_low_count, low_count, ref_low_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            fused_low_host, active_low_count, low_count, fused_low_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            ref_out_host, active_out_count, out_count, ref_out_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            ref_hc_host, active_hc_count, hc_count, ref_hc_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            fused_hc_host, active_hc_count, hc_count, fused_hc_tag);
+    }
+
+    fprintf(stderr,
+            "ds4-test: Metal %s batch attention-output HC exact N=%u "
+            "low=%zu/%llu hc=%zu/%llu max_ulp=%u/%u "
+            "active_poison=%zu guard=%zu fused_out_writes=%zu "
+            "reject_writes=%zu\n",
+            q4 ? "Q4_K/F16-RHS" : "Q8_0",
+            n_tokens,
+            low_stats.mismatch_count,
+            (unsigned long long)active_low_count,
+            hc_stats.mismatch_count,
+            (unsigned long long)active_hc_count,
+            low_stats.max_ulp,
+            hc_stats.max_ulp,
+            active_poisoned,
+            guard_mismatches,
+            fused_out_writes,
+            reject_writes);
+    TEST_ASSERT(low_stats.mismatch_count == 0u && low_stats.max_ulp == 0u);
+    TEST_ASSERT(hc_stats.mismatch_count == 0u && hc_stats.max_ulp == 0u);
+    TEST_ASSERT(active_poisoned == 0u);
+    TEST_ASSERT(guard_mismatches == 0u);
+    TEST_ASSERT(fused_out_writes == 0u);
+    TEST_ASSERT(reject_writes == 0u);
+
+    ds4_gpu_test_set_flags(0u);
+    ds4_gpu_set_quality(false);
+    test_restore_env(q8_profile_env, saved_q8_profile);
+    test_restore_env(stage_profile_env, saved_stage_profile);
+    test_restore_env(disable_q4_rhs_env, saved_disable_q4_rhs);
+    test_restore_env(require_q4_rhs_env, saved_require_q4_rhs);
+    test_restore_env(require_q4_env, saved_require_q4);
+    test_restore_env(require_q8_env, saved_require_q8);
+    test_restore_env(disable_fusion_env, saved_disable_fusion);
+    ds4_gpu_tensor_free(fused_hc);
+    ds4_gpu_tensor_free(ref_hc);
+    ds4_gpu_tensor_free(fused_out);
+    ds4_gpu_tensor_free(ref_out);
+    ds4_gpu_tensor_free(fused_low);
+    ds4_gpu_tensor_free(ref_low);
+    ds4_gpu_tensor_free(split);
+    ds4_gpu_tensor_free(residual);
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_tensor_free(low_tmp);
+    ds4_gpu_tensor_free(group_tmp);
+    ds4_gpu_tensor_free(fused_hc_base);
+    ds4_gpu_tensor_free(ref_hc_base);
+    ds4_gpu_tensor_free(fused_out_base);
+    ds4_gpu_tensor_free(ref_out_base);
+    ds4_gpu_tensor_free(fused_low_base);
+    ds4_gpu_tensor_free(ref_low_base);
+    ds4_gpu_tensor_free(split_base);
+    ds4_gpu_tensor_free(residual_base);
+    ds4_gpu_tensor_free(heads_base);
+    free(fused_hc_host);
+    free(ref_hc_host);
+    free(fused_out_host);
+    free(ref_out_host);
+    free(fused_low_host);
+    free(ref_low_host);
+    free(split_host);
+    free(residual_host);
+    free(heads_host);
+    free(model_raw);
+}
+
+static void test_metal_batch_attn_out_hc_fusion_exact(void) {
+    test_metal_batch_attn_out_hc_fusion_exact_case(
+        TEST_METAL_ATTN_OUT_HC_Q8);
+    test_metal_batch_attn_out_hc_fusion_exact_case(
+        TEST_METAL_ATTN_OUT_HC_Q4);
+}
+
 static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
     /* Compare the batched HC+RMSNorm fusion against the exact two-dispatch
      * sequence used by the reference path at DS4's production dimensions. */
@@ -6899,6 +7588,13 @@ static void test_metal_router_weights_batch_exact(void) {
 #endif
 
 static void test_metal_kernel_group(void) {
+#if defined(__APPLE__)
+    if (test_env_bool("DS4_TEST_METAL_RESIDENT_ORACLES_ONLY")) {
+        test_metal_flush_commands_progress_exact();
+        test_metal_batch_attn_out_hc_fusion_exact();
+        return;
+    }
+#endif
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
@@ -6907,6 +7603,7 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
+    test_metal_flush_commands_progress_exact();
     test_metal_q8_0_decode_rows_exact();
     test_metal_q8_attention_output_static_batch_exact();
     test_metal_q4_attention_output_tiny_batch_exact();
@@ -6925,6 +7622,7 @@ static void test_metal_kernel_group(void) {
     test_metal_contiguous_compressed_f16_attention_exact();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
+    test_metal_batch_attn_out_hc_fusion_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();
     test_metal_hc_producer_pre_norm_compound_exact();
     test_metal_output_hc_weights4_exact();
@@ -9025,6 +9723,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  DS4_TEST_METAL_RESIDENT_ORACLES_ONLY=1  Restrict --metal-kernels to resident optimization oracles.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");

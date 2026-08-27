@@ -51,10 +51,12 @@ static uint64_t g_rocm_q4_attn_q_b_f16_rejects;
 static int g_rocm_q4_attn_q_b_f16_hard_failure;
 static int g_rocm_q4_attn_q_b_f16_pending_evict;
 /* The resident default rebuilds one layer at a time into this combined
- * allocation.  The first 64 MiB hold W_F16 and the suffix holds the largest
- * preflighted X_F16 batch.  ROCm currently submits graph work on stream 0, but
- * keep the mutex through the complete dequant/copy/GEMM/epilogue enqueue
- * sequence so two host callers cannot interleave reuse of either region. */
+ * allocation. The first 64 MiB hold W_F16; the suffix holds the largest
+ * preflighted X_F16 batch and, only for the explicit F16-output experiment,
+ * Q_F16. ROCm currently submits graph work on stream 0, but keep the mutex
+ * through the complete
+ * dequant/copy/GEMM/epilogue enqueue sequence so two host callers cannot
+ * interleave reuse of any region. */
 static void *g_rocm_q4_attn_q_b_transient_f16_scratch;
 static uint64_t g_rocm_q4_attn_q_b_transient_f16_scratch_bytes;
 static uint64_t g_rocm_q4_attn_q_b_transient_f16_weight_bytes;
@@ -143,6 +145,16 @@ static int rocm_q4_attn_q_b_f16_disabled(void) {
 static int rocm_q4_attn_q_b_transient_f16_disabled(void) {
     return rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16") == 1;
+}
+
+static int rocm_q4_attn_q_b_f16_output_enabled(void) {
+    const char *value = getenv(
+        "DS4_ROCM_ENABLE_Q4_ATTN_Q_B_F16_OUTPUT");
+    if (!value) return 0;
+    while (isspace((unsigned char)*value)) value++;
+    if (!*value) return 0;
+    return rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_ENABLE_Q4_ATTN_Q_B_F16_OUTPUT") == 1;
 }
 
 static uint64_t rocm_q4_attn_q_b_transient_f16_min_tokens(void) {
@@ -463,13 +475,17 @@ static int rocm_q4_attn_q_b_f16_memory_has_room(
 
 static int rocm_q4_attn_q_b_transient_f16_layout(
         uint64_t rows,
+        int include_output,
         uint64_t *weight_bytes_out,
         uint64_t *x_bytes_out,
+        uint64_t *q_bytes_out,
         uint64_t *total_bytes_out) {
     uint64_t weight_elems = 0;
     uint64_t weight_bytes = 0;
     uint64_t x_elems = 0;
     uint64_t x_bytes = 0;
+    uint64_t q_elems = 0;
+    uint64_t q_bytes = 0;
     uint64_t total_bytes = 0;
     if (rows == 0u ||
         !cuda_u64_mul_checked(DS4_ROCM_Q4_ATTN_Q_B_IN_DIM,
@@ -484,8 +500,17 @@ static int rocm_q4_attn_q_b_transient_f16_layout(
         total_bytes > (uint64_t)SIZE_MAX) {
         return 0;
     }
+    if (include_output &&
+        (!cuda_u64_mul_checked(rows, DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM,
+                               &q_elems) ||
+         !cuda_u64_mul_checked(q_elems, sizeof(__half), &q_bytes) ||
+         !cuda_u64_add_checked(total_bytes, q_bytes, &total_bytes) ||
+         total_bytes > (uint64_t)SIZE_MAX)) {
+        return 0;
+    }
     if (weight_bytes_out) *weight_bytes_out = weight_bytes;
     if (x_bytes_out) *x_bytes_out = x_bytes;
+    if (q_bytes_out) *q_bytes_out = q_bytes;
     if (total_bytes_out) *total_bytes_out = total_bytes;
     return 1;
 }
@@ -561,13 +586,17 @@ static int rocm_q4_attn_q_b_transient_f16_ensure_locked(
  * enqueue sequence.  No allocation or synchronization is permitted here. */
 static int rocm_q4_attn_q_b_transient_f16_acquire(
         uint64_t rows,
+        int include_output,
         __half **weight_f16_out,
-        __half **x_f16_out) {
+        __half **x_f16_out,
+        __half **q_f16_out) {
     uint64_t weight_bytes = 0;
+    uint64_t x_bytes = 0;
     uint64_t total_bytes = 0;
-    if (!weight_f16_out || !x_f16_out ||
+    if (!weight_f16_out || !x_f16_out || !q_f16_out ||
         !rocm_q4_attn_q_b_transient_f16_layout(
-            rows, &weight_bytes, NULL, &total_bytes)) {
+            rows, include_output, &weight_bytes, &x_bytes, NULL,
+            &total_bytes)) {
         return 0;
     }
     pthread_mutex_lock(&g_rocm_q4_attn_q_b_transient_f16_mu);
@@ -581,6 +610,9 @@ static int rocm_q4_attn_q_b_transient_f16_acquire(
         (__half *)g_rocm_q4_attn_q_b_transient_f16_scratch;
     *x_f16_out = (__half *)(
         (char *)g_rocm_q4_attn_q_b_transient_f16_scratch + weight_bytes);
+    *q_f16_out = (__half *)(
+        (char *)g_rocm_q4_attn_q_b_transient_f16_scratch +
+        weight_bytes + x_bytes);
     return 1;
 }
 
@@ -795,8 +827,12 @@ static int rocm_q4_attn_q_b_prepare_transient_f16(
 
     uint64_t layout_weight_bytes = 0;
     uint64_t total_bytes = 0;
+    const int include_output =
+        rocm_q4_attn_q_b_f16_output_enabled();
     if (!rocm_q4_attn_q_b_transient_f16_layout(
-            max_prefill_rows, &layout_weight_bytes, NULL, &total_bytes) ||
+            max_prefill_rows, include_output,
+            &layout_weight_bytes, NULL, NULL,
+            &total_bytes) ||
         layout_weight_bytes != weight_f16_bytes) {
         pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
         return 0;
@@ -901,14 +937,20 @@ extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
         return required ? -1 : 0;
     }
 
-    /* The persistent sidecar still needs private X_F16 staging.  Reuse the
-     * dedicated combined arena instead of the backend-global cuda_tmp buffer;
-     * dispatch holds transient_mu through conversion, GEMM, and epilogue.
-     * Keep the global lock order build -> transient -> cache. */
+    /* The persistent sidecar still needs private X_F16 staging and, for the
+     * explicit output experiment, Q_F16. Reuse the dedicated combined arena
+     * instead of the backend-global cuda_tmp buffer; unlike Metal, the ROCm
+     * graph does not normally own a batch_q_half tensor. Dispatch holds
+     * transient_mu through conversion, GEMM, and epilogue. Keep the global
+     * lock order build -> transient -> cache. */
     uint64_t scratch_weight_bytes = 0;
     uint64_t scratch_bytes = 0;
+    const int include_output =
+        rocm_q4_attn_q_b_f16_output_enabled();
     if (!rocm_q4_attn_q_b_transient_f16_layout(
-            max_prefill_rows, &scratch_weight_bytes, NULL, &scratch_bytes) ||
+            max_prefill_rows, include_output,
+            &scratch_weight_bytes, NULL, NULL,
+            &scratch_bytes) ||
         scratch_weight_bytes != desc_f16_bytes[0]) {
         pthread_mutex_unlock(&g_rocm_q4_attn_q_b_f16_build_mu);
         return required ? -1 : 0;

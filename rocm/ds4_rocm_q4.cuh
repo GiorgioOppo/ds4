@@ -116,6 +116,8 @@ __global__ static void rocm_matmul_q4_K_dense_grouped_decode_kernel(
 enum {
     ROCM_Q4_PREFILL_TOKEN_TILE = 8u,
     ROCM_Q4_PREFILL_KBLOCK_TILE = 8u,
+    ROCM_Q4_PREFILL_K1024_KBLOCK_TILE = 4u,
+    ROCM_Q4_PREFILL_K1024_ROWS = 64u,
     ROCM_Q4_Q8K_WORDS = sizeof(cuda_block_q8_K) / sizeof(uint32_t),
 };
 static_assert((sizeof(cuda_block_q8_K) % sizeof(uint32_t)) == 0u,
@@ -193,6 +195,89 @@ rocm_dot_q4_K_q8_K_block8_reuse_weights(
             const float yd = ys[p]->d;
             acc[p] += yd * xd * (float)isum[p] -
                       yd * xmin * (float)summs[p];
+        }
+    }
+}
+
+/* K=1024 has exactly four Q8_K blocks.  The generic TILE8 kernel leaves half
+ * of each eight-lane row group idle and still reserves LDS for eight blocks.
+ * Four-lane groups preserve the legacy block/reduction order while doubling
+ * the rows produced by a 256-thread workgroup and halving the LDS footprint
+ * to 8 tokens * 4 K blocks * 292 bytes = 9,344 bytes. */
+__device__ __forceinline__ static float
+rocm_q4_K_lane4_sum_f32(float v) {
+    /* Build the active-lane mask relative to the physical wave.  A 32-bit
+     * mask repeats lanes 0..31 for the upper half of an AMD wave64 and
+     * violates HIP's __shfl_down_sync contract even though width=4 keeps the
+     * data exchange inside the intended subgroup. */
+    const uint32_t wave_lane = threadIdx.x & (warpSize - 1u);
+    const MASK_T mask = static_cast<MASK_T>(0x0fu) << (wave_lane & ~3u);
+    v += __shfl_down_sync(mask, v, 2, 4);
+    v += __shfl_down_sync(mask, v, 1, 4);
+    return v;
+}
+
+__global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
+        float *out,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t out_dim,
+        uint32_t n_tok) {
+    __shared__ cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
+                                         [ROCM_Q4_PREFILL_K1024_KBLOCK_TILE];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 3u;
+    const uint32_t row_lane = tid >> 2u;
+    const uint32_t row = blockIdx.x * ROCM_Q4_PREFILL_K1024_ROWS + row_lane;
+    const uint32_t tok0 = blockIdx.y * ROCM_Q4_PREFILL_TOKEN_TILE;
+    const uint32_t nt = n_tok - tok0 < ROCM_Q4_PREFILL_TOKEN_TILE
+                      ? n_tok - tok0 : ROCM_Q4_PREFILL_TOKEN_TILE;
+    const bool row_valid = row < out_dim;
+    const cuda_block_q4_K *wr = row_valid
+        ? reinterpret_cast<const cuda_block_q4_K *>(
+              w_base + (uint64_t)row * row_bytes)
+        : NULL;
+    float acc[ROCM_Q4_PREFILL_TOKEN_TILE] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    };
+
+    /* The complete K dimension fits one LDS tile.  Flatten the copy so
+     * neighboring threads read consecutive words across token/block rows. */
+    const uint32_t tile_words = nt * ROCM_Q4_PREFILL_K1024_KBLOCK_TILE *
+                                ROCM_Q4_Q8K_WORDS;
+    uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
+    for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
+        const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
+        const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
+        const uint32_t p = block_slot >> 2u;
+        const uint32_t bb = block_slot & 3u;
+        const uint32_t *const src_words =
+            reinterpret_cast<const uint32_t *>(
+                xq + (uint64_t)(tok0 + p) *
+                          ROCM_Q4_PREFILL_K1024_KBLOCK_TILE + bb);
+        sxq_words[i] = src_words[word];
+    }
+    __syncthreads();
+
+    if (row_valid) {
+        rocm_dot_q4_K_q8_K_block8_reuse_weights(
+            wr + lane,
+            sxq[0] + lane, sxq[1] + lane,
+            sxq[2] + lane, sxq[3] + lane,
+            sxq[4] + lane, sxq[5] + lane,
+            sxq[6] + lane, sxq[7] + lane,
+            nt, acc);
+
+        #pragma unroll
+        for (uint32_t p = 0u; p < ROCM_Q4_PREFILL_TOKEN_TILE; p++) {
+            if (p < nt) {
+                const float v = rocm_q4_K_lane4_sum_f32(acc[p]);
+                if (lane == 0u) {
+                    out[(uint64_t)(tok0 + p) * out_dim + row] = v;
+                }
+            }
         }
     }
 }
@@ -452,11 +537,27 @@ static int rocm_q4_K_prefill_tile8_required(void) {
     return getenv("DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8") != NULL;
 }
 
+static int rocm_q4_K_prefill_k1024_tile4_requested(
+        uint64_t blocks,
+        uint64_t out_dim) {
+    /* This is the production attn_q_b shape.  Keep SSD streaming on the
+     * established TILE8 path: only a fully resident model can use the new
+     * specialization, and the dedicated switch provides a narrow rollback. */
+    return !g_ssd_streaming_mode &&
+           blocks == ROCM_Q4_PREFILL_K1024_KBLOCK_TILE &&
+           out_dim == DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM &&
+           rocm_q4_attn_q_b_env_bool(
+               "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4") != 1;
+}
+
 static uint64_t g_rocm_q4_prefill_tile8_dense_calls;
 static uint64_t g_rocm_q4_prefill_tile8_pair_calls;
 static uint64_t g_rocm_q4_prefill_tile8_attention_batch_calls;
+static uint64_t g_rocm_q4_prefill_k1024_tile4_calls;
 static uint64_t g_rocm_q4_prefill_tile8_tokens;
 static int g_rocm_q4_prefill_tile8_report_registered;
+static pthread_mutex_t g_rocm_q4_prefill_tile8_stats_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t g_rocm_q4_grouped_attn_a_calls;
 static uint64_t g_rocm_q4_grouped_attn_a_dispatches;
@@ -464,20 +565,30 @@ static uint64_t g_rocm_q4_grouped_attn_a_groups;
 static uint64_t g_rocm_q4_grouped_attn_a_fallbacks;
 static uint64_t g_rocm_q4_grouped_attn_a_failures;
 static int g_rocm_q4_grouped_attn_a_report_registered;
+static pthread_mutex_t g_rocm_q4_grouped_attn_a_stats_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
 
 static void rocm_q4_K_grouped_attn_a_report(void) {
+    pthread_mutex_lock(&g_rocm_q4_grouped_attn_a_stats_mutex);
+    const uint64_t calls = g_rocm_q4_grouped_attn_a_calls;
+    const uint64_t dispatches = g_rocm_q4_grouped_attn_a_dispatches;
+    const uint64_t groups = g_rocm_q4_grouped_attn_a_groups;
+    const uint64_t fallbacks = g_rocm_q4_grouped_attn_a_fallbacks;
+    const uint64_t failures = g_rocm_q4_grouped_attn_a_failures;
+    pthread_mutex_unlock(&g_rocm_q4_grouped_attn_a_stats_mutex);
     fprintf(stderr,
             "ds4: ROCm Q4_K grouped attention-A decode stats: "
             "calls=%llu dispatches=%llu groups=%llu fallbacks=%llu failures=%llu\n",
-            (unsigned long long)g_rocm_q4_grouped_attn_a_calls,
-            (unsigned long long)g_rocm_q4_grouped_attn_a_dispatches,
-            (unsigned long long)g_rocm_q4_grouped_attn_a_groups,
-            (unsigned long long)g_rocm_q4_grouped_attn_a_fallbacks,
-            (unsigned long long)g_rocm_q4_grouped_attn_a_failures);
+            (unsigned long long)calls,
+            (unsigned long long)dispatches,
+            (unsigned long long)groups,
+            (unsigned long long)fallbacks,
+            (unsigned long long)failures);
 }
 
 static int rocm_q4_K_grouped_attn_a_result(int rc, uint32_t n_groups) {
     if (getenv("DS4_ROCM_Q4_GROUPED_ATTN_A_STATS") != NULL) {
+        pthread_mutex_lock(&g_rocm_q4_grouped_attn_a_stats_mutex);
         if (!g_rocm_q4_grouped_attn_a_report_registered) {
             g_rocm_q4_grouped_attn_a_report_registered = 1;
             (void)atexit(rocm_q4_K_grouped_attn_a_report);
@@ -491,27 +602,40 @@ static int rocm_q4_K_grouped_attn_a_result(int rc, uint32_t n_groups) {
         } else {
             g_rocm_q4_grouped_attn_a_fallbacks++;
         }
+        pthread_mutex_unlock(&g_rocm_q4_grouped_attn_a_stats_mutex);
     }
     return rc;
 }
 
 static void rocm_q4_K_prefill_tile8_report(void) {
+    pthread_mutex_lock(&g_rocm_q4_prefill_tile8_stats_mutex);
+    const uint64_t dense_calls = g_rocm_q4_prefill_tile8_dense_calls;
+    const uint64_t pair_calls = g_rocm_q4_prefill_tile8_pair_calls;
+    const uint64_t attention_batch_calls =
+        g_rocm_q4_prefill_tile8_attention_batch_calls;
+    const uint64_t k1024_tile4_calls =
+        g_rocm_q4_prefill_k1024_tile4_calls;
+    const uint64_t tokens = g_rocm_q4_prefill_tile8_tokens;
+    pthread_mutex_unlock(&g_rocm_q4_prefill_tile8_stats_mutex);
     fprintf(stderr,
             "ds4: ROCm Q4_K prefill tile8 stats: "
             "dense_calls=%llu pair_calls=%llu attention_batch_calls=%llu "
-            "tokens=%llu\n",
-            (unsigned long long)g_rocm_q4_prefill_tile8_dense_calls,
-            (unsigned long long)g_rocm_q4_prefill_tile8_pair_calls,
-            (unsigned long long)g_rocm_q4_prefill_tile8_attention_batch_calls,
-            (unsigned long long)g_rocm_q4_prefill_tile8_tokens);
+            "k1024_tile4_calls=%llu tokens=%llu\n",
+            (unsigned long long)dense_calls,
+            (unsigned long long)pair_calls,
+            (unsigned long long)attention_batch_calls,
+            (unsigned long long)k1024_tile4_calls,
+            (unsigned long long)tokens);
 }
 
 static void rocm_q4_K_prefill_tile8_note(
         uint32_t dense_calls,
         uint32_t pair_calls,
         uint32_t attention_batch_calls,
+        uint32_t k1024_tile4_calls,
         uint64_t tokens) {
     if (getenv("DS4_ROCM_Q4_PREFILL_TILE8_STATS") == NULL) return;
+    pthread_mutex_lock(&g_rocm_q4_prefill_tile8_stats_mutex);
     if (!g_rocm_q4_prefill_tile8_report_registered) {
         g_rocm_q4_prefill_tile8_report_registered = 1;
         (void)atexit(rocm_q4_K_prefill_tile8_report);
@@ -519,7 +643,9 @@ static void rocm_q4_K_prefill_tile8_note(
     g_rocm_q4_prefill_tile8_dense_calls += dense_calls;
     g_rocm_q4_prefill_tile8_pair_calls += pair_calls;
     g_rocm_q4_prefill_tile8_attention_batch_calls += attention_batch_calls;
+    g_rocm_q4_prefill_k1024_tile4_calls += k1024_tile4_calls;
     g_rocm_q4_prefill_tile8_tokens += tokens;
+    pthread_mutex_unlock(&g_rocm_q4_prefill_tile8_stats_mutex);
 }
 
 extern "C" int ds4_rocm_matmul_q4_K_tensor(
@@ -565,6 +691,24 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
     if (!cuda_ok(cudaGetLastError(), "q4_K dense quantize launch")) return 0;
 
     if (prefill_scope && prefill_tile8) {
+        if (rocm_q4_K_prefill_k1024_tile4_requested(blocks, out_dim)) {
+            const dim3 tiled_grid(
+                (unsigned)((out_dim - 1u) /
+                           ROCM_Q4_PREFILL_K1024_ROWS + 1u),
+                (unsigned)((n_tok - 1u) /
+                           ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
+                1u);
+            rocm_matmul_q4_K_prefill_k1024_tile4_kernel<<<tiled_grid, 256>>>(
+                    reinterpret_cast<float *>(out->ptr), wptr, xq,
+                    row_bytes, (uint32_t)out_dim, (uint32_t)n_tok);
+            const int ok = cuda_ok(
+                    cudaGetLastError(),
+                    "q4_K dense prefill K1024 tile4 launch");
+            if (ok) {
+                rocm_q4_K_prefill_tile8_note(1u, 0u, 0u, 1u, n_tok);
+            }
+            return ok;
+        }
         const dim3 tiled_grid((unsigned)((out_dim - 1u) / 32u + 1u),
                               (unsigned)((n_tok - 1u) /
                                          ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
@@ -575,7 +719,7 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
                 blocks, out_dim);
         const int ok = cuda_ok(cudaGetLastError(),
                                "q4_K dense prefill tile8 launch");
-        if (ok) rocm_q4_K_prefill_tile8_note(1u, 0u, 0u, n_tok);
+        if (ok) rocm_q4_K_prefill_tile8_note(1u, 0u, 0u, 0u, n_tok);
         return ok;
     }
 
@@ -675,7 +819,7 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
                 (uint32_t)out1_dim, (uint32_t)n_tok);
         const int ok = cuda_ok(cudaGetLastError(),
                                "q4_K dense prefill pair tile8 launch");
-        if (ok) rocm_q4_K_prefill_tile8_note(0u, 1u, 0u, n_tok);
+        if (ok) rocm_q4_K_prefill_tile8_note(0u, 1u, 0u, 0u, n_tok);
         return ok;
     }
 
@@ -948,6 +1092,6 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
     }
     if (b_rc <= 0) return -1;
 
-    rocm_q4_K_prefill_tile8_note(0u, 0u, 1u, n_tokens);
+    rocm_q4_K_prefill_tile8_note(0u, 0u, 1u, 0u, n_tokens);
     return 1;
 }

@@ -30850,18 +30850,37 @@ static bool metal_graph_encode_layer_attention_batch(
 
         const bool topk_prefill_needed =
             ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
-#if defined(__APPLE__)
+#if !defined(DS4_NO_GPU)
+        const bool indexer_query_prune_common =
+            ratio == 4 && zero_prefix && n_tokens >= 32u &&
+            !topk_prefill_needed && !g->quality &&
+            g->placement == NULL && g->tp_world < 2u;
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
         /* Before the compressed cache grows past top-k, zero-prefix prefill
          * consumes every compressed row and never reads the transient indexer
          * query or its per-head weights.  This is also true for the Metal SSD
          * layer-major path: the current layer is mapped while these dispatches
          * would run, and skipping them changes no persistent cache state. */
         const bool prune_unused_indexer_query =
-            ratio == 4 && zero_prefix && n_tokens >= 32u &&
-            !topk_prefill_needed && !g->quality &&
-            g->placement == NULL && g->tp_world < 2u &&
+            indexer_query_prune_common &&
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             getenv("DS4_METAL_DISABLE_PRE_M5_BATCH_INDEXER_QUERY_PRUNE") == NULL;
+#elif defined(DS4_ROCM_BUILD)
+        /* The query projection is equally dead on resident ROCm: before the
+         * compressed cache exceeds top-k, attention consumes every compressed
+         * row and no later stage observes these transient query/weight tensors.
+         * Keep streaming out of scope because its layer-lifetime and overlap
+         * policy are intentionally independent from the resident fast path. */
+        const bool prune_unused_indexer_query =
+            indexer_query_prune_common && !g->ssd_streaming &&
+            getenv("DS4_ROCM_DISABLE_BATCH_INDEXER_QUERY_PRUNE") == NULL;
+#elif !defined(DS4_NO_GPU)
+        /* CUDA has the same resident layer lifetime as ROCm here.  Do not
+         * couple this graph-level pruning to any SSD streaming policy. */
+        const bool prune_unused_indexer_query =
+            indexer_query_prune_common && !g->ssd_streaming &&
+            getenv("DS4_CUDA_DISABLE_BATCH_INDEXER_QUERY_PRUNE") == NULL;
 #else
         const bool prune_unused_indexer_query = false;
 #endif
@@ -31633,8 +31652,61 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool attn_out_debug =
         metal_graph_debug_wants("attn_low", il, pos0) ||
         metal_graph_debug_wants("attn_out", il, pos0);
+    bool attn_out_hc_fused = false;
+#ifdef __APPLE__
+    if (ok && !attn_out_debug && !tp_row_split_attn &&
+        !metal_graph_directional_steering_attn_enabled(g)) {
+        int fused_rc = 0;
+        if (layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+            layer->attn_output_b->type == DS4_TENSOR_Q8_0) {
+            fused_rc = ds4_gpu_attention_output_q8_batch_hc_tensor(
+                metal_graph_batch_attn_out(g),
+                after_attn_hc_view,
+                metal_graph_batch_cur_hc(g),
+                hc_split_view,
+                metal_graph_batch_attn_low(g),
+                metal_graph_batch_group_tmp(g),
+                metal_graph_batch_low_tmp(g),
+                model->map,
+                model->size,
+                layer->attn_output_a->abs_offset,
+                layer->attn_output_b->abs_offset,
+                group_dim,
+                rank,
+                n_groups,
+                DS4_N_EMBD,
+                metal_graph_batch_heads(g),
+                n_tokens,
+                DS4_N_HC);
+        } else if (layer->attn_output_a->type == DS4_TENSOR_Q4_K &&
+                   layer->attn_output_b->type == DS4_TENSOR_Q4_K) {
+            fused_rc = ds4_gpu_attention_output_q4_K_batch_hc_tensor(
+                metal_graph_batch_attn_out(g),
+                after_attn_hc_view,
+                metal_graph_batch_cur_hc(g),
+                hc_split_view,
+                metal_graph_batch_attn_low(g),
+                metal_graph_batch_group_tmp(g),
+                metal_graph_batch_low_tmp(g),
+                model->map,
+                model->size,
+                layer->attn_output_a->abs_offset,
+                layer->attn_output_b->abs_offset,
+                layer->attn_output_b->type,
+                group_dim,
+                rank,
+                n_groups,
+                DS4_N_EMBD,
+                metal_graph_batch_heads(g),
+                n_tokens,
+                DS4_N_HC);
+        }
+        if (fused_rc < 0) ok = false;
+        attn_out_hc_fused = fused_rc > 0;
+    }
+#endif
     bool attn_out_f16 = false;
-    if (ok &&
+    if (ok && !attn_out_hc_fused &&
         !attn_out_debug &&
         !tp_row_split_attn &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
@@ -31667,7 +31739,7 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool tp_attn_pipeline =
         tp_row_split_attn && (n_tokens % 256u) == 0u &&
         metal_graph_tp_subgate_pipeline();
-    if (!attn_out_f16) {
+    if (!attn_out_f16 && !attn_out_hc_fused) {
         if (ok && tp_attn_pipeline) {
             /* Sub-chunk pipelined swap: the output projection runs in two
              * sub-halves of this rank's rows and each sub-half's row swap
@@ -31772,10 +31844,13 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         if (!ok) fprintf(stderr, "ds4: TP prefill attention row gate failed (layer %u)\n", il);
     }
-    if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
+    if (ok && !attn_out_f16 && !attn_out_hc_fused &&
+        metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, metal_graph_batch_attn_out(g), il, n_tokens);
     }
-    if (ok && attn_out_f16) {
+    if (ok && attn_out_hc_fused) {
+        /* The fused output-B epilogue already wrote after_attn_hc_view. */
+    } else if (ok && attn_out_f16) {
         ok = ds4_gpu_hc_expand_split_half_tensor(after_attn_hc_view,
                                                  g->batch_q_half,
                                                  metal_graph_batch_cur_hc(g),
@@ -36399,6 +36474,38 @@ static void gpu_graph_report_prefill_display_progress(
                      (int)(start + (uint32_t)done), total);
 }
 
+#ifdef __APPLE__
+typedef struct {
+    ds4_session_progress_fn display_progress;
+    void                   *ud;
+    int                     current;
+    int                     total;
+    volatile uint32_t       completed;
+} metal_graph_flush_progress_ctx;
+
+/* Metal completion threads only publish readiness.  User callbacks can own
+ * sockets, terminal state, or non-atomic session fields, so they stay on the
+ * graph caller thread and are emitted in monotonically increasing order. */
+static void metal_graph_flush_progress_mark(void *vctx) {
+    metal_graph_flush_progress_ctx *ctx = vctx;
+    __atomic_store_n(&ctx->completed, 1u, __ATOMIC_RELEASE);
+}
+
+static void metal_graph_flush_progress_report_ready(
+        metal_graph_flush_progress_ctx *ctx,
+        uint32_t                        submitted,
+        uint32_t                       *reported) {
+    if (!ctx || !reported) return;
+    while (*reported < submitted &&
+           __atomic_load_n(&ctx[*reported].completed, __ATOMIC_ACQUIRE)) {
+        metal_graph_flush_progress_ctx *ready = &ctx[*reported];
+        ready->display_progress(
+            ready->ud, "prefill_display", ready->current, ready->total);
+        (*reported)++;
+    }
+}
+#endif
+
 typedef struct {
     int tier;
     uint32_t first_layer;
@@ -36759,6 +36866,16 @@ static bool metal_graph_prefill_layer_major(
      */
     const bool throttle = graph_power_throttle_enabled(g);
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
+#ifdef __APPLE__
+    /* A display-only split must preserve layer boundaries for truthful UI
+     * progress, but it does not need a host-side drain after every layer. */
+    const bool progress_flush =
+        callback_split && n_tokens <= 2048u && !g->ssd_streaming &&
+        !split_profile && !throttle && imatrix == NULL &&
+        getenv("DS4_METAL_DISABLE_PREFILL_FLUSH_PROGRESS") == NULL;
+#else
+    const bool progress_flush = false;
+#endif
     const bool split_commands = g->ssd_streaming ||
                                 split_profile || throttle || callback_split ||
                                 n_tokens > 2048 || imatrix != NULL;
@@ -36984,7 +37101,23 @@ static bool metal_graph_prefill_layer_major(
         return false;
     }
 
+#ifdef __APPLE__
+    metal_graph_flush_progress_ctx flush_ctx[DS4_N_LAYER];
+    memset(flush_ctx, 0, sizeof(flush_ctx));
+    uint32_t flush_submitted = 0u;
+    uint32_t flush_reported = 0u;
+    if (progress_flush && ok) {
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+#endif
+
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+#ifdef __APPLE__
+        if (progress_flush) {
+            metal_graph_flush_progress_report_ready(
+                flush_ctx, flush_submitted, &flush_reported);
+        }
+#endif
         double layer_elapsed = 0.0;
         const bool layer_selected_addr =
             batch_selected_addr &&
@@ -37186,7 +37319,7 @@ static bool metal_graph_prefill_layer_major(
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
             const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
+            if (!progress_flush) ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
                                                         model,
                                                         &weights->layer[il],
@@ -37213,7 +37346,31 @@ static bool metal_graph_prefill_layer_major(
             }
 #endif
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+#ifdef __APPLE__
+            if (ok && progress_flush) {
+                uint64_t pdone =
+                    (uint64_t)n_tokens * (il + 1u) / (uint32_t)DS4_N_LAYER;
+                if (il + 1u == (uint32_t)DS4_N_LAYER) pdone = n_tokens;
+                flush_ctx[il] = (metal_graph_flush_progress_ctx){
+                    display_progress,
+                    display_progress_ud,
+                    (int)(start + (uint32_t)pdone),
+                    prompt->len,
+                    0u,
+                };
+                ok = ds4_gpu_flush_commands_progress(
+                         metal_graph_flush_progress_mark,
+                         &flush_ctx[il]) != 0;
+                if (ok) {
+                    flush_submitted = il + 1u;
+                    metal_graph_flush_progress_report_ready(
+                        flush_ctx, flush_submitted, &flush_reported);
+                }
+            } else
+#endif
+            if (ok) {
+                ok = ds4_gpu_end_commands() != 0;
+            }
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
 #ifdef DS4_ROCM_BUILD
             if (ok) {
@@ -37285,12 +37442,14 @@ static bool metal_graph_prefill_layer_major(
             return false;
         }
         graph_power_note_prefill_layer(g, il, layer_elapsed);
-        gpu_graph_report_prefill_display_progress(display_progress,
-                                                  display_progress_ud,
-                                                  start,
-                                                  n_tokens,
-                                                  il + 1,
-                                                  prompt->len);
+        if (!progress_flush) {
+            gpu_graph_report_prefill_display_progress(display_progress,
+                                                      display_progress_ud,
+                                                      start,
+                                                      n_tokens,
+                                                      il + 1,
+                                                      prompt->len);
+        }
         if (show_progress) {
             fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
             fflush(stderr);
@@ -37310,6 +37469,18 @@ static bool metal_graph_prefill_layer_major(
         }
         return false;
     }
+#ifdef __APPLE__
+    /* Every flush opens the next batch.  If no output head follows, close the
+     * final empty batch and wait here so completion contexts stay alive. */
+    if (progress_flush && !logits) {
+        ok = ds4_gpu_end_commands() != 0;
+        if (ok) {
+            metal_graph_flush_progress_report_ready(
+                flush_ctx, flush_submitted, &flush_reported);
+            ok = flush_reported == flush_submitted;
+        }
+    }
+#endif
 #ifdef __APPLE__
     /* Zero-prefix masks are shared across the 43 per-layer command batches,
      * then become dead weight. Release them before the output head and later
@@ -37334,9 +37505,15 @@ static bool metal_graph_prefill_layer_major(
     if (g->ssd_streaming) ds4_gpu_release_q8_f16_cache();
 #endif
     if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
+#ifdef __APPLE__
+        if (progress_flush) (void)ds4_gpu_synchronize();
+#endif
         return false;
     }
     if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
+#ifdef __APPLE__
+        if (progress_flush) (void)ds4_gpu_synchronize();
+#endif
         return false;
     }
 
@@ -37379,15 +37556,34 @@ static bool metal_graph_prefill_layer_major(
     }
     if (ok && logits) {
         g->cur_hc_by_tier[g->active_tier] = last_hc;
-        ok = ds4_gpu_begin_commands() != 0;
+        if (!progress_flush || !ds4_gpu_commands_active()) {
+            ok = ds4_gpu_begin_commands() != 0;
+        }
     }
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+#ifdef __APPLE__
+    if (progress_flush && !ds4_gpu_commands_active()) {
+        metal_graph_flush_progress_report_ready(
+            flush_ctx, flush_submitted, &flush_reported);
+        if (ok && flush_reported != flush_submitted) ok = false;
+    }
+#endif
     const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc_by_tier[g->active_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
-    if (!ok) return false;
+    if (!ok) {
+#ifdef __APPLE__
+        /* A failed head setup/encode can leave the empty post-flush batch
+         * open.  Close it and join completion hooks before stack contexts go
+         * out of scope. */
+        if (progress_flush && ds4_gpu_commands_active()) {
+            (void)ds4_gpu_end_commands();
+        }
+#endif
+        return false;
+    }
 
     const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {

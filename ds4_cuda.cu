@@ -551,11 +551,12 @@ static int g_q4_attn_q_b_f16_hard_disabled;
 static int g_q4_attn_q_b_f16_dispatch_disabled;
 static int g_q4_attn_q_b_f16_pending_evict;
 /* The long-prefill transient path expands exactly one q_b matrix at a time.
- * Keep its weight and activation staging in one dedicated allocation so it
- * cannot alias the legacy global CUDA scratch used by unrelated projections.
- * A single mutex covers both ownership and the complete enqueue sequence: the
- * NULL stream orders GPU work, while the mutex prevents two host threads from
- * interleaving dequantize -> GEMM sequences that reuse this storage. */
+ * Keep its weight and activation staging, plus the optional diagnostic F16
+ * projection, in one dedicated allocation so it cannot alias the legacy
+ * global CUDA scratch used by unrelated projections.  A single mutex covers
+ * both ownership and the complete enqueue sequence: the decode stream orders
+ * GPU work, while the mutex prevents two host threads from interleaving
+ * sequences that reuse this storage. */
 static __half *g_q4_attn_q_b_transient_f16_scratch;
 static uint64_t g_q4_attn_q_b_transient_f16_scratch_bytes;
 static int g_q4_attn_q_b_transient_f16_scratch_device = -1;
@@ -2507,25 +2508,55 @@ static int cuda_q4_attn_q_b_transient_f16_disabled(void) {
         getenv("DS4_CUDA_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16"));
 }
 
+/* Diagnostic-only until CUDA logits/acceptance testing establishes the extra
+ * projection rounding as an acceptable release boundary.  The established
+ * path keeps the cuBLAS output and RMS/RoPE input in F32. */
+static int cuda_q4_attn_q_b_f16_output_requested(void) {
+    return cuda_env_value_enabled(
+        getenv("DS4_CUDA_ENABLE_Q4_ATTN_Q_B_F16_OUTPUT"));
+}
+
 static int cuda_q4_attn_q_b_transient_f16_scratch_size(
         uint32_t max_rows,
+        int include_output,
         uint64_t *weight_bytes,
         uint64_t *activation_offset,
+        uint64_t *output_offset,
         uint64_t *scratch_bytes) {
     const uint64_t wh_bytes =
         (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM *
         CUDA_Q4_ATTN_Q_B_OUT_DIM * sizeof(__half);
     const uint64_t xh_off = (wh_bytes + 255u) & ~UINT64_C(255);
-    const uint64_t row_bytes =
+    const uint64_t xh_row_bytes =
         (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM * sizeof(__half);
     if (max_rows == 0u ||
-        (uint64_t)max_rows > (UINT64_MAX - xh_off) / row_bytes) {
+        (uint64_t)max_rows > (UINT64_MAX - xh_off) / xh_row_bytes) {
         return 0;
     }
-    const uint64_t total = xh_off + (uint64_t)max_rows * row_bytes;
+    const uint64_t xh_end =
+        xh_off + (uint64_t)max_rows * xh_row_bytes;
+    if (!include_output) {
+        if (xh_end > SIZE_MAX) return 0;
+        if (weight_bytes) *weight_bytes = wh_bytes;
+        if (activation_offset) *activation_offset = xh_off;
+        if (output_offset) *output_offset = 0u;
+        if (scratch_bytes) *scratch_bytes = xh_end;
+        return 1;
+    }
+    if (xh_end > UINT64_MAX - 255u) return 0;
+    const uint64_t qh_off = (xh_end + 255u) & ~UINT64_C(255);
+    const uint64_t qh_row_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_OUT_DIM * sizeof(__half);
+    if ((uint64_t)max_rows >
+        (UINT64_MAX - qh_off) / qh_row_bytes) {
+        return 0;
+    }
+    const uint64_t total =
+        qh_off + (uint64_t)max_rows * qh_row_bytes;
     if (total > SIZE_MAX) return 0;
     if (weight_bytes) *weight_bytes = wh_bytes;
     if (activation_offset) *activation_offset = xh_off;
+    if (output_offset) *output_offset = qh_off;
     if (scratch_bytes) *scratch_bytes = total;
     return 1;
 }
@@ -2613,9 +2644,12 @@ static int cuda_q4_attn_q_b_transient_f16_scratch_ensure(
         uint32_t max_rows,
         uint64_t working_set_reserve_bytes,
         uint64_t *prepared_bytes) {
+    const int include_output =
+        cuda_q4_attn_q_b_f16_output_requested();
     uint64_t scratch_bytes = 0;
     if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
-            max_rows, NULL, NULL, &scratch_bytes)) {
+            max_rows, include_output,
+            NULL, NULL, NULL, &scratch_bytes)) {
         return 0;
     }
 
@@ -2724,8 +2758,9 @@ static int cuda_q4_attn_q_b_transient_f16_scratch_ensure(
     if (previous_device >= 0) (void)cudaSetDevice(previous_device);
     fprintf(stderr,
             "ds4: CUDA prepared reusable Q4 attn_q_b transient F16 scratch "
-            "(%.2f MiB, max batch %u tokens)\n",
-            (double)scratch_bytes / 1048576.0, max_rows);
+            "(%.2f MiB, max batch %u tokens, output %s)\n",
+            (double)scratch_bytes / 1048576.0, max_rows,
+            include_output ? "F16 diagnostic" : "F32");
     return 1;
 }
 
@@ -43200,10 +43235,9 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
     /* The pre-existing CUDA Q8 specialization was a stub.  Preserve that
-     * fallback behavior and arm only resident Q4_K.  CUDA writes the GEMM
-     * directly to the canonical F32 graph tensor, so the Metal-only q_half
-     * workspace is deliberately optional here. */
-    (void)q_half;
+     * fallback behavior and arm only resident Q4_K.  The release path keeps
+     * its established F32 projection boundary; an explicit diagnostic can
+     * stage an F16 result in the resident-only arena for CUDA validation. */
     if (weight_type != CUDA_Q4_ATTN_Q_B_TYPE) return 0;
     if (n_tok < 32u) return 0;
     const int required = cuda_q4_attn_q_b_f16_required();
@@ -43254,6 +43288,25 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     if (x->bytes < x_bytes || out->bytes < out_bytes) {
         return fallback;
     }
+    const int use_f16_output =
+        cuda_q4_attn_q_b_f16_output_requested();
+    const uint64_t q_half_bytes =
+        (uint64_t)n_tok * out_dim * sizeof(__half);
+    int use_graph_q_half = 0;
+    if (use_f16_output && q_half && q_half->ptr &&
+        q_half->bytes >= q_half_bytes &&
+        ds4_tensor_device_idx(q_half) == 0) {
+        const uintptr_t q_half_addr = (uintptr_t)q_half->ptr;
+        const uintptr_t out_addr = (uintptr_t)out->ptr;
+        const uintptr_t x_addr = (uintptr_t)x->ptr;
+        const int overlaps_out = q_half_addr <= out_addr
+            ? (uint64_t)(out_addr - q_half_addr) < q_half_bytes
+            : (uint64_t)(q_half_addr - out_addr) < out_bytes;
+        const int overlaps_x = q_half_addr <= x_addr
+            ? (uint64_t)(x_addr - q_half_addr) < q_half_bytes
+            : (uint64_t)(q_half_addr - x_addr) < x_bytes;
+        use_graph_q_half = !overlaps_out && !overlaps_x;
+    }
 
     const uint64_t blocks = in_dim / CUDA_QK_K;
     const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
@@ -43265,16 +43318,19 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 
     uint64_t transient_weight_bytes = 0;
     uint64_t xh_offset = 0;
+    uint64_t qh_offset = 0;
     uint64_t required_scratch_bytes = 0;
     if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
-            n_tok, &transient_weight_bytes, &xh_offset,
+            n_tok, use_f16_output,
+            &transient_weight_bytes, &xh_offset, &qh_offset,
             &required_scratch_bytes)) {
         return fallback;
     }
 
-    /* Protect the shared W/X arena for the entire enqueue sequence.  Stream
-     * ordering protects reuse after this function returns; host serialization
-     * protects the sequence itself from interleaving with another session. */
+    /* Protect the shared W/X/output arena for the entire enqueue sequence.
+     * Stream ordering protects reuse after this function returns; host
+     * serialization protects the sequence itself from interleaving with
+     * another session. */
     std::unique_lock<std::mutex> scratch_use_lock(
         g_q4_attn_q_b_transient_f16_mutex);
     if (!g_q4_attn_q_b_transient_f16_scratch ||
@@ -43287,6 +43343,12 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         g_q4_attn_q_b_transient_f16_scratch;
     __half *const xh = reinterpret_cast<__half *>(
         reinterpret_cast<char *>(scratch) + xh_offset);
+    __half *const scratch_qh = use_f16_output
+        ? reinterpret_cast<__half *>(
+              reinterpret_cast<char *>(scratch) + qh_offset)
+        : NULL;
+    __half *const qh = use_graph_q_half
+        ? (__half *)q_half->ptr : scratch_qh;
 
     /* Prefer an explicitly prepared persistent sidecar.  Keep its cache lock
      * until the epilogue is enqueued so lifecycle release cannot free the
@@ -43399,7 +43461,8 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         w_f16, CUDA_R_16F, (int)in_dim,
         xh, CUDA_R_16F, (int)in_dim,
         &beta,
-        out->ptr, CUDA_R_32F, (int)out_dim,
+        use_f16_output ? (void *)qh : out->ptr,
+        use_f16_output ? CUDA_R_16F : CUDA_R_32F, (int)out_dim,
         CUDA_R_32F,
         CUBLAS_GEMM_DEFAULT);
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -43418,12 +43481,21 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 
     /* cuBLAS has accepted the first output writer.  From this point onward a
      * native-Q4 replay is unsafe even when the specialization was optional. */
-    head_rms_norm_rope_tail_kernel<<<
-        n_tok * n_head, 256, 0, stream>>>(
-            (float *)out->ptr,
-            n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
-            inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
-            attn_factor, beta_fast, beta_slow, eps);
+    if (use_f16_output) {
+        head_rms_norm_rope_tail_from_half_kernel<<<
+            n_tok * n_head, 256, 0, stream>>>(
+                (float *)out->ptr, qh,
+                n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+                inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
+                attn_factor, beta_fast, beta_slow, eps);
+    } else {
+        head_rms_norm_rope_tail_kernel<<<
+            n_tok * n_head, 256, 0, stream>>>(
+                (float *)out->ptr,
+                n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+                inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
+                attn_factor, beta_fast, beta_slow, eps);
+    }
     launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
         fprintf(stderr,

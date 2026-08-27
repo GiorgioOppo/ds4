@@ -83,6 +83,12 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
+#ifdef __APPLE__
+/* Commit the current Metal batch without draining.  The completion hook runs
+ * on a Metal-owned thread and must only publish thread-safe readiness state;
+ * the next full command drain joins it before returning. */
+int ds4_gpu_flush_commands_progress(void (*report)(void *ctx), void *ctx);
+#endif
 int ds4_gpu_commands_active(void);
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
@@ -368,6 +374,8 @@ enum {
     DS4_GPU_TEST_STREAMING_LIVE_INDEX_FAILURE = 1u << 7,
     DS4_GPU_TEST_IQ2_SSD_GROUPED_PIPELINE_FAILURE = 1u << 8,
     DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC = 1u << 9,
+    DS4_GPU_TEST_BATCH_ATTN_OUT_Q8_HC_FUSION = 1u << 10,
+    DS4_GPU_TEST_BATCH_ATTN_OUT_Q4_HC_FUSION = 1u << 11,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
@@ -2710,6 +2718,30 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+#ifdef __APPLE__
+/* Optional resident Metal output-B + HC4 epilogues.  Return 1 when fused work
+ * was encoded, 0 before writing anything when ineligible, and -1 after an
+ * attempted-path failure (the caller must not replay the fallback then). */
+int ds4_gpu_attention_output_q8_batch_hc_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens,
+        uint32_t              n_hc);
+#endif
 /* Returns 1 when the batch path ran, 0 for the ordinary row fallback, and -1
  * for a post-enqueue failure or a backend REQUIRE diagnostic.  The caller
  * must not retry the row fallback after -1. */
@@ -2729,6 +2761,28 @@ int ds4_gpu_attention_output_q4_K_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+#ifdef __APPLE__
+int ds4_gpu_attention_output_q4_K_batch_hc_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint32_t              out_b_type,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens,
+        uint32_t              n_hc);
+#endif
 
 int ds4_gpu_attention_output_q8_batch_f16_tensor(
         ds4_gpu_tensor       *out_h,

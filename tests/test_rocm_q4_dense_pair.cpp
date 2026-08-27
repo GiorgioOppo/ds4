@@ -39,6 +39,10 @@ constexpr uint32_t kM1 = 33u;
 constexpr uint32_t kQ4Type = 12u;
 constexpr uint32_t kQ8Type = 8u;
 constexpr uint32_t kTailK = 1024u;
+constexpr uint32_t kQbOutDim = 32768u;
+constexpr uint32_t kQbHeads = 64u;
+constexpr uint32_t kQbHeadDim = 512u;
+constexpr uint32_t kQbRot = 64u;
 constexpr uint32_t kAttnGroupDim = 4096u;
 constexpr uint32_t kAttnRank = 32u;
 constexpr uint32_t kAttnGroups = 8u;
@@ -60,6 +64,18 @@ constexpr const char *kPrefillDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_TILE8";
 constexpr const char *kPrefillRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8";
+constexpr const char *kPrefillK1024Tile4Disable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4";
+constexpr const char *kQbF16Enable =
+    "DS4_ROCM_ENABLE_Q4_ATTN_Q_B_F16_CACHE";
+constexpr const char *kQbF16Disable =
+    "DS4_ROCM_DISABLE_Q4_ATTN_Q_B_F16_CACHE";
+constexpr const char *kQbF16Require =
+    "DS4_ROCM_REQUIRE_Q4_ATTN_Q_B_F16_CACHE";
+constexpr const char *kQbF16MinTokens =
+    "DS4_ROCM_Q4_ATTN_Q_B_F16_CACHE_MIN_TOKENS";
+constexpr const char *kQbF16OutputEnable =
+    "DS4_ROCM_ENABLE_Q4_ATTN_Q_B_F16_OUTPUT";
 constexpr const char *kGroupedDecodeEnable =
     "DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A";
 constexpr const char *kGroupedDecodeDisable =
@@ -116,6 +132,7 @@ struct aligned_model {
     uint64_t attn_b_q8_offset = 0;
     uint64_t tail_k1024_offset = 0;
     uint64_t tail_k1024_pair_offset = 0;
+    uint64_t q_b_k1024_offset = 0;
 
     ~aligned_model() { std::free(data); }
 
@@ -282,6 +299,8 @@ bool make_model(aligned_model *model) {
         (kTailK / kQkK) * sizeof(block_q4_K_test);
     const uint64_t tail0_bytes = (uint64_t)kM0 * tail_row_bytes;
     const uint64_t tail1_bytes = (uint64_t)kM1 * tail_row_bytes;
+    const uint64_t q_b_k1024_bytes =
+        (uint64_t)kQbOutDim * tail_row_bytes;
     const uint64_t attn_b_q8_row_bytes =
         (kAttnLowDim / 32u) * sizeof(block_q8_0_test);
     const uint64_t attn_b_q8_bytes =
@@ -300,8 +319,10 @@ bool make_model(aligned_model *model) {
         model->tail_k1024_offset + tail0_bytes, page);
     model->attn_b_q8_offset = round_up(
         model->tail_k1024_pair_offset + tail1_bytes, page);
-    model->size = round_up(
+    model->q_b_k1024_offset = round_up(
         model->attn_b_q8_offset + attn_b_q8_bytes, page);
+    model->size = round_up(
+        model->q_b_k1024_offset + q_b_k1024_bytes, page);
     void *storage = nullptr;
     if (posix_memalign(&storage, (size_t)page, (size_t)model->size) != 0) {
         return false;
@@ -333,6 +354,9 @@ bool make_model(aligned_model *model) {
     fill_q4_rows(reinterpret_cast<block_q4_K_test *>(
                      model->data + model->tail_k1024_pair_offset),
                  kM1, kTailK, 0xa4093822u);
+    fill_q4_rows(reinterpret_cast<block_q4_K_test *>(
+                     model->data + model->q_b_k1024_offset),
+                 kQbOutDim, kTailK, 0x082efa98u);
     fill_q8_0_rows(reinterpret_cast<block_q8_0_test *>(
                        model->data + model->attn_b_q8_offset),
                    kAttnOutDim, kAttnLowDim, 0x03707344u);
@@ -702,6 +726,7 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
     env_snapshot enable(kPrefillEnable);
     env_snapshot disable(kPrefillDisable);
     env_snapshot require(kPrefillRequire);
+    env_snapshot k1024_tile4_disable(kPrefillK1024Tile4Disable);
 
     // The authoritative rollback remains the reference now that the tiled
     // path is default-on.
@@ -718,6 +743,7 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
     (void)unsetenv(kPrefillEnable);
     (void)unsetenv(kPrefillDisable);
     (void)setenv(kPrefillRequire, "1", 1);
+    (void)unsetenv(kPrefillK1024Tile4Disable);
     const int candidate_rc = ds4_gpu_matmul_quant_tensor(
         candidate_gpu.ptr, model.data, model.size, offset, kQ4Type,
         in_dim, out_dim, x_gpu.ptr, n_tokens);
@@ -755,6 +781,227 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
                  "%s: legacy_rc=%d candidate_rc=%d logical=%zu guard=%zu %s\n",
                  label, legacy_rc, candidate_rc, logical_count,
                  kOutputGuardFloats, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_q_b_f16_null_qhalf_case(const aligned_model &model) {
+    constexpr uint32_t n_tokens = 32u;
+    static_assert(kQbHeads * kQbHeadDim == kQbOutDim,
+                  "q_b test head geometry must cover the projection");
+    const size_t logical_count = (size_t)n_tokens * kQbOutDim;
+    const size_t allocation_count = logical_count + kOutputGuardFloats;
+    const size_t q_half_guard = kOutputGuardFloats;
+    const size_t q_half_count = logical_count + q_half_guard;
+    std::vector<float> x;
+    fill_activation(&x, n_tokens, kTailK);
+    const std::vector<float> sentinel = sentinel_values(allocation_count);
+    const std::vector<uint16_t> q_half_sentinel(q_half_count, 0x7e55u);
+    tensor_owner x_gpu(x.size() * sizeof(float));
+    tensor_owner provided_out(allocation_count * sizeof(float));
+    tensor_owner scratch_out(allocation_count * sizeof(float));
+    tensor_owner reference_out(logical_count * sizeof(float));
+    tensor_owner q_half_gpu(q_half_count * sizeof(uint16_t));
+    if (!x_gpu.ptr || !provided_out.ptr || !scratch_out.ptr ||
+        !reference_out.ptr || !q_half_gpu.ptr ||
+        !write_tensor(x_gpu.ptr, x) ||
+        !write_tensor(provided_out.ptr, sentinel) ||
+        !write_tensor(scratch_out.ptr, sentinel) ||
+        !ds4_gpu_tensor_write(q_half_gpu.ptr, 0, q_half_sentinel.data(),
+                              q_half_sentinel.size() * sizeof(uint16_t))) {
+        std::fprintf(stderr,
+                     "q_b F16 null-q_half: tensor allocation/write FAIL\n");
+        return false;
+    }
+
+    env_snapshot enable(kQbF16Enable);
+    env_snapshot disable(kQbF16Disable);
+    env_snapshot require(kQbF16Require);
+    env_snapshot min_tokens(kQbF16MinTokens);
+    env_snapshot f16_output(kQbF16OutputEnable);
+    (void)setenv(kQbF16Enable, "1", 1);
+    (void)unsetenv(kQbF16Disable);
+    (void)setenv(kQbF16Require, "1", 1);
+    (void)setenv(kQbF16MinTokens, "32", 1);
+    (void)setenv(kQbF16OutputEnable, "1", 1);
+
+    const uint64_t weight_bytes =
+        (uint64_t)kQbOutDim * (kTailK / kQkK) *
+        sizeof(block_q4_K_test);
+    const ds4_gpu_q4_attn_q_b_f16_sidecar_desc desc = {
+        model.q_b_k1024_offset,
+        weight_bytes,
+        kTailK,
+        kQbOutDim,
+        kQ4Type,
+        0u,
+    };
+    uint64_t prepared_bytes = 0;
+    const int prepare_rc = ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+        model.data, model.size, &desc, 1u, n_tokens, 0u,
+        &prepared_bytes);
+
+    /* The release default must keep writing C=F32 and must not touch q_half,
+     * even when a large staging tensor is supplied by a test caller. */
+    (void)setenv(kQbF16OutputEnable, "0", 1);
+    int default_rc = 0;
+    if (prepare_rc > 0) {
+        default_rc = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+            provided_out.ptr, q_half_gpu.ptr, model.data, model.size,
+            model.q_b_k1024_offset, kQ4Type, kTailK, kQbOutDim,
+            x_gpu.ptr, n_tokens, kQbHeads, kQbHeadDim, kQbRot,
+            17u, 0u, false, 10000.0f, 1.0f, 0.0f, 1.0f,
+            32.0f, 1.0f, 1.0e-6f);
+    }
+    std::vector<float> default_host(allocation_count);
+    std::vector<uint16_t> default_half_host(q_half_count);
+    const bool default_read_ok = default_rc > 0 &&
+        read_tensor(provided_out.ptr, &default_host) &&
+        ds4_gpu_tensor_read(q_half_gpu.ptr, 0, default_half_host.data(),
+                            default_half_host.size() * sizeof(uint16_t));
+    bool ok = prepare_rc > 0 && default_read_ok;
+    if (default_read_ok) {
+        ok = output_guard_unchanged(
+                 default_host, sentinel, logical_count,
+                 "q_b default-F32 output canary") && ok;
+        uint64_t untouched_or_nonfinite = 0;
+        for (size_t i = 0; i < logical_count; i++) {
+            if (!std::isfinite(default_host[i]) ||
+                std::memcmp(&default_host[i], &sentinel[i],
+                            sizeof(float)) == 0) {
+                untouched_or_nonfinite++;
+            }
+        }
+        uint64_t half_mismatches = 0;
+        for (size_t i = 0; i < q_half_count; i++) {
+            if (default_half_host[i] != q_half_sentinel[i]) {
+                half_mismatches++;
+            }
+        }
+        std::fprintf(stderr,
+                     "q_b default-F32 writes finite output: failures=%llu/%zu; "
+                     "q_half mismatches=%llu/%zu %s\n",
+                     (unsigned long long)untouched_or_nonfinite,
+                     logical_count,
+                     (unsigned long long)half_mismatches, q_half_count,
+                     untouched_or_nonfinite == 0 && half_mismatches == 0
+                         ? "PASS" : "FAIL");
+        ok = untouched_or_nonfinite == 0 && half_mismatches == 0 && ok;
+    }
+
+    (void)setenv(kQbF16OutputEnable, "1", 1);
+    if (!write_tensor(provided_out.ptr, sentinel) ||
+        !ds4_gpu_tensor_write(q_half_gpu.ptr, 0, q_half_sentinel.data(),
+                              q_half_sentinel.size() * sizeof(uint16_t))) {
+        ok = false;
+    }
+    int provided_rc = 0;
+    if (prepare_rc > 0) {
+        provided_rc = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+            provided_out.ptr, q_half_gpu.ptr, model.data, model.size,
+            model.q_b_k1024_offset, kQ4Type, kTailK, kQbOutDim,
+            x_gpu.ptr, n_tokens, kQbHeads, kQbHeadDim, kQbRot,
+            17u, 0u, false, 10000.0f, 1.0f, 0.0f, 1.0f,
+            32.0f, 1.0f, 1.0e-6f);
+    }
+
+    std::vector<float> provided_host(allocation_count);
+    std::vector<uint16_t> q_half_host(q_half_count);
+    const bool provided_read_ok = provided_rc > 0 &&
+        read_tensor(provided_out.ptr, &provided_host) &&
+        ds4_gpu_tensor_read(q_half_gpu.ptr, 0, q_half_host.data(),
+                            q_half_host.size() * sizeof(uint16_t));
+    ok = provided_read_ok && ok;
+    if (provided_read_ok) {
+        ok = output_guard_unchanged(
+                 provided_host, sentinel, logical_count,
+                 "q_b F16 provided-q_half output canary") && ok;
+        uint64_t nonfinite = 0;
+        for (size_t i = 0; i < logical_count; i++) {
+            if (!std::isfinite(provided_host[i])) nonfinite++;
+        }
+        uint64_t half_guard_mismatches = 0;
+        for (size_t i = logical_count; i < q_half_count; i++) {
+            if (q_half_host[i] != q_half_sentinel[i]) {
+                half_guard_mismatches++;
+            }
+        }
+        std::fprintf(stderr,
+                     "q_b F16 provided-q_half: nonfinite=%llu/%zu; "
+                     "canary mismatches=%llu/%zu %s\n",
+                     (unsigned long long)nonfinite, logical_count,
+                     (unsigned long long)half_guard_mismatches, q_half_guard,
+                     nonfinite == 0 && half_guard_mismatches == 0
+                         ? "PASS" : "FAIL");
+        ok = nonfinite == 0 && half_guard_mismatches == 0 && ok;
+    }
+
+    /* Re-expand the accepted F16 projection exactly and feed the established
+     * F32 epilogue. This is a bitwise oracle for the fused half-input tail,
+     * with a nonzero production-shape projection rather than a zero smoke test. */
+    int reference_rc = 0;
+    std::vector<float> reference_input(logical_count);
+    if (provided_read_ok) {
+        for (size_t i = 0; i < logical_count; i++) {
+            reference_input[i] = fp16_to_float(q_half_host[i]);
+        }
+        if (write_tensor(reference_out.ptr, reference_input)) {
+            reference_rc = ds4_gpu_head_rms_norm_rope_tail_tensor(
+                reference_out.ptr, n_tokens, kQbHeads, kQbHeadDim, kQbRot,
+                17u, 0u, false, 10000.0f, 1.0f, 0.0f, 1.0f,
+                32.0f, 1.0f, 1.0e-6f);
+        }
+    }
+    std::vector<float> reference_host(logical_count);
+    if (reference_rc > 0 && read_tensor(reference_out.ptr, &reference_host)) {
+        provided_host.resize(logical_count);
+        ok = bitwise_equal(provided_host, reference_host,
+                           "q_b F16 fused tail vs expanded-F16 F32 tail") && ok;
+    } else {
+        std::fprintf(stderr,
+                     "q_b F16 expanded-F16 epilogue reference rc=%d FAIL\n",
+                     reference_rc);
+        ok = false;
+    }
+
+    /* Non-Apple graphs pass NULL q_half. The backend-owned Q_F16 region must
+     * produce the exact same fused result as an explicit staging tensor. */
+    int scratch_rc = 0;
+    if (prepare_rc > 0) {
+        scratch_rc = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+            scratch_out.ptr, nullptr, model.data, model.size,
+            model.q_b_k1024_offset, kQ4Type, kTailK, kQbOutDim,
+            x_gpu.ptr, n_tokens, kQbHeads, kQbHeadDim, kQbRot,
+            17u, 0u, false, 10000.0f, 1.0f, 0.0f, 1.0f,
+            32.0f, 1.0f, 1.0e-6f);
+    }
+    std::vector<float> scratch_host(allocation_count);
+    if (scratch_rc > 0 && read_tensor(scratch_out.ptr, &scratch_host)) {
+        ok = output_guard_unchanged(
+                 scratch_host, sentinel, logical_count,
+                 "q_b F16 null-q_half output canary") && ok;
+        scratch_host.resize(logical_count);
+        if (provided_read_ok) {
+            ok = bitwise_equal(scratch_host, provided_host,
+                               "q_b F16 null vs provided q_half") && ok;
+        } else {
+            ok = false;
+        }
+    } else {
+        std::fprintf(stderr,
+                     "q_b F16 null-q_half dispatch/read rc=%d FAIL\n",
+                     scratch_rc);
+        ok = false;
+    }
+
+    const int release_rc = ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+    ok = release_rc != 0 && ok;
+    std::fprintf(stderr,
+                 "q_b F16 q_half staging: prepare=%d default=%d provided=%d "
+                 "scratch=%d "
+                 "prepared=%.2f MiB release=%d %s\n",
+                 prepare_rc, default_rc, provided_rc, scratch_rc,
+                 (double)prepared_bytes / 1048576.0, release_rc,
+                 ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -1644,6 +1891,11 @@ int main(int argc, char **argv) {
         const bool prefill_tail128_ok = run_prefill_parity_case(
             model, 128u, model.tail_k1024_offset, kM0, true,
             "prefill K=1024 M=65 n_tok=128 (K-tail nb=4)", kTailK);
+        const bool prefill_q_b_tile4_ok = run_prefill_parity_case(
+            model, 9u, model.q_b_k1024_offset, kQbOutDim, false,
+            "prefill q_b K=1024 M=32768 n_tok=9 (tile4)", kTailK);
+        const bool q_b_f16_null_qhalf_ok =
+            run_q_b_f16_null_qhalf_case(model);
         const bool prefill_single9_ok = run_prefill_parity_case(
             model, 9u, model.attn_b_offset, kAttnOutDim, true,
             "prefill K=256 M=65 n_tok=9 (K-tail nb=1)", kAttnLowDim);
@@ -1680,6 +1932,7 @@ int main(int argc, char **argv) {
         ok = prefill9_ok && prefill30_ok && prefill128_ok &&
              prefill_tail9_ok &&
              prefill_tail128_ok && prefill_single9_ok &&
+             prefill_q_b_tile4_ok && q_b_f16_null_qhalf_ok &&
              prefill_single128_ok && prefill_pair9_ok &&
              prefill_pair30_reverse_ok && prefill_pair128_ok && attention9_ok &&
              attention30_ok && attention128_ok && attention_q8_9_ok &&
