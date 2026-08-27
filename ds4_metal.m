@@ -48492,6 +48492,43 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+        /* The specialization is arithmetically valid for every grouped-MM
+         * IQ2_XXS/Q2_K top-6 shape below.  Keep the automatic default narrower:
+         * resident kernel A/B and full-model SSD A/B measured the exact DS4
+         * production geometry at 4096 tokens.  An explicit ENABLE opts other
+         * eligible shapes in; ENABLE=0 and DISABLE=1 are rollback controls. */
+        const bool iq2_q2_mm_id_pair_tail_cull_eligible =
+            use_mm_id &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            down_type == DS4_METAL_TENSOR_Q2_K &&
+            request_mid_f16 &&
+            n_expert == 6 &&
+            g_tp_split_world == 1 &&
+            n_tokens >= 32u;
+        const bool iq2_q2_mm_id_pair_tail_cull_production_geometry =
+            n_total_expert == 256u &&
+            expert_in_dim == 4096u &&
+            expert_mid_dim == 2048u &&
+            out_dim == 4096u &&
+            gate_row_bytes == 1056u &&
+            gate_expert_bytes == 2162688u &&
+            down_row_bytes == 672u &&
+            down_expert_bytes == 2752512u;
+        const int enable_iq2_xxs_mm_id_pair_tail_simdgroup_cull =
+            ds4_gpu_env_bool(
+                "DS4_METAL_ENABLE_IQ2_XXS_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL");
+        const int disable_iq2_xxs_mm_id_pair_tail_simdgroup_cull =
+            ds4_gpu_env_bool(
+                "DS4_METAL_DISABLE_IQ2_XXS_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL");
+        const bool use_iq2_xxs_mm_id_pair_tail_simdgroup_cull =
+            iq2_q2_mm_id_pair_tail_cull_eligible &&
+            use_mm_id_pair_swiglu &&
+            disable_iq2_xxs_mm_id_pair_tail_simdgroup_cull != 1 &&
+            (enable_iq2_xxs_mm_id_pair_tail_simdgroup_cull == 1 ||
+             (enable_iq2_xxs_mm_id_pair_tail_simdgroup_cull == -1 &&
+              ds4_gpu_device_is_pre_m5_apple_silicon() &&
+              iq2_q2_mm_id_pair_tail_cull_production_geometry &&
+              n_tokens >= 4096u));
         /*
          * The MXFP4 32x32 specialization uses two SIMDgroups and 8 KiB of
          * threadgroup memory, and exactly culls SIMDgroup 1 on at-most-16-row
@@ -48670,7 +48707,21 @@ int ds4_gpu_routed_moe_batch_tensor(
                                 (use_mxfp4_mm_id_pair_half_scale ?
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale" :
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16")) :
-                            "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                            (use_iq2_xxs_mm_id_pair_tail_simdgroup_cull ?
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_tail_cull" :
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16"));
+                /* Custom DS4_METAL_MOE_SOURCE files may predate the promoted
+                 * symbol.  Preserve automatic-default compatibility by
+                 * falling back to the established pair kernel.  An explicit
+                 * ENABLE remains strict so benchmark/bring-up cannot silently
+                 * measure the baseline under the candidate label. */
+                if (!pair_swiglu_mm_pipeline &&
+                    gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+                    use_iq2_xxs_mm_id_pair_tail_simdgroup_cull &&
+                    enable_iq2_xxs_mm_id_pair_tail_simdgroup_cull != 1) {
+                    pair_swiglu_mm_pipeline = ds4_gpu_get_pipeline(
+                        "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                }
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {
