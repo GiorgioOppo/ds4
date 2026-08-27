@@ -3559,12 +3559,14 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
+        const uint tid = 32u*(uint)sgitg + (uint)tiisg;
+        const uint nth = 32u*(uint)NSG;
+        for (uint i = tid; i < 256u; i += nth) {
+            svalues[i] = ds4_metal_iq2xxs_grid[i];
+        }
+        for (uint i = tid; i < 128u; i += nth) {
+            ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3781,15 +3783,14 @@ void kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl(
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t *ssigns = (threadgroup uint8_t *)(svalues + 256);
     {
-        int base = (32 * sgitg + tiisg);
-        int pos_a = base << 2;
-        int pos_b = base << 1;
-        svalues[pos_a] = ds4_metal_iq2xxs_grid[pos_a];
-        svalues[pos_a + 1] = ds4_metal_iq2xxs_grid[pos_a + 1];
-        svalues[pos_a + 2] = ds4_metal_iq2xxs_grid[pos_a + 2];
-        svalues[pos_a + 3] = ds4_metal_iq2xxs_grid[pos_a + 3];
-        ssigns[pos_b] = ds4_metal_ksigns_iq2xs[pos_b];
-        ssigns[pos_b + 1] = ds4_metal_ksigns_iq2xs[pos_b + 1];
+        const uint tid = 32u * (uint)sgitg + (uint)tiisg;
+        const uint nth = 32u * (uint)NSG;
+        for (uint i = tid; i < 256u; i += nth) {
+            svalues[i] = ds4_metal_iq2xxs_grid[i];
+        }
+        for (uint i = tid; i < 128u; i += nth) {
+            ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
