@@ -3,3 +3,4 @@ __pycache__/
 local-runs/
 metal_decode_schedule_bench
 metal_prefill_variant_bench
+metal_q4_dense_pair_bench

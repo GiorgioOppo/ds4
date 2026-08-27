@@ -81,7 +81,7 @@ test-quantizer-indexer-q4: gguf-tools/deepseek4-quantize tests/test_quantizer_in
 	./tests/test_quantizer_indexer_q4 ./gguf-tools/deepseek4-quantize
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut test-mxfp4-metal
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench check-mxfp4-half-lut test-mxfp4-metal
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -108,6 +108,7 @@ help:
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
+	@echo "  make metal-q4-dense-pair-bench  Build the resident Q4 decode pair kernel benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make test-metal-exactn-oracle  Compare Metal exact-N state with sequential decode"
@@ -309,6 +310,11 @@ test-metal-exactn-oracle: tests/test_metal_exactn_oracle
 	DS4_TEST_REQUIRE_MODEL=1 \
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" \
 	./tests/test_metal_exactn_oracle
+
+speed-bench/metal_q4_dense_pair_bench: speed-bench/metal_q4_dense_pair_bench.m $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+metal-q4-dense-pair-bench: speed-bench/metal_q4_dense_pair_bench
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -893,4 +899,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_quantizer_indexer_q4 tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/bench_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_q4_dense_pair tests/test_metal_session_batch tests/test_metal_q4_streams tests/test_metal_indexer_q4 tests/test_metal_q4_attn_exactn tests/test_metal_q4_qb_f16_cache tests/test_metal_exactn_oracle tests/test_metal_dspark_capture tests/test_metal_argmax_top1 tests/test_metal_iq2_midonly tests/test_metal_iq2_ssd_grouped_mm tests/test_metal_iq2_live_index tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_q4_dense_pair_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_quantizer_indexer_q4 tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/bench_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_q4_dense_pair tests/test_metal_session_batch tests/test_metal_q4_streams tests/test_metal_indexer_q4 tests/test_metal_q4_attn_exactn tests/test_metal_q4_qb_f16_cache tests/test_metal_exactn_oracle tests/test_metal_dspark_capture tests/test_metal_argmax_top1 tests/test_metal_iq2_midonly tests/test_metal_iq2_ssd_grouped_mm tests/test_metal_iq2_live_index tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
