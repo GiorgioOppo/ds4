@@ -1462,6 +1462,11 @@ static void ds4_gpu_close_batch_encoder(void) {
 
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
+/* Stage profilers split a batch into owned command buffers.  Retain the GPU
+ * interval from the last synchronous completion on the calling thread so
+ * their reports can exclude CPU encoding, submit, and wait overhead. */
+static _Thread_local double g_last_completed_gpu_seconds;
+static _Thread_local int g_last_completed_gpu_time_valid;
 
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
@@ -1475,9 +1480,16 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 }
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    g_last_completed_gpu_time_valid = 0;
     [cb waitUntilCompleted];
+    const double gpu_start = cb.GPUStartTime;
+    const double gpu_end = cb.GPUEndTime;
+    const double busy = gpu_end - gpu_start;
+    if (isfinite(gpu_start) && isfinite(gpu_end) && busy > 0.0) {
+        g_last_completed_gpu_seconds = busy;
+        g_last_completed_gpu_time_valid = 1;
+    }
     if (getenv("DS4_METAL_GPU_BUSY_PROFILE")) {
-        const double busy = cb.GPUEndTime - cb.GPUStartTime;
         if (busy > 0) g_gpu_busy_accum += busy;
         if ((++g_gpu_busy_cbs % 64u) == 0u) {
             fprintf(stderr, "ds4: gpu busy accum %.1f ms over %llu cbs\n",
@@ -48945,19 +48957,23 @@ int ds4_gpu_routed_moe_batch_tensor(
                 } else { \
                     const char *stage_name = (name); \
                     const double now_ms = ds4_gpu_now_ms(); \
+                    const double gpu_ms = \
+                        g_last_completed_gpu_time_valid ? \
+                            g_last_completed_gpu_seconds * 1000.0 : -1.0; \
                     const int print_stage = \
                         !moe_stage_filter || !moe_stage_filter[0] || \
                         strstr(stage_name, moe_stage_filter) != NULL; \
                     if (print_stage) { \
                         fprintf(stderr, \
                                 "ds4: Metal routed MoE stage layer=%u tokens=%u pairs=%u experts=%u " \
-                                "gate=%s down=%s path=%s mid=%s %s=%.3f ms\n", \
+                                "gate=%s down=%s path=%s mid=%s " \
+                                "%s=%.3f ms gpu=%.3f ms\n", \
                                 layer_index, n_tokens, pair_rows, n_expert, \
                                 ds4_gpu_metal_tensor_type_name(gate_type), \
                                 ds4_gpu_metal_tensor_type_name(down_type), \
                                 moe_path, \
                                 request_mid_f16 ? "f16" : "f32", \
-                                stage_name, now_ms - moe_stage_t0); \
+                                stage_name, now_ms - moe_stage_t0, gpu_ms); \
                     } \
                     moe_stage_t0 = now_ms; \
                     if (ds4_gpu_begin_commands() == 0) { \
