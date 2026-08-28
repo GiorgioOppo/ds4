@@ -1265,9 +1265,10 @@ int main(void) {
           "DISABLE accounting");
     CHECK(unsetenv(k_disable) == 0, "clear cache disable env");
 
-    /* The SSD-streaming extension is opt-in: its default must continue to
-     * drop resident-only sidecars and reject the optimization without
-     * rebuilding them. */
+    /* The persistent-sidecar SSD extension is opt-in: its default must
+     * continue to drop resident-only sidecars and, under REQUIRE, reject the
+     * persistent cache path without rebuilding it.  The independent transient
+     * path is exercised below with REQUIRE cleared. */
     gate_before = gate_after;
     CHECK(gate_before.entries != 0u,
           "default SSD transition lacks a resident sidecar to release");
@@ -1533,10 +1534,9 @@ int main(void) {
 
     /* Exercise the public production selector, not only its benchmark hook.
      * Lower the threshold for this bounded oracle so aligned and boundary
-     * geometries fit in the guarded allocations.  Default mode must use one
-     * transient scratch without publishing persistent sidecars, while SSD
-     * streaming must return the clean native-Q4 fallback sentinel before
-     * touching output. */
+     * geometries fit in the guarded allocations.  Resident and SSD-streamed
+     * modes must use one transient scratch without publishing persistent
+     * sidecars. */
     ds4_gpu_test_q4_attn_q_b_f16_cache_reset();
     CHECK(unsetenv(k_require) == 0,
           "clear REQUIRE for transient production oracle");
@@ -1773,54 +1773,228 @@ int main(void) {
               transient_report.builds == 0u,
           "transient production published a persistent sidecar");
 
+    /* Install a second model identity whose registered view covers only a
+     * disjoint prefix.  Its byte-identical Q4 matrix starts at a deliberately
+     * non-page-aligned, uncovered offset, so this succeeds only when the SSD
+     * path creates an exact owned source view.  Running inside a real command
+     * batch also exercises the completion-handler lifetime under
+     * DS4_METAL_UNRETAINED_COMMAND_BUFFERS. */
+    const uint64_t ssd_transient_weight_offset = page + SSD_SOURCE_LEADING;
+    const uint64_t ssd_transient_model_bytes = align_up(
+        ssd_transient_weight_offset + weight_bytes, page);
+    void *ssd_transient_model = NULL;
+    CHECK(posix_memalign(&ssd_transient_model, (size_t)page,
+                         (size_t)ssd_transient_model_bytes) == 0,
+          "SSD transient exact-view model allocation");
+    memset(ssd_transient_model, 0, (size_t)ssd_transient_model_bytes);
+    fill_q4_matrix((block_q4_K *)((uint8_t *)ssd_transient_model +
+                                  ssd_transient_weight_offset));
+
+    const uint32_t ssd_transient_tokens = 64u;
+    const uint64_t ssd_transient_output_count =
+        (uint64_t)ssd_transient_tokens * OUT_DIM;
+    const uint64_t ssd_transient_output_bytes =
+        ssd_transient_output_count * sizeof(float);
+    const uint64_t ssd_transient_half_count =
+        (uint64_t)ssd_transient_tokens * IN_DIM;
+    const uint64_t ssd_transient_half_bytes =
+        ssd_transient_half_count * sizeof(uint16_t);
+    poison_f32(reference_host, output_storage_count, k_reference_poison);
     poison_f32(candidate_host, output_storage_count, k_candidate_poison);
     poison_f16(q_half_host, q_half_storage_count);
     CHECK(ds4_gpu_tensor_write(
+              reference_base, 0, reference_host,
+              output_storage_count * sizeof(float)) != 0,
+          "transient SSD reference poison upload");
+    CHECK(ds4_gpu_tensor_write(
               candidate_base, 0, candidate_host,
               output_storage_count * sizeof(float)) != 0,
-          "transient SSD fallback poison upload");
+          "transient SSD candidate poison upload");
     CHECK(ds4_gpu_tensor_write(
               q_half_base, 0, q_half_host,
               q_half_storage_count * sizeof(uint16_t)) != 0,
-          "transient SSD fallback q_half poison upload");
+          "transient SSD q_half poison upload");
+    ds4_gpu_tensor *transient_ssd_reference = ds4_gpu_tensor_view(
+        reference_base, GUARD_FLOATS * sizeof(float),
+        ssd_transient_output_bytes);
     ds4_gpu_tensor *transient_ssd_out = ds4_gpu_tensor_view(
         candidate_base, GUARD_FLOATS * sizeof(float),
-        (uint64_t)64u * OUT_DIM * sizeof(float));
+        ssd_transient_output_bytes);
     ds4_gpu_tensor *transient_ssd_half = ds4_gpu_tensor_view(
         q_half_base, GUARD_HALFS * sizeof(uint16_t),
-        (uint64_t)64u * IN_DIM * sizeof(uint16_t));
-    CHECK(transient_ssd_out && transient_ssd_half,
-          "transient SSD fallback tensor views");
+        ssd_transient_half_bytes);
+    CHECK(transient_ssd_reference && transient_ssd_out && transient_ssd_half,
+          "transient SSD exact-view tensor views");
+    CHECK(run_reference(
+              transient_ssd_reference, model, model_bytes, x,
+              ssd_transient_tokens) == 1,
+          "transient SSD native Q4 reference");
+    ds4_gpu_tensor_free(transient_ssd_reference);
+    CHECK(ds4_gpu_tensor_read(
+              reference_base, 0, reference_host,
+              output_storage_count * sizeof(float)) != 0,
+          "transient SSD reference readback");
+
+    /* Stream 0 already owns the resident oracle's 64 MiB scratch.  Move the
+     * SSD transient case to a fresh stream so its successful preflight also
+     * covers cold scratch + exact-source admission and allocation. */
+    ds4_gpu_set_stream(1);
     ds4_gpu_set_ssd_streaming(true);
-    CHECK(run_candidate(
+    CHECK(ds4_gpu_set_model_map_range(
+              ssd_transient_model, ssd_transient_model_bytes,
+              0u, page, page) != 0,
+          "install disjoint SSD transient model prefix");
+    const ds4_gpu_q4_attn_q_b_f16_sidecar_desc ssd_transient_desc = {
+        .weight_offset = ssd_transient_weight_offset,
+        .weight_bytes = weight_bytes,
+        .in_dim = IN_DIM,
+        .out_dim = OUT_DIM,
+        .weight_type = Q4_K_TYPE,
+        .layer = 0u,
+    };
+    ds4_gpu_q4_attn_q_b_f16_cache_report ssd_lifetime_before;
+    ds4_gpu_q4_attn_q_b_f16_cache_report ssd_lifetime_mid;
+    ds4_gpu_q4_attn_q_b_f16_cache_report ssd_lifetime_after;
+    ds4_gpu_stream_test_stats ssd_transients_before;
+    ds4_gpu_stream_test_stats ssd_transients_mid;
+    ds4_gpu_stream_test_stats ssd_transients_after;
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&ssd_lifetime_before);
+
+    /* A rejected session reserve must latch the transient selector off.  The
+     * public call then returns the native-Q4 fallback sentinel without
+     * touching either output, even though its smaller runtime-only gate would
+     * otherwise fit.  A later successful preflight re-arms the same slot. */
+    uint64_t ssd_transient_prepared_bytes = UINT64_MAX;
+    CHECK(ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+              ssd_transient_model, ssd_transient_model_bytes,
+              &ssd_transient_desc, 1u, 4096u, UINT64_MAX,
+              &ssd_transient_prepared_bytes) == 0,
+          "transient SSD oversized-reserve preflight rejection");
+    CHECK(ssd_transient_prepared_bytes == 0u,
+          "transient SSD rejected preflight allocated scratch");
+    CHECK(ds4_gpu_begin_commands() != 0,
+          "begin transient SSD rejected command batch");
+    CHECK(run_candidate_at(
               transient_ssd_out, transient_ssd_half,
-              model, model_bytes, x, 64u) == 0,
-          "transient path must fall back under SSD streaming");
+              ssd_transient_model, ssd_transient_model_bytes,
+              ssd_transient_weight_offset, x,
+              ssd_transient_tokens) == 0,
+          "transient SSD rejected preflight escaped admission latch");
+    CHECK(ds4_gpu_end_commands() != 0,
+          "finish transient SSD rejected command batch");
+    CHECK(ds4_gpu_tensor_read(
+              candidate_base, 0, candidate_host,
+              output_storage_count * sizeof(float)) != 0,
+          "transient SSD rejected output readback");
+    CHECK(ds4_gpu_tensor_read(
+              q_half_base, 0, q_half_host,
+              q_half_storage_count * sizeof(uint16_t)) != 0,
+          "transient SSD rejected q_half readback");
+    CHECK(count_poison_f32_mismatches(
+              candidate_host, 0u, output_storage_count,
+              k_candidate_poison) == 0u,
+          "transient SSD rejected preflight touched output");
+    CHECK(count_poison_f16_mismatches(
+              q_half_host, q_half_storage_count) == 0u,
+          "transient SSD rejected preflight touched q_half");
+
+    ssd_transient_prepared_bytes = UINT64_MAX;
+    CHECK(ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+              ssd_transient_model, ssd_transient_model_bytes,
+              &ssd_transient_desc, 1u, 4096u, 0u,
+              &ssd_transient_prepared_bytes) == 1,
+          "transient SSD successful preflight re-arm");
+    CHECK(ssd_transient_prepared_bytes == f16_cache_bytes,
+          "transient SSD cold preflight did not allocate one scratch");
+    ds4_gpu_test_stream_stats(&ssd_transients_before);
+    CHECK(ds4_gpu_begin_commands() != 0,
+          "begin transient SSD exact-view command batch");
+    CHECK(run_candidate_at(
+              transient_ssd_out, transient_ssd_half,
+              ssd_transient_model, ssd_transient_model_bytes,
+              ssd_transient_weight_offset, x,
+              ssd_transient_tokens) == 1,
+          "encode transient SSD exact-view candidate");
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&ssd_lifetime_mid);
+    ds4_gpu_test_stream_stats(&ssd_transients_mid);
+    CHECK(ssd_lifetime_mid.transient_exact_views_created ==
+              ssd_lifetime_before.transient_exact_views_created + 1u &&
+          ssd_lifetime_mid.transient_exact_views_live ==
+              ssd_lifetime_before.transient_exact_views_live + 1u &&
+          ssd_lifetime_mid.model_exact_cache_entries ==
+              ssd_lifetime_before.model_exact_cache_entries &&
+          ssd_lifetime_mid.model_exact_cache_bytes ==
+              ssd_lifetime_before.model_exact_cache_bytes &&
+          ssd_transients_mid.transient_references ==
+              ssd_transients_before.transient_references,
+          "transient SSD exact source was not command-buffer-owned");
+    CHECK(ds4_gpu_end_commands() != 0,
+          "finish transient SSD exact-view command batch");
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&ssd_lifetime_after);
+    ds4_gpu_test_stream_stats(&ssd_transients_after);
+    CHECK(ssd_lifetime_after.transient_exact_views_created ==
+              ssd_lifetime_before.transient_exact_views_created + 1u &&
+          ssd_lifetime_after.transient_exact_views_live ==
+              ssd_lifetime_before.transient_exact_views_live &&
+          ssd_lifetime_after.model_exact_cache_entries ==
+              ssd_lifetime_before.model_exact_cache_entries &&
+          ssd_lifetime_after.model_exact_cache_bytes ==
+              ssd_lifetime_before.model_exact_cache_bytes &&
+          ssd_transients_after.transient_references ==
+              ssd_transients_before.transient_references,
+          "transient SSD exact source leaked past command completion");
     ds4_gpu_tensor_free(transient_ssd_half);
     ds4_gpu_tensor_free(transient_ssd_out);
     CHECK(ds4_gpu_tensor_read(
               candidate_base, 0, candidate_host,
               output_storage_count * sizeof(float)) != 0,
-          "transient SSD fallback output readback");
+          "transient SSD candidate readback");
+    uint64_t transient_ssd_first = UINT64_MAX;
+    CHECK(count_bit_mismatches(
+              reference_host + GUARD_FLOATS,
+              candidate_host + GUARD_FLOATS,
+              ssd_transient_output_count,
+              &transient_ssd_first) == 0u,
+          "transient SSD exact-view bitwise mismatch");
     CHECK(count_poison_f32_mismatches(
-              candidate_host, 0u, output_storage_count,
+              candidate_host, 0u, GUARD_FLOATS,
+              k_candidate_poison) == 0u &&
+          count_poison_f32_mismatches(
+              candidate_host,
+              GUARD_FLOATS + ssd_transient_output_count,
+              output_storage_count,
               k_candidate_poison) == 0u,
-          "transient SSD fallback touched output");
+          "transient SSD exact-view touched output guards");
     CHECK(ds4_gpu_tensor_read(
               q_half_base, 0, q_half_host,
               q_half_storage_count * sizeof(uint16_t)) != 0,
-          "transient SSD fallback q_half readback");
-    CHECK(count_poison_f16_mismatches(
-              q_half_host, q_half_storage_count) == 0u,
-          "transient SSD fallback touched q_half");
+          "transient SSD q_half readback");
+    CHECK(count_poison_f16_mismatches_range(
+              q_half_host, 0u, GUARD_HALFS) == 0u &&
+          count_poison_f16_mismatches_range(
+              q_half_host, GUARD_HALFS,
+              GUARD_HALFS + ssd_transient_half_count) ==
+                  ssd_transient_half_count &&
+          count_poison_f16_mismatches_range(
+              q_half_host,
+              GUARD_HALFS + ssd_transient_half_count,
+              q_half_storage_count) == 0u,
+          "transient SSD q_half payload/canary mismatch");
+    ds4_gpu_test_q4_attn_q_b_f16_cache_report(&transient_report);
+    CHECK(transient_report.entries == 0u &&
+              transient_report.bytes == 0u &&
+              transient_report.lookups == 0u &&
+              transient_report.builds == 0u,
+          "transient SSD exact-view published a persistent sidecar");
     ds4_gpu_set_ssd_streaming(false);
+    ds4_gpu_set_stream(0);
     CHECK(setenv(k_require, "1", 1) == 0,
           "restore REQUIRE after transient production oracle");
     CHECK(unsetenv(k_transient_min_tokens) == 0,
           "restore transient production threshold");
     fprintf(stderr,
             "Metal Q4 attn_q_b transient F16 production selector "
-            "N=32/33/64 and SSD fallback: PASS\n");
+            "N=32/33/64 and SSD exact-view: PASS\n");
 
     /* The input, including both guards, is immutable across every path. */
     CHECK(ds4_gpu_tensor_read(
@@ -2363,6 +2537,7 @@ int main(void) {
     free(input_readback);
     free(input_host);
     free(support_model);
+    free(ssd_transient_model);
     free(model);
 
     CHECK(unsetenv(k_require) == 0, "clear cache require env at exit");

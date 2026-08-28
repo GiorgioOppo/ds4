@@ -567,12 +567,96 @@ static id<MTLBuffer> __strong
     g_q4_qb_transient_f16_scratch[DS4_GPU_MAX_STREAMS];
 static NSUInteger
     g_q4_qb_transient_f16_scratch_capacity[DS4_GPU_MAX_STREAMS];
-/* Protect only allocation/publication and cleanup.  Encoding never retains
- * this mutex; command ordering and the one-in-flight-batch-per-stream rule
- * protect reuse after a buffer has been captured strongly by the caller. */
+typedef struct {
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t generation;
+    uint64_t reserve_bytes;
+    bool admitted;
+} ds4_gpu_q4_qb_transient_f16_admission;
+static ds4_gpu_q4_qb_transient_f16_admission
+    g_q4_qb_transient_f16_admission[DS4_GPU_MAX_STREAMS];
+static uint64_t g_q4_qb_transient_f16_exact_views_created;
+static uint64_t g_q4_qb_transient_f16_exact_views_live;
+/* Protect allocation/publication, SSD admission metadata, and cleanup.
+ * Encoding never retains this mutex; command ordering and the
+ * one-in-flight-batch-per-stream rule protect reuse after a buffer has been
+ * captured strongly by the caller. */
 static pthread_mutex_t g_q4_qb_transient_f16_scratch_mu =
     PTHREAD_MUTEX_INITIALIZER;
 static int g_initialized;
+
+static void ds4_gpu_q4_qb_transient_f16_admission_clear(void) {
+    pthread_mutex_lock(&g_q4_qb_transient_f16_scratch_mu);
+    memset(g_q4_qb_transient_f16_admission, 0,
+           sizeof(g_q4_qb_transient_f16_admission));
+    pthread_mutex_unlock(&g_q4_qb_transient_f16_scratch_mu);
+}
+
+static bool ds4_gpu_q4_qb_transient_f16_admission_begin(
+        int stream,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t reserve_bytes,
+        bool *same_contract) {
+    if (stream < 0 || stream >= DS4_GPU_MAX_STREAMS) return false;
+    pthread_mutex_lock(&g_q4_qb_transient_f16_scratch_mu);
+    const bool invalidated =
+        g_q4_qb_transient_f16_admission[stream].admitted;
+    if (same_contract) {
+        *same_contract = invalidated &&
+            g_q4_qb_transient_f16_admission[stream].model_map == model_map &&
+            g_q4_qb_transient_f16_admission[stream].model_size == model_size &&
+            g_q4_qb_transient_f16_admission[stream].reserve_bytes ==
+                reserve_bytes;
+    }
+    g_q4_qb_transient_f16_admission[stream] =
+        (ds4_gpu_q4_qb_transient_f16_admission) {
+            .model_map = model_map,
+            .model_size = model_size,
+            .generation = 0u,
+            .reserve_bytes = reserve_bytes,
+            .admitted = false,
+        };
+    pthread_mutex_unlock(&g_q4_qb_transient_f16_scratch_mu);
+    return invalidated;
+}
+
+static void ds4_gpu_q4_qb_transient_f16_admission_commit(
+        int stream,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t generation,
+        uint64_t reserve_bytes) {
+    if (stream < 0 || stream >= DS4_GPU_MAX_STREAMS) return;
+    pthread_mutex_lock(&g_q4_qb_transient_f16_scratch_mu);
+    ds4_gpu_q4_qb_transient_f16_admission *state =
+        &g_q4_qb_transient_f16_admission[stream];
+    if (state->model_map == model_map &&
+        state->model_size == model_size) {
+        state->generation = generation;
+        state->reserve_bytes = reserve_bytes;
+        state->admitted = true;
+    }
+    pthread_mutex_unlock(&g_q4_qb_transient_f16_scratch_mu);
+}
+
+static bool ds4_gpu_q4_qb_transient_f16_admission_allows(
+        int stream,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t generation) {
+    if (stream < 0 || stream >= DS4_GPU_MAX_STREAMS) return false;
+    pthread_mutex_lock(&g_q4_qb_transient_f16_scratch_mu);
+    const ds4_gpu_q4_qb_transient_f16_admission *state =
+        &g_q4_qb_transient_f16_admission[stream];
+    const bool allowed = state->admitted &&
+        state->model_map == model_map &&
+        state->model_size == model_size &&
+        state->generation == generation;
+    pthread_mutex_unlock(&g_q4_qb_transient_f16_scratch_mu);
+    return allowed;
+}
 
 static void ds4_gpu_q4_attn_q_b_f16_cache_clear(int reset_stats) {
     pthread_mutex_lock(&g_q4_attn_q_b_f16_build_mu);
@@ -614,6 +698,15 @@ static void ds4_gpu_q4_attn_q_b_f16_cache_clear(int reset_stats) {
     pthread_mutex_unlock(&g_q4_attn_q_b_f16_build_mu);
 }
 
+static void ds4_gpu_q4_attn_q_b_f16_advance_generation(void) {
+    pthread_mutex_lock(&g_q4_attn_q_b_f16_cache_mu);
+    g_q4_attn_q_b_f16_cache_generation++;
+    if (g_q4_attn_q_b_f16_cache_generation == 0u) {
+        g_q4_attn_q_b_f16_cache_generation = 1u;
+    }
+    pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
+}
+
 void ds4_gpu_test_q4_attn_q_b_f16_cache_report(
         ds4_gpu_q4_attn_q_b_f16_cache_report *report) {
     if (!report) return;
@@ -632,6 +725,15 @@ void ds4_gpu_test_q4_attn_q_b_f16_cache_report(
         .build_circuit_open = (uint64_t)(
             g_q4_attn_q_b_f16_build_circuit_state !=
             DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED),
+        .transient_exact_views_created = __atomic_load_n(
+            &g_q4_qb_transient_f16_exact_views_created,
+            __ATOMIC_ACQUIRE),
+        .transient_exact_views_live = __atomic_load_n(
+            &g_q4_qb_transient_f16_exact_views_live,
+            __ATOMIC_ACQUIRE),
+        .model_exact_cache_entries = g_model_buffer_cache
+            ? (uint64_t)[g_model_buffer_cache count] : 0u,
+        .model_exact_cache_bytes = g_model_buffer_cache_bytes,
     };
     pthread_mutex_unlock(&g_q4_attn_q_b_f16_cache_mu);
 }
@@ -644,6 +746,13 @@ void ds4_gpu_test_q4_attn_q_b_f16_cache_reset(void) {
         return;
     }
     ds4_gpu_q4_attn_q_b_f16_cache_clear(1);
+    ds4_gpu_q4_qb_transient_f16_admission_clear();
+    __atomic_store_n(&g_q4_qb_transient_f16_exact_views_created,
+                     0u,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&g_q4_qb_transient_f16_exact_views_live,
+                     0u,
+                     __ATOMIC_RELEASE);
     __atomic_store_n(&g_q4_attn_q_b_f16_ssd_admission_blocked,
                      0,
                      __ATOMIC_RELEASE);
@@ -669,6 +778,7 @@ int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void) {
      * breaker open and must not poison the next resident session. */
     if (has_entries && g_initialized && !ds4_gpu_synchronize()) return 0;
     ds4_gpu_q4_attn_q_b_f16_cache_clear(0);
+    ds4_gpu_q4_qb_transient_f16_admission_clear();
     __atomic_store_n(&g_q4_attn_q_b_f16_ssd_admission_blocked,
                      0,
                      __ATOMIC_RELEASE);
@@ -5020,6 +5130,9 @@ void ds4_gpu_set_glm_model(bool enabled) {
 void ds4_gpu_set_ssd_streaming(bool enabled) {
     const int was_ssd_streaming = g_ssd_streaming_mode;
     g_ssd_streaming_mode = enabled ? 1 : 0;
+    if (g_ssd_streaming_mode != was_ssd_streaming) {
+        ds4_gpu_q4_qb_transient_f16_admission_clear();
+    }
     /* A real resident->streaming transition must re-evaluate sidecar
      * admission against the streaming reserve. Reasserting an already active
      * SSD mode is configuration plumbing, not a lifecycle boundary, and must
@@ -11618,8 +11731,16 @@ void ds4_gpu_cleanup(void) {
         for (int si = 0; si < DS4_GPU_MAX_STREAMS; si++) {
             g_q4_qb_transient_f16_scratch[si] = nil;
             g_q4_qb_transient_f16_scratch_capacity[si] = 0u;
+            g_q4_qb_transient_f16_admission[si] =
+                (ds4_gpu_q4_qb_transient_f16_admission) {0};
         }
         pthread_mutex_unlock(&g_q4_qb_transient_f16_scratch_mu);
+        __atomic_store_n(&g_q4_qb_transient_f16_exact_views_created,
+                         0u,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&g_q4_qb_transient_f16_exact_views_live,
+                         0u,
+                         __ATOMIC_RELEASE);
         ds4_gpu_stream_expert_pread_pool_shutdown();
         ds4_gpu_stream_expert_cache_clear_all(1);
         ds4_gpu_stream_expert_cache_live_release();
@@ -25786,6 +25907,27 @@ static id<MTLBuffer> ds4_gpu_q4_attn_q_b_f16_wrap_source(
         inner_offset);
 }
 
+static uint64_t ds4_gpu_q4_attn_q_b_f16_exact_source_bytes(
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t weight_bytes) {
+    if (model_size == 0u || weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset) {
+        return UINT64_MAX;
+    }
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t page_offset = weight_offset & ~(page - 1u);
+    const uint64_t leading = weight_offset - page_offset;
+    if (weight_bytes > UINT64_MAX - leading ||
+        leading + weight_bytes > UINT64_MAX - (page - 1u)) {
+        return UINT64_MAX;
+    }
+    uint64_t view_bytes = round_up_u64(leading + weight_bytes, page);
+    const uint64_t remaining = model_size - page_offset;
+    if (view_bytes > remaining) view_bytes = remaining;
+    return view_bytes;
+}
+
 static void ds4_gpu_q4_attn_q_b_f16_suppress_builds(
         ds4_gpu_q4_attn_q_b_f16_circuit_state state) {
     if (state == DS4_Q4_ATTN_Q_B_F16_CIRCUIT_CLOSED) return;
@@ -25911,7 +26053,9 @@ static int ds4_gpu_q4_qb_transient_f16_scratch_ensure_locked(
 /* Resolve the complete transient path and reserve its one stream-local
  * expansion buffer before prefill timing starts.  Per-layer Q4->F16 work is
  * intentionally not performed here: unlike PSO creation and allocation, that
- * dequantization is a real recurring cost of the optimized projection. */
+ * dequantization is a real recurring cost of the optimized projection.  SSD
+ * streaming additionally reserves room for one short-lived exact Q4 source
+ * view; the view itself is created only when its layer is encoded. */
 static int ds4_gpu_prepare_q4_attn_q_b_transient_f16(
         const void *model_map,
         uint64_t model_size,
@@ -25925,7 +26069,7 @@ static int ds4_gpu_prepare_q4_attn_q_b_transient_f16(
         "DS4_METAL_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS",
         4096u, 32u, UINT32_MAX);
     if (max_prefill_rows < min_tokens ||
-        g_ssd_streaming_mode || g_quality_mode ||
+        g_quality_mode ||
         g_batch_encoder_concurrent ||
         !ds4_gpu_device_is_pre_m5_apple_silicon() ||
         ds4_gpu_mpp_available() ||
@@ -25934,6 +26078,7 @@ static int ds4_gpu_prepare_q4_attn_q_b_transient_f16(
     }
 
     uint64_t f16_bytes = 0u;
+    uint64_t max_source_view_bytes = 0u;
     for (uint32_t i = 0; i < count; i++) {
         const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *desc = &descs[i];
         if (desc->weight_type != DS4_METAL_TENSOR_Q4_K ||
@@ -25953,6 +26098,14 @@ static int ds4_gpu_prepare_q4_attn_q_b_transient_f16(
             return 0;
         }
         f16_bytes = desc_f16_bytes;
+        if (g_ssd_streaming_mode) {
+            const uint64_t source_view_bytes =
+                ds4_gpu_q4_attn_q_b_f16_exact_source_bytes(
+                    model_size, desc->weight_offset, desc->weight_bytes);
+            if (source_view_bytes > max_source_view_bytes) {
+                max_source_view_bytes = source_view_bytes;
+            }
+        }
     }
     if (!model_map || f16_bytes == 0u || f16_bytes > NSUIntegerMax) {
         return 0;
@@ -25983,19 +26136,30 @@ static int ds4_gpu_prepare_q4_attn_q_b_transient_f16(
     }
 
     const int stream = g_ds4_stream;
+    const uint64_t effective_working_set_reserve_bytes =
+        ds4_gpu_q4_attn_q_b_f16_effective_working_set_reserve(
+            working_set_reserve_bytes, NULL);
     bool allocated = false;
     pthread_mutex_lock(&g_q4_qb_transient_f16_scratch_mu);
     const bool needs_allocation =
         !g_q4_qb_transient_f16_scratch[stream] ||
         g_q4_qb_transient_f16_scratch_capacity[stream] <
             (NSUInteger)f16_bytes;
-    uint64_t admission_bytes = f16_bytes;
-    if (UINT64_MAX - admission_bytes < working_set_reserve_bytes) {
+    uint64_t admission_bytes = needs_allocation ? f16_bytes : 0u;
+    const uint64_t source_view_bytes =
+        g_ssd_streaming_mode ? max_source_view_bytes : 0u;
+    if (UINT64_MAX - admission_bytes < source_view_bytes) {
         admission_bytes = UINT64_MAX;
     } else {
-        admission_bytes += working_set_reserve_bytes;
+        admission_bytes += source_view_bytes;
     }
-    if ((needs_allocation &&
+    if (UINT64_MAX - admission_bytes <
+            effective_working_set_reserve_bytes) {
+        admission_bytes = UINT64_MAX;
+    } else {
+        admission_bytes += effective_working_set_reserve_bytes;
+    }
+    if (((needs_allocation || g_ssd_streaming_mode) &&
          !ds4_gpu_q4_attn_q_b_f16_working_set_has_room(
              admission_bytes)) ||
         !ds4_gpu_q4_qb_transient_f16_scratch_ensure_locked(
@@ -26034,6 +26198,16 @@ int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
     }
     if (!g_initialized && !ds4_gpu_init()) return 0;
 
+    const uint64_t transient_effective_reserve_bytes =
+        ds4_gpu_q4_attn_q_b_f16_effective_working_set_reserve(
+            working_set_reserve_bytes, NULL);
+    bool ssd_transient_same_contract = false;
+    const bool ssd_transient_invalidated = g_ssd_streaming_mode &&
+        ds4_gpu_q4_qb_transient_f16_admission_begin(
+            g_ds4_stream, model_map, model_size,
+            transient_effective_reserve_bytes,
+            &ssd_transient_same_contract);
+
     const int required =
         ds4_gpu_env_bool("DS4_METAL_REQUIRE_Q4_ATTN_Q_B_F16_CACHE") == 1;
     const int transient_disabled =
@@ -26048,9 +26222,26 @@ int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
      * operator explicitly selects the legacy path, makes it mandatory, or
      * opts into the established SSD-streaming hybrid. */
     if (!required && !transient_disabled && !ssd_sidecar_opt_in) {
-        return ds4_gpu_prepare_q4_attn_q_b_transient_f16(
+        const int rc = ds4_gpu_prepare_q4_attn_q_b_transient_f16(
             model_map, model_size, descs, count, max_prefill_rows,
             working_set_reserve_bytes, prepared_bytes);
+        if (ssd_transient_invalidated &&
+            (rc != 1 || !ssd_transient_same_contract)) {
+            /* The stream slot is shared by sessions.  If an admitted slot is
+             * rejected or repurposed, invalidate every session that cached
+             * the old generation so it cannot skip its next preflight. */
+            ds4_gpu_q4_attn_q_b_f16_advance_generation();
+        }
+        if (rc == 1 && g_ssd_streaming_mode) {
+            ds4_gpu_q4_qb_transient_f16_admission_commit(
+                g_ds4_stream, model_map, model_size,
+                ds4_gpu_q4_attn_q_b_f16_cache_generation(),
+                transient_effective_reserve_bytes);
+        }
+        return rc;
+    }
+    if (ssd_transient_invalidated) {
+        ds4_gpu_q4_attn_q_b_f16_advance_generation();
     }
     const int disabled =
         ds4_gpu_env_bool("DS4_METAL_DISABLE_Q4_ATTN_Q_B_F16_CACHE") == 1;
@@ -26730,11 +26921,12 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor_impl(
     return 1;
 }
 
-/* Resident pre-M5 production path: rebuild one Q4_K q_b matrix into a
+/* Pre-M5 production path: rebuild one Q4_K q_b matrix into a
  * stream-local 64 MiB F16 buffer, consume it immediately with the compact
- * F16 RHS, and reuse that allocation for the next layer.  This removes the
- * native kernel's per-output-tile dequantization without retaining a 64 MiB
- * sidecar for every layer. */
+ * F16 RHS, and reuse that allocation for the next layer.  Under SSD streaming
+ * the current Q4 source is a short-lived exact no-copy view retained by its
+ * command buffer.  This removes the native kernel's per-output-tile
+ * dequantization without retaining a 64 MiB sidecar for every layer. */
 static int ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *q_half,
@@ -26766,7 +26958,7 @@ static int ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         "DS4_METAL_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS",
         4096u, 32u, UINT32_MAX);
     if ((uint64_t)n_tok < min_tokens ||
-        g_ssd_streaming_mode || g_quality_mode ||
+        g_quality_mode ||
         g_batch_encoder_concurrent ||
         !ds4_gpu_device_is_pre_m5_apple_silicon() ||
         ds4_gpu_mpp_available() ||
@@ -26811,6 +27003,12 @@ static int ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         g_ds4_stream < 0 || g_ds4_stream >= DS4_GPU_MAX_STREAMS) {
         return 0;
     }
+    if (g_ssd_streaming_mode &&
+        !ds4_gpu_q4_qb_transient_f16_admission_allows(
+            g_ds4_stream, model_map, model_size,
+            ds4_gpu_q4_attn_q_b_f16_cache_generation())) {
+        return 0;
+    }
 
     const bool mm_bc_out = (n_tok & 31u) != 0u;
     id<MTLComputePipelineState> dequant_pipeline =
@@ -26831,12 +27029,6 @@ static int ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         return 0;
     }
 
-    uint64_t weight_inner = 0u;
-    id<MTLBuffer> weight_buffer = ds4_gpu_wrap_model_range(
-        model_map, model_size, weight_offset, weight_bytes,
-        &weight_inner);
-    if (!weight_buffer || weight_inner > NSUIntegerMax) return 0;
-
     const int stream = g_ds4_stream;
     id<MTLBuffer> scratch = nil;
     pthread_mutex_lock(&g_q4_qb_transient_f16_scratch_mu);
@@ -26844,8 +27036,17 @@ static int ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         !g_q4_qb_transient_f16_scratch[stream] ||
         g_q4_qb_transient_f16_scratch_capacity[stream] <
             (NSUInteger)f16_bytes;
-    if ((needs_allocation &&
-         !ds4_gpu_q4_attn_q_b_f16_working_set_has_room(f16_bytes)) ||
+    uint64_t admission_bytes = needs_allocation ? f16_bytes : 0u;
+    if (g_ssd_streaming_mode) {
+        const uint64_t source_view_bytes =
+            ds4_gpu_q4_attn_q_b_f16_exact_source_bytes(
+                model_size, weight_offset, weight_bytes);
+        admission_bytes = UINT64_MAX - admission_bytes < source_view_bytes
+            ? UINT64_MAX
+            : admission_bytes + source_view_bytes;
+    }
+    if (((needs_allocation || g_ssd_streaming_mode) &&
+         !ds4_gpu_q4_attn_q_b_f16_working_set_has_room(admission_bytes)) ||
         !ds4_gpu_q4_qb_transient_f16_scratch_ensure_locked(
             stream, f16_bytes)) {
         pthread_mutex_unlock(&g_q4_qb_transient_f16_scratch_mu);
@@ -26854,9 +27055,42 @@ static int ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
     scratch = g_q4_qb_transient_f16_scratch[stream];
     pthread_mutex_unlock(&g_q4_qb_transient_f16_scratch_mu);
 
+    uint64_t weight_inner = 0u;
+    id<MTLBuffer> weight_buffer =
+        ds4_gpu_q4_attn_q_b_f16_wrap_source(
+            model_map, model_size, weight_offset, weight_bytes,
+            &weight_inner);
+    if (!weight_buffer || weight_inner > NSUIntegerMax) return 0;
+
     int owned = 0;
     id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
     if (!cb) return 0;
+    if (g_ssd_streaming_mode) {
+        /* Retained command buffers normally own every bound resource.  Keep
+         * the exact mmap view alive explicitly as well so the diagnostic
+         * unretained-command-buffer mode and asynchronous progress flushes
+         * obey the same lifetime contract.  The completion block releases the
+         * ~18 MiB view immediately instead of accumulating one per layer. */
+        id<MTLBuffer> retained_weight_buffer = weight_buffer;
+        dispatch_group_enter(g_progress_completion_group);
+        __atomic_add_fetch(
+            &g_q4_qb_transient_f16_exact_views_created,
+            1u,
+            __ATOMIC_RELEASE);
+        __atomic_add_fetch(
+            &g_q4_qb_transient_f16_exact_views_live,
+            1u,
+            __ATOMIC_RELEASE);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            (void)completed;
+            (void)[retained_weight_buffer length];
+            __atomic_sub_fetch(
+                &g_q4_qb_transient_f16_exact_views_live,
+                1u,
+                __ATOMIC_RELEASE);
+            dispatch_group_leave(g_progress_completion_group);
+        }];
+    }
 
     /* Copy may share the caller's current serial batch encoder.  Close it
      * before dequantization, then close the dequant encoder as well: each
@@ -26950,8 +27184,8 @@ int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         /* Default mode never falls through to the multi-GiB sidecar cache.
          * A non-candidate or any failure before the output writer returns the
          * native-Q4 fallback sentinel directly.  The explicit SSD hybrid
-         * remains on its persistent sidecar path because transient scratch is
-         * deliberately resident-only. */
+         * remains on its persistent sidecar path; ordinary SSD streaming uses
+         * one exact Q4 view and the same stream-local transient scratch. */
         return ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
             out, q_half, model_map, model_size, weight_offset, weight_type,
             in_dim, out_dim, x, n_tok, n_head, head_dim, n_rot, pos0,

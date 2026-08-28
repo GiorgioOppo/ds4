@@ -319,6 +319,10 @@ typedef struct ds4_gpu_q4_attn_q_b_f16_cache_report {
     uint64_t fallbacks;
     uint64_t rejects;
     uint64_t build_circuit_open;
+    uint64_t transient_exact_views_created;
+    uint64_t transient_exact_views_live;
+    uint64_t model_exact_cache_entries;
+    uint64_t model_exact_cache_bytes;
 } ds4_gpu_q4_attn_q_b_f16_cache_report;
 /* Test observability for the resident Metal Q4_K attn_q_b F16 sidecar. */
 void ds4_gpu_test_q4_attn_q_b_f16_cache_report(
