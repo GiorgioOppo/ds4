@@ -123,6 +123,188 @@ enum {
 static_assert((sizeof(cuda_block_q8_K) % sizeof(uint32_t)) == 0u,
               "ROCm Q8_K LDS copies require a whole number of words");
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* Experimental compressed Q4_K MMQ for resident gfx1151 prefill.
+ *
+ * This deliberately mirrors the live Q8 WMMA kernel: four wave32s compute a
+ * 64-token x 64-row output tile, K advances by 32, only the 64x32 activation
+ * tile is staged in 4 KiB of LDS, and accumulator fragments are written
+ * straight to the output.  Each lane dequantizes one Q4_K row/group directly
+ * into two F16 register vectors, so there is no Q8_K activation scratch and no
+ * persistent F16 weight sidecar.
+ *
+ * Arithmetic is not bit-identical to Q4_K x Q8_K: activations and transient
+ * weights round to F16 before F32 WMMA accumulation.  Host policy therefore
+ * keeps this path opt-in, physically device-resident, gfx1151-only, and out of
+ * quality mode until device-side A/B plus a prompt-level oracle promote it.
+ */
+enum {
+    ROCM_Q4_WMMA_M_TILE = 64u,
+    ROCM_Q4_WMMA_N_TILE = 64u,
+    ROCM_Q4_WMMA_K_TILE = 32u,
+    ROCM_Q4_WMMA_WAVES = 4u,
+    ROCM_Q4_WMMA_FRAGMENT = 16u,
+};
+
+typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q4_half16_t;
+typedef float __attribute__((ext_vector_type(8))) ds4_q4_float8_t;
+typedef uint8_t __attribute__((ext_vector_type(16))) ds4_q4_uchar16_t;
+
+__launch_bounds__(128, 2)
+__global__ static void rocm_matmul_q4_K_prefill_wmma64_strided_kernel(
+        float *out,
+        const char *w_base,
+        const float *x,
+        uint32_t n_tok,
+        uint32_t n_groups,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes,
+        uint64_t x_token_stride,
+        uint64_t x_group_stride,
+        uint64_t out_token_stride) {
+    if (warpSize != 32) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t group = blockIdx.z;
+    const uint32_t row0 = blockIdx.x * ROCM_Q4_WMMA_N_TILE;
+    const uint32_t tok0 = blockIdx.y * ROCM_Q4_WMMA_M_TILE;
+    if (group >= n_groups) return;
+
+    const uint32_t wave_row0 = row0 + wave * ROCM_Q4_WMMA_FRAGMENT;
+    const uint32_t my_row = wave_row0 + lane16;
+    const uint32_t safe_row = my_row < out_dim ? my_row : out_dim - 1u;
+    const cuda_block_q4_K *row_blocks =
+        reinterpret_cast<const cuda_block_q4_K *>(
+            w_base + ((uint64_t)group * out_dim + safe_row) * row_bytes);
+    const uint32_t q4_blocks = in_dim / CUDA_QK_K;
+
+    ds4_q4_float8_t acc0 = {0.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 0.0f};
+    ds4_q4_float8_t acc1 = acc0;
+    ds4_q4_float8_t acc2 = acc0;
+    ds4_q4_float8_t acc3 = acc0;
+    __shared__ _Float16 lds_x[ROCM_Q4_WMMA_M_TILE * ROCM_Q4_WMMA_K_TILE];
+
+    for (uint32_t block_index = 0u; block_index < q4_blocks;
+         block_index++) {
+        const cuda_block_q4_K *block = row_blocks + block_index;
+        const float block_d = dev_f16_to_f32(block->d);
+        const float block_dm = dev_f16_to_f32(block->dmin);
+        for (uint32_t qpair = 0u; qpair < 4u; qpair++) {
+            /* Adjacent 32-value groups are the low/high nibbles of the same
+             * 32 payload bytes.  Keep them in registers across both K tiles
+             * instead of issuing the same global loads twice. */
+            ds4_q4_uchar16_t packed0;
+            ds4_q4_uchar16_t packed1;
+            __builtin_memcpy(
+                &packed0, block->qs + qpair * 32u, sizeof(packed0));
+            __builtin_memcpy(
+                &packed1,
+                block->qs + qpair * 32u + ROCM_Q4_WMMA_FRAGMENT,
+                sizeof(packed1));
+
+            #pragma unroll
+            for (uint32_t nibble = 0u; nibble < 2u; nibble++) {
+                const uint32_t qgroup = qpair * 2u + nibble;
+                const uint32_t group32 = block_index * 8u + qgroup;
+                for (uint32_t j = tid;
+                     j < ROCM_Q4_WMMA_M_TILE * ROCM_Q4_WMMA_K_TILE;
+                     j += blockDim.x) {
+                    const uint32_t tok_local = j >> 5u;
+                    const uint32_t kk = j & 31u;
+                    const uint32_t tok = tok0 + tok_local;
+                    float value = 0.0f;
+                    if (tok < n_tok) {
+                        value = x[(uint64_t)tok * x_token_stride +
+                                  (uint64_t)group * x_group_stride +
+                                  (uint64_t)group32 * ROCM_Q4_WMMA_K_TILE +
+                                  kk];
+                    }
+                    lds_x[j] = (_Float16)value;
+                }
+                __syncthreads();
+
+                uint8_t scale = 0u;
+                uint8_t minimum = 0u;
+                dev_q4_K_get_scale_min(
+                    qgroup, block->scales, &scale, &minimum);
+                const float d = block_d * (float)scale;
+                const float dm = block_dm * (float)minimum;
+                const uint32_t shift = nibble * 4u;
+                ds4_q4_half16_t weights0;
+                ds4_q4_half16_t weights1;
+                #pragma unroll
+                for (uint32_t i = 0u; i < ROCM_Q4_WMMA_FRAGMENT; i++) {
+                    const uint8_t q0 = (packed0[i] >> shift) & 0x0fu;
+                    const uint8_t q1 = (packed1[i] >> shift) & 0x0fu;
+                    weights0[i] = (_Float16)(d * (float)q0 - dm);
+                    weights1[i] = (_Float16)(d * (float)q1 - dm);
+                }
+
+                #pragma unroll
+                for (uint32_t token_tile = 0u; token_tile < 4u;
+                     token_tile++) {
+                    const uint32_t token_local =
+                        token_tile * ROCM_Q4_WMMA_FRAGMENT + lane16;
+                    const _Float16 *activation =
+                        lds_x + token_local * ROCM_Q4_WMMA_K_TILE;
+                    const ds4_q4_half16_t activation0 =
+                        *reinterpret_cast<const ds4_q4_half16_t *>(activation);
+                    const ds4_q4_half16_t activation1 =
+                        *reinterpret_cast<const ds4_q4_half16_t *>(
+                            activation + ROCM_Q4_WMMA_FRAGMENT);
+                    if (token_tile == 0u) {
+                        acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights0, activation0, acc0);
+                        acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights1, activation1, acc0);
+                    } else if (token_tile == 1u) {
+                        acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights0, activation0, acc1);
+                        acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights1, activation1, acc1);
+                    } else if (token_tile == 2u) {
+                        acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights0, activation0, acc2);
+                        acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights1, activation1, acc2);
+                    } else {
+                        acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights0, activation0, acc3);
+                        acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            weights1, activation1, acc3);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t token_tile = 0u; token_tile < 4u; token_tile++) {
+        const uint32_t tok =
+            tok0 + token_tile * ROCM_Q4_WMMA_FRAGMENT + lane16;
+        if (tok >= n_tok) continue;
+        const ds4_q4_float8_t acc = token_tile == 0u
+            ? acc0
+            : (token_tile == 1u ? acc1
+                                : (token_tile == 2u ? acc2 : acc3));
+        #pragma unroll
+        for (uint32_t j = 0u; j < 8u; j++) {
+            const uint32_t row = wave_row0 + 2u * j + (lane >> 4u);
+            if (row < out_dim) {
+                out[(uint64_t)tok * out_token_stride +
+                    (uint64_t)group * out_dim + row] = acc[j];
+            }
+        }
+    }
+}
+#endif
+
 __device__ __forceinline__ static void
 rocm_dot_q4_K_q8_K_block8_reuse_weights(
         const cuda_block_q4_K *x,
@@ -562,6 +744,120 @@ static int rocm_q4_K_prefill_tile8_required(void) {
 }
 
 enum {
+    ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE = -1,
+    ROCM_Q4_PREFILL_WMMA_FALLBACK = 0,
+    ROCM_Q4_PREFILL_WMMA_USE = 1,
+};
+
+/* Test oracle for strict dispatch: REQUIRE must attest this launch wrapper,
+ * not merely produce output through a canonical fallback. */
+static uint64_t g_rocm_q4_prefill_wmma_launches;
+
+extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void) {
+    __atomic_store_n(&g_rocm_q4_prefill_wmma_launches, 0u,
+                     __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void) {
+    return __atomic_load_n(&g_rocm_q4_prefill_wmma_launches,
+                           __ATOMIC_RELAXED);
+}
+
+static int rocm_q4_K_prefill_wmma_select(
+        uint64_t n_tok,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        int weight_device_resident) {
+    const int enabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA") == 1;
+    const int ssd_enabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD") == 1;
+    const int disabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA") == 1;
+    const int required = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1;
+    const int requested = enabled || required ||
+                          (g_ssd_streaming_mode && ssd_enabled);
+    if (!requested) return ROCM_Q4_PREFILL_WMMA_FALLBACK;
+
+    const int shape_ok =
+        n_tok >= 256u && n_tok <= 4096u &&
+        in_dim != 0u && (in_dim % CUDA_QK_K) == 0u &&
+        out_dim != 0u && in_dim <= UINT32_MAX &&
+        out_dim <= UINT32_MAX && n_tok <= UINT32_MAX;
+    const int storage_ok = !g_ssd_streaming_mode ||
+                           ((ssd_enabled || required) &&
+                            weight_device_resident);
+    const int eligible = !disabled && shape_ok && storage_ok &&
+        !g_quality_mode && rocm_attention_runtime_is_gfx1151_wave32();
+    if (eligible) return ROCM_Q4_PREFILL_WMMA_USE;
+    if (!required) return ROCM_Q4_PREFILL_WMMA_FALLBACK;
+
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX
+            "required Q4_K prefill WMMA is unavailable "
+            "(N=%llu K=%llu M=%llu disabled=%d ssd=%d ssd_opt=%d "
+            "resident=%d quality=%d)\n",
+            (unsigned long long)n_tok,
+            (unsigned long long)in_dim,
+            (unsigned long long)out_dim,
+            disabled,
+            g_ssd_streaming_mode ? 1 : 0,
+            ssd_enabled,
+            weight_device_resident,
+            g_quality_mode ? 1 : 0);
+    return ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE;
+}
+
+static int rocm_q4_K_prefill_wmma_launch(
+        float *out,
+        const char *w,
+        const float *x,
+        uint32_t n_tok,
+        uint32_t n_groups,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes,
+        uint64_t x_token_stride,
+        uint64_t x_group_stride,
+        uint64_t out_token_stride,
+        const char *label) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    if (!out || !w || !x || n_groups == 0u) return 0;
+    const dim3 grid(
+        (unsigned)(((uint64_t)out_dim + ROCM_Q4_WMMA_N_TILE - 1u) /
+                   ROCM_Q4_WMMA_N_TILE),
+        (unsigned)(((uint64_t)n_tok + ROCM_Q4_WMMA_M_TILE - 1u) /
+                   ROCM_Q4_WMMA_M_TILE),
+        n_groups);
+    rocm_matmul_q4_K_prefill_wmma64_strided_kernel<<<grid, 128u>>>(
+        out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
+        x_token_stride, x_group_stride, out_token_stride);
+    const int ok = cuda_ok(
+        cudaGetLastError(), label ? label : "q4_K prefill WMMA64 launch");
+    if (ok) {
+        __atomic_fetch_add(&g_rocm_q4_prefill_wmma_launches, 1u,
+                           __ATOMIC_RELAXED);
+    }
+    return ok;
+#else
+    (void)out;
+    (void)w;
+    (void)x;
+    (void)n_tok;
+    (void)n_groups;
+    (void)in_dim;
+    (void)out_dim;
+    (void)row_bytes;
+    (void)x_token_stride;
+    (void)x_group_stride;
+    (void)out_token_stride;
+    (void)label;
+    return 0;
+#endif
+}
+
+enum {
     ROCM_Q4_PREFILL_K1024_TILE4_REQUIRED_FAILURE = -1,
     ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK = 0,
     ROCM_Q4_PREFILL_K1024_TILE4_USE = 1,
@@ -804,6 +1100,47 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
                                             weight_bytes, "q4_K dense");
     if (!wptr) return 0;
+    const char *resident_wptr = g_ssd_streaming_mode
+        ? rocm_q4_attn_q_b_device_resident_source(
+              model_map, weight_offset, weight_bytes)
+        : wptr;
+    const int weight_device_resident =
+        resident_wptr != NULL && resident_wptr == wptr;
+    int prefill_wmma = rocm_q4_K_prefill_wmma_select(
+        n_tok, in_dim, out_dim, weight_device_resident);
+    if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) return 0;
+    if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE &&
+        prefill_scope && prefill_tile8_required) {
+        if (rocm_q4_attn_q_b_env_bool(
+                "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4_K prefill cannot require both WMMA and TILE8\n");
+            return 0;
+        }
+        /* REQUIRE_TILE8 owns the dispatch when WMMA is only an optional
+         * experiment. */
+        prefill_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    }
+    if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE &&
+        k1024_tile4_shape && k1024_tile4_required) {
+        if (rocm_q4_attn_q_b_env_bool(
+                "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4_K prefill cannot require both WMMA and K1024 TILE4\n");
+            return 0;
+        }
+        prefill_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    }
+    if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE) {
+        return rocm_q4_K_prefill_wmma_launch(
+            reinterpret_cast<float *>(out->ptr), wptr,
+            reinterpret_cast<const float *>(x->ptr),
+            (uint32_t)n_tok, 1u, (uint32_t)in_dim, (uint32_t)out_dim,
+            row_bytes, in_dim, 0u, out_dim,
+            "q4_K dense prefill WMMA64 launch");
+    }
     int k1024_tile4 = ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK;
     if (prefill_scope && prefill_tile8) {
         k1024_tile4 = rocm_q4_K_prefill_k1024_tile4_resolve(
@@ -877,10 +1214,38 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
     const int prefill_scope = rocm_q4_K_prefill_tile8_scope(n_tok);
-    const int prefill_pair = prefill_scope &&
-                             rocm_q4_K_prefill_tile8_requested();
     const int prefill_required = prefill_scope &&
                                  rocm_q4_K_prefill_tile8_required();
+    const int wmma_required = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1;
+
+    /* The fused pair consumes a shared Q8_K activation tile.  When the direct
+     * F16 WMMA experiment is selected, return before validation/enqueue so the
+     * graph's established fallback issues two dense calls and both can take
+     * the strict WMMA path.  This also prevents REQUIRE from falsely passing
+     * after silently measuring the TILE8 pair.  SSD preflight is deliberately
+     * optimistic about residency: it only decides whether to yield; each dense
+     * fallback then proves its exact physical device range before enqueue. */
+    if (!prefill_required) {
+        const int wmma0 = rocm_q4_K_prefill_wmma_select(
+            n_tok, in_dim, out0_dim, 1);
+        const int wmma1 = rocm_q4_K_prefill_wmma_select(
+            n_tok, in_dim, out1_dim, 1);
+        if (wmma0 == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE ||
+            wmma1 == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE ||
+            wmma0 == ROCM_Q4_PREFILL_WMMA_USE ||
+            wmma1 == ROCM_Q4_PREFILL_WMMA_USE) {
+            return 0;
+        }
+    } else if (wmma_required) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "Q4_K prefill pair cannot require both WMMA and TILE8\n");
+        return 0;
+    }
+
+    const int prefill_pair = prefill_scope &&
+                             rocm_q4_K_prefill_tile8_requested();
     if (prefill_required && !prefill_pair) {
         fprintf(stderr,
                 "ds4: required ROCm Q4_K prefill tile8 pair is disabled "
@@ -1061,9 +1426,11 @@ static int rocm_q4_K_prefill_tile8_quant_launch(
         uint32_t in_dim,
         uint32_t out_dim,
         uint64_t row_bytes,
+        int prefill_wmma,
         const char *label) {
     uint64_t n_rows = 0;
     uint64_t xq_token_stride = 0;
+    uint64_t x_token_stride = 0;
     uint64_t out_token_stride = 0;
     const uint64_t blocks = in_dim / CUDA_QK_K;
     if (!out || !w || !x || n_tok == 0u || n_groups == 0u ||
@@ -1074,8 +1441,17 @@ static int rocm_q4_K_prefill_tile8_quant_launch(
          * eight groups, so even the 4096-token ceiling remains in range. */
         n_rows > UINT16_MAX ||
         !cuda_u64_mul_checked(n_groups, blocks, &xq_token_stride) ||
+        !cuda_u64_mul_checked(n_groups, in_dim, &x_token_stride) ||
         !cuda_u64_mul_checked(n_groups, out_dim, &out_token_stride)) {
         return 0;
+    }
+
+    if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE) {
+        return rocm_q4_K_prefill_wmma_launch(
+                   out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
+                   x_token_stride, in_dim, out_token_stride,
+                   label ? label : "q4_K attention-output WMMA64 launch")
+            ? 1 : -1;
     }
 
     cuda_block_q8_K *xq = rocm_q4_K_prequant_alloc(
@@ -1127,8 +1503,19 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
     const int tile8_requested = rocm_q4_K_prefill_tile8_requested();
     const int tile8_required = tile8_scope &&
                                rocm_q4_K_prefill_tile8_required();
+    const int wmma_enabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA") == 1;
+    const int wmma_ssd_enabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD") == 1;
+    const int wmma_disabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA") == 1;
+    const int wmma_required = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1;
+    const int wmma_requested = wmma_required ||
+        (!wmma_disabled && ((!g_ssd_streaming_mode && wmma_enabled) ||
+                           (g_ssd_streaming_mode && wmma_ssd_enabled)));
     if (!tile8_scope) return 0;
-    if (!tile8_requested) {
+    if (!tile8_requested && !wmma_requested) {
         if (tile8_required) {
             fprintf(stderr,
                     "ds4: required ROCm Q4_K attention-output prefill "
@@ -1138,7 +1525,8 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         }
         return 0;
     }
-    const int pre_enqueue_failure = tile8_required ? -1 : 0;
+    const int pre_enqueue_failure =
+        (tile8_required || wmma_required) ? -1 : 0;
 
     if (!out || !low || !heads || !model_map || group_dim == 0u ||
         rank == 0u || n_groups == 0u || out_dim == 0u ||
@@ -1203,13 +1591,61 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
             model_map, out_b_offset, out_b_bytes, "q4_K attention output B");
     if (!out_a || !out_b) return pre_enqueue_failure;
 
-    /* A: one quantization over [token,group] plus one z-grouped tile8 launch;
-     * no group pack/unpack buffers or n_tokens*n_groups dispatch loop. */
+    const char *resident_out_a = g_ssd_streaming_mode
+        ? rocm_q4_attn_q_b_device_resident_source(
+              model_map, out_a_offset, out_a_bytes)
+        : out_a;
+    const char *resident_out_b = g_ssd_streaming_mode && out_b_type == 12u
+        ? rocm_q4_attn_q_b_device_resident_source(
+              model_map, out_b_offset, out_b_bytes)
+        : out_b;
+    const int out_a_device_resident =
+        resident_out_a != NULL && resident_out_a == out_a;
+    const int out_b_device_resident =
+        resident_out_b != NULL && resident_out_b == out_b;
+
+    /* Resolve every strict WMMA decision before A can enqueue work.  That
+     * keeps REQUIRE fail-closed: an ineligible B projection can never make
+     * the graph replay a fallback over an already submitted A projection. */
+    int a_wmma = rocm_q4_K_prefill_wmma_select(
+        n_tokens, group_dim, rank, out_a_device_resident);
+    int b_wmma = out_b_type == 12u
+        ? rocm_q4_K_prefill_wmma_select(
+              n_tokens, low_dim, out_dim, out_b_device_resident)
+        : ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    if (a_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE ||
+        b_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) {
+        return -1;
+    }
+    if (tile8_required &&
+        (a_wmma == ROCM_Q4_PREFILL_WMMA_USE ||
+         b_wmma == ROCM_Q4_PREFILL_WMMA_USE)) {
+        if (wmma_required) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4_K attention-output prefill cannot require both "
+                    "WMMA and TILE8\n");
+            return -1;
+        }
+        a_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+        b_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    }
+    if (!tile8_requested &&
+        (a_wmma != ROCM_Q4_PREFILL_WMMA_USE ||
+         (out_b_type == 12u &&
+          b_wmma != ROCM_Q4_PREFILL_WMMA_USE))) {
+        return pre_enqueue_failure;
+    }
+
+    /* A: the WMMA candidate consumes F32 heads directly; TILE8 retains one
+     * quantization over [token,group].  Neither path needs group pack/unpack
+     * buffers or an n_tokens*n_groups dispatch loop. */
     const int a_rc = rocm_q4_K_prefill_tile8_quant_launch(
             reinterpret_cast<float *>(low->ptr), out_a,
             reinterpret_cast<const float *>(heads->ptr), n_tokens, n_groups,
             (uint32_t)group_dim, (uint32_t)rank, row_a_bytes,
-            "q4_K attention output A prequant");
+            a_wmma,
+            "q4_K attention output A WMMA64/tile8");
     if (a_rc <= 0) {
         return a_rc < 0 ? -1 : pre_enqueue_failure;
     }
@@ -1220,7 +1656,8 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                 reinterpret_cast<float *>(out->ptr), out_b,
                 reinterpret_cast<const float *>(low->ptr), n_tokens, 1u,
                 (uint32_t)low_dim, (uint32_t)out_dim, row_b_bytes,
-                "q4_K attention output B prequant");
+                b_wmma,
+                "q4_K attention output B WMMA64/tile8");
     } else {
         b_rc = ds4_gpu_matmul_q8_0_tensor(
                 out, model_map, model_size, out_b_offset, low_dim, out_dim,
@@ -1228,6 +1665,9 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
     }
     if (b_rc <= 0) return -1;
 
-    rocm_q4_K_prefill_tile8_note(0u, 0u, 1u, 0u, n_tokens);
+    if (a_wmma != ROCM_Q4_PREFILL_WMMA_USE &&
+        b_wmma != ROCM_Q4_PREFILL_WMMA_USE) {
+        rocm_q4_K_prefill_tile8_note(0u, 0u, 1u, 0u, n_tokens);
+    }
     return 1;
 }
