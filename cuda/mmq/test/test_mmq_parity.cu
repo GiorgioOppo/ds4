@@ -1984,7 +1984,13 @@ bool run_q4_K_dense_vec_gb10_parity(
                     cudaMemcpyDeviceToHost, stream);
     int rc_required_disabled = 0;
     int rc_oracle = 0;
+    int rc_nonresident_fallback = 0;
+    int rc_nonresident_required = 0;
+    cudaError_t nonresident_guard_setup_err = cudaSuccess;
     std::vector<float> oracle((size_t)M * N);
+    std::vector<float> nonresident_fallback((size_t)M * N);
+    std::vector<unsigned char> nonresident_guard(
+        (size_t)M * N * sizeof(float));
     if (persistent_k1024) {
         setenv("DS4_CUDA_NO_Q4_K1024_PERSISTENT", "1", 1);
         rc_required_disabled = ds4_mmq_q4_K_dense_vec(
@@ -1996,15 +2002,50 @@ bool run_q4_K_dense_vec_gb10_parity(
         unsetenv("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE");
         cudaMemcpyAsync(oracle.data(), dGot, oracle.size() * sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
+
+        /* Simulate the full runtime resolving W from mapped host/HMM rather
+         * than a cudaMalloc cache. ENABLE must fall back to canonical MMVQ;
+         * REQUIRE must reject before enqueue and leave the sentinel intact. */
+        unsetenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT");
+        rc_nonresident_fallback =
+            ds4_mmq_q4_K_dense_vec_with_weight_residency(
+                dW, dX, dGot, M, N, K,
+                /*weight_device_resident=*/0, stream);
+        cudaMemcpyAsync(nonresident_fallback.data(), dGot,
+                        nonresident_fallback.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaMemsetAsync(dGot, 0xa5, (size_t)M * N * sizeof(float), stream);
+        nonresident_guard_setup_err = cudaStreamSynchronize(stream);
+
+        setenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT", "1", 1);
+        rc_nonresident_required =
+            ds4_mmq_q4_K_dense_vec_with_weight_residency(
+                dW, dX, dGot, M, N, K,
+                /*weight_device_resident=*/0, stream);
+        cudaMemcpyAsync(nonresident_guard.data(), dGot,
+                        nonresident_guard.size(), cudaMemcpyDeviceToHost,
+                        stream);
     }
     const cudaError_t sync_err = cudaStreamSynchronize(stream);
     size_t mismatches = 0;
     size_t oracle_output_mismatches = 0;
+    size_t nonresident_fallback_mismatches = 0;
+    size_t nonresident_guard_mismatches = 0;
     for (size_t i = 0; i < ref.size(); i++) {
         if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0) mismatches++;
         if (persistent_k1024 &&
             std::memcmp(&ref[i], &oracle[i], sizeof(float)) != 0) {
             oracle_output_mismatches++;
+        }
+        if (persistent_k1024 &&
+            std::memcmp(&ref[i], &nonresident_fallback[i],
+                        sizeof(float)) != 0) {
+            nonresident_fallback_mismatches++;
+        }
+    }
+    if (persistent_k1024) {
+        for (unsigned char value : nonresident_guard) {
+            if (value != 0xa5u) nonresident_guard_mismatches++;
         }
     }
 
@@ -2015,24 +2056,36 @@ bool run_q4_K_dense_vec_gb10_parity(
         &candidates1, &uses1, &fallbacks1, &require_failures1,
         &oracle_calls1, &oracle_mismatches1, &oracle_skips1);
     const bool counter_ok = !persistent_k1024 ||
-        (candidates1 - candidates0 >= 4u &&
+        (candidates1 - candidates0 >= 6u &&
          uses1 - uses0 >= 2u &&
-         fallbacks1 - fallbacks0 >= 2u &&
-         require_failures1 - require_failures0 >= 1u &&
+         fallbacks1 - fallbacks0 >= 4u &&
+         require_failures1 - require_failures0 >= 2u &&
          oracle_calls1 - oracle_calls0 >= 1u &&
          oracle_mismatches1 == oracle_mismatches0 &&
          oracle_skips1 == oracle_skips0);
     ok = rc_ref == 0 && rc_got == 0 &&
          (!persistent_k1024 || rc_required_disabled != 0) &&
          (!persistent_k1024 || rc_oracle == 0) &&
+         (!persistent_k1024 || rc_nonresident_fallback == 0) &&
+         (!persistent_k1024 || rc_nonresident_required != 0) &&
+         nonresident_guard_setup_err == cudaSuccess &&
          sync_err == cudaSuccess &&
-         mismatches == 0 && oracle_output_mismatches == 0 && counter_ok;
+         mismatches == 0 && oracle_output_mismatches == 0 &&
+         nonresident_fallback_mismatches == 0 &&
+         nonresident_guard_mismatches == 0 && counter_ok;
     fprintf(stderr,
             "rc_ref=%d rc_candidate=%d rc_required_disabled=%d "
-            "rc_oracle=%d mismatches=%zu oracle_output_mismatches=%zu "
-            "counter_delta=%llu/%llu/%llu/%llu/%llu/%llu/%llu sync=%s\n%s\n\n",
-            rc_ref, rc_got, rc_required_disabled, rc_oracle, mismatches,
-            oracle_output_mismatches,
+            "rc_oracle=%d rc_nonresident_fallback=%d "
+            "rc_nonresident_required=%d mismatches=%zu "
+            "oracle_output_mismatches=%zu "
+            "nonresident_fallback_mismatches=%zu "
+            "nonresident_guard_mismatches=%zu "
+            "counter_delta=%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+            "guard_setup=%s sync=%s\n%s\n\n",
+            rc_ref, rc_got, rc_required_disabled, rc_oracle,
+            rc_nonresident_fallback, rc_nonresident_required, mismatches,
+            oracle_output_mismatches, nonresident_fallback_mismatches,
+            nonresident_guard_mismatches,
             (unsigned long long)(candidates1 - candidates0),
             (unsigned long long)(uses1 - uses0),
             (unsigned long long)(fallbacks1 - fallbacks0),
@@ -2040,6 +2093,7 @@ bool run_q4_K_dense_vec_gb10_parity(
             (unsigned long long)(oracle_calls1 - oracle_calls0),
             (unsigned long long)(oracle_mismatches1 - oracle_mismatches0),
             (unsigned long long)(oracle_skips1 - oracle_skips0),
+            cudaGetErrorString(nonresident_guard_setup_err),
             cudaGetErrorString(sync_err),
             ok ? "PASS" : "FAIL");
 

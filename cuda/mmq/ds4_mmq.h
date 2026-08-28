@@ -968,6 +968,24 @@ int ds4_mmq_q4_K_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// Full-runtime form of ds4_mmq_q4_K_dense_vec. The CUDA model resolver
+// supplies weight_device_resident from allocation/cache provenance so the
+// exact K1024 persistent candidate can reject mapped-host/HMM weights without
+// issuing cudaPointerGetAttributes on every decode dispatch. Only a positive
+// hint admits that candidate; zero/negative provenance remains fail-closed and
+// canonical MMVQ stays available. The legacy entry
+// above performs its own pointer-attribute query for standalone callers and
+// benchmarks that allocate W with cudaMalloc.
+int ds4_mmq_q4_K_dense_vec_with_weight_residency(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           weight_device_resident,
+    cudaStream_t  stream);
+
 // Exact grouped one-row Q4_K MMVQ for AProjQ4 attention-A on a single GB10.
 // W is [n_groups][M][K], X is [n_groups][K], and out is
 // [n_groups][M].  Each group retains the canonical dense_vec reduction tree;
@@ -1018,7 +1036,9 @@ int ds4_mmq_q4_K_grouped_batch_vec(
 // run it with DS4_CUDA_DECODE_GRAPHS=0. Set
 // DS4_CUDA_Q4_K1024_PERSISTENT_STATS=1 for the atexit counter summary.
 // DS4_CUDA_NO_Q4_GB10_FAST=1 is the umbrella rollback for this and the
-// GB10 Q4 activation scratch. Other shapes and devices retain canonical MMVQ.
+// GB10 Q4 activation scratch. The candidate additionally requires W to be in
+// CUDA device allocation/cache storage; mapped host and managed/HMM pointers
+// retain canonical MMVQ. Other shapes and devices retain canonical MMVQ.
 void ds4_mmq_q4_K_k1024_persistent_counters(
     uint64_t *candidates,
     uint64_t *uses,

@@ -4028,6 +4028,7 @@ int ds4_mmq_dense_vec_impl(
         int           M,
         int           N,
         int           K,
+        int           q4_weight_device_resident,
         cudaStream_t  stream) {
 
     if (!W || !X_f32 || !out_f32) {
@@ -4078,6 +4079,7 @@ int ds4_mmq_dense_vec_impl(
         }
         if (q4_k1024_exact && gb10_optimizations_enabled() &&
             (enable || q4_k1024_oracle) && !disable &&
+            q4_weight_device_resident > 0 &&
             (((uintptr_t)W & 15u) == 0u)) {
             const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
             const int nsm = ggml_cuda_info().devices[dev].nsm;
@@ -6809,14 +6811,51 @@ extern "C" int ds4_mmq_q8_0_dense_vec(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_vec_impl<GGML_TYPE_Q8_0>(
-        "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
+        "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K,
+        /*q4_weight_device_resident=*/0, stream);
+}
+
+static int ds4_mmq_pointer_is_device_resident(
+        const void *ptr, int expected_device) {
+    if (!ptr || expected_device < 0) return 0;
+    cudaPointerAttributes attr = {};
+    const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+#if CUDART_VERSION >= 10000
+    return attr.type == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#else
+    return attr.memoryType == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#endif
 }
 
 extern "C" int ds4_mmq_q4_K_dense_vec(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
+    int weight_device_resident = 0;
+    /* Keep pointer introspection out of generic Q4 MMVQ traffic. It is only
+     * needed when the exact-shape persistent candidate could be considered;
+     * the full runtime uses the explicit provenance API below instead. */
+    if (M == 32768 && N == 1 && K == 1024) {
+        weight_device_resident = ds4_mmq_pointer_is_device_resident(
+            W, ggml_cuda_get_device());
+    }
     return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
-        "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K, stream);
+        "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K,
+        weight_device_resident, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_vec_with_weight_residency(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, int weight_device_resident,
+        cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_vec_with_weight_residency",
+        W, X, out, M, N, K, weight_device_resident > 0, stream);
 }
 
 extern "C" int ds4_mmq_q4_K_grouped_vec(

@@ -1932,13 +1932,54 @@ extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint
     return 1;
 }
 
+static int cuda_resolved_model_range_is_device_resident(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *resolved_ptr) {
+    if (!resolved_ptr) return 0;
+    if (model_map == g_model_host_base &&
+        g_model_device_owned && g_model_device_base &&
+        resolved_ptr == g_model_device_base + offset) {
+        return 1;
+    }
+    const uint64_t end = offset + bytes;
+    if (end < offset) return 0;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base != model_map || !r.device_ptr ||
+            offset < r.offset) {
+            continue;
+        }
+        const uint64_t delta = offset - r.offset;
+        if (delta > r.bytes || bytes > r.bytes - delta) continue;
+        const char *range_ptr = r.device_ptr + delta;
+        if (range_ptr == resolved_ptr) {
+            /* host_registered ranges are CUDA-addressable but page-backed by
+             * the mmap. All other cuda_model_range entries originate from
+             * cudaMalloc (standalone or arena-backed) and are resident even
+             * on GB10's physically unified memory. */
+            return r.host_registered == 0;
+        }
+    }
+    return 0;
+}
+
 static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t offset,
                                             uint64_t bytes,
                                             int logical_tier,
-                                            const char *label) {
+                                            const char *label,
+                                            int *device_resident = NULL) {
+    if (device_resident) *device_resident = 0;
     if (g_n_gpus <= 1) {
-        return cuda_model_range_ptr(model_map, offset, bytes, label);
+        const char *ptr = cuda_model_range_ptr(
+            model_map, offset, bytes, label);
+        if (device_resident) {
+            *device_resident =
+                cuda_resolved_model_range_is_device_resident(
+                    model_map, offset, bytes, ptr);
+        }
+        return ptr;
     }
     if (g_support_host_base && model_map == g_support_host_base) {
         offset += g_support_offset_bias;
@@ -1953,6 +1994,7 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
     void *dev_ptr = NULL;
     if (ds4_gpu_lookup_cache_strict(offset, bytes, physical_device, &dev_ptr)
         && dev_ptr) {
+        if (device_resident) *device_resident = 1;
         return (const char *)dev_ptr;
     }
     /* GLM multi-tier: generic launchers resolve by the OUT tensor's tier,
@@ -1964,6 +2006,7 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
         cur_dev != physical_device &&
         ds4_gpu_lookup_cache_strict(offset, bytes, cur_dev, &dev_ptr) &&
         dev_ptr) {
+        if (device_resident) *device_resident = 1;
         return (const char *)dev_ptr;
     }
     fprintf(stderr,
@@ -40360,9 +40403,10 @@ static int cuda_matmul_q4_K_tensor(
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
-    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
-                                               weight_bytes, logical_tier,
-                                               "q4_K dense");
+    int weight_device_resident = 0;
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "q4_K dense", &weight_device_resident);
     if (!wptr) return 0;
     /* The scalar-token kernel below rereads every weight row for every token,
      * making prefill scale almost linearly with batch length. MMQ tiles both
@@ -40374,9 +40418,10 @@ static int cuda_matmul_q4_K_tensor(
          * regular MMQ wins once enough token columns can share each weight
          * tile. Both consume the GGUF Q4_K layout directly. */
         const int rc = n_tok <= 8u
-            ? ds4_mmq_q4_K_dense_vec(
+            ? ds4_mmq_q4_K_dense_vec_with_weight_residency(
                   wptr, (const float *)x->ptr, (float *)out->ptr,
                   (int)out_dim, (int)n_tok, (int)in_dim,
+                  weight_device_resident,
                   cuda_decode_stream())
             : ds4_mmq_q4_K_dense(
                   wptr, (const float *)x->ptr, (float *)out->ptr,
