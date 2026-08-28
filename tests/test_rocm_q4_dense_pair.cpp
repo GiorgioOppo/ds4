@@ -28,7 +28,12 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <sys/mman.h>
 #include <vector>
+
+extern "C" int ds4_rocm_test_q4_prefill_k1024_tile4_policy(
+    int ssd_streaming, int weight_device_resident, int ssd_enabled,
+    int disabled, int required);
 
 namespace {
 
@@ -66,6 +71,10 @@ constexpr const char *kPrefillRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8";
 constexpr const char *kPrefillK1024Tile4Disable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4";
+constexpr const char *kPrefillK1024Tile4SsdEnable =
+    "DS4_ROCM_ENABLE_Q4_PREFILL_K1024_TILE4_SSD";
+constexpr const char *kPrefillK1024Tile4Require =
+    "DS4_ROCM_REQUIRE_Q4_PREFILL_K1024_TILE4";
 constexpr const char *kQbF16Enable =
     "DS4_ROCM_ENABLE_Q4_ATTN_Q_B_F16_CACHE";
 constexpr const char *kQbF16Disable =
@@ -702,6 +711,31 @@ bool output_guard_unchanged(const std::vector<float> &values,
     return mismatches == 0;
 }
 
+bool output_body_overwritten(const std::vector<float> &values,
+                             const std::vector<float> &sentinel,
+                             size_t logical_count,
+                             const char *label) {
+    if (values.size() != sentinel.size() || logical_count > values.size()) {
+        std::fprintf(stderr, "%s: invalid body geometry FAIL\n", label);
+        return false;
+    }
+    uint64_t unchanged = 0;
+    size_t first = logical_count;
+    for (size_t i = 0; i < logical_count; i++) {
+        if (std::memcmp(&values[i], &sentinel[i], sizeof(float)) == 0) {
+            if (unchanged == 0) first = i;
+            unchanged++;
+        }
+    }
+    std::fprintf(stderr, "%s: unchanged=%llu/%zu %s\n",
+                 label, (unsigned long long)unchanged, logical_count,
+                 unchanged == 0 ? "PASS" : "FAIL");
+    if (unchanged != 0) {
+        std::fprintf(stderr, "  first unwritten output at float %zu\n", first);
+    }
+    return unchanged == 0;
+}
+
 bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
                              uint64_t offset, uint32_t out_dim,
                              bool compare_cpu, const char *label,
@@ -727,12 +761,18 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
     env_snapshot disable(kPrefillDisable);
     env_snapshot require(kPrefillRequire);
     env_snapshot k1024_tile4_disable(kPrefillK1024Tile4Disable);
+    env_snapshot k1024_tile4_ssd_enable(kPrefillK1024Tile4SsdEnable);
+    env_snapshot k1024_tile4_require(kPrefillK1024Tile4Require);
+    const bool require_k1024_tile4 =
+        in_dim == kTailK && out_dim == kQbOutDim;
 
     // The authoritative rollback remains the reference now that the tiled
     // path is default-on.
     (void)unsetenv(kPrefillEnable);
     (void)setenv(kPrefillDisable, "1", 1);
     (void)unsetenv(kPrefillRequire);
+    (void)unsetenv(kPrefillK1024Tile4SsdEnable);
+    (void)unsetenv(kPrefillK1024Tile4Require);
     const int legacy_rc = ds4_gpu_matmul_quant_tensor(
         legacy_gpu.ptr, model.data, model.size, offset, kQ4Type,
         in_dim, out_dim, x_gpu.ptr, n_tokens);
@@ -744,6 +784,12 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
     (void)unsetenv(kPrefillDisable);
     (void)setenv(kPrefillRequire, "1", 1);
     (void)unsetenv(kPrefillK1024Tile4Disable);
+    (void)unsetenv(kPrefillK1024Tile4SsdEnable);
+    if (require_k1024_tile4) {
+        (void)setenv(kPrefillK1024Tile4Require, "1", 1);
+    } else {
+        (void)unsetenv(kPrefillK1024Tile4Require);
+    }
     const int candidate_rc = ds4_gpu_matmul_quant_tensor(
         candidate_gpu.ptr, model.data, model.size, offset, kQ4Type,
         in_dim, out_dim, x_gpu.ptr, n_tokens);
@@ -1002,6 +1048,194 @@ bool run_q_b_f16_null_qhalf_case(const aligned_model &model) {
                  prepare_rc, default_rc, provided_rc, scratch_rc,
                  (double)prepared_bytes / 1048576.0, release_rc,
                  ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_prefill_k1024_tile4_policy_oracle() {
+    struct policy_case {
+        const char *label;
+        int ssd_streaming;
+        int device_resident;
+        int ssd_enabled;
+        int disabled;
+        int required;
+        int expected;
+    };
+    const policy_case cases[] = {
+        {"resident default remains automatic", 0, 0, 0, 0, 0, 1},
+        {"resident rollback", 0, 1, 0, 1, 0, 0},
+        {"resident DISABLE dominates REQUIRE", 0, 1, 1, 1, 1, -1},
+        {"SSD default stays conservative", 1, 1, 0, 0, 0, 0},
+        {"SSD opt-in rejects a nonresident range", 1, 0, 1, 0, 0, 0},
+        {"SSD opt-in accepts a resident range", 1, 1, 1, 0, 0, 1},
+        {"SSD REQUIRE rejects a nonresident range", 1, 0, 0, 0, 1, -1},
+        {"SSD REQUIRE requests a resident range", 1, 1, 0, 0, 1, 1},
+        {"SSD DISABLE dominates ENABLE", 1, 1, 1, 1, 0, 0},
+        {"SSD DISABLE dominates REQUIRE", 1, 1, 1, 1, 1, -1},
+    };
+
+    bool ok = true;
+    for (const policy_case &test : cases) {
+        const int got = ds4_rocm_test_q4_prefill_k1024_tile4_policy(
+            test.ssd_streaming, test.device_resident, test.ssd_enabled,
+            test.disabled, test.required);
+        if (got != test.expected) {
+            std::fprintf(stderr,
+                         "K1024 TILE4 policy %s: expected=%d got=%d FAIL\n",
+                         test.label, test.expected, got);
+            ok = false;
+        }
+    }
+    std::fprintf(stderr,
+                 "ROCm Q4 K1024 TILE4 policy oracle: cases=%zu %s\n",
+                 sizeof(cases) / sizeof(cases[0]), ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_prefill_k1024_tile4_ssd_case(const aligned_model &model) {
+    constexpr uint32_t n_tokens = 9u;
+    const size_t logical_count = (size_t)n_tokens * kQbOutDim;
+    const size_t allocation_count = logical_count + kOutputGuardFloats;
+    const std::vector<float> sentinel = sentinel_values(allocation_count);
+    std::vector<float> x;
+    fill_activation(&x, n_tokens, kTailK);
+    tensor_owner x_gpu(x.size() * sizeof(float));
+    tensor_owner tile8_gpu(allocation_count * sizeof(float));
+    tensor_owner tile4_gpu(allocation_count * sizeof(float));
+    if (!x_gpu.ptr || !tile8_gpu.ptr || !tile4_gpu.ptr ||
+        !write_tensor(x_gpu.ptr, x) ||
+        !write_tensor(tile8_gpu.ptr, sentinel) ||
+        !write_tensor(tile4_gpu.ptr, sentinel)) {
+        std::fprintf(stderr, "prefill K1024 TILE4 SSD: setup FAIL\n");
+        return false;
+    }
+
+    env_snapshot tile8_disable(kPrefillDisable);
+    env_snapshot tile8_require(kPrefillRequire);
+    env_snapshot tile4_enable(kPrefillK1024Tile4SsdEnable);
+    env_snapshot tile4_disable(kPrefillK1024Tile4Disable);
+    env_snapshot tile4_require(kPrefillK1024Tile4Require);
+    env_snapshot cache_limit("DS4_ROCM_STREAM_MODEL_CACHE_GB");
+    (void)unsetenv(kPrefillDisable);
+    (void)setenv(kPrefillRequire, "1", 1);
+    (void)unsetenv(kPrefillK1024Tile4SsdEnable);
+    (void)unsetenv(kPrefillK1024Tile4Disable);
+    (void)unsetenv(kPrefillK1024Tile4Require);
+    (void)setenv("DS4_ROCM_STREAM_MODEL_CACHE_GB", "1", 1);
+
+    FILE *model_file = std::tmpfile();
+    void *ssd_model_map = MAP_FAILED;
+    bool model_map_switched = false;
+    bool ok = model_file != nullptr && model.size <= (uint64_t)SIZE_MAX;
+    if (ok) {
+        ok = std::fwrite(model.data, 1u, (size_t)model.size, model_file) ==
+                 (size_t)model.size &&
+             std::fflush(model_file) == 0;
+    }
+    const int model_fd = ok ? fileno(model_file) : -1;
+    if (ok && model_fd >= 0) {
+        ssd_model_map = mmap(nullptr, (size_t)model.size, PROT_READ,
+                             MAP_PRIVATE, model_fd, 0);
+        ok = ssd_model_map != MAP_FAILED;
+    } else {
+        ok = false;
+    }
+    if (ok) {
+        ok = ds4_gpu_synchronize() != 0 &&
+             ds4_gpu_set_model_map(ssd_model_map, model.size) != 0;
+        model_map_switched = ok;
+    }
+    if (ok) ok = ds4_gpu_set_model_fd(model_fd) != 0;
+
+    int tile8_rc = 0;
+    int tile4_rc = 0;
+    int rejected_rc = 1;
+    if (ok) {
+        /* Switching modes releases prior synthetic resident ranges.  The
+         * default call reloads q_b from the file into the normal SSD device
+         * cache but must retain TILE8 because the new SSD candidate is off. */
+        ds4_gpu_set_ssd_streaming(true);
+        tile8_rc = ds4_gpu_matmul_quant_tensor(
+            tile8_gpu.ptr, ssd_model_map, model.size,
+            model.q_b_k1024_offset,
+            kQ4Type, kTailK, kQbOutDim, x_gpu.ptr, n_tokens);
+
+        /* REQUIRE is also an opt-in.  The second call reuses the already
+         * cached device range and cannot false-green through TILE8. */
+        (void)setenv(kPrefillK1024Tile4SsdEnable, "1", 1);
+        (void)setenv(kPrefillK1024Tile4Require, "1", 1);
+        tile4_rc = ds4_gpu_matmul_quant_tensor(
+            tile4_gpu.ptr, ssd_model_map, model.size,
+            model.q_b_k1024_offset,
+            kQ4Type, kTailK, kQbOutDim, x_gpu.ptr, n_tokens);
+    }
+
+    std::vector<float> tile8_host(allocation_count);
+    std::vector<float> tile4_host(allocation_count);
+    const bool read_ok = tile8_rc != 0 && tile4_rc != 0 &&
+        read_tensor(tile8_gpu.ptr, &tile8_host) &&
+        read_tensor(tile4_gpu.ptr, &tile4_host);
+    bool parity_ok = read_ok;
+    if (read_ok) {
+        parity_ok = output_body_overwritten(
+            tile8_host, sentinel, logical_count,
+            "prefill K1024 TILE8 SSD output body");
+        parity_ok = output_body_overwritten(
+                        tile4_host, sentinel, logical_count,
+                        "prefill K1024 TILE4 SSD output body") &&
+                    parity_ok;
+        parity_ok = output_guard_unchanged(
+            tile8_host, sentinel, logical_count,
+            "prefill K1024 TILE8 SSD output canary");
+        parity_ok = output_guard_unchanged(
+                        tile4_host, sentinel, logical_count,
+                        "prefill K1024 TILE4 SSD output canary") &&
+                    parity_ok;
+        tile8_host.resize(logical_count);
+        tile4_host.resize(logical_count);
+        parity_ok = bitwise_equal(
+                        tile4_host, tile8_host,
+                        "prefill K1024 TILE4 SSD vs TILE8 SSD") &&
+                    parity_ok;
+    }
+
+    if (ok) {
+        (void)setenv(kPrefillK1024Tile4Disable, "1", 1);
+        if (write_tensor(tile4_gpu.ptr, sentinel)) {
+            rejected_rc = ds4_gpu_matmul_quant_tensor(
+                tile4_gpu.ptr, ssd_model_map, model.size,
+                model.q_b_k1024_offset, kQ4Type, kTailK, kQbOutDim,
+                x_gpu.ptr, n_tokens);
+        }
+    }
+    const bool rejected_ok = rejected_rc == 0 &&
+        unchanged_after_rejected_call(
+            tile4_gpu.ptr, sentinel,
+            "prefill K1024 TILE4 SSD DISABLE+REQUIRE preserves output");
+
+    /* Even a failed candidate may follow an accepted baseline launch.  Drain
+     * it before the mode transition releases the backing range cache. */
+    (void)ds4_gpu_synchronize();
+    ds4_gpu_set_ssd_streaming(false);
+    (void)ds4_gpu_set_model_fd(-1);
+    bool model_map_restored = !model_map_switched;
+    if (model_map_switched &&
+        !ds4_gpu_set_model_map(model.data, model.size)) {
+        std::fprintf(stderr,
+                     "prefill K1024 TILE4 SSD: model-map restore FAIL\n");
+        ok = false;
+    } else if (model_map_switched) {
+        model_map_restored = true;
+    }
+    if (ssd_model_map != MAP_FAILED && model_map_restored) {
+        (void)munmap(ssd_model_map, (size_t)model.size);
+    }
+    if (model_file) std::fclose(model_file);
+    ok = ok && parity_ok && rejected_ok;
+    std::fprintf(stderr,
+                 "prefill q_b K1024 TILE4 SSD: tile8=%d tile4=%d "
+                 "rejected=%d %s\n",
+                 tile8_rc, tile4_rc, rejected_rc, ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -1862,6 +2096,7 @@ int main(int argc, char **argv) {
     bool run_prefill = true;
     bool run_grouped_decode = true;
     bool run_prefill_long = false;
+    bool run_policy_only = false;
     if (argc == 2 && std::strcmp(argv[1], "--dense") == 0) {
         run_pair = false;
         run_prefill = false;
@@ -1885,11 +2120,17 @@ int main(int argc, char **argv) {
         run_pair = false;
         run_grouped_decode = false;
         run_prefill_long = true;
+    } else if (argc == 2 && std::strcmp(argv[1], "--policy") == 0) {
+        run_dense = false;
+        run_pair = false;
+        run_prefill = false;
+        run_grouped_decode = false;
+        run_policy_only = true;
     } else if (argc > 1 &&
                !(argc == 2 && std::strcmp(argv[1], "--all") == 0)) {
         std::fprintf(stderr,
                      "usage: %s [--all|--dense|--pair|--grouped-decode|"
-                     "--prefill|--prefill-long]\n",
+                     "--prefill|--prefill-long|--policy]\n",
                      argv[0]);
         return 2;
     }
@@ -1897,6 +2138,9 @@ int main(int argc, char **argv) {
     env_snapshot prefill_enable(kPrefillEnable);
     env_snapshot prefill_disable(kPrefillDisable);
     env_snapshot prefill_require(kPrefillRequire);
+    env_snapshot tile4_ssd_enable(kPrefillK1024Tile4SsdEnable);
+    env_snapshot tile4_disable(kPrefillK1024Tile4Disable);
+    env_snapshot tile4_require(kPrefillK1024Tile4Require);
     env_snapshot grouped_enable(kGroupedDecodeEnable);
     env_snapshot grouped_disable(kGroupedDecodeDisable);
     env_snapshot grouped_require(kGroupedDecodeRequire);
@@ -1904,10 +2148,16 @@ int main(int argc, char **argv) {
     (void)unsetenv(kPrefillEnable);
     (void)unsetenv(kPrefillDisable);
     (void)unsetenv(kPrefillRequire);
+    (void)unsetenv(kPrefillK1024Tile4SsdEnable);
+    (void)unsetenv(kPrefillK1024Tile4Disable);
+    (void)unsetenv(kPrefillK1024Tile4Require);
     (void)unsetenv(kGroupedDecodeEnable);
     (void)unsetenv(kGroupedDecodeDisable);
     (void)unsetenv(kGroupedDecodeRequire);
     (void)unsetenv(kGroupedDecodeStats);
+
+    const bool policy_ok = run_prefill_k1024_tile4_policy_oracle();
+    if (run_policy_only || !policy_ok) return policy_ok ? 0 : 1;
 
     if (detect_rocm_device() <= 0) {
         const char *require_device =
@@ -1924,7 +2174,7 @@ int main(int argc, char **argv) {
     }
 
     aligned_model model;
-    bool ok = make_model(&model);
+    bool ok = policy_ok && make_model(&model);
     if (!ok) {
         std::fprintf(stderr,
                      "ROCm Q4 dense/pair/prefill: fixture allocation FAIL\n");
@@ -2043,6 +2293,12 @@ int main(int argc, char **argv) {
                 "prefill stress K=4096 M=33 n_tok=4096");
             ok = long_ok && ok;
         }
+        /* Run the file-backed SSD oracle last.  Switching model maps marks the
+         * process multi-model and intentionally disables optional caches; no
+         * later parity case should inherit that conservative policy. */
+        const bool prefill_q_b_tile4_ssd_ok =
+            run_prefill_k1024_tile4_ssd_case(model);
+        ok = prefill_q_b_tile4_ssd_ok && ok;
     }
 
     // Registered host ranges must be released before their aligned backing

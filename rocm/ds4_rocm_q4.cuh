@@ -561,23 +561,103 @@ static int rocm_q4_K_prefill_tile8_required(void) {
     return getenv("DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8") != NULL;
 }
 
-static int rocm_q4_K_prefill_k1024_tile4_requested(
+enum {
+    ROCM_Q4_PREFILL_K1024_TILE4_REQUIRED_FAILURE = -1,
+    ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK = 0,
+    ROCM_Q4_PREFILL_K1024_TILE4_USE = 1,
+};
+
+/* Keep this decision independent from the device lookup so the complete
+ * policy matrix has a hardware-free oracle.  Resident execution preserves
+ * the established automatic default.  SSD execution stays opt-in and may
+ * only select TILE4 after the exact weight range has been found in actual
+ * device storage; mapped/registered host memory is deliberately insufficient.
+ * REQUIRE requests the candidate as well as asserting it, while DISABLE is
+ * authoritative in both modes. */
+static int rocm_q4_K_prefill_k1024_tile4_policy(
+        int ssd_streaming,
+        int weight_device_resident,
+        int ssd_enabled,
+        int disabled,
+        int required) {
+    if (disabled) {
+        return required ? ROCM_Q4_PREFILL_K1024_TILE4_REQUIRED_FAILURE
+                        : ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK;
+    }
+    if (!ssd_streaming) return ROCM_Q4_PREFILL_K1024_TILE4_USE;
+    if (!ssd_enabled && !required) {
+        return ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK;
+    }
+    if (!weight_device_resident) {
+        return required ? ROCM_Q4_PREFILL_K1024_TILE4_REQUIRED_FAILURE
+                        : ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK;
+    }
+    return ROCM_Q4_PREFILL_K1024_TILE4_USE;
+}
+
+/* Test-only pure-policy entry point.  It intentionally performs no HIP call,
+ * so hosts with a ROCm toolchain but no visible device can still validate the
+ * SSD default, residency gate, and DISABLE/REQUIRE precedence. */
+extern "C" int ds4_rocm_test_q4_prefill_k1024_tile4_policy(
+        int ssd_streaming,
+        int weight_device_resident,
+        int ssd_enabled,
+        int disabled,
+        int required) {
+    return rocm_q4_K_prefill_k1024_tile4_policy(
+        ssd_streaming != 0, weight_device_resident != 0,
+        ssd_enabled != 0, disabled != 0, required != 0);
+}
+
+static int rocm_q4_K_prefill_k1024_tile4_resolve(
         uint64_t blocks,
-        uint64_t out_dim) {
-    /* This is the production attn_q_b shape.  Keep SSD streaming on the
-     * established TILE8 path: only a fully resident model can use the new
-     * specialization, and the dedicated switch provides a narrow rollback. */
-    return !g_ssd_streaming_mode &&
-           blocks == ROCM_Q4_PREFILL_K1024_KBLOCK_TILE &&
-           out_dim == DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM &&
-           rocm_q4_attn_q_b_env_bool(
-               "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4") != 1;
+        uint64_t out_dim,
+        const void *model_map,
+        uint64_t weight_offset,
+        uint64_t weight_bytes,
+        const char *weight_ptr) {
+    if (blocks != ROCM_Q4_PREFILL_K1024_KBLOCK_TILE ||
+        out_dim != DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM) {
+        return ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK;
+    }
+
+    const int enabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_ENABLE_Q4_PREFILL_K1024_TILE4_SSD") == 1;
+    const int disabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4") == 1;
+    const int required = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_REQUIRE_Q4_PREFILL_K1024_TILE4") == 1;
+    const char *resident_ptr = g_ssd_streaming_mode
+        ? rocm_q4_attn_q_b_device_resident_source(
+              model_map, weight_offset, weight_bytes)
+        : weight_ptr;
+    const int weight_device_resident =
+        resident_ptr != NULL && resident_ptr == weight_ptr;
+    const int decision = rocm_q4_K_prefill_k1024_tile4_policy(
+        g_ssd_streaming_mode, weight_device_resident, enabled, disabled,
+        required);
+    if (decision == ROCM_Q4_PREFILL_K1024_TILE4_REQUIRED_FAILURE) {
+        if (disabled) {
+            fprintf(stderr,
+                    "ds4: required ROCm Q4_K prefill K1024 tile4 is "
+                    "disabled\n");
+        } else {
+            fprintf(stderr,
+                    "ds4: required ROCm Q4_K prefill K1024 tile4 has no "
+                    "device-resident SSD weight range "
+                    "(offset=%llu bytes=%llu)\n",
+                    (unsigned long long)weight_offset,
+                    (unsigned long long)weight_bytes);
+        }
+    }
+    return decision;
 }
 
 static uint64_t g_rocm_q4_prefill_tile8_dense_calls;
 static uint64_t g_rocm_q4_prefill_tile8_pair_calls;
 static uint64_t g_rocm_q4_prefill_tile8_attention_batch_calls;
 static uint64_t g_rocm_q4_prefill_k1024_tile4_calls;
+static uint64_t g_rocm_q4_prefill_k1024_tile4_ssd_calls;
 static uint64_t g_rocm_q4_prefill_tile8_tokens;
 static int g_rocm_q4_prefill_tile8_report_registered;
 static pthread_mutex_t g_rocm_q4_prefill_tile8_stats_mutex =
@@ -639,16 +719,20 @@ static void rocm_q4_K_prefill_tile8_report(void) {
         g_rocm_q4_prefill_tile8_attention_batch_calls;
     const uint64_t k1024_tile4_calls =
         g_rocm_q4_prefill_k1024_tile4_calls;
+    const uint64_t k1024_tile4_ssd_calls =
+        g_rocm_q4_prefill_k1024_tile4_ssd_calls;
     const uint64_t tokens = g_rocm_q4_prefill_tile8_tokens;
     pthread_mutex_unlock(&g_rocm_q4_prefill_tile8_stats_mutex);
     fprintf(stderr,
-            "ds4: ROCm Q4_K prefill tile8 stats: "
+            "ds4: ROCm Q4_K tiled-prefill stats: "
             "dense_calls=%llu pair_calls=%llu attention_batch_calls=%llu "
-            "k1024_tile4_calls=%llu tokens=%llu\n",
+            "k1024_tile4_calls=%llu k1024_tile4_ssd_calls=%llu "
+            "tokens=%llu\n",
             (unsigned long long)dense_calls,
             (unsigned long long)pair_calls,
             (unsigned long long)attention_batch_calls,
             (unsigned long long)k1024_tile4_calls,
+            (unsigned long long)k1024_tile4_ssd_calls,
             (unsigned long long)tokens);
 }
 
@@ -668,6 +752,9 @@ static void rocm_q4_K_prefill_tile8_note(
     g_rocm_q4_prefill_tile8_pair_calls += pair_calls;
     g_rocm_q4_prefill_tile8_attention_batch_calls += attention_batch_calls;
     g_rocm_q4_prefill_k1024_tile4_calls += k1024_tile4_calls;
+    if (k1024_tile4_calls && g_ssd_streaming_mode) {
+        g_rocm_q4_prefill_k1024_tile4_ssd_calls += k1024_tile4_calls;
+    }
     g_rocm_q4_prefill_tile8_tokens += tokens;
     pthread_mutex_unlock(&g_rocm_q4_prefill_tile8_stats_mutex);
 }
@@ -693,6 +780,11 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
     const int prefill_scope = rocm_q4_K_prefill_tile8_scope(n_tok);
     const int prefill_tile8 = rocm_q4_K_prefill_tile8_requested();
     const int prefill_tile8_required = rocm_q4_K_prefill_tile8_required();
+    const int k1024_tile4_shape =
+        blocks == ROCM_Q4_PREFILL_K1024_KBLOCK_TILE &&
+        out_dim == DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM;
+    const int k1024_tile4_required = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_REQUIRE_Q4_PREFILL_K1024_TILE4") == 1;
     if (prefill_scope && prefill_tile8_required && !prefill_tile8) {
         fprintf(stderr,
                 "ds4: required ROCm Q4_K prefill tile8 is disabled "
@@ -700,10 +792,27 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
                 (unsigned long long)n_tok);
         return 0;
     }
+    if (prefill_scope && k1024_tile4_shape && k1024_tile4_required &&
+        !prefill_tile8) {
+        fprintf(stderr,
+                "ds4: required ROCm Q4_K prefill K1024 tile4 cannot run "
+                "because tiled prefill is disabled (n_tok=%llu)\n",
+                (unsigned long long)n_tok);
+        return 0;
+    }
 
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
                                             weight_bytes, "q4_K dense");
     if (!wptr) return 0;
+    int k1024_tile4 = ROCM_Q4_PREFILL_K1024_TILE4_FALLBACK;
+    if (prefill_scope && prefill_tile8) {
+        k1024_tile4 = rocm_q4_K_prefill_k1024_tile4_resolve(
+            blocks, out_dim, model_map, weight_offset, weight_bytes, wptr);
+        if (k1024_tile4 ==
+            ROCM_Q4_PREFILL_K1024_TILE4_REQUIRED_FAILURE) {
+            return 0;
+        }
+    }
     cuda_block_q8_K *xq = rocm_q4_K_prequant_alloc(
             n_tok, blocks, "q4_K dense prequant");
     if (!xq) return 0;
@@ -715,7 +824,7 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
     if (!cuda_ok(cudaGetLastError(), "q4_K dense quantize launch")) return 0;
 
     if (prefill_scope && prefill_tile8) {
-        if (rocm_q4_K_prefill_k1024_tile4_requested(blocks, out_dim)) {
+        if (k1024_tile4 == ROCM_Q4_PREFILL_K1024_TILE4_USE) {
             const dim3 tiled_grid(
                 (unsigned)((out_dim - 1u) /
                            ROCM_Q4_PREFILL_K1024_ROWS + 1u),
