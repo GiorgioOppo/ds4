@@ -635,6 +635,7 @@ runtime/metal	DS4_METAL_DISABLE_SHARED_DOWN_HC_FUSION	nonempty boolean; unset/em
 runtime/metal	DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION	presence rollback; unset: automatic/default path; any value including 0 disables	Disables shared gate up SwiGLU fusion.	ds4.c:17567
 runtime/metal	DS4_METAL_DISABLE_SHARED_KV_PAD	presence rollback; unset: automatic/default path; any value including 0 disables	Disables shared KV pad.	ds4_metal.m:31510
 runtime/metal	DS4_METAL_DISABLE_SHARED_ROPE_COEFF	presence rollback; unset: automatic/default path; any value including 0 disables	Disables shared RoPE coeff.	ds4_metal.m:6341
+runtime/metal	DS4_METAL_DISABLE_SMALL_PREFILL_DIRECT	presence rollback; unset: direct one-workgroup FlashAttention output for prefill with at most 32 keys; any defined value including 0 restores split reduction	Disables direct normalized output for small Metal prefill and restores the 32-way temporary plus reduction path.	ds4_metal.m:4356
 runtime/metal	DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL	presence rollback; unset: automatic/default path; any value including 0 disables	Disables streaming cold decode prefill.	ds4.c:32007
 runtime/metal	DS4_METAL_DISABLE_STREAMING_COMPACT_ADDR	presence rollback; unset: automatic/default path; any value including 0 disables	Disables streaming compact address.	ds4_metal.m:14598
 runtime/metal	DS4_METAL_DISABLE_STREAMING_DECODE_PREFILL	presence rollback; unset: automatic/default path; any value including 0 disables	Disables streaming decode prefill.	ds4.c:31956

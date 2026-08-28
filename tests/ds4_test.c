@@ -4358,7 +4358,8 @@ static void test_metal_compressor_ratio4_exact_pool_decode_case(
             kv_cur, sc_cur, ref_state_kv, ref_state_score, ref_comp,
             model_raw, model_bytes, 0, ape_type, norm_offset, 0,
             head_dim, ratio, pos, 0, 0, 0,
-            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, false);
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f,
+            false, false, false);
         TEST_ASSERT(ref_ok != 0);
 
         TEST_ASSERT(unsetenv(disable_env) == 0);
@@ -4372,7 +4373,8 @@ static void test_metal_compressor_ratio4_exact_pool_decode_case(
             kv_cur, sc_cur, exact_state_kv, exact_state_score, exact_comp,
             model_raw, model_bytes, 0, ape_type, norm_offset, 0,
             head_dim, ratio, pos, 0, 0, 0,
-            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, false);
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f,
+            false, false, false);
         TEST_ASSERT(exact_ok != 0);
 
         TEST_ASSERT(ds4_gpu_tensor_read(
@@ -5806,6 +5808,539 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact(void) {
         TEST_METAL_PREFILL_MASK_CACHE_RATIO4, 43);
     test_metal_zero_prefix_prefill_mask_cache_exact_kind(
         TEST_METAL_PREFILL_MASK_CACHE_RATIO128, 47);
+}
+
+static double test_metal_small_prefill_gpu_batch_ms(
+        test_metal_prefill_mask_cache_kind kind,
+        bool masked,
+        const test_metal_prefill_mask_cache_shape *shape,
+        ds4_gpu_tensor *heads,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw,
+        const ds4_gpu_tensor *comp,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t flags,
+        uint32_t repeats,
+        uint32_t expected_nwg) {
+    ds4_gpu_test_set_flags(flags);
+    const int begin_ok = ds4_gpu_begin_commands();
+    TEST_ASSERT(begin_ok != 0);
+    if (!begin_ok) return -1.0;
+    for (uint32_t rep = 0u; rep < repeats; rep++) {
+        const int call_ok = test_metal_zero_prefix_prefill_mask_cache_call(
+            kind, heads, model_map, model_size, q, raw, comp, comp_mask,
+            shape, masked, n_head, head_dim);
+        TEST_ASSERT(call_ok != 0);
+        if (!call_ok) {
+            (void)ds4_gpu_end_commands();
+            return -1.0;
+        }
+    }
+    const int end_ok = ds4_gpu_end_commands();
+    TEST_ASSERT(end_ok != 0);
+    if (!end_ok) return -1.0;
+    const uint32_t selected_nwg =
+        ds4_gpu_test_last_flash_attn_prefill_nwg();
+    TEST_ASSERT(selected_nwg == expected_nwg);
+    if (selected_nwg != expected_nwg) return -1.0;
+    const double gpu_ms = ds4_gpu_test_last_completed_gpu_ms();
+    TEST_ASSERT(gpu_ms > 0.0);
+    return gpu_ms > 0.0 ? gpu_ms / (double)repeats : -1.0;
+}
+
+static void test_metal_small_prefill_direct_exact(void) {
+    const uint32_t head_dim = 512u;
+    const uint32_t n_head = 2u;
+    const uint32_t max_tokens = 19u;
+    const uint32_t max_comp = 14u;
+    const uint64_t guard_bytes = 256u;
+    const uint64_t raw_count = (uint64_t)max_tokens * head_dim;
+    const uint64_t comp_count = (uint64_t)max_comp * head_dim;
+    const uint64_t q_count =
+        (uint64_t)max_tokens * n_head * head_dim;
+    const uint64_t mask_count = (uint64_t)max_tokens * max_comp;
+    const uint64_t raw_bytes = raw_count * sizeof(float);
+    const uint64_t comp_bytes = comp_count * sizeof(uint16_t);
+    const uint64_t q_bytes = q_count * sizeof(float);
+    const uint64_t mask_bytes = mask_count * sizeof(float);
+    const uint64_t heads_base_bytes = guard_bytes + q_bytes + guard_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    const char *disable_env = "DS4_METAL_DISABLE_SMALL_PREFILL_DIRECT";
+    char *saved_disable = test_save_env(disable_env);
+    const char *stage_profile_env = "DS4_METAL_FLASH_ATTN_STAGE_PROFILE";
+    char *saved_stage_profile = test_save_env(stage_profile_env);
+
+    typedef struct {
+        const char *name;
+        test_metal_prefill_mask_cache_kind kind;
+        bool masked;
+        test_metal_prefill_mask_cache_shape shape;
+    } test_metal_small_prefill_case;
+    static const test_metal_small_prefill_case cases[] = {
+        {"raw-1", TEST_METAL_PREFILL_MASK_CACHE_RAW, false,
+         {1u, 0u, 0u, 0u}},
+        {"raw-7", TEST_METAL_PREFILL_MASK_CACHE_RAW, false,
+         {7u, 0u, 5u, 0u}},
+        {"raw-19", TEST_METAL_PREFILL_MASK_CACHE_RAW, false,
+         {19u, 0u, 11u, 0u}},
+        {"static-12", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, false,
+         {7u, 5u, 5u, 4u}},
+        {"static-32", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, false,
+         {19u, 13u, 11u, 4u}},
+        {"masked-12", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, true,
+         {7u, 5u, 5u, 4u}},
+        {"masked-32", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, true,
+         {19u, 13u, 11u, 4u}},
+        {"static-33-fallback", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, false,
+         {19u, 14u, 11u, 4u}},
+    };
+    enum {
+        TEST_SMALL_PREFILL_DIRECT_COLD = 0,
+        TEST_SMALL_PREFILL_PSO_FALLBACK,
+        TEST_SMALL_PREFILL_ENV_ROLLBACK,
+        TEST_SMALL_PREFILL_DIRECT_REPLAY,
+        TEST_SMALL_PREFILL_ARM_COUNT,
+    };
+
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *comp_mask = ds4_gpu_tensor_alloc(mask_bytes);
+    ds4_gpu_tensor *heads_base = ds4_gpu_tensor_alloc(heads_base_bytes);
+    float *raw_host = malloc((size_t)raw_bytes);
+    uint16_t *comp_host = malloc((size_t)comp_bytes);
+    float *q_host = malloc((size_t)q_bytes);
+    float *mask_host = malloc((size_t)mask_bytes);
+    uint8_t *initial = malloc((size_t)heads_base_bytes);
+    uint8_t *snapshots = malloc(
+        (size_t)(TEST_SMALL_PREFILL_ARM_COUNT * heads_base_bytes));
+    /* Metal retains a no-copy model view after this oracle returns.  Static
+     * page-aligned storage keeps that backing valid until backend cleanup. */
+    static uint8_t model_storage[16384]
+        __attribute__((aligned(16384)));
+    void *model_raw = model_storage;
+    const bool model_storage_ok = page <= sizeof(model_storage);
+    TEST_ASSERT(model_storage_ok);
+    TEST_ASSERT(raw != NULL);
+    TEST_ASSERT(comp != NULL);
+    TEST_ASSERT(q != NULL);
+    TEST_ASSERT(comp_mask != NULL);
+    TEST_ASSERT(heads_base != NULL);
+    TEST_ASSERT(raw_host != NULL);
+    TEST_ASSERT(comp_host != NULL);
+    TEST_ASSERT(q_host != NULL);
+    TEST_ASSERT(mask_host != NULL);
+    TEST_ASSERT(initial != NULL);
+    TEST_ASSERT(snapshots != NULL);
+
+    size_t direct_mismatches = 0u;
+    size_t replay_mismatches = 0u;
+    size_t fallback_mismatches = 0u;
+    size_t alias_mismatches = 0u;
+    size_t alias_guard_mismatches = 0u;
+    size_t guard_mismatches = 0u;
+    size_t nonfinite = 0u;
+    size_t total_words = 0u;
+    size_t completed_cases = 0u;
+    const bool allocated = raw && comp && q && comp_mask && heads_base &&
+        raw_host && comp_host && q_host && mask_host && initial &&
+        snapshots && model_storage_ok;
+    if (allocated) {
+        memset(model_raw, 0, (size_t)page);
+        ((float *)model_raw)[0] = -0.375f;
+        ((float *)model_raw)[1] = 0.21875f;
+        for (uint64_t i = 0; i < raw_count; i++) {
+            const int value = (int)((i * 17u +
+                (i ^ (i >> 5u)) * 11u + 23u) % 211u) - 105;
+            raw_host[i] = (float)value / 192.0f;
+        }
+        for (uint64_t i = 0; i < comp_count; i++) {
+            const int value = (int)((i * 23u +
+                (i ^ (i >> 4u)) * 7u + 29u) % 193u) - 96;
+            comp_host[i] = test_float_to_f16(
+                0.125f + (float)value / 224.0f);
+        }
+        for (uint64_t i = 0; i < q_count; i++) {
+            const int value = (int)((i * 31u +
+                (i ^ (i >> 3u)) * 5u + 37u) % 227u) - 113;
+            q_host[i] = (float)value / 208.0f;
+        }
+        for (uint64_t i = 0; i < mask_count; i++) {
+            mask_host[i] = (i % 5u) == 0u
+                ? -65504.0f : -(float)((i % 13u) + 1u) / 16.0f;
+        }
+        for (uint64_t i = 0; i < heads_base_bytes; i++) {
+            initial[i] = (uint8_t)(0xa5u ^ (uint8_t)(i * 37u));
+        }
+        const uint32_t poison = 0x7fc12345u;
+        for (uint64_t i = 0; i < q_count; i++) {
+            memcpy(initial + guard_bytes + i * sizeof(poison),
+                   &poison, sizeof(poison));
+        }
+
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            raw, 0u, raw_host, raw_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            comp, 0u, comp_host, comp_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            q, 0u, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            comp_mask, 0u, mask_host, mask_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
+        ds4_gpu_set_quality(false);
+        TEST_ASSERT(unsetenv(disable_env) == 0);
+        TEST_ASSERT(unsetenv(stage_profile_env) == 0);
+
+        for (size_t case_i = 0;
+             case_i < sizeof(cases) / sizeof(cases[0]); case_i++) {
+            const test_metal_small_prefill_case *c = &cases[case_i];
+            const uint64_t output_count =
+                (uint64_t)c->shape.n_tokens * n_head * head_dim;
+            const uint64_t output_bytes = output_count * sizeof(float);
+            ds4_gpu_tensor *heads = ds4_gpu_tensor_view(
+                heads_base, guard_bytes, output_bytes);
+            TEST_ASSERT(heads != NULL);
+            bool case_ok = heads != NULL;
+            for (uint32_t arm = 0u;
+                 arm < TEST_SMALL_PREFILL_ARM_COUNT && case_ok; arm++) {
+                const bool cold_scratch_case =
+                    case_i == 0u || case_i == 3u;
+                if (cold_scratch_case &&
+                    (arm == TEST_SMALL_PREFILL_DIRECT_COLD ||
+                     arm == TEST_SMALL_PREFILL_PSO_FALLBACK)) {
+                    TEST_ASSERT(ds4_gpu_test_reset_flash_attn_tmp() != 0);
+                    TEST_ASSERT(ds4_gpu_test_flash_attn_tmp_bytes() == 0u);
+                }
+                TEST_ASSERT(ds4_gpu_tensor_write(
+                    heads_base, 0u, initial, heads_base_bytes) != 0);
+                const bool env_rollback =
+                    arm == TEST_SMALL_PREFILL_ENV_ROLLBACK;
+                const int env_ok = env_rollback
+                    ? setenv(disable_env, "0", 1)
+                    : unsetenv(disable_env);
+                TEST_ASSERT(env_ok == 0);
+                ds4_gpu_test_set_flags(
+                    arm == TEST_SMALL_PREFILL_PSO_FALLBACK
+                        ? DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG1_FAILURE
+                        : 0u);
+                const int call_ok =
+                    test_metal_zero_prefix_prefill_mask_cache_call(
+                        c->kind, heads, model_raw, page, q, raw, comp,
+                        comp_mask, &c->shape, c->masked,
+                        n_head, head_dim);
+                TEST_ASSERT(call_ok != 0);
+                const uint32_t n_keys =
+                    c->shape.n_tokens + c->shape.n_comp;
+                const bool expect_direct =
+                    (arm == TEST_SMALL_PREFILL_DIRECT_COLD ||
+                     arm == TEST_SMALL_PREFILL_DIRECT_REPLAY) &&
+                    n_keys <= 32u;
+                const uint32_t expected_nwg = expect_direct ? 1u : 32u;
+                const uint32_t selected_nwg =
+                    ds4_gpu_test_last_flash_attn_prefill_nwg();
+                TEST_ASSERT(selected_nwg == expected_nwg);
+                if (cold_scratch_case &&
+                    arm == TEST_SMALL_PREFILL_DIRECT_COLD) {
+                    TEST_ASSERT(
+                        ds4_gpu_test_flash_attn_tmp_bytes() == 0u);
+                }
+                if (cold_scratch_case &&
+                    arm == TEST_SMALL_PREFILL_PSO_FALLBACK) {
+                    TEST_ASSERT(
+                        ds4_gpu_test_flash_attn_tmp_bytes() != 0u);
+                }
+                const int read_ok = call_ok && ds4_gpu_tensor_read(
+                    heads_base, 0u,
+                    snapshots + (uint64_t)arm * heads_base_bytes,
+                    heads_base_bytes) != 0;
+                TEST_ASSERT(read_ok != 0);
+                case_ok = read_ok != 0 && selected_nwg == expected_nwg;
+            }
+            ds4_gpu_test_set_flags(0u);
+            ds4_gpu_tensor_free(heads);
+            if (!case_ok) continue;
+
+            const uint8_t *direct = snapshots +
+                TEST_SMALL_PREFILL_DIRECT_COLD * heads_base_bytes;
+            const uint8_t *baseline = snapshots +
+                TEST_SMALL_PREFILL_ENV_ROLLBACK * heads_base_bytes;
+            const uint8_t *replay = snapshots +
+                TEST_SMALL_PREFILL_DIRECT_REPLAY * heads_base_bytes;
+            const uint8_t *fallback = snapshots +
+                TEST_SMALL_PREFILL_PSO_FALLBACK * heads_base_bytes;
+            const test_float_compare_stats direct_stats =
+                test_compare_float_bits(
+                    (const float *)(baseline + guard_bytes),
+                    (const float *)(direct + guard_bytes),
+                    (size_t)output_count);
+            const test_float_compare_stats replay_stats =
+                test_compare_float_bits(
+                    (const float *)(baseline + guard_bytes),
+                    (const float *)(replay + guard_bytes),
+                    (size_t)output_count);
+            const test_float_compare_stats fallback_stats =
+                test_compare_float_bits(
+                    (const float *)(baseline + guard_bytes),
+                    (const float *)(fallback + guard_bytes),
+                    (size_t)output_count);
+            direct_mismatches += direct_stats.mismatch_count;
+            replay_mismatches += replay_stats.mismatch_count;
+            fallback_mismatches += fallback_stats.mismatch_count;
+            total_words += (size_t)output_count;
+            completed_cases++;
+
+            for (uint32_t arm = 0u;
+                 arm < TEST_SMALL_PREFILL_ARM_COUNT; arm++) {
+                const uint8_t *snapshot =
+                    snapshots + (uint64_t)arm * heads_base_bytes;
+                for (uint64_t i = 0; i < heads_base_bytes; i++) {
+                    const bool in_output = i >= guard_bytes &&
+                        i < guard_bytes + output_bytes;
+                    if (!in_output && snapshot[i] != initial[i]) {
+                        guard_mismatches++;
+                    }
+                }
+                const float *values =
+                    (const float *)(snapshot + guard_bytes);
+                for (uint64_t i = 0; i < output_count; i++) {
+                    if (!isfinite(values[i])) nonfinite++;
+                }
+            }
+            fprintf(stderr,
+                    "ds4-test: small-prefill direct %s keys=%u "
+                    "direct=%zu/%llu replay=%zu/%llu fallback=%zu/%llu\n",
+                    c->name,
+                    c->shape.n_tokens + c->shape.n_comp,
+                    direct_stats.mismatch_count,
+                    (unsigned long long)output_count,
+                    replay_stats.mismatch_count,
+                    (unsigned long long)output_count,
+                    fallback_stats.mismatch_count,
+                    (unsigned long long)output_count);
+        }
+
+        /* The legacy split path permits heads to alias q because its first
+         * dispatch finishes reading q before the reducer writes heads.  The
+         * direct kernel must preserve that API behavior by falling back. */
+        {
+            static const size_t alias_case_indices[] = {1u, 3u, 5u};
+            for (size_t alias_i = 0u;
+                 alias_i < sizeof(alias_case_indices) /
+                     sizeof(alias_case_indices[0]);
+                 alias_i++) {
+                const test_metal_small_prefill_case *c =
+                    &cases[alias_case_indices[alias_i]];
+                const uint64_t output_count =
+                    (uint64_t)c->shape.n_tokens * n_head * head_dim;
+                const uint64_t output_bytes = output_count * sizeof(float);
+                ds4_gpu_tensor *heads_ref = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, output_bytes);
+                ds4_gpu_tensor *q_alias = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, q_bytes);
+                ds4_gpu_tensor *heads_alias = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, output_bytes);
+                TEST_ASSERT(heads_ref != NULL);
+                TEST_ASSERT(q_alias != NULL);
+                TEST_ASSERT(heads_alias != NULL);
+                if (heads_ref && q_alias && heads_alias) {
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        q, 0u, q_host, q_bytes) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        heads_base, 0u, initial, heads_base_bytes) != 0);
+                    TEST_ASSERT(setenv(disable_env, "0", 1) == 0);
+                    ds4_gpu_test_set_flags(0u);
+                    const int ref_ok =
+                        test_metal_zero_prefix_prefill_mask_cache_call(
+                            c->kind, heads_ref, model_raw, page, q, raw,
+                            comp, comp_mask, &c->shape, c->masked,
+                            n_head, head_dim);
+                    TEST_ASSERT(ref_ok != 0);
+                    TEST_ASSERT(
+                        ds4_gpu_test_last_flash_attn_prefill_nwg() == 32u);
+                    const int ref_read_ok = ref_ok && ds4_gpu_tensor_read(
+                        heads_base, 0u, snapshots, heads_base_bytes) != 0;
+                    TEST_ASSERT(ref_read_ok != 0);
+
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        heads_base, 0u, initial, heads_base_bytes) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        q_alias, 0u, q_host, q_bytes) != 0);
+                    const int before_read_ok = ds4_gpu_tensor_read(
+                        heads_base, 0u, snapshots + heads_base_bytes,
+                        heads_base_bytes) != 0;
+                    TEST_ASSERT(before_read_ok != 0);
+                    TEST_ASSERT(unsetenv(disable_env) == 0);
+                    ds4_gpu_test_set_flags(0u);
+                    const int alias_ok =
+                        test_metal_zero_prefix_prefill_mask_cache_call(
+                            c->kind, heads_alias, model_raw, page, q_alias,
+                            raw, comp, comp_mask, &c->shape, c->masked,
+                            n_head, head_dim);
+                    TEST_ASSERT(alias_ok != 0);
+                    const uint32_t alias_nwg =
+                        ds4_gpu_test_last_flash_attn_prefill_nwg();
+                    TEST_ASSERT(alias_nwg == 32u);
+                    const int alias_read_ok = alias_ok &&
+                        ds4_gpu_tensor_read(
+                            heads_base, 0u,
+                            snapshots + 2u * heads_base_bytes,
+                            heads_base_bytes) != 0;
+                    TEST_ASSERT(alias_read_ok != 0);
+                    if (ref_read_ok && before_read_ok && alias_read_ok) {
+                        const test_float_compare_stats alias_stats =
+                            test_compare_float_bits(
+                                (const float *)(snapshots + guard_bytes),
+                                (const float *)(snapshots +
+                                    2u * heads_base_bytes + guard_bytes),
+                                (size_t)output_count);
+                        alias_mismatches += alias_stats.mismatch_count;
+                        size_t case_guard_mismatches = 0u;
+                        const uint8_t *before =
+                            snapshots + heads_base_bytes;
+                        const uint8_t *after =
+                            snapshots + 2u * heads_base_bytes;
+                        for (uint64_t i = 0u;
+                             i < heads_base_bytes; i++) {
+                            const bool in_output = i >= guard_bytes &&
+                                i < guard_bytes + output_bytes;
+                            if (!in_output && before[i] != after[i]) {
+                                case_guard_mismatches++;
+                            }
+                        }
+                        alias_guard_mismatches += case_guard_mismatches;
+                        fprintf(stderr,
+                                "ds4-test: small-prefill q/heads alias "
+                                "%s nwg=%u mismatches=%zu/%llu guards=%zu\n",
+                                c->name, alias_nwg,
+                                alias_stats.mismatch_count,
+                                (unsigned long long)output_count,
+                                case_guard_mismatches);
+                    }
+                }
+                ds4_gpu_test_set_flags(0u);
+                TEST_ASSERT(unsetenv(disable_env) == 0);
+                ds4_gpu_tensor_free(heads_alias);
+                ds4_gpu_tensor_free(q_alias);
+                ds4_gpu_tensor_free(heads_ref);
+            }
+        }
+
+        if (test_env_bool("DS4_TEST_METAL_SMALL_PREFILL_TIMING")) {
+            /* GPUStartTime/GPUEndTime excludes CPU mask construction,
+             * encoding, submit, and wait time.  Both arms run the same
+             * copy/pad kernels; their only topology difference is NWG=32 +
+             * reduce versus direct NWG=1 output.  Alternate pair order to
+             * limit thermal/order bias.  Keep this opt-in so the exactness
+             * oracle remains suitable for routine test runs. */
+            static const size_t timing_case_indices[] = {2u, 4u};
+            const uint32_t timing_repeats = 16u;
+            const uint32_t timing_samples = 4u;
+            for (size_t timing_i = 0u;
+                 timing_i < sizeof(timing_case_indices) /
+                     sizeof(timing_case_indices[0]);
+                 timing_i++) {
+                const test_metal_small_prefill_case *c =
+                    &cases[timing_case_indices[timing_i]];
+                const uint64_t output_bytes =
+                    (uint64_t)c->shape.n_tokens * n_head * head_dim *
+                    sizeof(float);
+                ds4_gpu_tensor *heads = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, output_bytes);
+                TEST_ASSERT(heads != NULL);
+                if (!heads) continue;
+
+                (void)test_metal_small_prefill_gpu_batch_ms(
+                    c->kind, c->masked, &c->shape, heads, model_raw, page,
+                    q, raw, comp, comp_mask, n_head, head_dim,
+                    DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG32, 4u, 32u);
+                (void)test_metal_small_prefill_gpu_batch_ms(
+                    c->kind, c->masked, &c->shape, heads, model_raw, page,
+                    q, raw, comp, comp_mask, n_head, head_dim,
+                    0u, 4u, 1u);
+
+                double baseline_sum = 0.0;
+                double direct_sum = 0.0;
+                double log_speedup_sum = 0.0;
+                uint32_t valid_samples = 0u;
+                for (uint32_t sample = 0u;
+                     sample < timing_samples; sample++) {
+                    double pair_ms[2] = {-1.0, -1.0};
+                    for (uint32_t order_i = 0u; order_i < 2u; order_i++) {
+                        const uint32_t arm = (sample & 1u) != 0u
+                            ? 1u - order_i : order_i;
+                        pair_ms[arm] =
+                            test_metal_small_prefill_gpu_batch_ms(
+                                c->kind, c->masked, &c->shape,
+                                heads, model_raw, page, q, raw, comp,
+                                comp_mask, n_head, head_dim,
+                                arm == 0u
+                                    ? DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG32
+                                    : 0u,
+                                timing_repeats,
+                                arm == 0u ? 32u : 1u);
+                    }
+                    if (pair_ms[0] > 0.0 && pair_ms[1] > 0.0) {
+                        baseline_sum += pair_ms[0];
+                        direct_sum += pair_ms[1];
+                        log_speedup_sum += log(pair_ms[0] / pair_ms[1]);
+                        valid_samples++;
+                    }
+                }
+                TEST_ASSERT(valid_samples == timing_samples);
+                if (valid_samples != 0u) {
+                    const double baseline_ms =
+                        baseline_sum / (double)valid_samples;
+                    const double direct_ms =
+                        direct_sum / (double)valid_samples;
+                    const double speedup =
+                        exp(log_speedup_sum / (double)valid_samples);
+                    fprintf(stderr,
+                            "ds4-test: small-prefill GPU-only kernel-chain %s "
+                            "legacy=%.6f ms direct=%.6f ms speedup=%.3fx "
+                            "throughput=%.1f%%\n",
+                            c->name, baseline_ms, direct_ms, speedup,
+                            (speedup - 1.0) * 100.0);
+                }
+                ds4_gpu_tensor_free(heads);
+            }
+        }
+    }
+
+    ds4_gpu_test_set_flags(0u);
+    test_restore_env(stage_profile_env, saved_stage_profile);
+    test_restore_env(disable_env, saved_disable);
+    fprintf(stderr,
+            "ds4-test: small-prefill direct exact cases=%zu/%zu "
+            "words=%zu direct=%zu replay=%zu fallback=%zu alias=%zu "
+            "guards=%zu alias_guards=%zu nonfinite=%zu\n",
+            completed_cases, sizeof(cases) / sizeof(cases[0]), total_words,
+            direct_mismatches, replay_mismatches, fallback_mismatches,
+            alias_mismatches, guard_mismatches, alias_guard_mismatches,
+            nonfinite);
+    TEST_ASSERT(completed_cases == sizeof(cases) / sizeof(cases[0]));
+    TEST_ASSERT(direct_mismatches == 0u);
+    TEST_ASSERT(replay_mismatches == 0u);
+    TEST_ASSERT(fallback_mismatches == 0u);
+    TEST_ASSERT(alias_mismatches == 0u);
+    TEST_ASSERT(guard_mismatches == 0u);
+    TEST_ASSERT(alias_guard_mismatches == 0u);
+    TEST_ASSERT(nonfinite == 0u);
+
+    free(snapshots);
+    free(initial);
+    free(mask_host);
+    free(q_host);
+    free(comp_host);
+    free(raw_host);
+    ds4_gpu_tensor_free(heads_base);
+    ds4_gpu_tensor_free(comp_mask);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
 }
 #endif
 
@@ -7592,6 +8127,7 @@ static void test_metal_kernel_group(void) {
 #if defined(__APPLE__)
     if (test_env_bool("DS4_TEST_METAL_RESIDENT_ORACLES_ONLY")) {
         test_metal_flush_commands_progress_exact();
+        test_metal_small_prefill_direct_exact();
         test_metal_batch_attn_out_hc_fusion_exact();
         return;
     }
@@ -7623,6 +8159,7 @@ static void test_metal_kernel_group(void) {
     test_metal_contiguous_compressed_f16_attention_exact();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
+    test_metal_small_prefill_direct_exact();
     test_metal_batch_attn_out_hc_fusion_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();
     test_metal_hc_producer_pre_norm_compound_exact();
@@ -9725,6 +10262,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_METAL_RESIDENT_ORACLES_ONLY=1  Restrict --metal-kernels to resident optimization oracles.");
+    puts("  DS4_TEST_METAL_SMALL_PREFILL_TIMING=1   Include the small-prefill GPU-only microbenchmark.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");

@@ -394,8 +394,14 @@ enum {
     DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC = 1u << 9,
     DS4_GPU_TEST_BATCH_ATTN_OUT_Q8_HC_FUSION = 1u << 10,
     DS4_GPU_TEST_BATCH_ATTN_OUT_Q4_HC_FUSION = 1u << 11,
+    DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG32 = 1u << 12,
+    DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG1_FAILURE = 1u << 13,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+double ds4_gpu_test_last_completed_gpu_ms(void);
+uint32_t ds4_gpu_test_last_flash_attn_prefill_nwg(void);
+int ds4_gpu_test_reset_flash_attn_tmp(void);
+uint64_t ds4_gpu_test_flash_attn_tmp_bytes(void);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
