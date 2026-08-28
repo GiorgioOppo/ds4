@@ -1125,7 +1125,9 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    if constexpr (type != GGML_TYPE_Q4_K) {
+        ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    }
     return 0;
 }
 
@@ -1261,8 +1263,6 @@ int ds4_mmq_q4_K_dense_pair_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(
-        out0_f32, (uint64_t)M0 * (uint64_t)N, stream);
 
     if (out_memset_enabled()) {
         cudaMemsetAsync(out1_f32, 0, out1_bytes, stream);
@@ -1300,8 +1300,130 @@ int ds4_mmq_q4_K_dense_pair_impl(
                 tag, cudaGetErrorString(err));
         return -4;
     }
-    ds4_mmq_sanitize_f32(
-        out1_f32, (uint64_t)M1 * (uint64_t)N, stream);
+    return 0;
+}
+
+/* Token-batched grouped Q4_K projection for attention output-A.  The source
+ * is token-major [N][G][K], while MMQ stores directly into token-major
+ * [N][G][M].  Quantizing the strided source as G channels removes the old
+ * pack/unpack copies and shares one scratch allocation/quantizer launch.
+ * Keep one MMQ launch per group: its stream-K partition and reduction tree
+ * are therefore identical to the established per-group dense call. */
+int ds4_mmq_q4_K_grouped_dense_impl(
+        const void  *W,
+        const float *X,
+        float       *out,
+        int          M,
+        int          N,
+        int          K,
+        int          n_groups,
+        cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q4_K_grouped_dense";
+    if (!W || !X || !out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || N <= 0 || K <= 0 || n_groups <= 0 ||
+        K % QK_K != 0) {
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d groups=%d\n",
+                tag, M, N, K, n_groups);
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n",
+                tag, dev);
+        return -1;
+    }
+    ds4_pool_set_stream(stream);
+
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t blocks_per_col =
+        (size_t)ne10_padded / (4u * (size_t)QK8_1);
+    const size_t bytes_per_col =
+        blocks_per_col * sizeof(block_q8_1_mmq);
+    if ((size_t)N > SIZE_MAX / bytes_per_col) return -1;
+    const size_t channel_bytes = (size_t)N * bytes_per_col;
+    if ((size_t)n_groups > SIZE_MAX / channel_bytes) return -1;
+    const size_t payload_bytes = (size_t)n_groups * channel_bytes;
+    const size_t slack_blocks = (size_t)get_mmq_x_max_host(cc);
+    if (slack_blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) return -1;
+    const size_t slack_bytes = slack_blocks * sizeof(block_q8_1_mmq);
+    if (payload_bytes > SIZE_MAX - slack_bytes) return -1;
+
+    const int64_t row_blocks = (int64_t)K / QK_K;
+    if ((size_t)M > SIZE_MAX / (size_t)row_blocks /
+                        sizeof(block_q4_K)) return -1;
+    const size_t group_weight_bytes =
+        (size_t)M * (size_t)row_blocks * sizeof(block_q4_K);
+    const int64_t low_dim = (int64_t)M * n_groups;
+    if (low_dim > INT_MAX ||
+        (uint64_t)low_dim > UINT64_MAX / (uint64_t)N) return -1;
+
+    ggml_cuda_pool_alloc<char> y_q8_1(
+        ctx->pool(), payload_bytes + slack_bytes);
+    ybuf_memset(y_q8_1.get(), payload_bytes + slack_bytes, stream);
+    quantize_mmq_q8_1_cuda(
+        X, /*ids=*/nullptr, (void *)y_q8_1.get(), GGML_TYPE_Q4_K,
+        /*ne00=*/K,
+        /*s01=*/(int64_t)n_groups * K,
+        /*s02=*/(int64_t)K,
+        /*s03=*/(int64_t)n_groups * N * K,
+        /*ne0=*/ne10_padded, /*ne1=*/N,
+        /*ne2=*/n_groups, /*ne3=*/1, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out, 0,
+                        (size_t)N * (size_t)low_dim * sizeof(float), stream);
+    }
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
+    for (int g = 0; g < n_groups; ++g) {
+        const mmq_args args = {
+            /*x=*/(const char *)W + (size_t)g * group_weight_bytes,
+            /*type_x=*/GGML_TYPE_Q4_K,
+            /*y=*/(const int *)(y_q8_1.get() + (size_t)g * channel_bytes),
+            /*ids_dst=*/nullptr,
+            /*expert_bounds=*/nullptr,
+            /*dst=*/out + (int64_t)g * M,
+            /*ncols_x=*/(int64_t)K,
+            /*nrows_x=*/(int64_t)M,
+            /*ncols_dst=*/(int64_t)N,
+            /*stride_row_x=*/row_blocks,
+            /*ncols_y=*/(int64_t)N,
+            /*nrows_dst=*/low_dim,
+            /*nchannels_x=*/1,
+            /*nchannels_y=*/1,
+            /*stride_channel_x=*/0,
+            /*stride_channel_y=*/(int64_t)(channel_bytes / sizeof(int)),
+            /*stride_channel_dst=*/0,
+            /*nsamples_x=*/1,
+            /*nsamples_y=*/1,
+            /*stride_sample_x=*/0,
+            /*stride_sample_y=*/(int64_t)(channel_bytes / sizeof(int)),
+            /*stride_sample_dst=*/0,
+            /*use_stream_k=*/use_stream_k,
+            /*ncols_max=*/(int64_t)N,
+        };
+        mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: group %d launch failed: %s\n",
+                    tag, g, cudaGetErrorString(err));
+            return -3;
+        }
+    }
     return 0;
 }
 
@@ -1539,6 +1661,13 @@ extern "C" int ds4_mmq_q4_K_dense_pair(
         int M0, int M1, int N, int K, cudaStream_t stream) {
     return ds4_mmq_q4_K_dense_pair_impl(
         W0, W1, X, out0, out1, M0, M1, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_dense(
+        const void *W, const float *X, float *out,
+        int M, int N, int K, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_dense_impl(
+        W, X, out, M, N, K, n_groups, stream);
 }
 
 extern "C" int ds4_mmq_mxfp4_dense(
@@ -1809,7 +1938,7 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
-    if (sanitize_out) {
+    if (sanitize_out && type != GGML_TYPE_Q4_K) {
         ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
     return 0;
@@ -2568,7 +2697,7 @@ int ds4_mmq_moe_pair_impl(
             }
         }
     }
-    if (sanitize_out) {
+    if (sanitize_out && type != GGML_TYPE_Q4_K) {
         ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }

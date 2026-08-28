@@ -43910,22 +43910,24 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
     const int grouped_batch_require = cuda_env_flag_enabled(
         "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH", 0);
+    const int grouped_prefill_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL", 0);
     if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
         n_tokens < 2u || group_dim > INT_MAX || rank > INT_MAX ||
         out_dim > INT_MAX || n_tokens > INT_MAX || !cuda_use_mmq()) {
-        return grouped_batch_require ? -1 : 0;
+        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
     }
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (low_dim > INT_MAX || (group_dim % CUDA_QK_K) != 0u ||
         (low_dim % CUDA_QK_K) != 0u) {
-        return grouped_batch_require ? -1 : 0;
+        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
     }
     const uint64_t row_a_bytes =
         (group_dim / CUDA_QK_K) * sizeof(cuda_block_q4_K);
     if (rank > UINT64_MAX / row_a_bytes ||
         n_groups > UINT64_MAX / (rank * row_a_bytes)) {
-        return grouped_batch_require ? -1 : 0;
+        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
     }
     const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
     if (out_a_offset > model_size ||
@@ -43935,22 +43937,35 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
         group_tmp->bytes < (uint64_t)n_tokens * group_dim * sizeof(float) ||
         low_tmp->bytes < (uint64_t)n_tokens * rank * sizeof(float)) {
-        return grouped_batch_require ? -1 : 0;
+        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
     const char *out_a = cuda_resolve_weight_ptr(
         model_map, out_a_offset, out_a_bytes, logical_tier, "q4 attn_out_a");
-    if (!out_a) return grouped_batch_require ? -1 : 0;
+    if (!out_a) {
+        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
+    }
     const int grouped_oracle = cuda_env_flag_enabled(
         "DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE", 0);
     const int grouped_batch_enable = cuda_env_flag_enabled(
         "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH", 0);
+    const int grouped_prefill_enable = cuda_env_flag_enabled(
+        "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL", 0);
+    const int grouped_prefill_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL") != NULL;
     if (grouped_oracle) cuda_q4_grouped_attn_a_oracle_register_report();
 
     const int grouped_gb10 =
         n_tokens <= 8u && n_groups <= INT_MAX &&
         ds4_tensor_device_idx(low) == logical_tier &&
         ds4_tensor_device_idx(heads) == logical_tier &&
+        cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    const int grouped_prefill_gb10 =
+        n_tokens > 8u && n_groups <= INT_MAX &&
+        ds4_tensor_device_idx(low) == logical_tier &&
+        ds4_tensor_device_idx(heads) == logical_tier &&
+        !grouped_prefill_disable &&
         cuda_q4_gb10_fast_path_enabled(
             logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
     if (grouped_batch_require &&
@@ -43960,7 +43975,26 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                 "not eligible\n");
         return -1;
     }
-    if (grouped_gb10) {
+    if (grouped_prefill_require && !grouped_prefill_gb10) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A prefill path "
+                "is not eligible\n");
+        return -1;
+    }
+    if ((grouped_prefill_enable || grouped_prefill_require) &&
+        grouped_prefill_gb10) {
+        const int rc = ds4_mmq_q4_K_grouped_dense(
+            out_a, (const float *)heads->ptr, (float *)low->ptr,
+            (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
+            cuda_decode_stream());
+        if (rc != 0) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 grouped attention-A prefill returned %d; "
+                    "failing closed after candidate dispatch\n",
+                    rc);
+            return -1;
+        }
+    } else if (grouped_gb10) {
         /* DSpark verification stores [token][group][K].  The opt-in batch
          * entry flattens (token, group) into channels while keeping
          * ncols_dst=1, preserving the canonical per-pair Q8_1 quantization

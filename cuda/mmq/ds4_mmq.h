@@ -205,6 +205,20 @@ int ds4_mmq_q4_K_dense_pair(
     int           K,
     cudaStream_t  stream);
 
+// Prefill attention output-A with W=[groups][M][K],
+// X=[N][groups][K], and out=[N][groups][M].  It quantizes the strided source
+// in one launch and writes each group directly to the final token-major
+// layout, while preserving the established per-group MMQ reduction tree.
+int ds4_mmq_q4_K_grouped_dense(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
 int ds4_mmq_mxfp4_dense(
     const void  * W_mxfp4,
     const float * X_f32,

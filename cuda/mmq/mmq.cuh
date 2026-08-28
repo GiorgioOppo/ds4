@@ -3663,6 +3663,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const int blocks_per_ne00_total,
         const char * __restrict__ x_soa, const int64_t soa_blocks) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
@@ -3750,6 +3751,22 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
+    }
+
+    /* AProjQ4 dense prefill used to run a separate full-output sanitize
+     * kernel after every MMQ.  Preserve that contract in the producer
+     * epilogue instead.  A stream-K block may publish only the leading
+     * partial of a split tile; sanitizing that partial would change the
+     * eventual sum, so only a block that owns the complete K range may fold
+     * non-finite values here.  Split tiles are handled after their final
+     * accumulation in mul_mat_q_stream_k_fixup below. */
+    if constexpr (type == GGML_TYPE_Q4_K && !fixup) {
+        if (kb0_start == 0 && kb0_stop == blocks_per_ne00_total) {
+#pragma unroll
+            for (int l = 0; l < mmq_x*mmq_y / (nwarps*warp_size); ++l) {
+                if (!isfinite(sum[l])) sum[l] = 0.0f;
+            }
+        }
     }
 
     if (fixup) {
@@ -3871,7 +3888,8 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+             blocks_per_ne00.z, x_soa, soa_blocks);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3957,7 +3975,8 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+             blocks_per_ne00.z, x_soa, soa_blocks);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -4026,7 +4045,8 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+         blocks_per_ne00.z, x_soa, soa_blocks);
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -4132,7 +4152,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
                 return;
             }
 
-            dst[j*stride_col_dst + i] += sum[j0/nwarps];
+            const int dst_idx = j*stride_col_dst + i;
+            float value = dst[dst_idx] + sum[j0/nwarps];
+            if constexpr (type == GGML_TYPE_Q4_K) {
+                if (!isfinite(value)) value = 0.0f;
+            }
+            dst[dst_idx] = value;
         }
         return;
     }
@@ -4168,7 +4193,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
             return;
         }
 
-        dst[ids_dst_shared[j]*stride_col_dst + i] += sum[j0/nwarps];
+        const int dst_idx = ids_dst_shared[j]*stride_col_dst + i;
+        float value = dst[dst_idx] + sum[j0/nwarps];
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            if (!isfinite(value)) value = 0.0f;
+        }
+        dst[dst_idx] = value;
     }
 }
 
