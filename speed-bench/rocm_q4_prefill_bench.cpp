@@ -28,10 +28,16 @@ constexpr uint32_t kDenseM = 1024u;
 constexpr uint32_t kKvM = 512u;
 constexpr uint32_t kQbK = 1024u;
 constexpr uint32_t kQbM = 32768u;
+constexpr uint32_t kOutputGroups = 8u;
+constexpr uint32_t kOutputRank = 1024u;
+constexpr uint32_t kOutputLowDim = kOutputGroups * kOutputRank;
+constexpr uint32_t kOutputM = 4096u;
 constexpr uint32_t kDefaultSets = 4u;
 constexpr uint32_t kDefaultSamples = 8u;
 constexpr uint32_t kDefaultWarmup = 2u;
-constexpr uint32_t kGuardWords = 64u;
+/* Catch a bad N-tail predicate anywhere in the final 64-token WMMA tile,
+ * including the widest q_b output used by this harness. */
+constexpr uint32_t kGuardWords = (64u - 1u) * kQbM;
 constexpr uint64_t kCompareChunk = 4u * 1024u * 1024u;
 
 constexpr const char *kPrefillEnable =
@@ -46,6 +52,14 @@ constexpr const char *kK1024Tile4SsdEnable =
     "DS4_ROCM_ENABLE_Q4_PREFILL_K1024_TILE4_SSD";
 constexpr const char *kK1024Tile4Require =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_K1024_TILE4";
+constexpr const char *kWmmaEnable =
+    "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA";
+constexpr const char *kWmmaSsdEnable =
+    "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD";
+constexpr const char *kWmmaDisable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA";
+constexpr const char *kWmmaRequire =
+    "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA";
 
 struct block_q4_K_host {
     uint16_t d;
@@ -62,20 +76,25 @@ enum class bench_case {
     dense,
     pair,
     qb,
+    outb,
+    output,
 };
 
 struct config {
     bench_case selected = bench_case::all;
-    std::vector<uint32_t> tokens = {9u, 17u, 33u, 128u, 512u};
+    std::vector<uint32_t> tokens = {9u, 17u, 33u, 128u, 257u, 512u};
     uint32_t sets = kDefaultSets;
     uint32_t samples = kDefaultSamples;
     uint32_t warmup = kDefaultWarmup;
+    bool wmma_supported = false;
 };
 
 struct weight_set {
     uint64_t dense_offset = 0;
     uint64_t kv_offset = 0;
     uint64_t qb_offset = 0;
+    uint64_t output_a_offset = 0;
+    uint64_t output_b_offset = 0;
 };
 
 struct model_fixture {
@@ -210,10 +229,14 @@ bool make_model(model_fixture *model, uint32_t sets) {
     const uint64_t dense_bytes = q4_weight_bytes(kDenseK, kDenseM);
     const uint64_t kv_bytes = q4_weight_bytes(kDenseK, kKvM);
     const uint64_t qb_bytes = q4_weight_bytes(kQbK, kQbM);
+    const uint64_t output_a_bytes =
+        q4_weight_bytes(kDenseK, kOutputLowDim);
+    const uint64_t output_b_bytes =
+        q4_weight_bytes(kOutputLowDim, kOutputM);
 
     model->weights.resize(sets);
-    model->span_offsets.reserve(static_cast<size_t>(sets) * 3u);
-    model->span_sizes.reserve(static_cast<size_t>(sets) * 3u);
+    model->span_offsets.reserve(static_cast<size_t>(sets) * 5u);
+    model->span_sizes.reserve(static_cast<size_t>(sets) * 5u);
     uint64_t cursor = 0;
     auto append = [&](uint64_t bytes) {
         const uint64_t offset = align_up(cursor, page);
@@ -227,6 +250,8 @@ bool make_model(model_fixture *model, uint32_t sets) {
         model->weights[i].dense_offset = append(dense_bytes);
         model->weights[i].kv_offset = append(kv_bytes);
         model->weights[i].qb_offset = append(qb_bytes);
+        model->weights[i].output_a_offset = append(output_a_bytes);
+        model->weights[i].output_b_offset = append(output_b_bytes);
     }
     model->size = align_up(cursor, page);
     void *storage = nullptr;
@@ -243,6 +268,10 @@ bool make_model(model_fixture *model, uint32_t sets) {
                 0x85a308d3u ^ (i * 0x7f4a7c15u));
         fill_q4(staging + model->weights[i].qb_offset, qb_bytes,
                 0x13198a2eu ^ (i * 0x94d049bbu));
+        fill_q4(staging + model->weights[i].output_a_offset, output_a_bytes,
+                0x03707344u ^ (i * 0x369dea0fu));
+        fill_q4(staging + model->weights[i].output_b_offset, output_b_bytes,
+                0xa4093822u ^ (i * 0xdb4f0b91u));
     }
 
     FILE *file = std::tmpfile();
@@ -361,6 +390,58 @@ bool bitwise_equal(const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
     return true;
 }
 
+bool numerically_close(const ds4_gpu_tensor *got,
+                       const ds4_gpu_tensor *reference,
+                       uint64_t bytes,
+                       const char *label,
+                       float abs_tolerance = 2.0f,
+                       float rel_tolerance = 3.0e-2f) {
+    if ((bytes % sizeof(float)) != 0u) return false;
+    const uint64_t chunk_bytes =
+        std::min(kCompareChunk, bytes) & ~(uint64_t)(sizeof(float) - 1u);
+    std::vector<float> lhs(static_cast<size_t>(chunk_bytes / sizeof(float)));
+    std::vector<float> rhs(static_cast<size_t>(chunk_bytes / sizeof(float)));
+    uint64_t failures = 0u;
+    uint64_t compared = 0u;
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    uint64_t worst = 0u;
+    for (uint64_t offset = 0u; offset < bytes; offset += chunk_bytes) {
+        const uint64_t count = std::min(chunk_bytes, bytes - offset);
+        if (!ds4_gpu_tensor_read(got, offset, lhs.data(), count) ||
+            !ds4_gpu_tensor_read(reference, offset, rhs.data(), count)) {
+            std::fprintf(stderr, "%s: oracle read failed\n", label);
+            return false;
+        }
+        const uint64_t values = count / sizeof(float);
+        for (uint64_t i = 0u; i < values; i++) {
+            const float diff = std::fabs(lhs[(size_t)i] - rhs[(size_t)i]);
+            const float rel = diff /
+                std::max(1.0f, std::fabs(rhs[(size_t)i]));
+            if (diff > max_abs) {
+                max_abs = diff;
+                worst = compared + i;
+            }
+            max_rel = std::max(max_rel, rel);
+            if (!std::isfinite(lhs[(size_t)i]) ||
+                !std::isfinite(rhs[(size_t)i]) ||
+                diff > abs_tolerance +
+                       rel_tolerance * std::fabs(rhs[(size_t)i])) {
+                failures++;
+            }
+        }
+        compared += values;
+    }
+    std::fprintf(stderr,
+                 "%s: failures=%llu/%llu max_abs=%g max_rel=%g worst=%llu "
+                 "tolerance(abs=%g rel=%g) %s\n",
+                 label, (unsigned long long)failures,
+                 (unsigned long long)compared, max_abs, max_rel,
+                 (unsigned long long)worst, abs_tolerance, rel_tolerance,
+                 failures == 0u ? "PASS" : "FAIL");
+    return failures == 0u;
+}
+
 void select_legacy() {
     (void)unsetenv(kPrefillEnable);
     (void)setenv(kPrefillDisable, "1", 1);
@@ -368,6 +449,10 @@ void select_legacy() {
     (void)unsetenv(kK1024Tile4Disable);
     (void)unsetenv(kK1024Tile4SsdEnable);
     (void)unsetenv(kK1024Tile4Require);
+    (void)unsetenv(kWmmaEnable);
+    (void)unsetenv(kWmmaSsdEnable);
+    (void)unsetenv(kWmmaDisable);
+    (void)unsetenv(kWmmaRequire);
 }
 
 void select_tile8(bool disable_k1024_tile4) {
@@ -376,6 +461,10 @@ void select_tile8(bool disable_k1024_tile4) {
     (void)setenv(kPrefillRequire, "1", 1);
     (void)unsetenv(kK1024Tile4SsdEnable);
     (void)unsetenv(kK1024Tile4Require);
+    (void)unsetenv(kWmmaEnable);
+    (void)unsetenv(kWmmaSsdEnable);
+    (void)unsetenv(kWmmaDisable);
+    (void)unsetenv(kWmmaRequire);
     if (disable_k1024_tile4) {
         (void)setenv(kK1024Tile4Disable, "1", 1);
     } else {
@@ -386,6 +475,18 @@ void select_tile8(bool disable_k1024_tile4) {
 void select_k1024_tile4() {
     select_tile8(false);
     (void)setenv(kK1024Tile4Require, "1", 1);
+}
+
+void select_wmma() {
+    select_tile8(false);
+    /* WMMA and TILE8 are separate strict contracts.  The candidate must not
+     * inherit REQUIRE_TILE8 from the baseline selector. */
+    (void)unsetenv(kPrefillRequire);
+    (void)setenv(kWmmaEnable, "1", 1);
+    (void)unsetenv(kWmmaSsdEnable);
+    (void)unsetenv(kWmmaDisable);
+    (void)setenv(kWmmaRequire, "1", 1);
+    (void)unsetenv(kK1024Tile4Require);
 }
 
 double percentile(std::vector<double> sorted, double fraction) {
@@ -574,10 +675,45 @@ bool run_dense(const model_fixture &model, const config &cfg,
                        check_guard(tiled.ptr, logical_bytes,
                                    "dense tile8 oracle");
             })) return false;
-    return bitwise_equal(legacy.ptr, tiled.ptr, logical_bytes,
-                         "dense legacy vs tile8") &&
-           check_guard(legacy.ptr, logical_bytes, "dense legacy") &&
-           check_guard(tiled.ptr, logical_bytes, "dense tile8");
+    if (!bitwise_equal(legacy.ptr, tiled.ptr, logical_bytes,
+                       "dense legacy vs tile8") ||
+        !check_guard(legacy.ptr, logical_bytes, "dense legacy") ||
+        !check_guard(tiled.ptr, logical_bytes, "dense tile8")) {
+        return false;
+    }
+    if (!cfg.wmma_supported || n_tokens < 256u) return true;
+
+    const arm wmma_baseline = {
+        "tile8", []() { select_tile8(false); },
+        [&](uint32_t set) {
+            return ds4_gpu_matmul_quant_tensor(
+                       legacy.ptr, model.data, model.size,
+                       model.weights[set].dense_offset, kQ4Type, kDenseK,
+                       kDenseM, x.ptr, n_tokens) != 0;
+        }};
+    const arm wmma_candidate = {
+        "wmma64", select_wmma,
+        [&](uint32_t set) {
+            return ds4_gpu_matmul_quant_tensor(
+                       tiled.ptr, model.data, model.size,
+                       model.weights[set].dense_offset, kQ4Type, kDenseK,
+                       kDenseM, x.ptr, n_tokens) != 0;
+        }};
+    return benchmark_arms(
+        "dense_wmma", n_tokens, kDenseK, kDenseM, cfg, wmma_baseline,
+        wmma_candidate,
+        [&]() {
+            return poison_output(legacy.ptr, logical_bytes, 0x7fc10001u) &&
+                   poison_output(tiled.ptr, logical_bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return numerically_close(tiled.ptr, legacy.ptr, logical_bytes,
+                                     "dense WMMA64 vs TILE8") &&
+                   check_guard(legacy.ptr, logical_bytes,
+                               "dense WMMA64 baseline oracle") &&
+                   check_guard(tiled.ptr, logical_bytes,
+                               "dense WMMA64 candidate oracle");
+        });
 }
 
 bool run_pair(const model_fixture &model, const config &cfg,
@@ -703,10 +839,178 @@ bool run_qb(const model_fixture &model, const config &cfg,
                        check_guard(tile4.ptr, logical_bytes,
                                    "q_b tile4 oracle");
             })) return false;
-    return bitwise_equal(tile8.ptr, tile4.ptr, logical_bytes,
-                         "q_b tile8 vs tile4") &&
-           check_guard(tile8.ptr, logical_bytes, "q_b tile8") &&
-           check_guard(tile4.ptr, logical_bytes, "q_b tile4");
+    if (!bitwise_equal(tile8.ptr, tile4.ptr, logical_bytes,
+                       "q_b tile8 vs tile4") ||
+        !check_guard(tile8.ptr, logical_bytes, "q_b tile8") ||
+        !check_guard(tile4.ptr, logical_bytes, "q_b tile4")) {
+        return false;
+    }
+    if (!cfg.wmma_supported || n_tokens < 256u) return true;
+
+    const arm wmma_baseline = {
+        "tile4", select_k1024_tile4,
+        [&](uint32_t set) {
+            return ds4_gpu_matmul_quant_tensor(
+                       tile8.ptr, model.data, model.size,
+                       model.weights[set].qb_offset, kQ4Type, kQbK, kQbM,
+                       x.ptr, n_tokens) != 0;
+        }};
+    const arm wmma_candidate = {
+        "wmma64", select_wmma,
+        [&](uint32_t set) {
+            return ds4_gpu_matmul_quant_tensor(
+                       tile4.ptr, model.data, model.size,
+                       model.weights[set].qb_offset, kQ4Type, kQbK, kQbM,
+                       x.ptr, n_tokens) != 0;
+        }};
+    return benchmark_arms(
+        "q_b_wmma", n_tokens, kQbK, kQbM, cfg, wmma_baseline,
+        wmma_candidate,
+        [&]() {
+            return poison_output(tile8.ptr, logical_bytes, 0x7fc10001u) &&
+                   poison_output(tile4.ptr, logical_bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return numerically_close(tile4.ptr, tile8.ptr, logical_bytes,
+                                     "q_b WMMA64 vs TILE4") &&
+                   check_guard(tile8.ptr, logical_bytes,
+                               "q_b WMMA64 baseline oracle") &&
+                   check_guard(tile4.ptr, logical_bytes,
+                               "q_b WMMA64 candidate oracle");
+        });
+}
+
+bool run_output_b(const model_fixture &model, const config &cfg,
+                  uint32_t n_tokens) {
+    if (!cfg.wmma_supported || n_tokens < 256u) return true;
+    uint64_t out_elements = 0;
+    if (!checked_mul(n_tokens, kOutputM, &out_elements)) return false;
+    const uint64_t logical_bytes = out_elements * sizeof(float);
+    const uint64_t allocation_bytes = logical_bytes +
+                                      kGuardWords * sizeof(uint32_t);
+    tensor_owner x(
+        static_cast<uint64_t>(n_tokens) * kOutputLowDim * sizeof(float));
+    tensor_owner tile8(allocation_bytes);
+    tensor_owner wmma(allocation_bytes);
+    if (!allocate_io(n_tokens, kOutputLowDim, out_elements,
+                     &x, &tile8, &wmma)) {
+        std::fprintf(stderr, "output_b N=%u: tensor setup failed\n", n_tokens);
+        return false;
+    }
+
+    const arm baseline = {
+        "tile8", []() { select_tile8(false); },
+        [&](uint32_t set) {
+            return ds4_gpu_matmul_quant_tensor(
+                       tile8.ptr, model.data, model.size,
+                       model.weights[set].output_b_offset, kQ4Type,
+                       kOutputLowDim, kOutputM, x.ptr, n_tokens) != 0;
+        }};
+    const arm candidate = {
+        "wmma64", select_wmma,
+        [&](uint32_t set) {
+            return ds4_gpu_matmul_quant_tensor(
+                       wmma.ptr, model.data, model.size,
+                       model.weights[set].output_b_offset, kQ4Type,
+                       kOutputLowDim, kOutputM, x.ptr, n_tokens) != 0;
+        }};
+    return benchmark_arms(
+        "output_b_wmma", n_tokens, kOutputLowDim, kOutputM, cfg,
+        baseline, candidate,
+        [&]() {
+            return poison_output(tile8.ptr, logical_bytes, 0x7fc10001u) &&
+                   poison_output(wmma.ptr, logical_bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return numerically_close(wmma.ptr, tile8.ptr, logical_bytes,
+                                     "output_b WMMA64 vs TILE8") &&
+                   check_guard(tile8.ptr, logical_bytes,
+                               "output_b TILE8 oracle") &&
+                   check_guard(wmma.ptr, logical_bytes,
+                               "output_b WMMA64 oracle");
+        });
+}
+
+bool run_attention_output(const model_fixture &model, const config &cfg,
+                          uint32_t n_tokens) {
+    if (!cfg.wmma_supported || n_tokens < 256u) return true;
+    uint64_t heads_elements = 0;
+    uint64_t low_elements = 0;
+    uint64_t out_elements = 0;
+    if (!checked_mul(n_tokens,
+                     static_cast<uint64_t>(kOutputGroups) * kDenseK,
+                     &heads_elements) ||
+        !checked_mul(n_tokens, kOutputLowDim, &low_elements) ||
+        !checked_mul(n_tokens, kOutputM, &out_elements)) {
+        return false;
+    }
+    const uint64_t low_bytes = low_elements * sizeof(float);
+    const uint64_t out_bytes = out_elements * sizeof(float);
+    const uint64_t guard_bytes = kGuardWords * sizeof(uint32_t);
+    tensor_owner heads(heads_elements * sizeof(float));
+    tensor_owner tile8_low(low_bytes + guard_bytes);
+    tensor_owner tile8_out(out_bytes + guard_bytes);
+    tensor_owner wmma_low(low_bytes + guard_bytes);
+    tensor_owner wmma_out(out_bytes + guard_bytes);
+    std::vector<float> activation;
+    fill_activation(&activation, n_tokens, kOutputGroups * kDenseK);
+    if (!heads.ptr || !tile8_low.ptr || !tile8_out.ptr || !wmma_low.ptr ||
+        !wmma_out.ptr ||
+        !ds4_gpu_tensor_write(heads.ptr, 0, activation.data(),
+                              activation.size() * sizeof(float))) {
+        std::fprintf(stderr,
+                     "attention_output N=%u: tensor setup failed\n", n_tokens);
+        return false;
+    }
+
+    auto poison_all = [&]() {
+        return poison_output(tile8_low.ptr, low_bytes, 0x7fc10001u) &&
+               poison_output(tile8_out.ptr, out_bytes, 0x7fc20002u) &&
+               poison_output(wmma_low.ptr, low_bytes, 0x7fc30003u) &&
+               poison_output(wmma_out.ptr, out_bytes, 0x7fc40004u);
+    };
+    if (!poison_all()) return false;
+
+    const arm baseline = {
+        "tile8_ab", []() { select_tile8(false); },
+        [&](uint32_t set) {
+            return ds4_gpu_attention_output_q4_K_batch_tensor(
+                       tile8_out.ptr, tile8_low.ptr, nullptr, nullptr,
+                       model.data, model.size,
+                       model.weights[set].output_a_offset,
+                       model.weights[set].output_b_offset, kQ4Type,
+                       kDenseK, kOutputRank, kOutputGroups, kOutputM,
+                       heads.ptr, n_tokens) > 0;
+        }};
+    const arm candidate = {
+        "wmma64_ab", select_wmma,
+        [&](uint32_t set) {
+            return ds4_gpu_attention_output_q4_K_batch_tensor(
+                       wmma_out.ptr, wmma_low.ptr, nullptr, nullptr,
+                       model.data, model.size,
+                       model.weights[set].output_a_offset,
+                       model.weights[set].output_b_offset, kQ4Type,
+                       kDenseK, kOutputRank, kOutputGroups, kOutputM,
+                       heads.ptr, n_tokens) > 0;
+        }};
+    return benchmark_arms(
+        "attention_output_ab_wmma", n_tokens, kOutputLowDim,
+        kDenseK + kOutputM, cfg, baseline, candidate, poison_all,
+        [&]() {
+            return numerically_close(wmma_low.ptr, tile8_low.ptr, low_bytes,
+                                     "output_a grouped WMMA64 vs TILE8") &&
+                   numerically_close(wmma_out.ptr, tile8_out.ptr, out_bytes,
+                                     "output_a+b WMMA64 vs TILE8",
+                                     16.0f, 8.0e-2f) &&
+                   check_guard(tile8_low.ptr, low_bytes,
+                               "output_a TILE8 oracle") &&
+                   check_guard(wmma_low.ptr, low_bytes,
+                               "output_a WMMA64 oracle") &&
+                   check_guard(tile8_out.ptr, out_bytes,
+                               "output_b TILE8 oracle") &&
+                   check_guard(wmma_out.ptr, out_bytes,
+                               "output_b WMMA64 oracle");
+        });
 }
 
 void usage(FILE *stream, const char *argv0) {
@@ -714,16 +1018,21 @@ void usage(FILE *stream, const char *argv0) {
         stream,
         "usage: %s [options]\n\n"
         "Resident ROCm Q4_K prefill kernel A/B (HIP event timing only).\n\n"
-        "  --case all|dense|pair|qb   comparison to run (default: all)\n"
+        "  --case all|dense|pair|qb|outb|output\n"
+        "                              comparison to run (default: all)\n"
         "  --tokens N[,N...]          token counts, each 9..4096\n"
-        "  --full                     use 9,16,17,31,32,33,128,512,4096\n"
+        "  --full                     use 9,16,17,31,32,33,128,257,512,4096\n"
         "  --sets N                   rotating resident weight sets (default: %u)\n"
         "  --samples N                samples/arm, multiple of 4 (default: %u)\n"
         "  --warmup N                 untimed dispatches/arm (default: %u)\n"
         "  -h, --help                 show this help\n\n"
-        "dense compares legacy with TILE8 at K=4096,M=1024; pair compares\n"
-        "two TILE8 projections with the fused K=4096,M=(1024+512) path; qb\n"
-        "compares TILE8 with TILE4 at the production K=1024,M=32768 shape.\n",
+        "dense compares legacy/TILE8 and, on gfx1151 for N>=256, TILE8/\n"
+        "WMMA64 at K=4096,M=1024. pair compares two TILE8 projections with\n"
+        "the fused K=4096,M=(1024+512) path. qb adds TILE4/WMMA64 at the\n"
+        "K=1024,M=32768 shape. outb isolates K=8192,M=4096; output measures\n"
+        "the production grouped output_a plus output_b API. WMMA comparisons\n"
+        "use a finite/toleranced oracle because their F16 boundary is not\n"
+        "bit-identical to the Q8_K activation path.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);
 }
 
@@ -785,6 +1094,8 @@ config parse_options(int argc, char **argv) {
             else if (!std::strcmp(value, "dense")) cfg.selected = bench_case::dense;
             else if (!std::strcmp(value, "pair")) cfg.selected = bench_case::pair;
             else if (!std::strcmp(value, "qb")) cfg.selected = bench_case::qb;
+            else if (!std::strcmp(value, "outb")) cfg.selected = bench_case::outb;
+            else if (!std::strcmp(value, "output")) cfg.selected = bench_case::output;
             else {
                 std::fprintf(stderr, "invalid --case: %s\n", value);
                 std::exit(2);
@@ -792,7 +1103,8 @@ config parse_options(int argc, char **argv) {
         } else if (!std::strcmp(argv[i], "--tokens")) {
             cfg.tokens = parse_tokens(need_value(&i, argc, argv));
         } else if (!std::strcmp(argv[i], "--full")) {
-            cfg.tokens = {9u, 16u, 17u, 31u, 32u, 33u, 128u, 512u, 4096u};
+            cfg.tokens = {
+                9u, 16u, 17u, 31u, 32u, 33u, 128u, 257u, 512u, 4096u};
         } else if (!std::strcmp(argv[i], "--sets")) {
             cfg.sets = parse_u32(need_value(&i, argc, argv), "--sets", 1u, 32u);
         } else if (!std::strcmp(argv[i], "--samples")) {
@@ -822,13 +1134,17 @@ bool includes(bench_case selected, bench_case wanted) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    const config cfg = parse_options(argc, argv);
+    config cfg = parse_options(argc, argv);
     env_snapshot enable_guard(kPrefillEnable);
     env_snapshot disable_guard(kPrefillDisable);
     env_snapshot require_guard(kPrefillRequire);
     env_snapshot tile4_guard(kK1024Tile4Disable);
     env_snapshot tile4_ssd_guard(kK1024Tile4SsdEnable);
     env_snapshot tile4_require_guard(kK1024Tile4Require);
+    env_snapshot wmma_enable_guard(kWmmaEnable);
+    env_snapshot wmma_ssd_enable_guard(kWmmaSsdEnable);
+    env_snapshot wmma_disable_guard(kWmmaDisable);
+    env_snapshot wmma_require_guard(kWmmaRequire);
 
     int device_count = 0;
     hipError_t hip_rc = hipGetDeviceCount(&device_count);
@@ -845,6 +1161,20 @@ int main(int argc, char **argv) {
                      "rocm-q4-prefill-bench: cannot query device properties\n");
         return 1;
     }
+    cfg.wmma_supported = properties.warpSize == 32 &&
+        std::strncmp(properties.gcnArchName, "gfx1151", 7u) == 0;
+    const bool wmma_only_case =
+        cfg.selected == bench_case::outb || cfg.selected == bench_case::output;
+    const bool has_wmma_tokens = std::any_of(
+        cfg.tokens.begin(), cfg.tokens.end(),
+        [](uint32_t n_tokens) { return n_tokens >= 256u; });
+    if (wmma_only_case && (!cfg.wmma_supported || !has_wmma_tokens)) {
+        std::fprintf(stderr,
+                     "rocm-q4-prefill-bench: SKIP (%s requires gfx1151 "
+                     "wave32 and at least one N>=256 sample)\n",
+                     cfg.selected == bench_case::outb ? "outb" : "output");
+        return 77;
+    }
     if (!ds4_gpu_init()) {
         std::fprintf(stderr, "rocm-q4-prefill-bench: ds4_gpu_init failed\n");
         return 1;
@@ -858,7 +1188,9 @@ int main(int argc, char **argv) {
     }
     if (ok) {
         ds4_gpu_set_ssd_streaming(false);
-        const uint64_t max_tensor = q4_weight_bytes(kQbK, kQbM);
+        const uint64_t max_tensor = std::max(
+            q4_weight_bytes(kOutputLowDim, kOutputM),
+            q4_weight_bytes(kDenseK, kOutputLowDim));
         if (!ds4_gpu_set_model_fd(fileno(model.file)) ||
             !ds4_gpu_set_model_map_spans(
                 model.data, model.size, model.span_offsets.data(),
@@ -874,9 +1206,11 @@ int main(int argc, char **argv) {
     if (ok) {
         std::printf(
             "DS4_ROCM_Q4_PREFILL_SETUP device=%s arch=%s warp=%d sets=%u "
-            "resident_mib=%.2f timing=hip_events ssd_streaming=off\n",
+            "resident_mib=%.2f timing=hip_events ssd_streaming=off "
+            "wmma64=%s\n",
             properties.name, properties.gcnArchName, properties.warpSize,
-            cfg.sets, static_cast<double>(model.resident_bytes) / 1048576.0);
+            cfg.sets, static_cast<double>(model.resident_bytes) / 1048576.0,
+            cfg.wmma_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
             if (includes(cfg.selected, bench_case::dense)) {
@@ -887,6 +1221,12 @@ int main(int argc, char **argv) {
             }
             if (ok && includes(cfg.selected, bench_case::qb)) {
                 ok = run_qb(model, cfg, n_tokens) && ok;
+            }
+            if (ok && includes(cfg.selected, bench_case::outb)) {
+                ok = run_output_b(model, cfg, n_tokens) && ok;
+            }
+            if (ok && includes(cfg.selected, bench_case::output)) {
+                ok = run_attention_output(model, cfg, n_tokens) && ok;
             }
             if (!ok) break;
         }

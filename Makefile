@@ -370,7 +370,7 @@ help:
 	@echo "  make rocm-dspark-verify-depth Build ROCm and run the DSpark verifier invariant"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make rocm-iq2-moe-prefill-bench  Build the resident ROCm IQ2/Q2 WMMA A/B harness"
-	@echo "  make rocm-q4-prefill-bench  Build the resident ROCm Q4 dense/pair/q_b A/B harness"
+	@echo "  make rocm-q4-prefill-bench  Build the resident ROCm Q4 projection/WMMA A/B harness"
 	@echo "  make cuda-iq2-moe-prefill-bench CUDA_ARCH=sm_N  Build the resident CUDA IQ2/Q2 profiling harness"
 	@echo "  make cuda-q4-prefill-bench CUDA_ARCH=sm_N  Build the resident CUDA Q4 dense/pair/q_b harness"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"

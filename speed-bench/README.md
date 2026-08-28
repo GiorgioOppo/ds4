@@ -127,26 +127,46 @@ make rocm-q4-prefill-bench ROCM_ARCH=gfx1151
 
 The fixture copies four rotating sets of synthetic GGUF-layout Q4_K weights
 to device memory before warmup and forces SSD streaming off. HIP events then
-measure only the activation quantizer and Q4 projection kernels. The three
-default comparisons are:
+measure only activation conversion/quantization and projection kernels. The
+comparisons are:
 
 - `dense`: legacy versus TILE8 at the Flash Q-A `K=4096,M=1024` shape;
 - `pair`: two TILE8 calls versus the fused Q-A/KV
   `K=4096,M=(1024+512)` path;
 - `qb`: TILE8 versus TILE4 at the production `attn_q_b`
   `K=1024,M=32768` shape.
+- `outb`: TILE8 versus the experimental compressed WMMA64 kernel at the
+  production `output_b` `K=8192,M=4096` shape;
+- `output`: the complete grouped `output_a` plus `output_b` production API,
+  comparing two TILE8 projections with two direct WMMA64 projections.
 
-The default token set is `9,17,33,128,512`, covering the first row after each
-small token-tile boundary plus medium prefill. Use `--full` for
-`9,16,17,31,32,33,128,512,4096`, or select a focused run such as:
+On gfx1151 wave32, `dense` and `qb` also emit a second WMMA64 comparison for
+`N>=256`. The candidate keeps Q4_K weights compressed, rounds each transient
+32-value weight group and the activation tile to F16 in the kernel, accumulates
+through WMMA in F32, and avoids both Q8_K activation scratch and persistent F16
+weight sidecars. It remains opt-in in the runtime; the benchmark uses the
+strict REQUIRE gate so a rejected dispatch fails instead of timing a fallback.
+The benchmark always keeps SSD streaming disabled. Runtime SSD experiments
+need the separate `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD=1` gate and only accept
+projection ranges already backed by physical device memory, so model I/O is
+never folded into the kernel result.
+
+The default token set is `9,17,33,128,257,512`, covering the first row after
+the small TILE8 boundaries and the first token after a 64-token WMMA boundary.
+Use `--full` for `9,16,17,31,32,33,128,257,512,4096`, or select a focused run
+such as:
 
 ```
 ./speed-bench/rocm_q4_prefill_bench \
-  --case qb --tokens 9,17,33,128,512,4096 --samples 8
+  --case output --tokens 256,257,512,1024,2048,4096 --samples 8
 ```
 
 Every case rotates identical resident weight sets between arms, alternates
-ABBA/BAAB, checks the outputs bit-for-bit, and verifies allocation guards.
+ABBA/BAAB, and verifies allocation guards. Comparisons among the integer Q4
+paths remain bit-exact. WMMA64 has a deliberate F16 arithmetic boundary, so
+those comparisons require finite results within an explicit absolute/relative
+smoke tolerance; a model-logit or prompt oracle is still required before
+enabling the kernel by default.
 Fixture creation, the host-to-device residency copy, warmup, oracle readback,
 and environment-gate changes are outside the reported HIP-event intervals.
 `candidate_delta_pct` is negative when the candidate is faster; the companion
