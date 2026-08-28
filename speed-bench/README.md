@@ -152,6 +152,56 @@ and environment-gate changes are outside the reported HIP-event intervals.
 `candidate_delta_pct` is negative when the candidate is faster; the companion
 `speedup_pct` reports the positive speedup convention.
 
+### Resident CUDA Q4_K prefill
+
+Build the production-API kernel harness on a CUDA host with an explicit
+architecture:
+
+```
+make cuda-q4-prefill-bench CUDA_ARCH=sm_121
+./speed-bench/cuda_q4_prefill_bench --path mmq
+```
+
+The default `dense`, `pair`, and `qb` cases use the same production shapes and
+token set as the ROCm harness. The synthetic GGUF-layout weights are copied by
+the backend into a `cudaMalloc` allocation before warmup. A CUDA test hook
+checks the backend-owned pointer provenance and device attributes of every
+dense, KV, and q_b range in every rotating weight set; a global free-memory
+delta is printed only as a diagnostic and is not accepted as residency proof.
+CUDA events measure the production backend GPU interval, including
+stream-ordered scratch allocation/free, tail clears, activation quantization,
+Q4 projection, and output sanitization. Model uploads, output poisoning, full
+finite-output scans, sampled CPU Q4_K oracles, canary checks, and warmups are
+outside the event interval.
+
+`cuda_use_mmq()` caches its first decision for the life of the process, so the
+dense and `attn_q_b` MMQ-versus-Q8_K comparison deliberately uses separate
+processes. The MMQ process also enables a test-only strict control, so an MMQ
+rejection fails the run instead of silently measuring the Q8_K fallback. Run
+both orders to balance thermal/order drift:
+
+```
+# ABBA
+./speed-bench/cuda_q4_prefill_bench --path legacy --case dense
+./speed-bench/cuda_q4_prefill_bench --path mmq    --case dense
+./speed-bench/cuda_q4_prefill_bench --path mmq    --case dense
+./speed-bench/cuda_q4_prefill_bench --path legacy --case dense
+
+# BAAB
+./speed-bench/cuda_q4_prefill_bench --path mmq    --case dense
+./speed-bench/cuda_q4_prefill_bench --path legacy --case dense
+./speed-bench/cuda_q4_prefill_bench --path legacy --case dense
+./speed-bench/cuda_q4_prefill_bench --path mmq    --case dense
+```
+
+Repeat with `--case qb` for `K=1024,M=32768`. Each result records the immutable
+path as `path=legacy` or `path=mmq`; do not toggle `DS4_CUDA_MMQ` around calls
+inside another harness. The default MMQ `pair` case is a true in-process
+ABBA/BAAB comparison between two public dense calls and the public fused pair
+API, with bit-exact pair outputs. Prefill pair is skipped under `--path legacy`
+because the CUDA pair API intentionally returns control to two independent
+dense projections for `N>8` when MMQ is disabled.
+
 ### Resident IQ2/Q2 MoE prefill on ROCm and CUDA
 
 The backend-neutral fixture uses the production `N=4096`, 256-expert, top-6

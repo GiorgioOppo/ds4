@@ -134,6 +134,20 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+#if defined(DS4_BENCH_CUDA) || \
+    (!defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && \
+     !defined(DS4_NO_GPU))
+/* CUDA benchmark/test controls.  These are deliberately explicit API hooks
+ * rather than environment knobs: production callers must not depend on
+ * strict dispatch or backend-internal model provenance. */
+int ds4_cuda_test_model_range_is_device_resident(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier);
+void ds4_cuda_test_set_q4_mmq_strict(int required);
+#endif
 /* Prepare a second, fully resident support GGUF without replacing the active
  * target-model mapping used by SSD streaming. */
 int ds4_gpu_prepare_support_model(const void *model_map, uint64_t model_size,

@@ -1766,6 +1766,15 @@ extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
     return cuda_q8_fold_take(src, in_dim, stream, q81);
 }
 
+/* Test-only fail-closed control used by the resident Q4 benchmark.  Keep this
+ * out of the environment surface: production dispatch retains its established
+ * MMQ-to-Q8_K rollback unless an explicit test caller enables strict mode. */
+static int g_cuda_test_q4_mmq_strict;
+
+extern "C" void ds4_cuda_test_set_q4_mmq_strict(int required) {
+    g_cuda_test_q4_mmq_strict = required != 0;
+}
+
 static int cuda_use_mmq(void) {
     static int init = 0;
     static int use = 0;
@@ -2625,6 +2634,30 @@ static int cuda_q4_attn_q_b_source_is_device_resident(
     return attr.memoryType == cudaMemoryTypeDevice &&
            attr.device == expected_device;
 #endif
+}
+
+extern "C" int ds4_cuda_test_model_range_is_device_resident(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier) {
+    if (!model_map || model_size == 0u || bytes == 0u ||
+        offset > model_size || bytes > model_size - offset ||
+        g_n_gpus != 1 || logical_tier != 0 ||
+        model_map != g_model_host_base ||
+        model_size != g_model_registered_size ||
+        !g_model_device_owned || !g_model_device_base) {
+        return 0;
+    }
+
+    const char *resolved = g_model_device_base + offset;
+    if (!cuda_resolved_model_range_is_device_resident(
+            model_map, offset, bytes, resolved)) {
+        return 0;
+    }
+    return cuda_q4_attn_q_b_source_is_device_resident(
+        resolved, g_gpu[logical_tier].device_id);
 }
 
 /* Match the existing CUDA weight-cache safety floor without coupling this
@@ -7756,6 +7789,7 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    g_cuda_test_q4_mmq_strict = 0;
     g_stream_expert_persistent_runtime_ready = 0;
     (void)cudaDeviceSynchronize();
     /* The resident q_b GEMMs may still reference cache-owned allocations.
@@ -40430,14 +40464,27 @@ static int cuda_matmul_q4_K_tensor(
         if (rc == 0) return 1;
         fprintf(stderr,
                 "ds4: Q4_K MMQ returned %d "
-                "(in=%llu out=%llu n_tok=%llu); falling back\n",
+                "(in=%llu out=%llu n_tok=%llu)%s\n",
                 rc, (unsigned long long)in_dim,
                 (unsigned long long)out_dim,
-                (unsigned long long)n_tok);
+                (unsigned long long)n_tok,
+                g_cuda_test_q4_mmq_strict
+                    ? "; strict benchmark mode rejects fallback"
+                    : "; falling back");
+        if (g_cuda_test_q4_mmq_strict) return 0;
         if (in_dim == 1024u && out_dim == 32768u && n_tok == 1u &&
             getenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT") != NULL) {
             return 0;
         }
+    }
+    if (g_cuda_test_q4_mmq_strict) {
+        fprintf(stderr,
+                "ds4: Q4_K strict benchmark mode found no MMQ dispatch "
+                "(in=%llu out=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok);
+        return 0;
     }
     void *tmp = cuda_tmp_alloc_on(logical_tier,
                                   n_tok * blocks * sizeof(cuda_block_q8_K),
@@ -40553,13 +40600,27 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
         if (rc == 0) return 1;
         fprintf(stderr,
                 "ds4: Q4_K %s pair returned %d "
-                "(in=%llu out0=%llu out1=%llu n_tok=%llu); falling back\n",
+                "(in=%llu out0=%llu out1=%llu n_tok=%llu)%s\n",
                 n_tok <= 8u ? "MMVQ" : "MMQ", rc,
                 (unsigned long long)in_dim,
                 (unsigned long long)out0_dim,
                 (unsigned long long)out1_dim,
-                (unsigned long long)n_tok);
+                (unsigned long long)n_tok,
+                g_cuda_test_q4_mmq_strict
+                    ? "; strict benchmark mode rejects fallback"
+                    : "; falling back");
+        if (g_cuda_test_q4_mmq_strict) return 0;
         if (gb10_canonical) return 0;
+    }
+    if (g_cuda_test_q4_mmq_strict) {
+        fprintf(stderr,
+                "ds4: Q4_K pair strict benchmark mode found no MMQ "
+                "dispatch (in=%llu out0=%llu out1=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out0_dim,
+                (unsigned long long)out1_dim,
+                (unsigned long long)n_tok);
+        return 0;
     }
 
     /* The Q8_K pair is the established decode/microbatch rollback only.
