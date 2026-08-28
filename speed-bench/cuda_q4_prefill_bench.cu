@@ -27,11 +27,25 @@ constexpr uint32_t kDenseM = 1024u;
 constexpr uint32_t kKvM = 512u;
 constexpr uint32_t kQbK = 1024u;
 constexpr uint32_t kQbM = 32768u;
+constexpr uint32_t kOutputGroups = 8u;
+constexpr uint32_t kOutputRank = 1024u;
+constexpr uint32_t kOutputLowDim = kOutputGroups * kOutputRank;
+constexpr uint32_t kOutputMinB = 256u;
 constexpr uint32_t kDefaultSets = 4u;
 constexpr uint32_t kDefaultSamples = 8u;
 constexpr uint32_t kDefaultWarmup = 2u;
 constexpr uint32_t kGuardWords = 64u;
 constexpr uint64_t kCompareChunk = 4u * 1024u * 1024u;
+
+constexpr const char *kGroupedPrefillEnable =
+    "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL";
+constexpr const char *kGroupedPrefillDisable =
+    "DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL";
+constexpr const char *kGroupedPrefillRequire =
+    "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL";
+constexpr const char *kGroupedGlobalDisable =
+    "DS4_CUDA_NO_Q4_GROUPED_ATTN_A";
+constexpr const char *kGb10GlobalDisable = "DS4_CUDA_NO_Q4_GB10_FAST";
 
 struct block_q4_K_host {
     uint16_t d;
@@ -48,6 +62,7 @@ enum class bench_case {
     dense,
     pair,
     qb,
+    outa,
 };
 
 enum class cuda_path {
@@ -58,7 +73,8 @@ enum class cuda_path {
 struct config {
     bench_case selected = bench_case::all;
     cuda_path path = cuda_path::mmq;
-    std::vector<uint32_t> tokens = {9u, 17u, 33u, 128u, 512u};
+    std::vector<uint32_t> tokens = {9u, 17u, 33u, 127u, 128u, 129u, 257u,
+                                    512u};
     uint32_t sets = kDefaultSets;
     uint32_t samples = kDefaultSamples;
     uint32_t warmup = kDefaultWarmup;
@@ -68,6 +84,8 @@ struct weight_set {
     uint64_t dense_offset = 0;
     uint64_t kv_offset = 0;
     uint64_t qb_offset = 0;
+    uint64_t output_a_offset = 0;
+    uint64_t output_b_offset = 0;
 };
 
 struct model_fixture {
@@ -146,6 +164,10 @@ struct event_timer {
 struct arm {
     const char *name;
     std::function<bool(uint32_t)> dispatch;
+    // Host-only path selection must happen before the start event.  Otherwise
+    // an idle device can execute that event while setenv()/unsetenv() is still
+    // running, folding host-side gate switching into the reported GPU time.
+    std::function<bool()> select;
 };
 
 struct stats {
@@ -199,6 +221,10 @@ bool make_model(model_fixture *model, uint32_t sets) {
     const uint64_t dense_bytes = q4_weight_bytes(kDenseK, kDenseM);
     const uint64_t kv_bytes = q4_weight_bytes(kDenseK, kKvM);
     const uint64_t qb_bytes = q4_weight_bytes(kQbK, kQbM);
+    const uint64_t output_a_bytes =
+        q4_weight_bytes(kDenseK, kOutputLowDim);
+    const uint64_t output_b_bytes =
+        q4_weight_bytes(kOutputLowDim, kOutputMinB);
 
     model->weights.resize(sets);
     uint64_t cursor = 0;
@@ -212,6 +238,8 @@ bool make_model(model_fixture *model, uint32_t sets) {
         model->weights[i].dense_offset = append(dense_bytes);
         model->weights[i].kv_offset = append(kv_bytes);
         model->weights[i].qb_offset = append(qb_bytes);
+        model->weights[i].output_a_offset = append(output_a_bytes);
+        model->weights[i].output_b_offset = append(output_b_bytes);
     }
     model->size = align_up(cursor, page);
     void *storage = nullptr;
@@ -228,6 +256,10 @@ bool make_model(model_fixture *model, uint32_t sets) {
                 0x85a308d3u ^ (i * 0x7f4a7c15u));
         fill_q4(model->data + model->weights[i].qb_offset, qb_bytes,
                 0x13198a2eu ^ (i * 0x94d049bbu));
+        fill_q4(model->data + model->weights[i].output_a_offset,
+                output_a_bytes, 0xa4093822u ^ (i * 0x2545f491u));
+        fill_q4(model->data + model->weights[i].output_b_offset,
+                output_b_bytes, 0x299f31d0u ^ (i * 0x369dea0fu));
     }
     return true;
 }
@@ -486,6 +518,80 @@ bool sampled_cpu_oracle(const ds4_gpu_tensor *output,
     return true;
 }
 
+bool sampled_grouped_cpu_oracle(
+        const ds4_gpu_tensor *output, const model_fixture &model,
+        uint64_t weight_offset, const std::vector<float> &activation,
+        uint32_t n_tokens, const char *label) {
+    const std::vector<uint32_t> tokens = sample_indices(n_tokens);
+    const std::vector<uint32_t> rows = sample_indices(kOutputRank);
+    const uint64_t blocks_per_row = kDenseK / kQkK;
+    const uint64_t row_bytes = blocks_per_row * sizeof(block_q4_K_host);
+    std::vector<float> weight_row;
+    const double abs_tol = 0.25 * std::sqrt(static_cast<double>(kDenseK));
+    constexpr double rel_tol = 0.06;
+
+    for (uint32_t group = 0; group < kOutputGroups; group++) {
+        for (uint32_t row : rows) {
+            const uint64_t weight_row_index =
+                static_cast<uint64_t>(group) * kOutputRank + row;
+            const auto *blocks =
+                reinterpret_cast<const block_q4_K_host *>(
+                    model.data + weight_offset + weight_row_index * row_bytes);
+            dequantize_q4_row(blocks, kDenseK, &weight_row);
+            for (uint32_t token : tokens) {
+                const float *x = activation.data() +
+                    (static_cast<uint64_t>(token) * kOutputGroups + group) *
+                        kDenseK;
+                float reference = 0.0f;
+                for (uint32_t k = 0; k < kDenseK; k++) {
+                    reference += weight_row[k] * x[k];
+                }
+                const uint64_t element =
+                    static_cast<uint64_t>(token) * kOutputLowDim +
+                    static_cast<uint64_t>(group) * kOutputRank + row;
+                float got = 0.0f;
+                if (!ds4_gpu_tensor_read(output, element * sizeof(float),
+                                         &got, sizeof(got))) {
+                    std::fprintf(stderr,
+                                 "%s: grouped output read failed\n", label);
+                    return false;
+                }
+                const double abs_error = std::fabs(
+                    static_cast<double>(got) - reference);
+                const double rel_error = reference != 0.0f
+                    ? abs_error / std::fabs(static_cast<double>(reference))
+                    : (abs_error == 0.0
+                           ? 0.0
+                           : std::numeric_limits<double>::infinity());
+                if (!std::isfinite(got) ||
+                    (abs_error > abs_tol && rel_error > rel_tol)) {
+                    std::fprintf(
+                        stderr,
+                        "%s: grouped CPU oracle mismatch token=%u group=%u "
+                        "row=%u got=%.7g reference=%.7g abs=%.5g rel=%.5g "
+                        "limits=%.5g/%.3g\n",
+                        label, token, group, row, got, reference, abs_error,
+                        rel_error, abs_tol, rel_tol);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool select_grouped_prefill_baseline() {
+    return unsetenv(kGroupedPrefillEnable) == 0 &&
+           setenv(kGroupedPrefillDisable, "1", 1) == 0 &&
+           unsetenv(kGroupedPrefillRequire) == 0;
+}
+
+bool select_grouped_prefill_candidate() {
+    return setenv(kGroupedPrefillEnable, "1", 1) == 0 &&
+           unsetenv(kGroupedPrefillDisable) == 0 &&
+           setenv(kGroupedPrefillRequire, "1", 1) == 0;
+}
+
 double percentile(std::vector<double> sorted, double fraction) {
     std::sort(sorted.begin(), sorted.end());
     if (sorted.empty()) return 0.0;
@@ -510,6 +616,10 @@ const char *path_name(cuda_path path) {
     return path == cuda_path::mmq ? "mmq" : "legacy";
 }
 
+bool select_arm(const arm &which) {
+    return !which.select || which.select();
+}
+
 bool benchmark_single_path(
         const char *case_name, uint32_t n_tokens, uint32_t in_dim,
         uint32_t out_dim, const config &cfg, const arm &which,
@@ -519,7 +629,8 @@ bool benchmark_single_path(
     // recording a CUDA event.  Upload, poison, readback, and CPU work remain
     // outside the measured interval.
     for (uint32_t set = 0; set < cfg.sets; set++) {
-        if (!oracle_prepare() || !which.dispatch(set) ||
+        if (!oracle_prepare() || !select_arm(which) ||
+            !which.dispatch(set) ||
             !ds4_gpu_synchronize() || !oracle(set)) {
             std::fprintf(stderr,
                          "cuda-q4-prefill-bench: %s oracle failed for "
@@ -530,7 +641,8 @@ bool benchmark_single_path(
     }
 
     for (uint32_t i = 0; i < cfg.warmup; i++) {
-        if (!which.dispatch(i % cfg.sets) || !ds4_gpu_synchronize()) {
+        if (!select_arm(which) || !which.dispatch(i % cfg.sets) ||
+            !ds4_gpu_synchronize()) {
             return false;
         }
     }
@@ -540,7 +652,8 @@ bool benchmark_single_path(
     samples.reserve(cfg.samples);
     for (uint32_t i = 0; i < cfg.samples; i++) {
         float elapsed = 0.0f;
-        if (!timer.measure([&]() { return which.dispatch(i % cfg.sets); },
+        if (!select_arm(which) ||
+            !timer.measure([&]() { return which.dispatch(i % cfg.sets); },
                            &elapsed)) {
             std::fprintf(stderr,
                          "cuda-q4-prefill-bench: %s/%s timed dispatch failed\n",
@@ -565,24 +678,29 @@ bool benchmark_single_path(
 }
 
 bool benchmark_pair_arms(
-        uint32_t n_tokens, const config &cfg, const arm &baseline,
-        const arm &candidate, const std::function<bool()> &oracle_prepare,
+        const char *case_name, uint32_t n_tokens, uint32_t in_dim,
+        uint32_t out_dim, uint64_t focus_macs_per_token,
+        uint64_t common_macs_per_token, const config &cfg,
+        const arm &baseline, const arm &candidate,
+        const std::function<bool()> &oracle_prepare,
         const std::function<bool(uint32_t)> &oracle) {
     for (uint32_t set = 0; set < cfg.sets; set++) {
-        if (!oracle_prepare() || !baseline.dispatch(set) ||
-            !ds4_gpu_synchronize() || !candidate.dispatch(set) ||
+        if (!oracle_prepare() || !select_arm(baseline) ||
+            !baseline.dispatch(set) || !ds4_gpu_synchronize() ||
+            !select_arm(candidate) || !candidate.dispatch(set) ||
             !ds4_gpu_synchronize() || !oracle(set)) {
             std::fprintf(stderr,
-                         "cuda-q4-prefill-bench: pair oracle failed for "
+                         "cuda-q4-prefill-bench: %s oracle failed for "
                          "weight set %u\n",
-                         set);
+                         case_name, set);
             return false;
         }
     }
 
     for (uint32_t i = 0; i < cfg.warmup; i++) {
         const uint32_t set = i % cfg.sets;
-        if (!baseline.dispatch(set) || !ds4_gpu_synchronize() ||
+        if (!select_arm(baseline) || !baseline.dispatch(set) ||
+            !ds4_gpu_synchronize() || !select_arm(candidate) ||
             !candidate.dispatch(set) || !ds4_gpu_synchronize()) {
             return false;
         }
@@ -596,10 +714,12 @@ bool benchmark_pair_arms(
     auto take = [&](const arm &which, uint32_t set,
                     std::vector<double> *samples) {
         float elapsed = 0.0f;
-        if (!timer.measure([&]() { return which.dispatch(set); }, &elapsed)) {
+        if (!select_arm(which) ||
+            !timer.measure([&]() { return which.dispatch(set); }, &elapsed)) {
             std::fprintf(stderr,
-                         "cuda-q4-prefill-bench: pair/%s timed dispatch failed\n",
-                         which.name);
+                         "cuda-q4-prefill-bench: %s/%s timed dispatch "
+                         "failed\n",
+                         case_name, which.name);
             return false;
         }
         samples->push_back(static_cast<double>(elapsed));
@@ -634,20 +754,23 @@ bool benchmark_pair_arms(
     const double paired_median = percentile(paired_delta, 0.5);
     const double median_delta = (b.median / a.median - 1.0) * 100.0;
     const double speedup = (a.median / b.median - 1.0) * 100.0;
-    const double macs = static_cast<double>(n_tokens) * kDenseK *
-                        (kDenseM + kKvM);
+    const double macs = static_cast<double>(n_tokens) *
+                        (focus_macs_per_token + common_macs_per_token);
     std::printf(
-        "DS4_CUDA_Q4_PREFILL_BENCH case=pair path=%s N=%u K=%u M=%u "
+        "DS4_CUDA_Q4_PREFILL_BENCH case=%s path=%s N=%u K=%u M=%u "
         "baseline=%s candidate=%s samples=%u sets=%u "
+        "focus_macs_per_token=%llu common_macs_per_token=%llu "
         "baseline_ms_p50=%.6f candidate_ms_p50=%.6f "
         "baseline_ms_min=%.6f candidate_ms_min=%.6f "
         "baseline_ms_p95=%.6f candidate_ms_p95=%.6f "
         "baseline_gmac_s=%.3f candidate_gmac_s=%.3f "
         "candidate_delta_pct=%.3f paired_delta_pct_p50=%.3f "
         "speedup_pct=%.3f\n",
-        path_name(cfg.path), n_tokens, kDenseK, kDenseM + kKvM,
-        baseline.name, candidate.name, cfg.samples, cfg.sets, a.median,
-        b.median, a.minimum, b.minimum, a.p95, b.p95,
+        case_name, path_name(cfg.path), n_tokens, in_dim, out_dim,
+        baseline.name, candidate.name, cfg.samples, cfg.sets,
+        static_cast<unsigned long long>(focus_macs_per_token),
+        static_cast<unsigned long long>(common_macs_per_token),
+        a.median, b.median, a.minimum, b.minimum, a.p95, b.p95,
         macs / (a.median * 1.0e6), macs / (b.median * 1.0e6),
         median_delta, paired_median, speedup);
     std::fflush(stdout);
@@ -679,7 +802,8 @@ bool run_dense(const model_fixture &model, const config &cfg,
                        output.ptr, model.data, model.size,
                        model.weights[set].dense_offset, kQ4Type, kDenseK,
                        kDenseM, x.ptr, n_tokens) != 0;
-        }};
+        },
+        {}};
     return benchmark_single_path(
         "dense", n_tokens, kDenseK, kDenseM, cfg, path,
         [&]() {
@@ -743,7 +867,8 @@ bool run_pair(const model_fixture &model, const config &cfg,
                        separate1.ptr, model.data, model.size,
                        model.weights[set].kv_offset, kQ4Type, kDenseK,
                        kKvM, x.ptr, n_tokens) != 0;
-        }};
+        },
+        {}};
     const arm candidate = {
         "pair_mmq",
         [&](uint32_t set) {
@@ -752,9 +877,12 @@ bool run_pair(const model_fixture &model, const config &cfg,
                        model.weights[set].dense_offset,
                        model.weights[set].kv_offset, kDenseK, kDenseM, kKvM,
                        x.ptr, n_tokens) != 0;
-        }};
+        },
+        {}};
     return benchmark_pair_arms(
-        n_tokens, cfg, baseline, candidate,
+        "pair", n_tokens, kDenseK, kDenseM + kKvM,
+        static_cast<uint64_t>(kDenseK) * (kDenseM + kKvM), 0u,
+        cfg, baseline, candidate,
         [&]() {
             return poison_output(separate0.ptr, out0_bytes, 0x7fc10001u,
                                  0x4000u) &&
@@ -828,7 +956,8 @@ bool run_qb(const model_fixture &model, const config &cfg,
                        output.ptr, model.data, model.size,
                        model.weights[set].qb_offset, kQ4Type, kQbK, kQbM,
                        x.ptr, n_tokens) != 0;
-        }};
+        },
+        {}};
     return benchmark_single_path(
         "q_b", n_tokens, kQbK, kQbM, cfg, path,
         [&]() {
@@ -849,15 +978,157 @@ bool run_qb(const model_fixture &model, const config &cfg,
         check_guard(output.ptr, out_bytes, 0x9000u, "q_b output final");
 }
 
+bool run_output_a(const model_fixture &model, const config &cfg,
+                  uint32_t n_tokens) {
+    if (cfg.path == cuda_path::legacy) {
+        std::printf(
+            "DS4_CUDA_Q4_PREFILL_SKIP case=outa_plus_min_b path=legacy "
+            "N=%u reason=grouped_prefill_requires_mmq\n",
+            n_tokens);
+        std::fflush(stdout);
+        return true;
+    }
+
+    uint64_t heads_elements = 0;
+    uint64_t low_elements = 0;
+    uint64_t out_elements = 0;
+    if (!checked_mul(n_tokens,
+                     static_cast<uint64_t>(kOutputGroups) * kDenseK,
+                     &heads_elements) ||
+        !checked_mul(n_tokens, kOutputLowDim, &low_elements) ||
+        !checked_mul(n_tokens, kOutputMinB, &out_elements)) {
+        return false;
+    }
+    const uint64_t heads_bytes = heads_elements * sizeof(float);
+    const uint64_t low_bytes = low_elements * sizeof(float);
+    const uint64_t out_bytes = out_elements * sizeof(float);
+    const uint64_t group_tmp_bytes =
+        static_cast<uint64_t>(n_tokens) * kDenseK * sizeof(float);
+    const uint64_t low_tmp_bytes =
+        static_cast<uint64_t>(n_tokens) * kOutputRank * sizeof(float);
+    const uint64_t guard_bytes = kGuardWords * sizeof(uint32_t);
+    tensor_owner heads(heads_bytes + guard_bytes);
+    tensor_owner baseline_low(low_bytes + guard_bytes);
+    tensor_owner baseline_out(out_bytes + guard_bytes);
+    tensor_owner candidate_low(low_bytes + guard_bytes);
+    tensor_owner candidate_out(out_bytes + guard_bytes);
+    tensor_owner group_tmp(group_tmp_bytes + guard_bytes);
+    tensor_owner low_tmp(low_tmp_bytes + guard_bytes);
+    std::vector<float> activation;
+    fill_activation(&activation, n_tokens, kOutputGroups * kDenseK);
+    if (!heads.ptr || !baseline_low.ptr || !baseline_out.ptr ||
+        !candidate_low.ptr || !candidate_out.ptr || !group_tmp.ptr ||
+        !low_tmp.ptr ||
+        !ds4_gpu_tensor_write(heads.ptr, 0, activation.data(), heads_bytes) ||
+        !prepare_guard(heads.ptr, heads_bytes, 0xa000u)) {
+        std::fprintf(stderr,
+                     "outa_plus_min_b N=%u: tensor setup failed\n",
+                     n_tokens);
+        return false;
+    }
+
+    const arm baseline = {
+        "pack8_mmq_unpack",
+        [&](uint32_t set) {
+            return ds4_gpu_attention_output_q4_K_batch_tensor(
+                       baseline_out.ptr, baseline_low.ptr, group_tmp.ptr,
+                       low_tmp.ptr, model.data, model.size,
+                       model.weights[set].output_a_offset,
+                       model.weights[set].output_b_offset, kQ4Type,
+                       kDenseK, kOutputRank, kOutputGroups, kOutputMinB,
+                       heads.ptr, n_tokens) > 0;
+        },
+        select_grouped_prefill_baseline};
+    const arm candidate = {
+        "grouped_dense",
+        [&](uint32_t set) {
+            return ds4_gpu_attention_output_q4_K_batch_tensor(
+                       candidate_out.ptr, candidate_low.ptr, group_tmp.ptr,
+                       low_tmp.ptr, model.data, model.size,
+                       model.weights[set].output_a_offset,
+                       model.weights[set].output_b_offset, kQ4Type,
+                       kDenseK, kOutputRank, kOutputGroups, kOutputMinB,
+                       heads.ptr, n_tokens) > 0;
+        },
+        select_grouped_prefill_candidate};
+    const uint64_t output_a_macs_per_token =
+        static_cast<uint64_t>(kOutputGroups) * kDenseK * kOutputRank;
+    const uint64_t output_b_macs_per_token =
+        static_cast<uint64_t>(kOutputLowDim) * kOutputMinB;
+    const bool ok = benchmark_pair_arms(
+        "outa_plus_min_b", n_tokens, kDenseK, kOutputLowDim,
+        output_a_macs_per_token, output_b_macs_per_token, cfg,
+        baseline, candidate,
+        [&]() {
+            return poison_output(baseline_low.ptr, low_bytes, 0x7fc10001u,
+                                 0xb000u) &&
+                   poison_output(baseline_out.ptr, out_bytes, 0x7fc20002u,
+                                 0xc000u) &&
+                   poison_output(candidate_low.ptr, low_bytes, 0x7fc30003u,
+                                 0xd000u) &&
+                   poison_output(candidate_out.ptr, out_bytes, 0x7fc40004u,
+                                 0xe000u) &&
+                   prepare_guard(group_tmp.ptr, group_tmp_bytes, 0xf000u) &&
+                   prepare_guard(low_tmp.ptr, low_tmp_bytes, 0x11000u);
+        },
+        [&](uint32_t set) {
+            return bitwise_equal(baseline_low.ptr, candidate_low.ptr,
+                                 low_bytes,
+                                 "output_a grouped dense vs pack/MMQ") &&
+                   bitwise_equal(baseline_out.ptr, candidate_out.ptr,
+                                 out_bytes,
+                                 "output_a minimal-B final output") &&
+                   output_is_finite(baseline_low.ptr, low_bytes,
+                                    "output_a low") &&
+                   output_is_finite(baseline_out.ptr, out_bytes,
+                                    "output_a minimal-B output") &&
+                   sampled_grouped_cpu_oracle(
+                       baseline_low.ptr, model,
+                       model.weights[set].output_a_offset, activation,
+                       n_tokens, "output_a") &&
+                   check_guard(heads.ptr, heads_bytes, 0xa000u,
+                               "output_a heads") &&
+                   check_guard(baseline_low.ptr, low_bytes, 0xb000u,
+                               "output_a baseline low") &&
+                   check_guard(baseline_out.ptr, out_bytes, 0xc000u,
+                               "output_a baseline out") &&
+                   check_guard(candidate_low.ptr, low_bytes, 0xd000u,
+                               "output_a candidate low") &&
+                   check_guard(candidate_out.ptr, out_bytes, 0xe000u,
+                               "output_a candidate out") &&
+                   check_guard(group_tmp.ptr, group_tmp_bytes, 0xf000u,
+                               "output_a group scratch") &&
+                   check_guard(low_tmp.ptr, low_tmp_bytes, 0x11000u,
+                               "output_a low scratch");
+        });
+    return ok &&
+           check_guard(heads.ptr, heads_bytes, 0xa000u,
+                       "output_a heads final") &&
+           check_guard(baseline_low.ptr, low_bytes, 0xb000u,
+                       "output_a baseline low final") &&
+           check_guard(baseline_out.ptr, out_bytes, 0xc000u,
+                       "output_a baseline out final") &&
+           check_guard(candidate_low.ptr, low_bytes, 0xd000u,
+                       "output_a candidate low final") &&
+           check_guard(candidate_out.ptr, out_bytes, 0xe000u,
+                       "output_a candidate out final") &&
+           check_guard(group_tmp.ptr, group_tmp_bytes, 0xf000u,
+                       "output_a group scratch final") &&
+           check_guard(low_tmp.ptr, low_tmp_bytes, 0x11000u,
+                       "output_a low scratch final");
+}
+
 void usage(FILE *stream, const char *argv0) {
     std::fprintf(
         stream,
         "usage: %s [options]\n\n"
         "Resident CUDA Q4_K prefill kernel benchmark (CUDA event timing).\n\n"
         "  --path mmq|legacy         process-wide path (default: mmq)\n"
-        "  --case all|dense|pair|qb  case to run (default: all)\n"
+        "  --case all|dense|pair|qb|outa\n"
+        "                             case to run (default: all)\n"
         "  --tokens N[,N...]         token counts, each 9..4096\n"
-        "  --full                    use 9,16,17,31,32,33,128,512,4096\n"
+        "  --full                    use 9,16,17,31,32,33,127,128,129,257,"
+        "512,2048,4096\n"
         "  --sets N                  rotating resident weight sets (default: %u)\n"
         "  --samples N               samples/arm, multiple of 4 (default: %u)\n"
         "  --warmup N                untimed dispatches/arm (default: %u)\n"
@@ -866,7 +1137,10 @@ void usage(FILE *stream, const char *argv0) {
         "legacy/MMQ\nprocesses (preferably ABBA/BAAB) to compare them because "
         "the CUDA backend\ncaches DS4_CUDA_MMQ on its first dispatch. Pair is "
         "an in-process ABBA/BAAB\ncomparison of two MMQ projections against "
-        "the fused public pair API.\n",
+        "the fused public pair API. outa\ncompares the current eight-group "
+        "pack/MMQ/unpack path against the strict\ngrouped-prefill candidate "
+        "at the production attention-A shape. It includes\na common minimal "
+        "Q4 output-B (M=256) whose MACs are reported separately.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);
 }
 
@@ -940,6 +1214,8 @@ config parse_options(int argc, char **argv) {
                 cfg.selected = bench_case::pair;
             } else if (!std::strcmp(value, "qb")) {
                 cfg.selected = bench_case::qb;
+            } else if (!std::strcmp(value, "outa")) {
+                cfg.selected = bench_case::outa;
             } else {
                 std::fprintf(stderr, "invalid --case: %s\n", value);
                 std::exit(2);
@@ -947,7 +1223,8 @@ config parse_options(int argc, char **argv) {
         } else if (!std::strcmp(argv[i], "--tokens")) {
             cfg.tokens = parse_tokens(need_value(&i, argc, argv));
         } else if (!std::strcmp(argv[i], "--full")) {
-            cfg.tokens = {9u, 16u, 17u, 31u, 32u, 33u, 128u, 512u, 4096u};
+            cfg.tokens = {9u,   16u,  17u,  31u,  32u,  33u, 127u,
+                          128u, 129u, 257u, 512u, 2048u, 4096u};
         } else if (!std::strcmp(argv[i], "--sets")) {
             cfg.sets = parse_u32(need_value(&i, argc, argv), "--sets", 1u,
                                  32u);
@@ -968,9 +1245,12 @@ config parse_options(int argc, char **argv) {
                      "--samples must be a multiple of 4 for balanced runs\n");
         std::exit(2);
     }
-    if (cfg.path == cuda_path::legacy && cfg.selected == bench_case::pair) {
+    if (cfg.path == cuda_path::legacy &&
+        (cfg.selected == bench_case::pair ||
+         cfg.selected == bench_case::outa)) {
         std::fprintf(stderr,
-                     "--case pair requires --path mmq for prefill N > 8\n");
+                     "--case pair/outa requires --path mmq for prefill "
+                     "N > 8\n");
         std::exit(2);
     }
     return cfg;
@@ -1007,6 +1287,10 @@ bool verify_resident_weight_ranges(const model_fixture &model) {
     const uint64_t dense_bytes = q4_weight_bytes(kDenseK, kDenseM);
     const uint64_t kv_bytes = q4_weight_bytes(kDenseK, kKvM);
     const uint64_t qb_bytes = q4_weight_bytes(kQbK, kQbM);
+    const uint64_t output_a_bytes =
+        q4_weight_bytes(kDenseK, kOutputLowDim);
+    const uint64_t output_b_bytes =
+        q4_weight_bytes(kOutputLowDim, kOutputMinB);
     for (uint32_t set = 0; set < model.weights.size(); set++) {
         struct range_desc {
             const char *name;
@@ -1017,6 +1301,9 @@ bool verify_resident_weight_ranges(const model_fixture &model) {
             {"dense", model.weights[set].dense_offset, dense_bytes},
             {"kv", model.weights[set].kv_offset, kv_bytes},
             {"q_b", model.weights[set].qb_offset, qb_bytes},
+            {"output_a", model.weights[set].output_a_offset, output_a_bytes},
+            {"output_b_min", model.weights[set].output_b_offset,
+             output_b_bytes},
         };
         for (const range_desc &range : ranges) {
             if (!ds4_cuda_test_model_range_is_device_resident(
@@ -1069,11 +1356,21 @@ int main(int argc, char **argv) {
     env_snapshot copy_guard("DS4_CUDA_COPY_MODEL");
     env_snapshot pair_guard("DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
     env_snapshot graph_guard("DS4_CUDA_DECODE_GRAPHS");
+    env_snapshot grouped_enable_guard(kGroupedPrefillEnable);
+    env_snapshot grouped_disable_guard(kGroupedPrefillDisable);
+    env_snapshot grouped_require_guard(kGroupedPrefillRequire);
+    env_snapshot grouped_global_disable_guard(kGroupedGlobalDisable);
+    env_snapshot gb10_global_disable_guard(kGb10GlobalDisable);
     if (setenv("DS4_CUDA_MMQ",
                cfg.path == cuda_path::mmq ? "1" : "0", 1) != 0 ||
         setenv("DS4_CUDA_COPY_MODEL", "1", 1) != 0 ||
         setenv("DS4_CUDA_DECODE_GRAPHS", "0", 1) != 0 ||
-        unsetenv("DS4_CUDA_DISABLE_Q4_DENSE_PAIR") != 0) {
+        unsetenv("DS4_CUDA_DISABLE_Q4_DENSE_PAIR") != 0 ||
+        unsetenv(kGroupedPrefillEnable) != 0 ||
+        unsetenv(kGroupedPrefillDisable) != 0 ||
+        unsetenv(kGroupedPrefillRequire) != 0 ||
+        unsetenv(kGroupedGlobalDisable) != 0 ||
+        unsetenv(kGb10GlobalDisable) != 0) {
         std::fprintf(stderr,
                      "cuda-q4-prefill-bench: environment setup failed\n");
         return 1;
@@ -1093,6 +1390,16 @@ int main(int argc, char **argv) {
         std::fprintf(stderr,
                      "cuda-q4-prefill-bench: cannot query device properties\n");
         return 1;
+    }
+    const bool grouped_prefill_supported =
+        device_count == 1 && properties.major == 12 &&
+        properties.minor == 1 && properties.warpSize == 32;
+    if (cfg.selected == bench_case::outa &&
+        !grouped_prefill_supported) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: SKIP (outa requires one "
+                     "GB10/sm_121 device)\n");
+        return 77;
     }
     if (!ds4_gpu_init()) {
         std::fprintf(stderr, "cuda-q4-prefill-bench: ds4_gpu_init failed\n");
@@ -1142,13 +1449,14 @@ int main(int argc, char **argv) {
             "device_free_delta_valid=%d timing=cuda_events "
             "ssd_streaming=off model_storage=cudaMalloc "
             "residency=backend_provenance strict_mmq=%d "
-            "dispatch_stream=legacy_default\n",
+            "grouped_attn_a_prefill=%s dispatch_stream=legacy_default\n",
             properties.name, properties.major, properties.minor,
             properties.warpSize, path_name(cfg.path), cfg.sets,
             static_cast<double>(model.payload_bytes) / 1048576.0,
             static_cast<double>(resident_delta) / 1048576.0,
             resident_delta_valid ? 1 : 0,
-            cfg.path == cuda_path::mmq ? 1 : 0);
+            cfg.path == cuda_path::mmq ? 1 : 0,
+            grouped_prefill_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
             if (includes(cfg.selected, bench_case::dense)) {
@@ -1159,6 +1467,10 @@ int main(int argc, char **argv) {
             }
             if (ok && includes(cfg.selected, bench_case::qb)) {
                 ok = run_qb(model, cfg, n_tokens) && ok;
+            }
+            if (ok && grouped_prefill_supported &&
+                includes(cfg.selected, bench_case::outa)) {
+                ok = run_output_a(model, cfg, n_tokens) && ok;
             }
             if (!ok) break;
         }

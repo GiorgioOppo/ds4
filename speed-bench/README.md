@@ -182,11 +182,13 @@ make cuda-q4-prefill-bench CUDA_ARCH=sm_121
 ./speed-bench/cuda_q4_prefill_bench --path mmq
 ```
 
-The default `dense`, `pair`, and `qb` cases use the same production shapes and
-token set as the ROCm harness. The synthetic GGUF-layout weights are copied by
+The default `dense`, `pair`, `qb`, and GB10-only `outa` cases use production
+shapes and include both sides of the 128-column MMQ tail. The synthetic
+GGUF-layout weights are copied by
 the backend into a `cudaMalloc` allocation before warmup. A CUDA test hook
 checks the backend-owned pointer provenance and device attributes of every
-dense, KV, and q_b range in every rotating weight set; a global free-memory
+dense, KV, q_b, output-A, and minimal output-B range in every rotating weight
+set; a global free-memory
 delta is printed only as a diagnostic and is not accepted as residency proof.
 CUDA events measure the production backend GPU interval, including
 stream-ordered scratch allocation/free, tail clears, activation quantization,
@@ -221,6 +223,23 @@ ABBA/BAAB comparison between two public dense calls and the public fused pair
 API, with bit-exact pair outputs. Prefill pair is skipped under `--path legacy`
 because the CUDA pair API intentionally returns control to two independent
 dense projections for `N>8` when MMQ is disabled.
+
+On GB10, isolate the production Flash attention-output A geometry
+(`groups=8`, `K=4096`, `rank=1024`) and its 127/128/129 token tails with:
+
+```
+./speed-bench/cuda_q4_prefill_bench \
+  --path mmq --case outa --tokens 127,128,129,257,512,2048 \
+  --samples 16 --warmup 4
+```
+
+This is an in-process ABBA/BAAB comparison between the current eight-group
+pack/MMQ/unpack sequence and the strictly required grouped-prefill dispatch.
+The public API must also execute output-B, so the fixture uses a valid Q4_K
+`K=8192,M=256` output-B common to both arms. It is 6.25% of output-A's MACs;
+the result prints `focus_macs_per_token` and `common_macs_per_token` separately
+and checks the two arms bit-for-bit. SSD streaming is forced off and every
+measured weight range must resolve to backend-owned device storage.
 
 ### Resident IQ2/Q2 MoE prefill on ROCm and CUDA
 

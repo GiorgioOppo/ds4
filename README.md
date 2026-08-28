@@ -756,6 +756,13 @@ arithmetic:
   dispatch while keeping `ncols_dst=1`;
   `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1` restores the per-token grouped loop
   and `DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1` restores the per-group loop;
+- for prefill widths above eight, the experimental
+  `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL=1` path quantizes the strided
+  `[token][group][K]` input in one launch and writes each group directly into
+  `[token][group][rank]`. It removes the eight F32 pack/unpack copies while
+  keeping one established stream-K MMQ reduction per group. Add
+  `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL=1` for fail-closed tests;
+  `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` is the dominant local rollback;
 - attention-output B keeps its canonical MMVQ result and the ordinary HC
   epilogue inside the graph-compatible fused call.  The row-packed epilogue
   remains oracle-only until a GB10 device run proves it bit-exact;
@@ -787,6 +794,12 @@ encounters another active capture or cannot allocate comparison scratch, it
 directly enqueues the canonical reference instead of consuming an unchecked
 candidate. The scratch, grouped, and persistent paths are also covered by
 `make test-mmq-parity-cuda CUDA_ARCH=sm_121`.
+
+CUDA Q4_K MMQ performs its non-finite output guard in the final write-back
+(or after the final stream-K fixup) instead of launching a separate
+full-output sanitizer. Finite results and the per-group reduction order are
+unchanged; the resident CUDA prefill harness checks them bit-for-bit against
+the former pack/MMQ/unpack path.
 
 Two additional CUDA fusions remain experimental until a device oracle passes
 on the target GPU. `DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE=1` combines HC RMSNorm
