@@ -116,6 +116,42 @@ ABBA/BAAB, and requires bit-exact outputs plus intact input/output canaries.
 No GGUF access, SSD I/O, upload, readback, or CPU wall time is included in a
 measured command buffer.
 
+### Resident ROCm Q4_K prefill
+
+Build the production-dispatch A/B harness on a ROCm host with:
+
+```
+make rocm-q4-prefill-bench ROCM_ARCH=gfx1151
+./speed-bench/rocm_q4_prefill_bench
+```
+
+The fixture copies four rotating sets of synthetic GGUF-layout Q4_K weights
+to device memory before warmup and forces SSD streaming off. HIP events then
+measure only the activation quantizer and Q4 projection kernels. The three
+default comparisons are:
+
+- `dense`: legacy versus TILE8 at the Flash Q-A `K=4096,M=1024` shape;
+- `pair`: two TILE8 calls versus the fused Q-A/KV
+  `K=4096,M=(1024+512)` path;
+- `qb`: TILE8 versus TILE4 at the production `attn_q_b`
+  `K=1024,M=32768` shape.
+
+The default token set is `9,17,33,128,512`, covering the first row after each
+small token-tile boundary plus medium prefill. Use `--full` for
+`9,16,17,31,32,33,128,512,4096`, or select a focused run such as:
+
+```
+./speed-bench/rocm_q4_prefill_bench \
+  --case qb --tokens 9,17,33,128,512,4096 --samples 8
+```
+
+Every case rotates identical resident weight sets between arms, alternates
+ABBA/BAAB, checks the outputs bit-for-bit, and verifies allocation guards.
+Fixture creation, the host-to-device residency copy, warmup, oracle readback,
+and environment-gate changes are outside the reported HIP-event intervals.
+`candidate_delta_pct` is negative when the candidate is faster; the companion
+`speedup_pct` reports the positive speedup convention.
+
 ### Resident IQ2/Q2 MoE prefill on ROCm and CUDA
 
 The backend-neutral fixture uses the production `N=4096`, 256-expert, top-6
