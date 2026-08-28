@@ -312,7 +312,9 @@ static bool compare_case(const float *actual, const float *reference,
 }
 
 int main(void) {
-    static const uint32_t token_cases[] = {1u, 8u, 9u, 31u, 32u, 33u};
+    static const uint32_t token_cases[] = {
+        1u, 8u, 9u, 16u, 17u, 31u, 32u, 33u,
+    };
     const uint64_t row_bytes =
         (INDEXER_IN_DIM / QK_K) * sizeof(block_q4_K);
     const uint64_t weight_bytes = (uint64_t)INDEXER_OUT_DIM * row_bytes;

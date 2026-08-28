@@ -2076,7 +2076,7 @@ template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
 // this to turn prefill into large simdgroup matrix operations; each block_q
 // contains 16*nl weights.
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false>
 kernel void kernel_mul_mm(
         constant ds4_metal_args_mul_mm & args,
         device const char * src0,
@@ -2104,6 +2104,12 @@ kernel void kernel_mul_mm(
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+    // SIMDgroups 0/1 own token rows 0..15 and SIMDgroups 2/3 own rows
+    // 16..31.  Every thread still participates in cooperative A/B staging and
+    // every threadgroup barrier; on a short final Q4_K tile only the waves with
+    // valid token rows construct fragments, execute MMA, and store results.
+    const bool mma_active =
+        !CULL_TAIL_SIMDGROUPS || 16*(short)(sgitg/2) < nr1;
 
     // a thread shouldn't load data outside of the matrix
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
@@ -2134,8 +2140,10 @@ kernel void kernel_mul_mm(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
-        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    if (mma_active) {
+        for (short i = 0; i < 8; i++){
+            mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
@@ -2210,27 +2218,29 @@ kernel void kernel_mul_mm(
         threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
         threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
 
-        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
+        if (mma_active) {
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 8; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+                }
+
+                lsma += 8*64;
+                lsmb += 4*64;
             }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 2; i++) {
-                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
-            }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 8; i++){
-                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
-            }
-
-            lsma += 8*64;
-            lsmb += 4*64;
         }
     }
 
@@ -2240,8 +2250,10 @@ kernel void kernel_mul_mm(
             (r0 + 32*(sgitg &  1)) + \
             (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
 
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        if (mma_active) {
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            }
         }
     } else {
         // block is smaller than 64x32, we should avoid writing data outside of the matrix
@@ -2249,8 +2261,10 @@ kernel void kernel_mul_mm(
 
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        if (mma_active) {
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2489,6 +2503,7 @@ kernel void kernel_mul_mm_f16_f32_scaled(
 }
 
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, true>) mul_mm_q4_K_tail_cull_t;
 
 // Host-visible prefill matmul variants for F16 and Q8_0 weights.
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
@@ -2500,6 +2515,7 @@ template [[host_name("kernel_mul_mm_f16_f16_rhs")]] kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f32_tail_cull")]] kernel mul_mm_q4_K_tail_cull_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, true>;
 // Q4_K output projection with a pre-materialized F16 RHS.  The ordinary F32
 // variant performs this same F32-to-F16 conversion every time a 64-row weight
 // tile revisits the activation matrix; this variant lets the host perform it

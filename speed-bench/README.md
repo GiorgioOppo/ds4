@@ -99,6 +99,23 @@ Environment variables consumed while the engine opens, including the Metal
 streaming `F_NOCACHE` controls, cannot be compared with `--candidate-env` in
 this harness and likewise require separate processes.
 
+### Metal Q4_K generic-MM tail cull
+
+Build and run the GGUF-free kernel-only comparison with:
+
+```
+make metal-q4-mm-tail-cull-bench
+./speed-bench/metal_q4_mm_tail_cull_bench
+```
+
+The default `4096 -> 1024` shape models a Flash Q-A projection. Use
+`--in-dim 1024 --out-dim 32768` to measure `attn_q_b`. Both arms dispatch the
+checked-in production Metal kernels with resident rotating Q4_K weights and
+GPU timestamps. The harness covers `N=9,16,17,31,33,47,63,65`, alternates
+ABBA/BAAB, and requires bit-exact outputs plus intact input/output canaries.
+No GGUF access, SSD I/O, upload, readback, or CPU wall time is included in a
+measured command buffer.
+
 ### Resident IQ2/Q2 MoE prefill on ROCm and CUDA
 
 The backend-neutral fixture uses the production `N=4096`, 256-expert, top-6

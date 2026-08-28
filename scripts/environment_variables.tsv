@@ -613,6 +613,7 @@ runtime/metal	DS4_METAL_DISABLE_Q4_GROUP8_EXPERT_TABLE	presence rollback; unset:
 runtime/metal	DS4_METAL_DISABLE_Q4_GROUPED_BOUNDARY	presence rollback; unset: automatic/default path; any value including 0 disables	Disables Q4 grouped boundary.	ds4_metal.m:42149
 runtime/metal	DS4_METAL_DISABLE_Q4_GROUPED_EXPERTS	presence rollback; unset: automatic/default path; any value including 0 disables	Disables Q4 grouped experts.	ds4_metal.m:42130
 runtime/metal	DS4_METAL_DISABLE_Q4_MV_CLASSIC	presence rollback; unset: automatic/default path; any value including 0 disables	Disables Q4 MV classic.	ds4_metal.m:21571
+runtime/metal	DS4_METAL_DISABLE_Q4_PREFILL_TAIL_SIMDGROUP_CULL	presence rollback; unset: automatic on Apple M1-M4 for Q4_K single-tile prefill N=9..16 and production attn_q_b tails through N=65; any value including 0 disables	Restores the legacy four-SIMDgroup Q4_K prefill kernel on the measured short-prefill scopes.	ds4_metal.m:22088
 runtime/metal	DS4_METAL_DISABLE_Q4_QKV_COMPRESSOR_FUSE	presence rollback; unset: automatic/default path; any value including 0 disables	Disables Q4 QKV compressor fuse.	ds4_metal.m:22083
 runtime/metal	DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS	presence rollback; unset: automatic/default path; any value including 0 disables	Disables Q4 selected expert views.	ds4.c:21136
 runtime/metal	DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN	value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables	Disables Q4 SSD prefill attn out exactn.	ds4_metal.m:28095

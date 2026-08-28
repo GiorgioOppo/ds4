@@ -22050,10 +22050,38 @@ static const char *ds4_gpu_q4_mv_ext_name(uint32_t weight_type, int16_t r1ptg) {
     }
 }
 
-static const char *ds4_gpu_q4_mm_name(uint32_t weight_type) {
+static const char *ds4_gpu_q4_mm_name(
+        uint32_t weight_type,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
     switch (weight_type) {
     case DS4_METAL_TENSOR_Q4_0: return "kernel_mul_mm_q4_0_f32";
-    case DS4_METAL_TENSOR_Q4_K: return "kernel_mul_mm_q4_K_f32";
+    case DS4_METAL_TENSOR_Q4_K: {
+        /*
+         * The legacy 64x32 kernel maps token rows 0..15 to SIMDgroups 0/1
+         * and rows 16..31 to SIMDgroups 2/3.  When the final token tile has
+         * at most 16 rows, the latter pair can skip its fragment loads, MMA,
+         * and store while all four SIMDgroups still perform cooperative
+         * staging and reach every threadgroup barrier.  Keep a narrow
+         * rollback and avoid the candidate when it cannot cull a whole pair.
+         */
+        const uint64_t tail = n_tok % 32u;
+        const bool measured_platform =
+            ds4_gpu_device_is_pre_m5_apple_silicon();
+        const bool measured_output_geometry = (out_dim % 64u) == 0u;
+        const bool production_q_b =
+            in_dim == 1024u && out_dim == 32768u && n_tok <= 65u;
+        const bool single_tile_prefill = n_tok <= 16u;
+        const bool tail_cull =
+            n_tok > 8u && tail > 0u && tail <= 16u &&
+            measured_platform &&
+            measured_output_geometry &&
+            (single_tile_prefill || production_q_b) &&
+            getenv("DS4_METAL_DISABLE_Q4_PREFILL_TAIL_SIMDGROUP_CULL") == NULL;
+        return tail_cull ? "kernel_mul_mm_q4_K_f32_tail_cull"
+                         : "kernel_mul_mm_q4_K_f32";
+    }
     default: return NULL;
     }
 }
@@ -22261,7 +22289,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             ds4_gpu_warn_mpp_fallback();
         }
 
-        const char *mm_fn = ds4_gpu_q4_mm_name(weight_type);
+        const char *mm_fn = ds4_gpu_q4_mm_name(
+            weight_type, in_dim, out_dim, n_tok);
         const bool bc_inp = (in_dim % 32u) != 0;
         const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
         id<MTLComputePipelineState> pipeline =

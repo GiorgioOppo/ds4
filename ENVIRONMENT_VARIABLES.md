@@ -130,13 +130,13 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1072 `DS4_*` runtime variables** and
+Inventory totals: **1073 `DS4_*` runtime variables** and
 **6 external runtime variables**.
 The auxiliary inventories contain **118 test/test-fixture entries**
 and **19 tool/wrapper entries**.
 
 <details>
-<summary><strong>Metal (444)</strong></summary>
+<summary><strong>Metal (445)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -277,6 +277,7 @@ and **19 tool/wrapper entries**.
 | `DS4_METAL_DISABLE_Q4_GROUPED_BOUNDARY` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 grouped boundary. | [ds4_metal.m:42149](ds4_metal.m#L42149) |
 | `DS4_METAL_DISABLE_Q4_GROUPED_EXPERTS` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 grouped experts. | [ds4_metal.m:42130](ds4_metal.m#L42130) |
 | `DS4_METAL_DISABLE_Q4_MV_CLASSIC` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 MV classic. | [ds4_metal.m:21571](ds4_metal.m#L21571) |
+| `DS4_METAL_DISABLE_Q4_PREFILL_TAIL_SIMDGROUP_CULL` | presence rollback; unset: automatic on Apple M1-M4 for Q4_K single-tile prefill N=9..16 and production attn_q_b tails through N=65; any value including 0 disables | Restores the legacy four-SIMDgroup Q4_K prefill kernel on the measured short-prefill scopes. | [ds4_metal.m:22088](ds4_metal.m#L22088) |
 | `DS4_METAL_DISABLE_Q4_QKV_COMPRESSOR_FUSE` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 QKV compressor fuse. | [ds4_metal.m:22083](ds4_metal.m#L22083) |
 | `DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 selected expert views. | [ds4.c:21136](ds4.c#L21136) |
 | `DS4_METAL_DISABLE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Disables Q4 SSD prefill attn out exactn. | [ds4_metal.m:28095](ds4_metal.m#L28095) |
