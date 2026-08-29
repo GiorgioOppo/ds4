@@ -549,7 +549,7 @@ test-mmq-parity-cuda: cuda/mmq/test/test_mmq_parity
 speed-bench/gpu_iq2_moe_prefill_bench_rocm.o: speed-bench/gpu_iq2_moe_prefill_bench.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -std=c11 -DDS4_ROCM_BUILD -DDS4_BENCH_ROCM -I. -c -o $@ $<
 
-speed-bench/gpu_iq2_moe_prefill_bench_rocm: speed-bench/gpu_iq2_moe_prefill_bench_rocm.o ds4_rocm.o
+speed-bench/gpu_iq2_moe_prefill_bench_rocm: speed-bench/gpu_iq2_moe_prefill_bench_rocm.o ds4_rocm.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 rocm-iq2-moe-prefill-bench:
