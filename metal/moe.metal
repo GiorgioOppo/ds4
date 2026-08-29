@@ -2603,7 +2603,7 @@ void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x
     const float dl = d * (0.5f + (aux32_s >> 28));
     constant const ushort * values = ds4_metal_iq2xxs_half_values[aux8[2*il+0]];
     uint8_t signs = ksigns_iq2xs[(aux32_s >> 14*il) & 127];
-    for (int i = 0; i < 8; ++i) {
+    FOR_UNROLL (int i = 0; i < 8; ++i) {
         const ushort bits = values[i] ^ (signs & kmask_iq2xs[i] ? 0x8000u : 0x0000u);
         reg[i/4][i%4] = dl * (float)as_type<half>(bits);
     }
