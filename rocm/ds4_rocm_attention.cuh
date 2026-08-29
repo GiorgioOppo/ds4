@@ -1736,6 +1736,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
             accum[i] *= old_scale[out_idx / 512u];
         }
 
+#pragma unroll
         for (uint32_t dim0 = 0; dim0 < 512u; dim0 += DIMS) {
             if constexpr (F32_VEC2) {
                 for (uint32_t idx = tid; idx < KEYS * (DIMS / 2u); idx += blockDim.x) {
