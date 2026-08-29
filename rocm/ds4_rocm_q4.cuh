@@ -1032,21 +1032,6 @@ static int rocm_q4_K_prefill_wmma_launch(
                            __ATOMIC_RELAXED);
     }
     return ok;
-#else
-    (void)out;
-    (void)w;
-    (void)x;
-    (void)n_tok;
-    (void)n_groups;
-    (void)in_dim;
-    (void)out_dim;
-    (void)row_bytes;
-    (void)x_token_stride;
-    (void)x_group_stride;
-    (void)out_token_stride;
-    (void)label;
-    return 0;
-#endif
 }
 
 enum {
