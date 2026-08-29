@@ -40,6 +40,9 @@ changing them.  Unless a row says otherwise:
 | `DS4_METAL_STREAMING_EXPERT_NOCACHE=1` | Reopen the Metal SSD expert file with `F_NOCACHE` so streamed experts do not displace the dense working set from the page cache. Leave unset for cached `pread`. |
 | `DS4_METAL_STREAMING_EXPERT_PREAD_SPLIT=N` | Split each expert read into 1–8 aligned requests. The automatic value is 1 below 64 configured cache experts and 4 at 64 or more. |
 | `DS4_METAL_DISABLE_Q4_DENSE_PAIR=1` | Split the default Metal Q-A/KV Q4 pair back into two standalone projections. |
+| `DS4_METAL_ENABLE_Q4_PREFILL_PAIR_F16_RHS=1` | On Apple M1–M4, opt into the Q-A/KV prefill pair that materializes their shared F32 activation as F16 once for exact 32-token tiles through N=128. |
+| `DS4_METAL_DISABLE_Q4_PREFILL_PAIR_F16_RHS=1` | Dominant rollback to two standalone Q4_K/F32-RHS prefill projections. |
+| `DS4_METAL_REQUIRE_Q4_PREFILL_PAIR_F16_RHS=1` | Request the shared-F16-RHS pair and fail closed if its device, shape, storage, or buffer contract is unavailable. Intended for strict A/B oracles. |
 | `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` | Restore the canonical IQ2 address-table gate/up producer on the exact M1 SSD-streaming decode shape. The specialization is automatic by default. |
 | `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` | Fail closed when an otherwise eligible M1 IQ2 mid-only dispatch cannot use the specialization. |
 | `DS4_METAL_ENABLE_M1_IQ2_MID_ONLY=1` | Legacy spelling retained for migration notes only. The runtime does not read it; the path is automatic and this setting is ignored. |
@@ -66,6 +69,9 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL=1` | Enable the GB10 Q4 attention-A prefill candidate for more than eight tokens. It quantizes the token-major grouped input directly and removes the eight pack/unpack copies while preserving each group’s MMQ reduction tree. |
 | `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` | Dominant rollback from the grouped Q4 attention-A prefill candidate to eight pack/MMQ/unpack projections. Any defined value disables the candidate. |
 | `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL=1` | Request the grouped Q4 attention-A prefill candidate and fail before enqueue when its GB10, shape, residency, or buffer contract is unavailable. |
+| `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID=1` | On eligible GB10 prefills, submit the eight grouped attention-A MMQs as one grid.z launch while retaining a separate stream-K coordinate and fixup slice per group. |
+| `DS4_CUDA_DISABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID=1` | Dominant rollback from the single-grid experiment to the established one-MMQ-grid-per-group path. |
+| `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_SINGLE_GRID=1` | Require the single-grid grouped attention-A submission and fail closed on rollback, ineligibility, or dispatch failure. |
 | `DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1` | Compare grouped attention-A with the canonical result and retain the canonical output. Disable graph capture for this diagnostic. |
 | `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1` | Enable the experimental persistent-CTA kernel for the exact `32768x1024` Q4 shape. |
 | `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1` | Roll back the persistent K1024 experiment. |
@@ -84,6 +90,9 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_ROCM_DISABLE_Q4_PREFILL_TILE8=1` | Restore the legacy Q4 prefill kernel. TILE8 is automatic for validated chunks of 9 through 4096 tokens. |
 | `DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8=1` | Fail closed when an eligible Q4 prefill call cannot use TILE8. |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_TILE8=1` | Legacy spelling retained for migration notes only. The runtime does not read it; TILE8 is automatic and this setting is ignored. |
+| `DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32=1` | On gfx1151 wave32, opt into the no-LDS Q8_K activation quantizer that assigns one 256-value block to each wave before the exact Q4 prefill matmul. |
+| `DS4_ROCM_DISABLE_Q4_PREFILL_Q8_K_WAVE32=1` | Dominant rollback to the canonical one-workgroup-per-Q8_K-block quantizer. |
+| `DS4_ROCM_REQUIRE_Q4_PREFILL_Q8_K_WAVE32=1` | Require the wave32 quantizer for strict prefill A/B runs; unsupported scope/device, rollback, or an incompatible required F16/WMMA path fails closed. |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA=1` | Opt into the experimental resident gfx1151 wave32 Q4_K WMMA64 prefill kernel for 256–4096 tokens. It replaces Q8_K activation scratch with transient F16 register dequantization and F32 accumulation. |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD=1` | Allow that WMMA64 path during SSD streaming only when the complete projection weight range is already backed by physical device storage. It never treats mapped/registered host memory as resident. |
 | `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` | Dominant value-aware rollback for the WMMA64 experiment. |
