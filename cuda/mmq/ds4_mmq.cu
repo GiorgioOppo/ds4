@@ -25,6 +25,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
+#if !defined(GGML_USE_HIP)
+#include "ds4_mmq_q4_16warp.cuh"
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -961,6 +964,181 @@ bool ds4_mmq_k_tile_supported(const char *tag, int K, int cc) {
     return true;
 }
 
+#if !defined(GGML_USE_HIP)
+static bool ds4_q4_test_q8_1_layout(
+        int N, int K, size_t *payload_bytes, size_t *total_bytes) {
+    if (N <= 0 || K <= 0 || (K % QK_K) != 0) return false;
+    const int64_t padded_k = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t blocks_per_column =
+        (size_t)padded_k / (4u * (size_t)QK8_1);
+    if ((size_t)N > SIZE_MAX / blocks_per_column) return false;
+    const size_t blocks = (size_t)N * blocks_per_column;
+    if (blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) return false;
+    const size_t payload = blocks * sizeof(block_q8_1_mmq);
+    const size_t slack = 128u * sizeof(block_q8_1_mmq);
+    if (payload > SIZE_MAX - slack) return false;
+    if (payload_bytes) *payload_bytes = payload;
+    if (total_bytes) *total_bytes = payload + slack;
+    return true;
+}
+
+extern "C" size_t ds4_mmq_q4_K_q8_1_scratch_bytes(int N, int K) {
+    size_t total = 0;
+    return ds4_q4_test_q8_1_layout(N, K, nullptr, &total) ? total : 0;
+}
+
+extern "C" int ds4_mmq_q4_K_quantize_q8_1_for_test(
+        const float *X_f32, void *q8_ds4, size_t q8_bytes,
+        int N, int K, cudaStream_t stream) {
+    size_t total = 0;
+    if (!X_f32 || !q8_ds4 ||
+        !ds4_q4_test_q8_1_layout(N, K, nullptr, &total) ||
+        q8_bytes < total) {
+        return -1;
+    }
+    cudaError_t err = cudaMemsetAsync(q8_ds4, 0, total, stream);
+    if (err != cudaSuccess) return -2;
+    quantize_mmq_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, q8_ds4, GGML_TYPE_Q4_K,
+        /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
+        /*ne0=*/GGML_PAD((int64_t)K, MATRIX_ROW_PADDING),
+        /*ne1=*/N, /*ne2=*/1, /*ne3=*/1, stream);
+    err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : -3;
+}
+
+extern "C" int ds4_mmq_q4_K_dense_preq_reference_for_test(
+        const void *W_q4_K, const void *q8_ds4, size_t q8_bytes,
+        float *out_f32, int M, int N, int K, int use_stream_k,
+        cudaStream_t stream) {
+    size_t payload = 0, total = 0;
+    if (!W_q4_K || !q8_ds4 || !out_f32 || M <= 0 ||
+        !ds4_q4_test_q8_1_layout(N, K, &payload, &total) ||
+        q8_bytes < total) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_k_tile_supported<GGML_TYPE_Q4_K>(
+            "ds4_mmq_q4_K_dense_preq_reference_for_test", K, cc)) {
+        return -1;
+    }
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return -1;
+    ds4_pool_set_stream(stream);
+    const int64_t stride_row_x = (int64_t)K / QK_K;
+    const int64_t stride_y = (int64_t)(payload / sizeof(int));
+    const mmq_args args = {
+        /*x=*/(const char *)W_q4_K,
+        /*type_x=*/GGML_TYPE_Q4_K,
+        /*y=*/(const int *)q8_ds4,
+        /*ids_dst=*/nullptr,
+        /*expert_bounds=*/nullptr,
+        /*dst=*/out_f32,
+        /*ncols_x=*/(int64_t)K, /*nrows_x=*/(int64_t)M,
+        /*ncols_dst=*/(int64_t)N,
+        /*stride_row_x=*/stride_row_x, /*ncols_y=*/(int64_t)N,
+        /*nrows_dst=*/(int64_t)M,
+        /*nchannels_x=*/1, /*nchannels_y=*/1,
+        /*stride_channel_x=*/0, /*stride_channel_y=*/stride_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1, /*nsamples_y=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/stride_y,
+        /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k != 0,
+        /*ncols_max=*/(int64_t)N,
+    };
+    mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args, stream);
+    const cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : -2;
+}
+
+static int ds4_q4_16warp_prepare_once(int device);
+
+extern "C" int ds4_mmq_q4_K_dense_preq_16warp_for_test(
+        const void *W_q4_K, const void *q8_ds4, size_t q8_bytes,
+        float *out_f32, int M, int N, int K, cudaStream_t stream) {
+    size_t total = 0;
+    if (!W_q4_K || !q8_ds4 || !out_f32 ||
+        !ds4_q4_test_q8_1_layout(N, K, nullptr, &total) ||
+        q8_bytes < total) {
+        return -1;
+    }
+    // This direct oracle hook deliberately accepts an N tail (the production
+    // selector is stricter until NVIDIA measurements justify broadening it),
+    // but it must reject shapes that cannot be represented by this kernel
+    // before enqueueing any work.
+    if (M < 128 || (M % 128) != 0 || N < 512 ||
+        K < 1024 || K > 4096 || (K % QK_K) != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_q4_K_dense_16warp_available(cc) ||
+        ds4_q4_16warp_prepare_once(dev) != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    return ds4_mmq_q4_K_dense_16warp_enqueue(
+        W_q4_K, q8_ds4, out_f32, M, N, K, stream);
+}
+
+enum {
+    DS4_Q4_16WARP_REQUEST = 1,
+    DS4_Q4_16WARP_REQUIRE = 2,
+    DS4_Q4_16WARP_DISABLE = 4,
+};
+
+static bool ds4_q4_16warp_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
+}
+
+static int ds4_q4_16warp_mode(void) {
+    static const int cached = [] {
+        int mode = 0;
+        if (ds4_q4_16warp_env_enabled("DS4_CUDA_Q4_MMQ_16WARP")) {
+            mode |= DS4_Q4_16WARP_REQUEST;
+        }
+        if (ds4_q4_16warp_env_enabled(
+                "DS4_CUDA_REQUIRE_Q4_MMQ_16WARP")) {
+            mode |= DS4_Q4_16WARP_REQUEST | DS4_Q4_16WARP_REQUIRE;
+        }
+        if (ds4_q4_16warp_env_enabled("DS4_CUDA_NO_Q4_MMQ_16WARP")) {
+            mode |= DS4_Q4_16WARP_DISABLE;
+        }
+        return mode;
+    }();
+    return cached;
+}
+
+static int ds4_q4_16warp_prepare_once(int device) {
+    static std::mutex mutex;
+    static std::atomic<int> state[GGML_CUDA_MAX_DEVICES];
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return -1;
+    int cached = state[device].load(std::memory_order_acquire);
+    if (cached == 1) return 0;
+    if (cached < 0) return cached;
+    std::lock_guard<std::mutex> lock(mutex);
+    cached = state[device].load(std::memory_order_relaxed);
+    if (cached == 1) return 0;
+    if (cached < 0) return cached;
+    const int rc = ds4_mmq_q4_K_dense_16warp_prepare();
+    state[device].store(rc == 0 ? 1 : rc, std::memory_order_release);
+    return rc;
+}
+
+static bool ds4_q4_canonical_owns_complete_k(int M, int N, int nsm) {
+    if (M <= 0 || N <= 0 || nsm <= 0) return false;
+    const int64_t tiles_m = ((int64_t)M + 127) / 128;
+    const int64_t tiles_n = ((int64_t)N + 127) / 128;
+    if (tiles_m > INT64_MAX / tiles_n) return false;
+    const int64_t tiles = tiles_m * tiles_n;
+    const int64_t waves = (tiles + nsm - 1) / nsm;
+    if (waves <= 0 || (int64_t)nsm > INT64_MAX / waves) return false;
+    return (100 * tiles) / ((int64_t)nsm * waves) >= 90;
+}
+#endif
+
 template <ggml_type type>
 int ds4_mmq_dense_impl(
         const char  * tag,
@@ -990,6 +1168,48 @@ int ds4_mmq_dense_impl(
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
     if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
+
+    bool use_q4_16warp = false;
+#if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        const int mode = ds4_q4_16warp_mode();
+        const bool disabled = (mode & DS4_Q4_16WARP_DISABLE) != 0;
+        const bool requested = (mode & DS4_Q4_16WARP_REQUEST) != 0;
+        const bool required = (mode & DS4_Q4_16WARP_REQUIRE) != 0;
+        const bool shape_supported =
+            ds4_mmq_q4_K_dense_16warp_supported(cc, M, N, K) != 0;
+        // The complete-K parity gate below models canonical m128n128 MMQ.
+        // A DS4_CUDA_MMQ_X_MAX sweep can make the reference choose a smaller
+        // X tile and therefore a different stream-K/fixup decision.
+        const bool canonical_x128 = get_mmq_x_max_host(cc) == 128;
+        const bool complete_k = ds4_q4_canonical_owns_complete_k(
+            M, N, ggml_cuda_info().devices[dev].nsm);
+        if (required && (disabled || !shape_supported || !canonical_x128 ||
+                         !complete_k)) {
+            fprintf(stderr,
+                    "%s: required Q4 16-warp path is ineligible "
+                    "(disabled=%d shape=%d x128=%d complete_k=%d "
+                    "M=%d N=%d K=%d)\n",
+                    tag, disabled ? 1 : 0, shape_supported ? 1 : 0,
+                    canonical_x128 ? 1 : 0, complete_k ? 1 : 0, M, N, K);
+            return DS4_MMQ_NOT_APPLICABLE;
+        }
+        if (requested && !disabled && shape_supported && canonical_x128 &&
+            complete_k) {
+            const int prep = ds4_q4_16warp_prepare_once(dev);
+            if (prep == 0) {
+                use_q4_16warp = true;
+            } else if (required) {
+                fprintf(stderr,
+                        "%s: required Q4 16-warp preflight failed: %d\n",
+                        tag, prep);
+                return DS4_MMQ_NOT_APPLICABLE;
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+    }
+#endif
 
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -1086,6 +1306,20 @@ int ds4_mmq_dense_impl(
     if (out_memset_enabled()) {
         (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
+
+#if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (use_q4_16warp) {
+            const int rc = ds4_mmq_q4_K_dense_16warp_enqueue(
+                W, src1_q8_1.get(), out_f32, M, N, K, stream);
+            if (rc != 0) {
+                fprintf(stderr, "%s: Q4 16-warp launch failed: %d\n", tag, rc);
+                return -3;
+            }
+            return 0;
+        }
+    }
+#endif
 
     const mmq_args args = {
         /*x=*/(const char *)W,

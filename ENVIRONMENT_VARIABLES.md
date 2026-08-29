@@ -76,6 +76,9 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1` | Enable the experimental persistent-CTA kernel for the exact `32768x1024` Q4 shape. |
 | `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1` | Roll back the persistent K1024 experiment. |
 | `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1` | Require the K1024 candidate before enqueue instead of silently using canonical MMVQ. |
+| `DS4_CUDA_Q4_MMQ_16WARP=1` | Request the experimental exact-integer m128n128 16-warp Q4_K kernel for eligible complete-K CUDA prefills; ineligible shapes fall back. |
+| `DS4_CUDA_NO_Q4_MMQ_16WARP=1` | Roll back the 16-warp Q4_K prefill experiment. This value-aware switch overrides request and require. |
+| `DS4_CUDA_REQUIRE_Q4_MMQ_16WARP=1` | Request the 16-warp Q4_K prefill kernel and fail closed instead of silently measuring another MMQ/Q8_K path. Decode/speculative batches of at most eight tokens remain on MMVQ. |
 | `DS4_CUDA_ENABLE_Q8_FOLD=1` | Enable the experimental one-shot Q8_1 producer-to-consumer fold. |
 | `DS4_CUDA_NO_Q8_FOLD=1` | Dominant rollback for the Q8_1 fold. |
 | `DS4_CUDA_Q8_FOLD_ORACLE=1` | Compare fresh canonical Q8_1 bytes and consumer outputs. Use with `DS4_CUDA_DECODE_GRAPHS=0`; require nonzero calls and zero mismatches/skips. |
@@ -147,7 +150,7 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1074 `DS4_*` runtime variables** and
+Inventory totals: **1077 `DS4_*` runtime variables** and
 **6 external runtime variables**.
 The auxiliary inventories contain **118 test/test-fixture entries**
 and **19 tool/wrapper entries**.
@@ -606,7 +609,7 @@ and **19 tool/wrapper entries**.
 </details>
 
 <details>
-<summary><strong>CUDA (331)</strong></summary>
+<summary><strong>CUDA (334)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -806,6 +809,7 @@ and **19 tool/wrapper entries**.
 | `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q4 grouped attn a batch CUDA Q4 optimization. | [cuda/mmq/ds4_mmq.cu:4305](cuda/mmq/ds4_mmq.cu#L4305) |
 | `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL` | presence kill switch; default unset; any defined value including empty or 0 disables and dominates ENABLE/REQUIRE | Restore the eight pack/MMQ/unpack Q4 attention-A prefill projections. | [ds4_cuda.cu:41930](ds4_cuda.cu#L41930) |
 | `DS4_CUDA_NO_Q4_K1024_PERSISTENT` | presence kill switch, default off; any defined value including 0 disables | Disable the Q4 K1024 persistent CUDA Q4 optimization. | [cuda/mmq/ds4_mmq.cu:3907](cuda/mmq/ds4_mmq.cu#L3907) |
+| `DS4_CUDA_NO_Q4_MMQ_16WARP` | value-aware rollback, default off; unset/empty/exact 0 permits the experiment, every other nonempty value disables it and overrides REQUEST/REQUIRE | Disable the experimental complete-K CUDA Q4_K m128n128 16-warp prefill kernel. | [cuda/mmq/ds4_mmq.cu:1059](cuda/mmq/ds4_mmq.cu#L1059) |
 | `DS4_CUDA_NO_Q8_ALIGNED_DENSE_SCRATCH` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q8 aligned dense scratch CUDA Q8 optimization. | [cuda/mmq/ds4_mmq.cu:5578](cuda/mmq/ds4_mmq.cu#L5578) |
 | `DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q8 aligned persistent CUDA Q8 optimization. | [cuda/mmq/ds4_mmq.cu:5410](cuda/mmq/ds4_mmq.cu#L5410) |
 | `DS4_CUDA_NO_Q8_BATCH_EXACT_TOK2` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q8 batch exact tok2 CUDA Q8 optimization. | [ds4_cuda.cu:19852](ds4_cuda.cu#L19852) |
@@ -856,6 +860,7 @@ and **19 tool/wrapper entries**.
 | `DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE` | value-aware flag, default off; unset/empty/exact 0 is off, any other nonempty value is on | Compare grouped attention-A against the canonical per-group result. | [ds4_cuda.cu:1477](ds4_cuda.cu#L1477) |
 | `DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE` | value-aware flag, default off; nonempty value other than exact 0 enables and implies candidate admission | Bitwise-compare the exact-shape persistent Q4 K1024 kernel with canonical MMVQ and retain canonical output. | [cuda/mmq/ds4_mmq.cu:3738](cuda/mmq/ds4_mmq.cu#L3738) |
 | `DS4_CUDA_Q4_K1024_PERSISTENT_STATS` | value-aware flag, default off; nonempty value other than exact 0 enables | Print exact-shape persistent Q4 K1024 dispatch counters at exit. | [cuda/mmq/ds4_mmq.cu:3737](cuda/mmq/ds4_mmq.cu#L3737) |
+| `DS4_CUDA_Q4_MMQ_16WARP` | value-aware opt-in cached on first Q4_K dense MMQ call; unset/empty/exact 0 is off, every other nonempty value requests the candidate; rollback wins and ineligible shapes fall back | Enable the experimental exact-integer CUDA Q4_K m128n128 16-warp kernel for eligible complete-K dense prefills. | [cuda/mmq/ds4_mmq.cu:1052](cuda/mmq/ds4_mmq.cu#L1052) |
 | `DS4_CUDA_Q8_F16_ALL` | presence flag; unset does not force the path; any defined value including 0 is true; eligibility/auto-policy still applies | Control the Q8 F16 all CUDA quantized-matmul/cache optimization. | [ds4_cuda.cu:2358](ds4_cuda.cu#L2358) |
 | `DS4_CUDA_Q8_F16_CACHE_MB` | unsigned integer MiB, full-string parse; default unlimited; 0 disables this cache | Limit the selective Q8-to-F16 derived-weight cache. | [ds4_cuda.cu:2218](ds4_cuda.cu#L2218) |
 | `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` | unsigned integer MiB, full-string parse; default is VRAM-dependent (>=112 GiB: 512; >=40 GiB: max(768,1%); smaller: max(4096,5%)) | Reserve free VRAM when growing the selective Q8-to-F16 cache. | [ds4_cuda.cu:2224](ds4_cuda.cu#L2224) |
@@ -873,6 +878,7 @@ and **19 tool/wrapper entries**.
 | `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH` | value-aware flag, default off; unset/empty/exact 0 is off, any other nonempty value is on | Fail if grouped batched attention-A cannot be used. | [ds4_cuda.cu:40198](ds4_cuda.cu#L40198) |
 | `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL` | value-aware fail-closed assertion, default off; unset/empty/exact 0 is off, any other nonempty value requests the candidate and rejects ineligibility before enqueue | Require the GB10 grouped Q4_K attention-A prefill path instead of silently using pack/MMQ/unpack. | [ds4_cuda.cu:41889](ds4_cuda.cu#L41889) |
 | `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT` | presence flag, default off; any defined value including 0 makes ineligible candidate fail closed | Fail when the exact Q4 K1024 persistent candidate is unavailable instead of using MMVQ. | [cuda/mmq/ds4_mmq.cu:3929](cuda/mmq/ds4_mmq.cu#L3929) |
+| `DS4_CUDA_REQUIRE_Q4_MMQ_16WARP` | value-aware fail-closed prefill opt-in cached on first Q4_K dense MMQ call; unset/empty/exact 0 is off, every other nonempty value requests and requires the candidate for N>8; rollback, disabled MMQ, ineligibility, or preflight failure prevents fallback; decode/speculative N<=8 remains on MMVQ | Require the experimental CUDA Q4_K 16-warp prefill kernel so benchmark runs cannot silently measure another path. | [cuda/mmq/ds4_mmq.cu:1056](cuda/mmq/ds4_mmq.cu#L1056); [ds4_cuda.cu:38208](ds4_cuda.cu#L38208) |
 | `DS4_CUDA_REQUIRE_STREAMING_EXPERT_PERSISTENT_CACHE` | false-like-aware flag, default off; 0/false/no/off (case-insensitive) is off, any other nonempty value is on; disable flags dominate | Require streaming expert persistent cache in CUDA SSD streaming; fail closed when unavailable. | [ds4_cuda.cu:4117](ds4_cuda.cu#L4117) |
 | `DS4_CUDA_REQUIRE_STREAMING_SELECTED_BATCH_IO` | false-like-aware flag, default off; 0/false/no/off (case-insensitive) is off, any other nonempty value is on; disable flags dominate | Require streaming selected batch I/O in CUDA SSD streaming; fail closed when unavailable. | [ds4_cuda.cu:4738](ds4_cuda.cu#L4738) |
 | `DS4_CUDA_REQUIRE_STREAMING_SELECTED_EVENT_PIPELINE` | false-like-aware flag, default off; 0/false/no/off (case-insensitive) is off, any other nonempty value is on; disable flags dominate | Require streaming selected event pipeline in CUDA SSD streaming; fail closed when unavailable. | [ds4_cuda.cu:4870](ds4_cuda.cu#L4870) |

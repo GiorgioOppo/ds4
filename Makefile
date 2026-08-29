@@ -51,7 +51,7 @@ endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
-MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
+MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/ds4_mmq_q4_16warp.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-ssd environment-docs test-quantizer-indexer-q4 test-rocm test-glm53-kda-rocm test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-q4-prefill-pair test-metal-indexer-q4 test-metal-q4-attn-exactn test-metal-q4-qb-f16-cache test-metal-q4-qb-f16-cache-timing test-metal-exactn-oracle test-metal-dspark-capture test-metal-argmax-top1 bench-metal-argmax-top1 test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-metal test-mxfp4-cuda test-mxfp4-rocm test-mmq-parity-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cuda-iq2-moe-prefill-bench cuda-q4-prefill-bench rocm-iq2-moe-prefill-bench rocm-q4-prefill-bench
+.PHONY: all help clean test test-ssd environment-docs test-quantizer-indexer-q4 test-rocm test-glm53-kda-rocm test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-q4-prefill-pair test-metal-indexer-q4 test-metal-q4-attn-exactn test-metal-q4-qb-f16-cache test-metal-q4-qb-f16-cache-timing test-metal-exactn-oracle test-metal-dspark-capture test-metal-argmax-top1 bench-metal-argmax-top1 test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-metal test-mxfp4-cuda test-mxfp4-rocm test-mmq-parity-cuda test-mmq-q4-16warp-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cuda-iq2-moe-prefill-bench cuda-q4-prefill-bench rocm-iq2-moe-prefill-bench rocm-q4-prefill-bench
 
 gguf-tools/deepseek4-quantize: gguf-tools/deepseek4-quantize.c gguf-tools/quants.c gguf-tools/quants.h
 	$(MAKE) -C gguf-tools deepseek4-quantize
@@ -413,6 +413,7 @@ help:
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make test-mmq-parity-cuda CUDA_ARCH=sm_N  Run quantized CUDA kernel parity tests"
+	@echo "  make test-mmq-q4-16warp-cuda CUDA_ARCH=sm_N  Run focused Q4 16-warp bitwise/canary oracle"
 	@echo "  make test-rocm-q4-parity        Run ROCm Q4_K dense/pair/prefill oracle"
 	@echo "  make test-strix-rocm-q4-prefill Require gfx1151 and run tiled-prefill oracle"
 	@echo "  make test-strix-rocm-q4-parity  Require a visible gfx1151 device and run the Q4 tests"
@@ -549,11 +550,14 @@ tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 
-cuda/mmq/test/test_mmq_parity: cuda/mmq/test/test_mmq_parity.cu $(MMQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $^ $(CUDA_LDLIBS)
+cuda/mmq/test/test_mmq_parity: cuda/mmq/test/test_mmq_parity.cu cuda/mmq/ds4_mmq.h $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $< $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 test-mmq-parity-cuda: cuda/mmq/test/test_mmq_parity
 	./cuda/mmq/test/test_mmq_parity
+
+test-mmq-q4-16warp-cuda: cuda/mmq/test/test_mmq_parity
+	./cuda/mmq/test/test_mmq_parity --q4-16warp
 
 speed-bench/gpu_iq2_moe_prefill_bench_rocm.o: speed-bench/gpu_iq2_moe_prefill_bench.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -std=c11 -DDS4_ROCM_BUILD -DDS4_BENCH_ROCM -I. -c -o $@ $<
@@ -582,7 +586,7 @@ speed-bench/gpu_iq2_moe_prefill_bench_cuda: speed-bench/gpu_iq2_moe_prefill_benc
 cuda-iq2-moe-prefill-bench:
 	$(MAKE) --no-print-directory -B speed-bench/gpu_iq2_moe_prefill_bench_cuda CUDA_ARCH="$(CUDA_ARCH)"
 
-speed-bench/cuda_q4_prefill_bench.o: speed-bench/cuda_q4_prefill_bench.cu ds4_gpu.h
+speed-bench/cuda_q4_prefill_bench.o: speed-bench/cuda_q4_prefill_bench.cu ds4_gpu.h cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_q4_16warp.cuh
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -DDS4_BENCH_CUDA -I. -c -o $@ $<
 
 speed-bench/cuda_q4_prefill_bench: speed-bench/cuda_q4_prefill_bench.o ds4_cuda.o $(MMQ_OBJS)
@@ -734,10 +738,13 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_iq
 cuda/mmq/ds4_ggml_stubs.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
-cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
+cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/ds4_mmq_q4_16warp.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/ds4_mmq_d2r.o: cuda/mmq/ds4_mmq_d2r.cu cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
+
+cuda/mmq/ds4_mmq_q4_16warp.o: cuda/mmq/ds4_mmq_q4_16warp.cu cuda/mmq/ds4_mmq_q4_16warp.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/quantize.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/mmq.cuh

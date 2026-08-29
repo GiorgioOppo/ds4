@@ -2659,6 +2659,23 @@ extern "C" int ds4_cuda_test_model_range_is_device_resident(
         resolved, g_gpu[logical_tier].device_id);
 }
 
+extern "C" int ds4_cuda_test_model_range_device_ptr(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier,
+        const void **device_ptr) {
+    if (device_ptr) *device_ptr = NULL;
+    if (!device_ptr ||
+        !ds4_cuda_test_model_range_is_device_resident(
+            model_map, model_size, offset, bytes, logical_tier)) {
+        return 0;
+    }
+    *device_ptr = g_model_device_base + offset;
+    return 1;
+}
+
 /* Match the existing CUDA weight-cache safety floor without coupling this
  * cache to the Q8-specific reserve environment variable.  The explicit
  * future-session reserve supplied by ds4.c is added independently. */
@@ -40195,6 +40212,12 @@ static int cuda_matmul_q4_K_tensor(
         model_map, weight_offset, weight_bytes, logical_tier,
         "q4_K dense", &weight_device_resident);
     if (!wptr) return 0;
+    // The 16-warp experiment is a prefill specialization.  Keep decode and
+    // speculative micro-batches on MMVQ, but make a strict prefill request
+    // fail closed even when the global MMQ selector was disabled before this
+    // call (otherwise the legacy Q8_K fallback could be measured silently).
+    const int require_q4_16warp = n_tok > 8u && cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_MMQ_16WARP", 0);
     /* The scalar-token kernel below rereads every weight row for every token,
      * making prefill scale almost linearly with batch length. MMQ tiles both
      * axes and shares the Q4_K weights across activation columns, matching the
@@ -40224,6 +40247,7 @@ static int cuda_matmul_q4_K_tensor(
                 g_cuda_test_q4_mmq_strict
                     ? "; strict benchmark mode rejects fallback"
                     : "; falling back");
+        if (require_q4_16warp) return 0;
         if (g_cuda_test_q4_mmq_strict) return 0;
         if (in_dim == 1024u && out_dim == 32768u && n_tok == 1u &&
             getenv("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT") != NULL) {
@@ -40233,6 +40257,15 @@ static int cuda_matmul_q4_K_tensor(
     if (g_cuda_test_q4_mmq_strict) {
         fprintf(stderr,
                 "ds4: Q4_K strict benchmark mode found no MMQ dispatch "
+                "(in=%llu out=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok);
+        return 0;
+    }
+    if (require_q4_16warp) {
+        fprintf(stderr,
+                "ds4: required Q4 16-warp prefill found no MMQ dispatch "
                 "(in=%llu out=%llu n_tok=%llu)\n",
                 (unsigned long long)in_dim,
                 (unsigned long long)out_dim,

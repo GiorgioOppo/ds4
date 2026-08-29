@@ -188,6 +188,44 @@ int ds4_mmq_q4_K_dense(
     int           K,
     cudaStream_t  stream);
 
+// CUDA benchmark/test boundary for separating activation quantization from
+// the Q4_K MMQ kernel.  The scratch layout is canonical block_q8_1_mmq DS4
+// ([K/128][N]) plus a zeroed 128-column tail.  These helpers never transfer
+// model weights and never synchronize the stream.
+size_t ds4_mmq_q4_K_q8_1_scratch_bytes(int N, int K);
+
+int ds4_mmq_q4_K_quantize_q8_1_for_test(
+    const float * X_f32,
+    void        * q8_ds4,
+    size_t        q8_bytes,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Enqueue-only A/B arms over a caller-owned, already-quantized activation.
+// The reference can disable stream-K to give the 16-warp candidate the same
+// complete-K reduction tree.  Zero is success; nonzero is rejection/failure.
+int ds4_mmq_q4_K_dense_preq_reference_for_test(
+    const void  * W_q4_K,
+    const void  * q8_ds4,
+    size_t        q8_bytes,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           use_stream_k,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_dense_preq_16warp_for_test(
+    const void  * W_q4_K,
+    const void  * q8_ds4,
+    size_t        q8_bytes,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 // Two dense Q4_K MMQ projections that share one token-tiled Q8_1
 // activation buffer.  This is the prefill sibling of
 // ds4_mmq_q4_K_dense_pair_vec: N is not limited to the MMVQ batch ceiling,

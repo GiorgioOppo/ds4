@@ -146,6 +146,13 @@ int ds4_cuda_test_model_range_is_device_resident(
         uint64_t offset,
         uint64_t bytes,
         int logical_tier);
+int ds4_cuda_test_model_range_device_ptr(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier,
+        const void **device_ptr);
 void ds4_cuda_test_set_q4_mmq_strict(int required);
 #endif
 /* Prepare a second, fully resident support GGUF without replacing the active

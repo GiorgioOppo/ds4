@@ -270,6 +270,38 @@ API, with bit-exact pair outputs. Prefill pair is skipped under `--path legacy`
 because the CUDA pair API intentionally returns control to two independent
 dense projections for `N>8` when MMQ is disabled.
 
+To isolate the experimental Q4_K m128n128 16-warp GEMM from activation
+quantization and every storage effect, run the focused bitwise/canary oracle
+and then the resident prequantized A/B benchmark:
+
+```
+make test-mmq-q4-16warp-cuda CUDA_ARCH=sm_121
+make cuda-q4-prefill-bench CUDA_ARCH=sm_121
+./speed-bench/cuda_q4_prefill_bench \
+  --path mmq --kernel-16warp --case qb \
+  --tokens 512,1024,2048,2049,4096 --sets 4 --samples 16 --warmup 4
+```
+
+The benchmark quantizes X to canonical Q8_1 DS4 once, before timing, and uses
+CUDA events around only the complete-K reference GEMM or the raw 16-warp GEMM.
+It alternates the two arms ABBA/BAAB over resident Q4_K weight sets, compares
+their complete outputs bit-for-bit, checks finite values and canaries, and
+samples a CPU Q4_K oracle before and after timing. Results attest
+`timing=kernel_only_prequant`; SSD streaming, model upload, Q8_1 quantization,
+allocation, host copies, and oracle work are outside the samples. Use
+`--case dense` as an exploratory `K=4096,M=1024` datapoint; the initial
+production admission gate is deliberately limited to larger, complete
+128x128 projections such as q_b.
+
+The production path remains opt-in until the NVIDIA oracle passes and the
+paired median is a repeatable win. `DS4_CUDA_Q4_MMQ_16WARP=1` requests it and
+falls back on ineligible shapes. For an attested production benchmark,
+`DS4_CUDA_REQUIRE_Q4_MMQ_16WARP=1` also prevents a Q8_K/MMQ fallback;
+`DS4_CUDA_NO_Q4_MMQ_16WARP=1` is the value-aware rollback. The strict path
+requires Ampere or newer, N and M divisible by 128, `M>=2048`, `N>=512`,
+`1024<=K<=4096`, the default 128-column MMQ selector, and a canonical tiling
+that owns complete K without stream-K fixup.
+
 On GB10, isolate the production Flash attention-output A geometry
 (`groups=8`, `K=4096`, `rank=1024`) and its 127/128/129 token tails with:
 

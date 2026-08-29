@@ -2,6 +2,8 @@
 // Resident, CUDA-event-only Q4_K prefill microbenchmark.
 
 #include "ds4_gpu.h"
+#include "cuda/mmq/ds4_mmq.h"
+#include "cuda/mmq/ds4_mmq_q4_16warp.cuh"
 
 #include <cuda_runtime.h>
 
@@ -84,6 +86,7 @@ struct config {
     uint32_t sets = kDefaultSets;
     uint32_t samples = kDefaultSamples;
     uint32_t warmup = kDefaultWarmup;
+    bool kernel_16warp = false;
 };
 
 struct weight_set {
@@ -113,6 +116,21 @@ struct tensor_owner {
     ~tensor_owner() { ds4_gpu_tensor_free(ptr); }
     tensor_owner(const tensor_owner &) = delete;
     tensor_owner &operator=(const tensor_owner &) = delete;
+};
+
+struct cuda_buffer {
+    void *ptr = nullptr;
+    cudaError_t status = cudaSuccess;
+
+    explicit cuda_buffer(size_t bytes) {
+        if (bytes == 0u) return;
+        status = cudaMalloc(&ptr, bytes);
+    }
+    ~cuda_buffer() {
+        if (ptr) (void)cudaFree(ptr);
+    }
+    cuda_buffer(const cuda_buffer &) = delete;
+    cuda_buffer &operator=(const cuda_buffer &) = delete;
 };
 
 struct env_snapshot {
@@ -152,10 +170,9 @@ struct event_timer {
     }
 
     bool measure(const std::function<bool()> &dispatch, float *milliseconds) {
-        // The harness disables decode graphs.  Production Q4 eager dispatch
-        // passes cuda_decode_stream()==0 to both MMQ (including its async
-        // scratch pool) and the Q8_K fallback kernels, so bracketing stream 0
-        // covers every enqueue in the public call.
+        // Every harness arm uses stream 0.  Production paths enqueue their
+        // complete backend work there; kernel-only arms enqueue exactly one
+        // already-prepared GEMM there.
         if (cudaEventRecord(begin, nullptr) != cudaSuccess) return false;
         if (!dispatch()) return false;
         if (cudaEventRecord(end, nullptr) != cudaSuccess ||
@@ -174,6 +191,10 @@ struct arm {
     // an idle device can execute that event while setenv()/unsetenv() is still
     // running, folding host-side gate switching into the reported GPU time.
     std::function<bool()> select;
+    // Optional checked boundary for oracle passes. Timed samples continue to
+    // use dispatch so an enqueue-only experimental arm can keep its safety
+    // preflight outside the CUDA-event interval.
+    std::function<bool(uint32_t)> oracle_dispatch = {};
 };
 
 struct stats {
@@ -628,8 +649,25 @@ const char *path_name(cuda_path path) {
     return path == cuda_path::mmq ? "mmq" : "legacy";
 }
 
+const char *case_scope(const config &cfg) {
+    switch (cfg.selected) {
+        case bench_case::all:
+            return cfg.kernel_16warp ? "dense,q_b" : "dense,pair,q_b,outa";
+        case bench_case::dense: return "dense";
+        case bench_case::pair: return "pair";
+        case bench_case::qb: return "q_b";
+        case bench_case::outa: return "outa";
+    }
+    return "unknown";
+}
+
 bool select_arm(const arm &which) {
     return !which.select || which.select();
+}
+
+bool dispatch_oracle_arm(const arm &which, uint32_t set) {
+    return which.oracle_dispatch ? which.oracle_dispatch(set)
+                                 : which.dispatch(set);
 }
 
 bool benchmark_single_path(
@@ -637,20 +675,25 @@ bool benchmark_single_path(
         uint32_t out_dim, const config &cfg, const arm &which,
         const std::function<bool()> &oracle_prepare,
         const std::function<bool(uint32_t)> &oracle) {
+    auto validate = [&](const char *phase) {
+        for (uint32_t set = 0; set < cfg.sets; set++) {
+            if (!oracle_prepare() || !select_arm(which) ||
+                !dispatch_oracle_arm(which, set) || !ds4_gpu_synchronize() ||
+                !oracle(set)) {
+                std::fprintf(stderr,
+                             "cuda-q4-prefill-bench: %s %s oracle failed "
+                             "for weight set %u\n",
+                             case_name, phase, set);
+                return false;
+            }
+        }
+        return true;
+    };
+
     // Validate every rotating weight set and prime lazy Q8 scratch before
     // recording a CUDA event.  Upload, poison, readback, and CPU work remain
     // outside the measured interval.
-    for (uint32_t set = 0; set < cfg.sets; set++) {
-        if (!oracle_prepare() || !select_arm(which) ||
-            !which.dispatch(set) ||
-            !ds4_gpu_synchronize() || !oracle(set)) {
-            std::fprintf(stderr,
-                         "cuda-q4-prefill-bench: %s oracle failed for "
-                         "weight set %u\n",
-                         case_name, set);
-            return false;
-        }
-    }
+    if (!validate("pre-timing")) return false;
 
     for (uint32_t i = 0; i < cfg.warmup; i++) {
         if (!select_arm(which) || !which.dispatch(i % cfg.sets) ||
@@ -675,6 +718,20 @@ bool benchmark_single_path(
         samples.push_back(static_cast<double>(elapsed));
     }
 
+    const uint32_t timed_set = (cfg.samples - 1u) % cfg.sets;
+    if (!oracle(timed_set)) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: %s timed-output oracle failed "
+                     "for weight set %u\n",
+                     case_name, timed_set);
+        return false;
+    }
+
+    // Timed launches overwrite the validated buffers.  Re-run the complete
+    // finite/CPU/guard oracle for every resident weight set after timing so a
+    // late or state-dependent corruption cannot survive as a benchmark result.
+    if (!validate("post-timing")) return false;
+
     const stats result = summarize(samples);
     const double macs = static_cast<double>(n_tokens) * in_dim * out_dim;
     const double gmac_s = macs / (result.median * 1.0e6);
@@ -695,19 +752,26 @@ bool benchmark_pair_arms(
         uint64_t common_macs_per_token, const config &cfg,
         const arm &baseline, const arm &candidate,
         const std::function<bool()> &oracle_prepare,
-        const std::function<bool(uint32_t)> &oracle) {
-    for (uint32_t set = 0; set < cfg.sets; set++) {
-        if (!oracle_prepare() || !select_arm(baseline) ||
-            !baseline.dispatch(set) || !ds4_gpu_synchronize() ||
-            !select_arm(candidate) || !candidate.dispatch(set) ||
-            !ds4_gpu_synchronize() || !oracle(set)) {
-            std::fprintf(stderr,
-                         "cuda-q4-prefill-bench: %s oracle failed for "
-                         "weight set %u\n",
-                         case_name, set);
-            return false;
+        const std::function<bool(uint32_t)> &oracle,
+        const char *timing_scope = "production_api_cuda_events") {
+    auto validate = [&](const char *phase) {
+        for (uint32_t set = 0; set < cfg.sets; set++) {
+            if (!oracle_prepare() || !select_arm(baseline) ||
+                !dispatch_oracle_arm(baseline, set) ||
+                !ds4_gpu_synchronize() || !select_arm(candidate) ||
+                !dispatch_oracle_arm(candidate, set) ||
+                !ds4_gpu_synchronize() || !oracle(set)) {
+                std::fprintf(stderr,
+                             "cuda-q4-prefill-bench: %s %s oracle failed "
+                             "for weight set %u\n",
+                             case_name, phase, set);
+                return false;
+            }
         }
-    }
+        return true;
+    };
+
+    if (!validate("pre-timing")) return false;
 
     for (uint32_t i = 0; i < cfg.warmup; i++) {
         const uint32_t set = i % cfg.sets;
@@ -756,6 +820,22 @@ bool benchmark_pair_arms(
         }
     }
 
+    // samples is a multiple of four, so the final ABBA/BAAB cycle leaves both
+    // output buffers holding weight set samples-1. Check those exact timed
+    // results before oracle_prepare is allowed to poison or reset any guard.
+    const uint32_t timed_set = (cfg.samples - 1u) % cfg.sets;
+    if (!oracle(timed_set)) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: %s timed-output oracle failed "
+                     "for weight set %u\n",
+                     case_name, timed_set);
+        return false;
+    }
+
+    // Both arms must still agree bit-for-bit (and with their CPU/guard
+    // oracle) after the measured ABBA/BAAB sequence, for every weight set.
+    if (!validate("post-timing")) return false;
+
     const stats a = summarize(a_samples);
     const stats b = summarize(b_samples);
     std::vector<double> paired_delta;
@@ -771,6 +851,7 @@ bool benchmark_pair_arms(
     std::printf(
         "DS4_CUDA_Q4_PREFILL_BENCH case=%s path=%s N=%u K=%u M=%u "
         "baseline=%s candidate=%s samples=%u sets=%u "
+        "timing=%s "
         "focus_macs_per_token=%llu common_macs_per_token=%llu "
         "baseline_ms_p50=%.6f candidate_ms_p50=%.6f "
         "baseline_ms_min=%.6f candidate_ms_min=%.6f "
@@ -780,6 +861,7 @@ bool benchmark_pair_arms(
         "speedup_pct=%.3f\n",
         case_name, path_name(cfg.path), n_tokens, in_dim, out_dim,
         baseline.name, candidate.name, cfg.samples, cfg.sets,
+        timing_scope,
         static_cast<unsigned long long>(focus_macs_per_token),
         static_cast<unsigned long long>(common_macs_per_token),
         a.median, b.median, a.minimum, b.minimum, a.p95, b.p95,
@@ -787,6 +869,161 @@ bool benchmark_pair_arms(
         median_delta, paired_median, speedup);
     std::fflush(stdout);
     return true;
+}
+
+bool run_q4_16warp_kernel(
+        const model_fixture &model, const config &cfg, uint32_t n_tokens,
+        uint32_t in_dim, uint32_t out_dim,
+        uint64_t weight_set::*weight_offset_member, const char *case_name) {
+    uint64_t x_elements = 0;
+    uint64_t out_elements = 0;
+    if (!checked_mul(n_tokens, in_dim, &x_elements) ||
+        !checked_mul(n_tokens, out_dim, &out_elements)) {
+        return false;
+    }
+    const uint64_t x_bytes = x_elements * sizeof(float);
+    const uint64_t out_bytes = out_elements * sizeof(float);
+    const uint64_t guard_bytes = kGuardWords * sizeof(uint32_t);
+    const uint64_t weight_bytes = q4_weight_bytes(in_dim, out_dim);
+    const size_t q8_bytes = ds4_mmq_q4_K_q8_1_scratch_bytes(
+        static_cast<int>(n_tokens), static_cast<int>(in_dim));
+    if (q8_bytes == 0u) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: %s kernel-only Q8_1 scratch "
+                     "shape rejected for N=%u K=%u\n",
+                     case_name, n_tokens, in_dim);
+        return false;
+    }
+
+    tensor_owner x(x_bytes + guard_bytes);
+    tensor_owner reference(out_bytes + guard_bytes);
+    tensor_owner candidate(out_bytes + guard_bytes);
+    cuda_buffer prequant(q8_bytes);
+    std::vector<float> activation;
+    fill_activation(&activation, n_tokens, in_dim);
+    if (!x.ptr || !reference.ptr || !candidate.ptr || !prequant.ptr ||
+        prequant.status != cudaSuccess ||
+        !ds4_gpu_tensor_write(x.ptr, 0, activation.data(), x_bytes) ||
+        !prepare_guard(x.ptr, x_bytes, 0x12000u)) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: %s N=%u kernel-only tensor/"
+                     "scratch setup failed (%s)\n",
+                     case_name, n_tokens,
+                     prequant.status == cudaSuccess
+                         ? "tensor setup"
+                         : cudaGetErrorString(prequant.status));
+        return false;
+    }
+
+    const auto *x_device = static_cast<const float *>(
+        ds4_gpu_tensor_contents(x.ptr));
+    auto *reference_device = static_cast<float *>(
+        ds4_gpu_tensor_contents(reference.ptr));
+    auto *candidate_device = static_cast<float *>(
+        ds4_gpu_tensor_contents(candidate.ptr));
+    if (!x_device || !reference_device || !candidate_device) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: %s N=%u device tensor pointer "
+                     "lookup failed\n",
+                     case_name, n_tokens);
+        return false;
+    }
+
+    std::vector<const void *> weight_device(cfg.sets, nullptr);
+    for (uint32_t set = 0; set < cfg.sets; set++) {
+        const uint64_t offset = model.weights[set].*weight_offset_member;
+        if (!ds4_cuda_test_model_range_device_ptr(
+                model.data, model.size, offset, weight_bytes,
+                /*logical_tier=*/0, &weight_device[set]) ||
+            !weight_device[set]) {
+            std::fprintf(stderr,
+                         "cuda-q4-prefill-bench: %s N=%u resident weight "
+                         "pointer lookup failed for set %u\n",
+                         case_name, n_tokens, set);
+            return false;
+        }
+    }
+
+    // Quantize exactly once.  Both A/B arms consume this immutable canonical
+    // DS4 Q8_1 buffer, and no quantizer, memset, allocation, or copy is issued
+    // by either timed dispatch.
+    const int quant_rc = ds4_mmq_q4_K_quantize_q8_1_for_test(
+        x_device, prequant.ptr, q8_bytes, static_cast<int>(n_tokens),
+        static_cast<int>(in_dim), /*stream=*/nullptr);
+    if (quant_rc != 0 || !ds4_gpu_synchronize() ||
+        !check_guard(x.ptr, x_bytes, 0x12000u,
+                     "kernel-only prequant input")) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: %s N=%u prequantization "
+                     "failed rc=%d\n",
+                     case_name, n_tokens, quant_rc);
+        return false;
+    }
+
+    const arm baseline = {
+        "canonical_preq_complete_k",
+        [&](uint32_t set) {
+            return ds4_mmq_q4_K_dense_preq_reference_for_test(
+                       weight_device[set], prequant.ptr, q8_bytes,
+                       reference_device, static_cast<int>(out_dim),
+                       static_cast<int>(n_tokens), static_cast<int>(in_dim),
+                       /*use_stream_k=*/0, /*stream=*/nullptr) == 0;
+        },
+        {}};
+    const arm candidate_arm = {
+        "q4_16warp_m128n128",
+        [&](uint32_t set) {
+            return ds4_mmq_q4_K_dense_16warp_enqueue(
+                       weight_device[set], prequant.ptr, candidate_device,
+                       static_cast<int>(out_dim),
+                       static_cast<int>(n_tokens), static_cast<int>(in_dim),
+                       /*stream=*/nullptr) == 0;
+        },
+        {},
+        [&](uint32_t set) {
+            return ds4_mmq_q4_K_dense_preq_16warp_for_test(
+                       weight_device[set], prequant.ptr, q8_bytes,
+                       candidate_device, static_cast<int>(out_dim),
+                       static_cast<int>(n_tokens), static_cast<int>(in_dim),
+                       /*stream=*/nullptr) == 0;
+        }};
+    const bool ok = benchmark_pair_arms(
+        case_name, n_tokens, in_dim, out_dim,
+        static_cast<uint64_t>(in_dim) * out_dim, 0u, cfg,
+        baseline, candidate_arm,
+        [&]() {
+            return poison_output(reference.ptr, out_bytes, 0x7fc50005u,
+                                 0x13000u) &&
+                   poison_output(candidate.ptr, out_bytes, 0x7fc60006u,
+                                 0x14000u);
+        },
+        [&](uint32_t set) {
+            const uint64_t offset =
+                model.weights[set].*weight_offset_member;
+            return bitwise_equal(reference.ptr, candidate.ptr, out_bytes,
+                                 "16-warp vs canonical complete-K") &&
+                   output_is_finite(reference.ptr, out_bytes,
+                                    "16-warp canonical output") &&
+                   output_is_finite(candidate.ptr, out_bytes,
+                                    "16-warp candidate output") &&
+                   sampled_cpu_oracle(
+                       reference.ptr, model, offset, activation, n_tokens,
+                       in_dim, out_dim, "16-warp canonical") &&
+                   check_guard(x.ptr, x_bytes, 0x12000u,
+                               "16-warp input") &&
+                   check_guard(reference.ptr, out_bytes, 0x13000u,
+                               "16-warp canonical output") &&
+                   check_guard(candidate.ptr, out_bytes, 0x14000u,
+                               "16-warp candidate output");
+        },
+        "kernel_only_prequant");
+    return ok &&
+           check_guard(x.ptr, x_bytes, 0x12000u,
+                       "16-warp input final") &&
+           check_guard(reference.ptr, out_bytes, 0x13000u,
+                       "16-warp canonical output final") &&
+           check_guard(candidate.ptr, out_bytes, 0x14000u,
+                       "16-warp candidate output final");
 }
 
 bool run_dense(const model_fixture &model, const config &cfg,
@@ -1139,11 +1376,12 @@ void usage(FILE *stream, const char *argv0) {
         "  --case all|dense|pair|qb|outa\n"
         "                             case to run (default: all)\n"
         "  --tokens N[,N...]         token counts, each 9..4096\n"
-        "  --full                    use 9,16,17,31,32,33,127,128,129,257,"
-        "512,2048,4096\n"
+        "  --full                    use 9,16,17,31,32,33,127,128,129,256,"
+        "257,512,1024,2048,2049,4096\n"
         "  --sets N                  rotating resident weight sets (default: %u)\n"
         "  --samples N               samples/arm, multiple of 4 (default: %u)\n"
         "  --warmup N                untimed dispatches/arm (default: %u)\n"
+        "  --kernel-16warp           prequantized canonical-vs-16-warp A/B\n"
         "  -h, --help                show this help\n\n"
         "Dense and q_b measure one immutable process path. Run separate "
         "legacy/MMQ\nprocesses (preferably ABBA/BAAB) to compare them because "
@@ -1153,7 +1391,13 @@ void usage(FILE *stream, const char *argv0) {
         "with one MMQ grid per group against the strict\nsingle-grid candidate "
         "at the production attention-A shape, isolating grid.z submission. It "
         "includes\na common minimal "
-        "Q4 output-B (M=256) whose MACs are reported separately.\n",
+        "Q4 output-B (M=256) whose MACs are reported separately. "
+        "DS4_CUDA_MMQ_X_MAX\nmay explicitly select an 8..128 multiple-of-8 "
+        "sweep point; the setup line\nattests it, or prints auto when the "
+        "variable is unset. --kernel-16warp requires\n--path mmq and "
+        "--case dense/qb; with --case all it runs only dense and q_b. Its "
+        "token\ncounts must be >=512; without --tokens/--full it uses "
+        "512,1024,2048,2049,4096.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);
 }
 
@@ -1205,6 +1449,7 @@ std::vector<uint32_t> parse_tokens(const char *text) {
 
 config parse_options(int argc, char **argv) {
     config cfg;
+    bool tokens_explicit = false;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
             usage(stdout, argv[0]);
@@ -1235,9 +1480,12 @@ config parse_options(int argc, char **argv) {
             }
         } else if (!std::strcmp(argv[i], "--tokens")) {
             cfg.tokens = parse_tokens(need_value(&i, argc, argv));
+            tokens_explicit = true;
         } else if (!std::strcmp(argv[i], "--full")) {
             cfg.tokens = {9u,   16u,  17u,  31u,  32u,  33u, 127u,
-                          128u, 129u, 257u, 512u, 2048u, 4096u};
+                          128u, 129u, 256u, 257u, 512u, 1024u, 2048u,
+                          2049u, 4096u};
+            tokens_explicit = true;
         } else if (!std::strcmp(argv[i], "--sets")) {
             cfg.sets = parse_u32(need_value(&i, argc, argv), "--sets", 1u,
                                  32u);
@@ -1247,6 +1495,8 @@ config parse_options(int argc, char **argv) {
         } else if (!std::strcmp(argv[i], "--warmup")) {
             cfg.warmup = parse_u32(need_value(&i, argc, argv), "--warmup",
                                    0u, 100u);
+        } else if (!std::strcmp(argv[i], "--kernel-16warp")) {
+            cfg.kernel_16warp = true;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(stderr, argv[0]);
@@ -1256,6 +1506,34 @@ config parse_options(int argc, char **argv) {
     if ((cfg.samples % 4u) != 0u) {
         std::fprintf(stderr,
                      "--samples must be a multiple of 4 for balanced runs\n");
+        std::exit(2);
+    }
+    if (cfg.kernel_16warp && !tokens_explicit) {
+        cfg.tokens = {512u, 1024u, 2048u, 2049u, 4096u};
+    }
+    if (cfg.kernel_16warp) {
+        const auto below_minimum = std::find_if(
+            cfg.tokens.begin(), cfg.tokens.end(),
+            [](uint32_t value) { return value < 512u; });
+        if (below_minimum != cfg.tokens.end()) {
+            std::fprintf(stderr,
+                         "--kernel-16warp requires every token count to be "
+                         ">=512 (got %u)\n",
+                         *below_minimum);
+            std::exit(2);
+        }
+    }
+    if (cfg.kernel_16warp && cfg.path != cuda_path::mmq) {
+        std::fprintf(stderr,
+                     "--kernel-16warp requires --path mmq\n");
+        std::exit(2);
+    }
+    if (cfg.kernel_16warp &&
+        (cfg.selected == bench_case::pair ||
+         cfg.selected == bench_case::outa)) {
+        std::fprintf(stderr,
+                     "--kernel-16warp supports only --case dense, qb, or "
+                     "all (all runs dense+qb only)\n");
         std::exit(2);
     }
     if (cfg.path == cuda_path::legacy &&
@@ -1271,6 +1549,21 @@ config parse_options(int argc, char **argv) {
 
 bool includes(bench_case selected, bench_case wanted) {
     return selected == bench_case::all || selected == wanted;
+}
+
+std::string mmq_x_max_attestation() {
+    const char *value = std::getenv("DS4_CUDA_MMQ_X_MAX");
+    if (!value || !value[0]) return "auto";
+    const uint32_t parsed =
+        parse_u32(value, "DS4_CUDA_MMQ_X_MAX", 8u, 128u);
+    if ((parsed % 8u) != 0u) {
+        std::fprintf(stderr,
+                     "invalid DS4_CUDA_MMQ_X_MAX: %s (must be a multiple "
+                     "of 8)\n",
+                     value);
+        std::exit(2);
+    }
+    return std::to_string(parsed);
 }
 
 bool install_resident_model(const model_fixture &model,
@@ -1365,6 +1658,11 @@ bool verify_mmq_prefill_dispatch(const model_fixture &model) {
 
 int main(int argc, char **argv) {
     const config cfg = parse_options(argc, argv);
+    // get_mmq_x_max_host() caches this process-wide on its first call.  Read
+    // and validate the inherited sweep request before backend initialization,
+    // then attest it in the setup record instead of silently contaminating a
+    // supposedly default run.
+    const std::string mmq_x_max = mmq_x_max_attestation();
     env_snapshot mmq_guard("DS4_CUDA_MMQ");
     env_snapshot copy_guard("DS4_CUDA_COPY_MODEL");
     env_snapshot pair_guard("DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
@@ -1410,6 +1708,12 @@ int main(int argc, char **argv) {
                      "cuda-q4-prefill-bench: cannot query device properties\n");
         return 1;
     }
+    if (cfg.kernel_16warp && device_count != 1) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: SKIP (--kernel-16warp "
+                     "requires exactly one visible CUDA device)\n");
+        return 77;
+    }
     const bool grouped_prefill_supported =
         device_count == 1 && properties.major == 12 &&
         properties.minor == 1 && properties.warpSize == 32;
@@ -1423,6 +1727,18 @@ int main(int argc, char **argv) {
     if (!ds4_gpu_init()) {
         std::fprintf(stderr, "cuda-q4-prefill-bench: ds4_gpu_init failed\n");
         return 1;
+    }
+    if (cfg.kernel_16warp) {
+        const int prepare_rc = ds4_mmq_q4_K_dense_16warp_prepare();
+        if (prepare_rc != 0) {
+            std::fprintf(
+                stderr,
+                "cuda-q4-prefill-bench: --kernel-16warp prepare failed "
+                "rc=%d\n",
+                prepare_rc);
+            ds4_gpu_cleanup();
+            return 1;
+        }
     }
     ds4_cuda_test_set_q4_mmq_strict(
         cfg.path == cuda_path::mmq ? 1 : 0);
@@ -1464,30 +1780,45 @@ int main(int argc, char **argv) {
     if (ok) {
         std::printf(
             "DS4_CUDA_Q4_PREFILL_SETUP device=%s cc=%d.%d warp=%d path=%s "
-            "sets=%u resident_payload_mib=%.2f device_free_delta_mib=%.2f "
-            "device_free_delta_valid=%d timing=cuda_events "
+            "mmq_x_max=%s sets=%u resident_payload_mib=%.2f "
+            "device_free_delta_mib=%.2f "
+            "device_free_delta_valid=%d timing=%s kernel_16warp=%d "
+            "cases=%s "
             "ssd_streaming=off model_storage=cudaMalloc "
             "residency=backend_provenance strict_mmq=%d "
             "grouped_attn_a_prefill=%s dispatch_stream=legacy_default\n",
             properties.name, properties.major, properties.minor,
-            properties.warpSize, path_name(cfg.path), cfg.sets,
+            properties.warpSize, path_name(cfg.path), mmq_x_max.c_str(),
+            cfg.sets,
             static_cast<double>(model.payload_bytes) / 1048576.0,
             static_cast<double>(resident_delta) / 1048576.0,
             resident_delta_valid ? 1 : 0,
+            cfg.kernel_16warp ? "kernel_only_prequant" : "cuda_events",
+            cfg.kernel_16warp ? 1 : 0,
+            case_scope(cfg),
             cfg.path == cuda_path::mmq ? 1 : 0,
             grouped_prefill_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
             if (includes(cfg.selected, bench_case::dense)) {
-                ok = run_dense(model, cfg, n_tokens) && ok;
+                ok = (cfg.kernel_16warp
+                          ? run_q4_16warp_kernel(
+                                model, cfg, n_tokens, kDenseK, kDenseM,
+                                &weight_set::dense_offset, "dense")
+                          : run_dense(model, cfg, n_tokens)) && ok;
             }
-            if (ok && includes(cfg.selected, bench_case::pair)) {
+            if (ok && !cfg.kernel_16warp &&
+                includes(cfg.selected, bench_case::pair)) {
                 ok = run_pair(model, cfg, n_tokens) && ok;
             }
             if (ok && includes(cfg.selected, bench_case::qb)) {
-                ok = run_qb(model, cfg, n_tokens) && ok;
+                ok = (cfg.kernel_16warp
+                          ? run_q4_16warp_kernel(
+                                model, cfg, n_tokens, kQbK, kQbM,
+                                &weight_set::qb_offset, "q_b")
+                          : run_qb(model, cfg, n_tokens)) && ok;
             }
-            if (ok && grouped_prefill_supported &&
+            if (ok && !cfg.kernel_16warp && grouped_prefill_supported &&
                 includes(cfg.selected, bench_case::outa)) {
                 ok = run_output_a(model, cfg, n_tokens) && ok;
             }
