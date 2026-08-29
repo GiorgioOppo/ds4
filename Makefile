@@ -567,7 +567,7 @@ rocm-iq2-moe-prefill-bench:
 speed-bench/rocm_q4_prefill_bench.o: speed-bench/rocm_q4_prefill_bench.cpp ds4_gpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -std=c++17 -fno-fast-math -I. -c -o $@ $<
 
-speed-bench/rocm_q4_prefill_bench: speed-bench/rocm_q4_prefill_bench.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+speed-bench/rocm_q4_prefill_bench: speed-bench/rocm_q4_prefill_bench.o ds4_rocm.o $(ROCM_MMQ_OBJS) ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 rocm-q4-prefill-bench:
@@ -797,7 +797,7 @@ ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 tests/test_rocm_q4_dense_pair.o: tests/test_rocm_q4_dense_pair.cpp ds4_gpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -std=c++17 -fno-fast-math -I. -c -o $@ $<
 
-tests/test_rocm_q4_dense_pair: tests/test_rocm_q4_dense_pair.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+tests/test_rocm_q4_dense_pair: tests/test_rocm_q4_dense_pair.o ds4_rocm.o $(ROCM_MMQ_OBJS) ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 # Keep the public test target usable on development hosts without ROCm.  The

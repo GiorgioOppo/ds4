@@ -113,8 +113,7 @@ __global__ static void attention_output_b_f16_wmma_64x64_kernel(
     frag_c acc;
     rocwmma::fill_fragment(acc, 0.0f);
 
-#pragma unroll
-    for (uint32_t k0 = 0; k0 < K; k0 + 16u) {
+    for (uint32_t k0 = 0; k0 < K; k0 += 16u) {
         const uint32_t ja = tid * 2u;
         const uint32_t a_row = ja & 63u;
         const uint32_t a_k = ja >> 6u;

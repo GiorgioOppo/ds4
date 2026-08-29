@@ -7009,7 +7009,13 @@ static int ds4_mmq_pointer_is_device_resident(
         (void)cudaGetLastError();
         return 0;
     }
-#if CUDART_VERSION >= 10000
+#if defined(GGML_USE_HIP) && HIP_VERSION >= 60000000
+    return attr.type == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#elif defined(GGML_USE_HIP)
+    return attr.memoryType == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#elif CUDART_VERSION >= 10000
     return attr.type == cudaMemoryTypeDevice &&
            attr.device == expected_device;
 #else
