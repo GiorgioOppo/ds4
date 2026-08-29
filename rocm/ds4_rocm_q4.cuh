@@ -1014,7 +1014,6 @@ static int rocm_q4_K_prefill_wmma_launch(
         uint64_t x_group_stride,
         uint64_t out_token_stride,
         const char *label) {
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     if (!out || !w || !x || n_groups == 0u) return 0;
     const dim3 grid(
         (unsigned)(((uint64_t)out_dim + ROCM_Q4_WMMA_N_TILE - 1u) /
