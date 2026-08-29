@@ -396,6 +396,7 @@ enum {
     DS4_GPU_TEST_BATCH_ATTN_OUT_Q4_HC_FUSION = 1u << 11,
     DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG32 = 1u << 12,
     DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG1_FAILURE = 1u << 13,
+    DS4_GPU_TEST_REQUIRE_IQ2_TOP8_PAIR_SWIGLU = 1u << 14,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 double ds4_gpu_test_last_completed_gpu_ms(void);

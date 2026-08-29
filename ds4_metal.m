@@ -48776,13 +48776,39 @@ int ds4_gpu_routed_moe_batch_tensor(
          * order, and the same epilogue math as separate GEMMs + SwiGLU, so the
          * mid tensor is bit-identical.
          */
-        const bool use_mm_id_pair_swiglu =
+        /* Repeated resident A/B on M1 Max covers this exact GLM prefill
+         * shape at 4096 tokens.  Keep the production default inside that
+         * measured domain: the SSD path has different page-fault locality,
+         * and other batch sizes/devices need their own promotion data.  The
+         * REQUIRE test flag may opt the same exact resident shape in on other
+         * Metal devices so the portable harness can collect that data. */
+        const bool measured_top8_iq2_pair_swiglu_shape =
+            n_expert == 8 &&
+            n_total_expert == 288u &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            down_type == DS4_METAL_TENSOR_Q2_K &&
+            expert_in_dim == 4096u &&
+            expert_mid_dim == 2048u &&
+            out_dim == 4096u &&
+            gate_row_bytes == 1056u &&
+            gate_expert_bytes == 2162688u &&
+            down_row_bytes == 672u &&
+            down_expert_bytes == 2752512u &&
+            clamp == 0.0f &&
+            n_tokens == 4096u &&
+            !g_ssd_streaming_mode;
+        const bool use_measured_top8_iq2_pair_swiglu =
+            measured_top8_iq2_pair_swiglu_shape &&
+            (ds4_gpu_device_name_contains("M1 Max") ||
+             (g_test_flags &
+              DS4_GPU_TEST_REQUIRE_IQ2_TOP8_PAIR_SWIGLU) != 0u);
+        bool use_mm_id_pair_swiglu =
             use_mm_id &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
-            g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
+            g_tp_split_world == 1 &&    /* pair-swiglu mm kernel lacks expert ownership */
             request_mid_f16 &&
-            n_expert == 6 &&
+            (n_expert == 6 || use_measured_top8_iq2_pair_swiglu) &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               down_type == DS4_METAL_TENSOR_Q2_K) ||
              (gate_type == DS4_METAL_TENSOR_Q4_K &&
@@ -48792,6 +48818,15 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+        if ((g_test_flags & DS4_GPU_TEST_REQUIRE_IQ2_TOP8_PAIR_SWIGLU) != 0u &&
+            !(measured_top8_iq2_pair_swiglu_shape &&
+              use_mm_id_pair_swiglu)) {
+            fprintf(stderr,
+                    "ds4: required Metal IQ2 top-8 MM ID pair-SwiGLU path "
+                    "was not selected tokens=%u experts=%u\n",
+                    n_tokens, n_expert);
+            return 0;
+        }
         /* The specialization is arithmetically valid for every grouped-MM
          * IQ2_XXS/Q2_K top-6 shape below.  Keep the automatic default narrower:
          * resident kernel A/B and full-model SSD A/B measured the exact DS4
@@ -49021,6 +49056,16 @@ int ds4_gpu_routed_moe_batch_tensor(
                     enable_iq2_xxs_mm_id_pair_tail_simdgroup_cull != 1) {
                     pair_swiglu_mm_pipeline = ds4_gpu_get_pipeline(
                         "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                }
+                /* A custom Metal source may also predate the base pair
+                 * symbol.  The measured top-8 production default must remain
+                 * fail-soft; only REQUIRE is allowed to turn that into a hard
+                 * error so benchmark labels cannot hide a fallback. */
+                if (!pair_swiglu_mm_pipeline &&
+                    use_measured_top8_iq2_pair_swiglu &&
+                    (g_test_flags &
+                     DS4_GPU_TEST_REQUIRE_IQ2_TOP8_PAIR_SWIGLU) == 0u) {
+                    use_mm_id_pair_swiglu = false;
                 }
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||

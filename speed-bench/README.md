@@ -116,6 +116,34 @@ ABBA/BAAB, and requires bit-exact outputs plus intact input/output canaries.
 No GGUF access, SSD I/O, upload, readback, or CPU wall time is included in a
 measured command buffer.
 
+### Metal resident IQ2/Q2 routed MoE
+
+Build the production top-6 tail-cull fixture or the GLM-shape top-8 pair-fusion
+fixture with:
+
+```
+make metal-iq2-moe-tail-cull-bench
+./speed-bench/metal_iq2_moe_tail_cull_bench --samples 12 --warmup-cycles 2
+
+make metal-iq2-moe-top8-pair-bench
+./speed-bench/metal_iq2_moe_top8_pair_bench --samples 12 --warmup-cycles 2
+```
+
+Both fixtures keep synthetic IQ2_XXS gate/up and Q2_K down weights resident,
+alternate variants in ABBA/BAAB order, and report per-stage GPU timestamps.
+The top-8 fixture matches the `4096 -> 2048 -> 4096`, 288-expert GLM routed
+MoE geometry. Its baseline launches gate and up separately; its candidate
+uses the grouped pair-SwiGLU kernel. It requires bit-exact F16 mid rows, F32
+expert rows and final output, plus intact allocation canaries. The measured
+stages contain no GGUF loading, file-backed model mapping, application SSD
+reads, uploads, readback, or CPU wall timing. The anonymous fixture is fully
+touched before oracle and warm-up, so a change in these GPU timestamps is
+attributable to the kernel path rather than SSD streaming.
+
+The automatic top-8 dispatch is intentionally limited to the measured
+M1 Max, resident, 4096-token shape. SSD streaming and other batch/device
+shapes keep the separate gate/up path until they have their own A/B data.
+
 ### Resident ROCm Q4_K prefill
 
 Build the production-dispatch A/B harness on a ROCm host with:

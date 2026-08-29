@@ -18,9 +18,21 @@
 #define MID_DIM 2048u
 #define OUT_DIM 4096u
 #define N_TOKENS 4096u
+#ifdef DS4_METAL_IQ2_MOE_TOP8_PAIR_BENCH
+#define N_TOTAL_EXPERT 288u
+#define N_EXPERT 8u
+#define CLAMP 0.0f
+#define BENCH_DESCRIPTION \
+    "Resident GLM-geometry IQ2_XXS routed-MoE top-8 pair-fusion benchmark."
+#define EXPERIMENT_NAME "top8-pair-fusion"
+#else
 #define N_TOTAL_EXPERT 256u
 #define N_EXPERT 6u
 #define CLAMP 4.0f
+#define BENCH_DESCRIPTION \
+    "Resident production-geometry IQ2_XXS pair routed-MoE tail-cull benchmark."
+#define EXPERIMENT_NAME "pair-tail-cull"
+#endif
 #define GUARD_WORDS 64u
 #define GUARD_BYTES ((uint64_t)GUARD_WORDS * sizeof(uint32_t))
 #define GUARD_BITS 0x51a7c3e9u
@@ -33,6 +45,8 @@
     "DS4_METAL_ENABLE_IQ2_XXS_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL"
 #define PAIR_TAIL_DISABLE_ENV \
     "DS4_METAL_DISABLE_IQ2_XXS_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL"
+#define PAIR_FUSION_DISABLE_ENV \
+    "DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU"
 
 typedef struct {
     uint16_t d;
@@ -111,8 +125,7 @@ static void usage(FILE *fp, const char *argv0) {
     fprintf(fp,
             "usage: %s [options]\n"
             "\n"
-            "Resident production-geometry IQ2_XXS pair routed-MoE tail-cull "
-            "benchmark.\n"
+            BENCH_DESCRIPTION "\n"
             "Metal stage profiling prints the kernel GPU timestamps; marker "
             "lines identify each arm.\n"
             "\n"
@@ -256,26 +269,56 @@ static uint64_t touch_model_pages(const void *model, uint64_t bytes,
     return checksum;
 }
 
-/* The 256 target counts use 643 complete 32-row tiles plus 4000 tail rows.
- * Every tail size 1..31 is present, while the 2/3-tile split keeps counts
- * non-uniform (65..127). A per-token hash breaks ties in the remaining-count
- * scheduler and keeps all six routed experts unique without changing counts. */
+/* Construct non-uniform expert counts with every final tile size 1..31.
+ * A per-token hash breaks ties in the remaining-count scheduler and keeps all
+ * routed experts unique without changing the target counts. */
 static int build_routes(int32_t *selected, float *weights) {
+#ifndef DS4_METAL_IQ2_MOE_TOP8_PAIR_BENCH
     static const uint8_t final_remainders[8] = {1, 2, 3, 4, 5, 6, 7, 4};
+#endif
     uint32_t target[N_TOTAL_EXPERT];
     uint32_t remaining[N_TOTAL_EXPERT];
     uint32_t actual[N_TOTAL_EXPERT] = {0};
     uint64_t target_sum = 0;
 
     for (uint32_t expert = 0; expert < N_TOTAL_EXPERT; expert++) {
+#ifdef DS4_METAL_IQ2_MOE_TOP8_PAIR_BENCH
+        const uint32_t tail = 1u + (expert * 17u) % 31u;
+        target[expert] = 3u * 32u + tail;
+#else
         const uint32_t tail = expert < 248u ?
             1u + (expert * 17u) % 31u :
             final_remainders[expert - 248u];
         const uint32_t full_tiles =
             ((expert * 73u) & 255u) < 131u ? 3u : 2u;
         target[expert] = full_tiles * 32u + tail;
-        remaining[expert] = target[expert];
+#endif
         target_sum += target[expert];
+    }
+#ifdef DS4_METAL_IQ2_MOE_TOP8_PAIR_BENCH
+    uint64_t deficit = (uint64_t)N_TOKENS * N_EXPERT - target_sum;
+    while (deficit != 0u) {
+        bool progressed = false;
+        /* Preserve experts 0..30 as one complete permutation of tails. */
+        for (uint32_t expert = 31u;
+             expert < N_TOTAL_EXPERT && deficit != 0u;
+             expert++) {
+            if ((target[expert] & 31u) == 31u) continue;
+            target[expert]++;
+            target_sum++;
+            deficit--;
+            progressed = true;
+        }
+        if (!progressed) {
+            fprintf(stderr,
+                    "metal-iq2-moe-tail-cull-bench: route target "
+                    "distribution exhausted\n");
+            return 0;
+        }
+    }
+#endif
+    for (uint32_t expert = 0; expert < N_TOTAL_EXPERT; expert++) {
+        remaining[expert] = target[expert];
     }
     if (target_sum != (uint64_t)N_TOKENS * N_EXPERT) {
         fprintf(stderr,
@@ -451,16 +494,28 @@ static int check_all_canaries(const fixture *f) {
 }
 
 static const char *variant_name(bench_arm arm) {
+#ifdef DS4_METAL_IQ2_MOE_TOP8_PAIR_BENCH
+    return arm == ARM_BASELINE ? "separate" : "fused";
+#else
     return arm == ARM_BASELINE ? "baseline" : "candidate";
+#endif
 }
 
 static int select_variant(bench_arm arm) {
+#ifdef DS4_METAL_IQ2_MOE_TOP8_PAIR_BENCH
+    ds4_gpu_test_set_flags(arm == ARM_CANDIDATE
+        ? DS4_GPU_TEST_REQUIRE_IQ2_TOP8_PAIR_SWIGLU : 0u);
+    return arm == ARM_BASELINE
+        ? setenv(PAIR_FUSION_DISABLE_ENV, "1", 1) == 0
+        : unsetenv(PAIR_FUSION_DISABLE_ENV) == 0;
+#else
     if (unsetenv(PAIR_TAIL_ENABLE_ENV) != 0 ||
         unsetenv(PAIR_TAIL_DISABLE_ENV) != 0) {
         return 0;
     }
     return setenv(arm == ARM_BASELINE ? PAIR_TAIL_DISABLE_ENV :
                   PAIR_TAIL_ENABLE_ENV, "1", 1) == 0;
+#endif
 }
 
 static int run_once(fixture *f, bench_arm arm,
@@ -481,7 +536,7 @@ static int run_once(fixture *f, bench_arm arm,
     fprintf(stderr,
             "DS4_IQ2_MOE_TAIL_BENCH phase=%s experiment=%s variant=%s "
             "sample=%u cycle=%u position=%u order=%s force_resident=1\n",
-            phase, "pair", variant_name(arm), sample,
+            phase, EXPERIMENT_NAME, variant_name(arm), sample,
             cycle, position, order);
     fflush(stderr);
 
@@ -507,7 +562,7 @@ static int run_once(fixture *f, bench_arm arm,
         fprintf(stderr,
                 "DS4_IQ2_MOE_TAIL_BENCH result=FAIL experiment=%s "
                 "variant=%s call=%d end=%d mid_f16=%d\n",
-                "pair", variant_name(arm),
+                EXPERIMENT_NAME, variant_name(arm),
                 call_ok, end_ok, mid_is_f16 ? 1 : 0);
     }
     if (check_canaries) ok = check_all_canaries(f) && ok;
@@ -613,7 +668,7 @@ static int run_oracle(fixture *f) {
         ok = run_once(f, ARM_CANDIDATE,
                       "oracle", "pair", 0u, 0u, 0u, true, true);
     }
-    if (ok) ok = compare_candidate("pair", f, &baseline, scratch);
+    if (ok) ok = compare_candidate(EXPERIMENT_NAME, f, &baseline, scratch);
 
     free(scratch);
     free(baseline.storage);
@@ -648,7 +703,7 @@ static int run_balanced_block(fixture *f, const char *phase, uint32_t cycles,
         fprintf(stderr,
                 "metal-iq2-moe-tail-cull-bench: %s %s arm count "
                 "baseline=%u candidate=%u expected=%u\n",
-                "pair", phase,
+                EXPERIMENT_NAME, phase,
                 arm_samples[ARM_BASELINE], arm_samples[ARM_CANDIDATE],
                 sample_limit);
         return 0;
@@ -670,7 +725,7 @@ static int run_experiment(fixture *f, const bench_config *config) {
     fprintf(stderr,
             "DS4_IQ2_MOE_TAIL_BENCH phase=complete experiment=%s "
             "samples_per_variant=%u warmup_per_variant=%u result=PASS\n",
-            "pair", config->samples,
+            EXPERIMENT_NAME, config->samples,
             config->warmup_cycles * 2u);
     return 1;
 }
@@ -843,13 +898,13 @@ int main(int argc, char **argv) {
     const bench_config config = parse_options(argc, argv);
 
     /* This benchmark compares the legacy grouped pair kernels directly.
-     * Prevent Metal 4 TensorOps/MPP from bypassing both A/B variants on M5+
-     * hosts; the promoted automatic policy itself remains pre-M5-only. */
+     * Prevent Metal 4 TensorOps/MPP from bypassing either A/B variant on
+     * M5+ hosts; production defaults remain independently hardware-gated. */
     setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
     setenv("DS4_METAL_MOE_STAGE_PROFILE", "1", 1);
     setenv("DS4_METAL_MOE_STAGE_PROFILE_LAYER", "0", 1);
     unsetenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
-    unsetenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU");
+    unsetenv(PAIR_FUSION_DISABLE_ENV);
     unsetenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
     unsetenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     unsetenv(PAIR_TAIL_ENABLE_ENV);
