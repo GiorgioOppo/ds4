@@ -43,6 +43,12 @@ constexpr const char *kGroupedPrefillDisable =
     "DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL";
 constexpr const char *kGroupedPrefillRequire =
     "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL";
+constexpr const char *kGroupedSingleGridEnable =
+    "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID";
+constexpr const char *kGroupedSingleGridDisable =
+    "DS4_CUDA_DISABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID";
+constexpr const char *kGroupedSingleGridRequire =
+    "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_SINGLE_GRID";
 constexpr const char *kGroupedGlobalDisable =
     "DS4_CUDA_NO_Q4_GROUPED_ATTN_A";
 constexpr const char *kGb10GlobalDisable = "DS4_CUDA_NO_Q4_GB10_FAST";
@@ -581,15 +587,21 @@ bool sampled_grouped_cpu_oracle(
 }
 
 bool select_grouped_prefill_baseline() {
-    return unsetenv(kGroupedPrefillEnable) == 0 &&
-           setenv(kGroupedPrefillDisable, "1", 1) == 0 &&
-           unsetenv(kGroupedPrefillRequire) == 0;
+    return setenv(kGroupedPrefillEnable, "1", 1) == 0 &&
+           unsetenv(kGroupedPrefillDisable) == 0 &&
+           setenv(kGroupedPrefillRequire, "1", 1) == 0 &&
+           unsetenv(kGroupedSingleGridEnable) == 0 &&
+           setenv(kGroupedSingleGridDisable, "1", 1) == 0 &&
+           unsetenv(kGroupedSingleGridRequire) == 0;
 }
 
 bool select_grouped_prefill_candidate() {
     return setenv(kGroupedPrefillEnable, "1", 1) == 0 &&
            unsetenv(kGroupedPrefillDisable) == 0 &&
-           setenv(kGroupedPrefillRequire, "1", 1) == 0;
+           setenv(kGroupedPrefillRequire, "1", 1) == 0 &&
+           setenv(kGroupedSingleGridEnable, "1", 1) == 0 &&
+           unsetenv(kGroupedSingleGridDisable) == 0 &&
+           setenv(kGroupedSingleGridRequire, "1", 1) == 0;
 }
 
 double percentile(std::vector<double> sorted, double fraction) {
@@ -876,7 +888,7 @@ bool run_pair(const model_fixture &model, const config &cfg,
                        pair0.ptr, pair1.ptr, model.data, model.size,
                        model.weights[set].dense_offset,
                        model.weights[set].kv_offset, kDenseK, kDenseM, kKvM,
-                       x.ptr, n_tokens) != 0;
+                       x.ptr, n_tokens) == 1;
         },
         {}};
     return benchmark_pair_arms(
@@ -1028,7 +1040,7 @@ bool run_output_a(const model_fixture &model, const config &cfg,
     }
 
     const arm baseline = {
-        "pack8_mmq_unpack",
+        "grouped_8_grids",
         [&](uint32_t set) {
             return ds4_gpu_attention_output_q4_K_batch_tensor(
                        baseline_out.ptr, baseline_low.ptr, group_tmp.ptr,
@@ -1040,7 +1052,7 @@ bool run_output_a(const model_fixture &model, const config &cfg,
         },
         select_grouped_prefill_baseline};
     const arm candidate = {
-        "grouped_dense",
+        "grouped_single_grid",
         [&](uint32_t set) {
             return ds4_gpu_attention_output_q4_K_batch_tensor(
                        candidate_out.ptr, candidate_low.ptr, group_tmp.ptr,
@@ -1074,7 +1086,7 @@ bool run_output_a(const model_fixture &model, const config &cfg,
         [&](uint32_t set) {
             return bitwise_equal(baseline_low.ptr, candidate_low.ptr,
                                  low_bytes,
-                                 "output_a grouped dense vs pack/MMQ") &&
+                                 "output_a single-grid vs eight-grid") &&
                    bitwise_equal(baseline_out.ptr, candidate_out.ptr,
                                  out_bytes,
                                  "output_a minimal-B final output") &&
@@ -1137,9 +1149,10 @@ void usage(FILE *stream, const char *argv0) {
         "legacy/MMQ\nprocesses (preferably ABBA/BAAB) to compare them because "
         "the CUDA backend\ncaches DS4_CUDA_MMQ on its first dispatch. Pair is "
         "an in-process ABBA/BAAB\ncomparison of two MMQ projections against "
-        "the fused public pair API. outa\ncompares the current eight-group "
-        "pack/MMQ/unpack path against the strict\ngrouped-prefill candidate "
-        "at the production attention-A shape. It includes\na common minimal "
+        "the fused public pair API. outa\ncompares the existing grouped path "
+        "with one MMQ grid per group against the strict\nsingle-grid candidate "
+        "at the production attention-A shape, isolating grid.z submission. It "
+        "includes\na common minimal "
         "Q4 output-B (M=256) whose MACs are reported separately.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);
 }
@@ -1344,7 +1357,7 @@ bool verify_mmq_prefill_dispatch(const model_fixture &model) {
            ds4_gpu_matmul_q4_K_pair_tensor(
                out0.ptr, out1.ptr, model.data, model.size,
                model.weights[0].dense_offset, model.weights[0].kv_offset,
-               kDenseK, kDenseM, kKvM, x.ptr, n_tokens) &&
+               kDenseK, kDenseM, kKvM, x.ptr, n_tokens) == 1 &&
            ds4_gpu_synchronize();
 }
 
@@ -1359,6 +1372,9 @@ int main(int argc, char **argv) {
     env_snapshot grouped_enable_guard(kGroupedPrefillEnable);
     env_snapshot grouped_disable_guard(kGroupedPrefillDisable);
     env_snapshot grouped_require_guard(kGroupedPrefillRequire);
+    env_snapshot grouped_single_grid_enable_guard(kGroupedSingleGridEnable);
+    env_snapshot grouped_single_grid_disable_guard(kGroupedSingleGridDisable);
+    env_snapshot grouped_single_grid_require_guard(kGroupedSingleGridRequire);
     env_snapshot grouped_global_disable_guard(kGroupedGlobalDisable);
     env_snapshot gb10_global_disable_guard(kGb10GlobalDisable);
     if (setenv("DS4_CUDA_MMQ",
@@ -1369,6 +1385,9 @@ int main(int argc, char **argv) {
         unsetenv(kGroupedPrefillEnable) != 0 ||
         unsetenv(kGroupedPrefillDisable) != 0 ||
         unsetenv(kGroupedPrefillRequire) != 0 ||
+        unsetenv(kGroupedSingleGridEnable) != 0 ||
+        unsetenv(kGroupedSingleGridDisable) != 0 ||
+        unsetenv(kGroupedSingleGridRequire) != 0 ||
         unsetenv(kGroupedGlobalDisable) != 0 ||
         unsetenv(kGb10GlobalDisable) != 0) {
         std::fprintf(stderr,

@@ -1149,17 +1149,17 @@ int ds4_mmq_q4_K_dense_pair_impl(
     const char *tag = "ds4_mmq_q4_K_dense_pair";
     if (!W0 || !W1 || !X_f32 || !out0_f32 || !out1_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     if (M0 <= 0 || M1 <= 0 || N <= 0 || K <= 0 || K % 256 != 0) {
         fprintf(stderr, "%s: bad shape M0=%d M1=%d N=%d K=%d\n",
                 tag, M0, M1, N, K);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     if ((size_t)M0 > SIZE_MAX / (size_t)N / sizeof(float) ||
         (size_t)M1 > SIZE_MAX / (size_t)N / sizeof(float)) {
         fprintf(stderr, "%s: output size overflow\n", tag);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     const size_t out0_bytes = (size_t)M0 * (size_t)N * sizeof(float);
     const size_t out1_bytes = (size_t)M1 * (size_t)N * sizeof(float);
@@ -1170,18 +1170,20 @@ int ds4_mmq_q4_K_dense_pair_impl(
         : (size_t)(out0_addr - out1_addr) < out1_bytes;
     if (outputs_overlap) {
         fprintf(stderr, "%s: output ranges overlap\n", tag);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
 
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_k_tile_supported<GGML_TYPE_Q4_K>(tag, K, cc)) return -1;
+    if (!ds4_mmq_k_tile_supported<GGML_TYPE_Q4_K>(tag, K, cc)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
 
     ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
     if (!ctx) {
         fprintf(stderr, "%s: failed to get cuda context for device %d\n",
                 tag, dev);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     ds4_pool_set_stream(stream);
 
@@ -1194,13 +1196,13 @@ int ds4_mmq_q4_K_dense_pair_impl(
     if ((size_t)N > SIZE_MAX / bytes_per_col ||
         slack_blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) {
         fprintf(stderr, "%s: activation scratch size overflow\n", tag);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     const size_t payload_bytes = (size_t)N * bytes_per_col;
     const size_t slack_bytes = slack_blocks * sizeof(block_q8_1_mmq);
     if (payload_bytes > SIZE_MAX - slack_bytes) {
         fprintf(stderr, "%s: activation scratch size overflow\n", tag);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     const size_t nbytes_q8_1 = payload_bytes + slack_bytes;
 
@@ -1307,8 +1309,11 @@ int ds4_mmq_q4_K_dense_pair_impl(
  * is token-major [N][G][K], while MMQ stores directly into token-major
  * [N][G][M].  Quantizing the strided source as G channels removes the old
  * pack/unpack copies and shares one scratch allocation/quantizer launch.
- * Keep one MMQ launch per group: its stream-K partition and reduction tree
- * are therefore identical to the established per-group dense call. */
+ *
+ * single_grid=false retains the established one-MMQ-launch-per-group path.
+ * single_grid=true maps groups to grid.z in one launch, but isolates each
+ * z-slice's stream-k coordinate space.  Its grid.x, partial-K ownership and
+ * fixup order are therefore identical to the former per-group invocation. */
 int ds4_mmq_q4_K_grouped_dense_impl(
         const void  *W,
         const float *X,
@@ -1317,17 +1322,23 @@ int ds4_mmq_q4_K_grouped_dense_impl(
         int          N,
         int          K,
         int          n_groups,
+        bool         single_grid,
         cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q4_K_grouped_dense";
+    const char *tag = single_grid
+        ? "ds4_mmq_q4_K_grouped_dense_single_grid"
+        : "ds4_mmq_q4_K_grouped_dense";
+    const int pre_enqueue_failure = single_grid
+        ? DS4_MMQ_NOT_APPLICABLE
+        : -1;
     if (!W || !X || !out) {
         fprintf(stderr, "%s: null pointer\n", tag);
-        return -1;
+        return pre_enqueue_failure;
     }
     if (M <= 0 || N <= 0 || K <= 0 || n_groups <= 0 ||
         K % QK_K != 0) {
         fprintf(stderr, "%s: bad shape M=%d N=%d K=%d groups=%d\n",
                 tag, M, N, K, n_groups);
-        return -1;
+        return pre_enqueue_failure;
     }
 
     const int dev = ggml_cuda_get_device();
@@ -1336,7 +1347,7 @@ int ds4_mmq_q4_K_grouped_dense_impl(
     if (!ctx) {
         fprintf(stderr, "%s: failed to get cuda context for device %d\n",
                 tag, dev);
-        return -1;
+        return pre_enqueue_failure;
     }
     ds4_pool_set_stream(stream);
 
@@ -1345,23 +1356,39 @@ int ds4_mmq_q4_K_grouped_dense_impl(
         (size_t)ne10_padded / (4u * (size_t)QK8_1);
     const size_t bytes_per_col =
         blocks_per_col * sizeof(block_q8_1_mmq);
-    if ((size_t)N > SIZE_MAX / bytes_per_col) return -1;
+    if ((size_t)N > SIZE_MAX / bytes_per_col) return pre_enqueue_failure;
     const size_t channel_bytes = (size_t)N * bytes_per_col;
-    if ((size_t)n_groups > SIZE_MAX / channel_bytes) return -1;
+    if ((size_t)n_groups > SIZE_MAX / channel_bytes) {
+        return pre_enqueue_failure;
+    }
     const size_t payload_bytes = (size_t)n_groups * channel_bytes;
     const size_t slack_blocks = (size_t)get_mmq_x_max_host(cc);
-    if (slack_blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) return -1;
+    if (slack_blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) {
+        return pre_enqueue_failure;
+    }
     const size_t slack_bytes = slack_blocks * sizeof(block_q8_1_mmq);
-    if (payload_bytes > SIZE_MAX - slack_bytes) return -1;
+    if (payload_bytes > SIZE_MAX - slack_bytes) return pre_enqueue_failure;
 
     const int64_t row_blocks = (int64_t)K / QK_K;
     if ((size_t)M > SIZE_MAX / (size_t)row_blocks /
-                        sizeof(block_q4_K)) return -1;
+                        sizeof(block_q4_K)) return pre_enqueue_failure;
     const size_t group_weight_bytes =
         (size_t)M * (size_t)row_blocks * sizeof(block_q4_K);
+    const int64_t group_weight_blocks = (int64_t)M * row_blocks;
     const int64_t low_dim = (int64_t)M * n_groups;
     if (low_dim > INT_MAX ||
-        (uint64_t)low_dim > UINT64_MAX / (uint64_t)N) return -1;
+        (uint64_t)low_dim > UINT64_MAX / (uint64_t)N) {
+        return pre_enqueue_failure;
+    }
+    /* The grouped kernel ABI narrows strides and weight-block offsets to int.
+     * Reject before allocating or enqueueing so an optional caller can safely
+     * fall back to the established per-group launch loop. */
+    if (single_grid &&
+        (n_groups > 65535 || group_weight_blocks > INT_MAX ||
+         group_weight_blocks * (int64_t)n_groups > INT_MAX ||
+         channel_bytes / sizeof(int) > (size_t)INT_MAX)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
 
     ggml_cuda_pool_alloc<char> y_q8_1(
         ctx->pool(), payload_bytes + slack_bytes);
@@ -1389,6 +1416,42 @@ int ds4_mmq_q4_K_grouped_dense_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) &&
          ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
+    if (single_grid) {
+        const mmq_args args = {
+            /*x=*/(const char *)W,
+            /*type_x=*/GGML_TYPE_Q4_K,
+            /*y=*/(const int *)y_q8_1.get(),
+            /*ids_dst=*/nullptr,
+            /*expert_bounds=*/nullptr,
+            /*dst=*/out,
+            /*ncols_x=*/(int64_t)K,
+            /*nrows_x=*/(int64_t)M,
+            /*ncols_dst=*/(int64_t)N,
+            /*stride_row_x=*/row_blocks,
+            /*ncols_y=*/(int64_t)N,
+            /*nrows_dst=*/low_dim,
+            /*nchannels_x=*/(int64_t)n_groups,
+            /*nchannels_y=*/(int64_t)n_groups,
+            /*stride_channel_x=*/group_weight_blocks,
+            /*stride_channel_y=*/(int64_t)(channel_bytes / sizeof(int)),
+            /*stride_channel_dst=*/(int64_t)M,
+            /*nsamples_x=*/1,
+            /*nsamples_y=*/1,
+            /*stride_sample_x=*/0,
+            /*stride_sample_y=*/0,
+            /*stride_sample_dst=*/0,
+            /*use_stream_k=*/use_stream_k,
+            /*ncols_max=*/(int64_t)N,
+        };
+        mul_mat_q_case_grouped_channels<GGML_TYPE_Q4_K>(*ctx, args, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: grouped launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -3;
+        }
+        return 0;
+    }
     for (int g = 0; g < n_groups; ++g) {
         const mmq_args args = {
             /*x=*/(const char *)W + (size_t)g * group_weight_bytes,
@@ -1667,7 +1730,14 @@ extern "C" int ds4_mmq_q4_K_grouped_dense(
         const void *W, const float *X, float *out,
         int M, int N, int K, int n_groups, cudaStream_t stream) {
     return ds4_mmq_q4_K_grouped_dense_impl(
-        W, X, out, M, N, K, n_groups, stream);
+        W, X, out, M, N, K, n_groups, false, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_dense_single_grid(
+        const void *W, const float *X, float *out,
+        int M, int N, int K, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_dense_impl(
+        W, X, out, M, N, K, n_groups, true, stream);
 }
 
 extern "C" int ds4_mmq_mxfp4_dense(
@@ -4430,21 +4500,21 @@ int ds4_mmq_dense_pair_vec_impl(
 
     if (!W0 || !W1 || !X_f32 || !out0_f32 || !out1_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     if (M0 <= 0 || M1 <= 0 || N <= 0 || K <= 0) {
         fprintf(stderr, "%s: bad shape M0=%d M1=%d N=%d K=%d\n",
                 tag, M0, M1, N, K);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     if (K % 256 != 0) {
         fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     if (N > MMVQ_MAX_BATCH_SIZE) {
         fprintf(stderr, "%s: N=%d exceeds MMVQ_MAX_BATCH_SIZE=%d\n",
                 tag, N, MMVQ_MAX_BATCH_SIZE);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
 
     const int dev = ggml_cuda_get_device();
@@ -4452,7 +4522,7 @@ int ds4_mmq_dense_pair_vec_impl(
     if (!ctx) {
         fprintf(stderr, "%s: failed to get cuda context for device %d\n",
                 tag, dev);
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
 
     ds4_pool_set_stream(stream);

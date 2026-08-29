@@ -193,6 +193,8 @@ int ds4_mmq_q4_K_dense(
 // ds4_mmq_q4_K_dense_pair_vec: N is not limited to the MMVQ batch ceiling,
 // M0 and M1 may differ, and each leg preserves ds4_mmq_q4_K_dense's
 // reduction and output layout. The two output ranges must be disjoint.
+// Shape/capability rejection returns DS4_MMQ_NOT_APPLICABLE before enqueue;
+// negative values report an attempted-path launch failure.
 int ds4_mmq_q4_K_dense_pair(
     const void  * W0_q4_K,
     const void  * W1_q4_K,
@@ -210,6 +212,20 @@ int ds4_mmq_q4_K_dense_pair(
 // in one launch and writes each group directly to the final token-major
 // layout, while preserving the established per-group MMQ reduction tree.
 int ds4_mmq_q4_K_grouped_dense(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+// Opt-in sibling of ds4_mmq_q4_K_grouped_dense that submits all groups in one
+// grid, with group selected by grid.z.  Stream-k coordinates and fixup storage
+// are isolated per grid.z slice, preserving the reduction tree and output bits
+// of the established one-launch-per-group implementation.
+int ds4_mmq_q4_K_grouped_dense_single_grid(
     const void  * W_q4_K,
     const float * X_f32,
     float       * out_f32,
@@ -1066,6 +1082,8 @@ void ds4_mmq_q4_K_k1024_persistent_counters(
 // activation quantization.  Each output is dispatched through the same MMVQ
 // entry as ds4_mmq_q4_K_dense_vec, so its reduction and output bits are
 // unchanged; M0 and M1 may differ (the DS4 Q-A/KV decode shape does).
+// Shape/capability rejection returns DS4_MMQ_NOT_APPLICABLE before enqueue;
+// negative values report an attempted-path launch failure.
 int ds4_mmq_q4_K_dense_pair_vec(
     const void  * W0_q4_K,
     const void  * W1_q4_K,

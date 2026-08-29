@@ -40606,10 +40606,13 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
                 (unsigned long long)out0_dim,
                 (unsigned long long)out1_dim,
                 (unsigned long long)n_tok,
-                g_cuda_test_q4_mmq_strict
-                    ? "; strict benchmark mode rejects fallback"
-                    : "; falling back");
-        if (g_cuda_test_q4_mmq_strict) return 0;
+                rc == DS4_MMQ_NOT_APPLICABLE
+                    ? (g_cuda_test_q4_mmq_strict
+                           ? "; strict benchmark mode rejects fallback"
+                           : "; falling back")
+                    : "; attempted path failed closed");
+        if (rc != DS4_MMQ_NOT_APPLICABLE) return -1;
+        if (g_cuda_test_q4_mmq_strict) return -1;
         if (gb10_canonical) return 0;
     }
     if (g_cuda_test_q4_mmq_strict) {
@@ -40620,7 +40623,7 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
                 (unsigned long long)out0_dim,
                 (unsigned long long)out1_dim,
                 (unsigned long long)n_tok);
-        return 0;
+        return -1;
     }
 
     /* The Q8_K pair is the established decode/microbatch rollback only.
@@ -40641,7 +40644,7 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
     q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
         xq, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
     if (!cuda_ok(cudaGetLastError(), "q4_K dense pair quantize launch")) {
-        return 0;
+        return -1;
     }
 
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
@@ -40658,7 +40661,9 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
         (uint32_t)out0_dim,
         (uint32_t)out1_dim,
         (uint32_t)n_tok);
-    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch");
+    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch")
+        ? 1
+        : -1;
 }
 
 static uint64_t g_q4_attn_hc_oracle_calls;
@@ -43912,22 +43917,26 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH", 0);
     const int grouped_prefill_require = cuda_env_flag_enabled(
         "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL", 0);
+    const int grouped_single_grid_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_SINGLE_GRID", 0);
+    const int any_grouped_require = grouped_batch_require ||
+        grouped_prefill_require || grouped_single_grid_require;
     if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
         n_tokens < 2u || group_dim > INT_MAX || rank > INT_MAX ||
         out_dim > INT_MAX || n_tokens > INT_MAX || !cuda_use_mmq()) {
-        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
+        return any_grouped_require ? -1 : 0;
     }
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (low_dim > INT_MAX || (group_dim % CUDA_QK_K) != 0u ||
         (low_dim % CUDA_QK_K) != 0u) {
-        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
+        return any_grouped_require ? -1 : 0;
     }
     const uint64_t row_a_bytes =
         (group_dim / CUDA_QK_K) * sizeof(cuda_block_q4_K);
     if (rank > UINT64_MAX / row_a_bytes ||
         n_groups > UINT64_MAX / (rank * row_a_bytes)) {
-        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
+        return any_grouped_require ? -1 : 0;
     }
     const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
     if (out_a_offset > model_size ||
@@ -43937,13 +43946,13 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
         group_tmp->bytes < (uint64_t)n_tokens * group_dim * sizeof(float) ||
         low_tmp->bytes < (uint64_t)n_tokens * rank * sizeof(float)) {
-        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
+        return any_grouped_require ? -1 : 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
     const char *out_a = cuda_resolve_weight_ptr(
         model_map, out_a_offset, out_a_bytes, logical_tier, "q4 attn_out_a");
     if (!out_a) {
-        return (grouped_batch_require || grouped_prefill_require) ? -1 : 0;
+        return any_grouped_require ? -1 : 0;
     }
     const int grouped_oracle = cuda_env_flag_enabled(
         "DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE", 0);
@@ -43953,6 +43962,15 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL", 0);
     const int grouped_prefill_disable =
         getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL") != NULL;
+    const int grouped_single_grid_enable = cuda_env_flag_enabled(
+        "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID", 0);
+    const int grouped_single_grid_disable = cuda_env_flag_enabled(
+        "DS4_CUDA_DISABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID", 0);
+    const int grouped_single_grid_selected =
+        (grouped_single_grid_enable || grouped_single_grid_require) &&
+        !grouped_single_grid_disable;
+    const int grouped_prefill_selected = grouped_prefill_enable ||
+        grouped_prefill_require || grouped_single_grid_selected;
     if (grouped_oracle) cuda_q4_grouped_attn_a_oracle_register_report();
 
     const int grouped_gb10 =
@@ -43981,16 +43999,44 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                 "is not eligible\n");
         return -1;
     }
-    if ((grouped_prefill_enable || grouped_prefill_require) &&
-        grouped_prefill_gb10) {
-        const int rc = ds4_mmq_q4_K_grouped_dense(
-            out_a, (const float *)heads->ptr, (float *)low->ptr,
-            (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
-            cuda_decode_stream());
+    if (grouped_single_grid_require &&
+        (grouped_single_grid_disable || !grouped_prefill_gb10)) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A single-grid "
+                "path is not eligible\n");
+        return -1;
+    }
+    if (grouped_prefill_selected && grouped_prefill_gb10) {
+        int rc = grouped_single_grid_selected
+            ? ds4_mmq_q4_K_grouped_dense_single_grid(
+                  out_a, (const float *)heads->ptr, (float *)low->ptr,
+                  (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
+                  cuda_decode_stream())
+            : ds4_mmq_q4_K_grouped_dense(
+                  out_a, (const float *)heads->ptr, (float *)low->ptr,
+                  (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
+                  cuda_decode_stream());
+        /* NOT_APPLICABLE is returned before allocation or enqueue, so the
+         * opt-in candidate can safely fall back to the established grouped
+         * implementation.  Every other failure may follow an enqueue and
+         * remains fail-closed. */
+        if (rc == DS4_MMQ_NOT_APPLICABLE && grouped_single_grid_selected) {
+            if (grouped_single_grid_require) {
+                fprintf(stderr,
+                        "ds4: required CUDA Q4 grouped attention-A "
+                        "single-grid dispatch was not applicable\n");
+                return -1;
+            }
+            rc = ds4_mmq_q4_K_grouped_dense(
+                out_a, (const float *)heads->ptr, (float *)low->ptr,
+                (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
+                cuda_decode_stream());
+        }
         if (rc != 0) {
             fprintf(stderr,
-                    "ds4: CUDA Q4 grouped attention-A prefill returned %d; "
+                    "ds4: CUDA Q4 grouped attention-A %s returned %d; "
                     "failing closed after candidate dispatch\n",
+                    grouped_single_grid_selected ? "single-grid" : "prefill",
                     rc);
             return -1;
         }
@@ -44020,7 +44066,7 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                     (float *)low->ptr + (uint64_t)t * low_dim,
                     (int)rank, (int)group_dim, (int)n_groups,
                     cuda_decode_stream());
-                if (rc == DS4_MMQ_NOT_APPLICABLE) return 0;
+                if (rc == DS4_MMQ_NOT_APPLICABLE) return -1;
                 if (rc != 0) return -1;
             }
         } else if (batch_rc != 0) {
@@ -44047,32 +44093,35 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                 (uint64_t)n_groups * group_dim * sizeof(float),
                 group_dim * sizeof(float), n_tokens,
                 cudaMemcpyDeviceToDevice, cuda_decode_stream());
-            if (!cuda_ok(ce, "q4 attention output heads pack")) return 0;
+            if (!cuda_ok(ce, "q4 attention output heads pack")) return -1;
             const int rc = ds4_mmq_q4_K_dense(
                 out_a + (uint64_t)g * rank * row_a_bytes,
                 (const float *)group_tmp->ptr, (float *)low_tmp->ptr,
                 (int)rank, (int)n_tokens, (int)group_dim,
                 cuda_decode_stream());
-            if (rc != 0) return 0;
+            if (rc != 0) return -1;
             ce = cudaMemcpy2DAsync(
                 (float *)low->ptr + (uint64_t)g * rank,
                 low_dim * sizeof(float), low_tmp->ptr, rank * sizeof(float),
                 rank * sizeof(float), n_tokens,
                 cudaMemcpyDeviceToDevice, cuda_decode_stream());
-            if (!cuda_ok(ce, "q4 attention output low unpack")) return 0;
+            if (!cuda_ok(ce, "q4 attention output low unpack")) return -1;
         }
     }
+    int b_rc = 0;
     if (out_b_type == 12u) {
-        return cuda_matmul_q4_K_tensor(out, model_map, model_size,
+        b_rc = cuda_matmul_q4_K_tensor(out, model_map, model_size,
                                        out_b_offset, low_dim, out_dim,
                                        low, n_tokens);
+    } else if (out_b_type == 8u) {
+        b_rc = cuda_matmul_q8_0_tensor_labeled(
+            out, model_map, model_size, out_b_offset, low_dim, out_dim,
+            low, n_tokens, "q4 attn_output_b");
     }
-    if (out_b_type == 8u) {
-        return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size,
-                                               out_b_offset, low_dim, out_dim,
-                                               low, n_tokens, "q4 attn_output_b");
-    }
-    return 0;
+    /* Attention-A has already been enqueued.  A B rejection or launch error
+     * can no longer request whole-operation fallback without replaying A, so
+     * preserve the tri-state compound-operation contract and fail closed. */
+    return b_rc > 0 ? 1 : -1;
 }
 
 static void cuda_q4_grouped_attn_a_oracle_report(void) {
