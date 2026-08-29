@@ -36,6 +36,19 @@ extern "C" int ds4_rocm_test_q4_prefill_k1024_tile4_policy(
     int disabled, int required);
 extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
+extern "C" int ds4_rocm_test_q4_prefill_q8_wave32_policy(
+    int prefill_scope, int runtime_compatible, int enabled, int disabled,
+    int required);
+extern "C" void ds4_rocm_test_q4_prefill_q8_wave32_reset(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_q8_wave32_get_calls(void);
+extern "C" int ds4_rocm_test_q8_K_quantize_tensor(
+    ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t in_dim,
+    uint32_t n_rows, int use_wave32);
+extern "C" int ds4_rocm_test_q4_attn_q_b_yield_to_q8_wave32_policy(
+    uint32_t weight_type, uint32_t n_tok, int q8_wave32_required,
+    int f16_cache_required);
+extern "C" int ds4_rocm_test_q4_pair_pre_enqueue_failure_policy(
+    int prefill_scope, int tile8_required, int q8_wave32_required);
 
 namespace {
 
@@ -86,6 +99,12 @@ constexpr const char *kPrefillWmmaDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA";
 constexpr const char *kPrefillWmmaRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA";
+constexpr const char *kPrefillQ8Wave32Enable =
+    "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32";
+constexpr const char *kPrefillQ8Wave32Disable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_Q8_K_WAVE32";
+constexpr const char *kPrefillQ8Wave32Require =
+    "DS4_ROCM_REQUIRE_Q4_PREFILL_Q8_K_WAVE32";
 constexpr const char *kQbF16Enable =
     "DS4_ROCM_ENABLE_Q4_ATTN_Q_B_F16_CACHE";
 constexpr const char *kQbF16Disable =
@@ -412,6 +431,30 @@ void fill_activation(std::vector<float> *x, uint32_t n_tokens,
     }
 }
 
+/* Exercise the two canonical edge cases for max selection: all-zero blocks
+ * and equal absolute maxima with opposite signs at different indices. */
+void fill_q8_wave32_activation(std::vector<float> *x, uint32_t n_tokens,
+                               uint32_t in_dim) {
+    x->resize((uint64_t)n_tokens * in_dim);
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t b = 0; b < in_dim / kQkK; b++) {
+            float *block = x->data() + (uint64_t)token * in_dim + b * kQkK;
+            if (((token + b) % 7u) == 0u) {
+                std::fill(block, block + kQkK, 0.0f);
+                continue;
+            }
+            for (uint32_t i = 0; i < kQkK; i++) {
+                const int value =
+                    (int)((i * 29u + token * 17u + b * 11u) % 97u) - 48;
+                block[i] = (float)value / 16.0f;
+            }
+            const float first = ((token + b) & 1u) ? 4.0f : -4.0f;
+            block[5] = first;
+            block[224] = -first;
+        }
+    }
+}
+
 void quantize_q8_K_cpu(const float *x, block_q8_K_test *out) {
     float amax = 0.0f;
     float maxv = 0.0f;
@@ -698,7 +741,7 @@ bool run_pair_case(const aligned_model &model, uint32_t n_tokens,
     std::vector<float> dense1_host(count1);
     std::vector<float> pair0_host(sentinel0.size());
     std::vector<float> pair1_host(sentinel1.size());
-    if (dense_rc0 == 0 || dense_rc1 == 0 || pair_rc == 0 ||
+    if (dense_rc0 == 0 || dense_rc1 == 0 || pair_rc <= 0 ||
         !read_tensor(dense0.ptr, &dense0_host) ||
         !read_tensor(dense1.ptr, &dense1_host) ||
         !read_tensor(pair0.ptr, &pair0_host) ||
@@ -1145,6 +1188,318 @@ bool run_prefill_k1024_tile4_policy_oracle() {
     return ok;
 }
 
+bool run_prefill_q8_wave32_policy_oracle() {
+    struct policy_case {
+        const char *label;
+        int scope;
+        int compatible;
+        int enabled;
+        int disabled;
+        int required;
+        int expected;
+    };
+    const policy_case cases[] = {
+        {"default remains canonical", 1, 1, 0, 0, 0, 0},
+        {"ENABLE selects compatible prefill", 1, 1, 1, 0, 0, 1},
+        {"ENABLE falls back outside prefill", 0, 1, 1, 0, 0, 0},
+        {"ENABLE falls back on incompatible runtime", 1, 0, 1, 0, 0, 0},
+        {"DISABLE dominates ENABLE", 1, 1, 1, 1, 0, 0},
+        {"REQUIRE is an opt-in", 1, 1, 0, 0, 1, 1},
+        {"REQUIRE rejects non-prefill", 0, 1, 0, 0, 1, -1},
+        {"REQUIRE rejects incompatible runtime", 1, 0, 0, 0, 1, -1},
+        {"DISABLE dominates REQUIRE", 1, 1, 1, 1, 1, -1},
+    };
+    bool ok = true;
+    for (const policy_case &test : cases) {
+        const int got = ds4_rocm_test_q4_prefill_q8_wave32_policy(
+            test.scope, test.compatible, test.enabled, test.disabled,
+            test.required);
+        if (got != test.expected) {
+            std::fprintf(stderr,
+                         "Q8_K wave32 policy %s: expected=%d got=%d FAIL\n",
+                         test.label, test.expected, got);
+            ok = false;
+        }
+    }
+    struct q_b_policy_case {
+        const char *label;
+        uint32_t weight_type;
+        uint32_t n_tok;
+        int required;
+        int f16_required;
+        int expected;
+    };
+    const q_b_policy_case q_b_cases[] = {
+        {"Q4 prefill REQUIRE yields", kQ4Type, 32u, 1, 0, 1},
+        {"Q4 long prefill REQUIRE yields", kQ4Type, 4097u, 1, 0, 1},
+        {"dual REQUIRE conflicts", kQ4Type, 32u, 1, 1, -1},
+        {"Q4 decode does not claim prefill", kQ4Type, 8u, 1, 1, 0},
+        {"Q8 prefill is unrelated", kQ8Type, 32u, 1, 1, 0},
+        {"Q4 prefill without Q8 REQUIRE keeps F16 policy",
+         kQ4Type, 32u, 0, 1, 0},
+    };
+    for (const q_b_policy_case &test : q_b_cases) {
+        const int got =
+            ds4_rocm_test_q4_attn_q_b_yield_to_q8_wave32_policy(
+                test.weight_type, test.n_tok, test.required,
+                test.f16_required);
+        if (got != test.expected) {
+            std::fprintf(stderr,
+                         "Q8_K wave32 q_b yield policy %s: "
+                         "expected=%d got=%d FAIL\n",
+                         test.label, test.expected, got);
+            ok = false;
+        }
+    }
+    std::fprintf(stderr,
+                 "ROCm Q4 Q8_K wave32 policy oracle: selector=%zu q_b=%zu "
+                 "%s\n",
+                 sizeof(cases) / sizeof(cases[0]),
+                 sizeof(q_b_cases) / sizeof(q_b_cases[0]),
+                 ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_pair_pre_enqueue_policy_oracle() {
+    struct policy_case {
+        const char *label;
+        int prefill_scope;
+        int tile8_required;
+        int q8_wave32_required;
+        int expected;
+    };
+    const policy_case cases[] = {
+        {"optional prefill rejection falls back", 1, 0, 0, 0},
+        {"TILE8 REQUIRE rejection fails closed", 1, 1, 0, -1},
+        {"Q8 wave32 REQUIRE can use dense fallback", 1, 0, 1, 0},
+        {"TILE8 remains strict with dual REQUIRE", 1, 1, 1, -1},
+        {"decode ignores prefill TILE8 REQUIRE", 0, 1, 0, 0},
+        {"optional decode rejection falls back", 0, 0, 0, 0},
+    };
+
+    bool ok = true;
+    for (const policy_case &test : cases) {
+        const int got = ds4_rocm_test_q4_pair_pre_enqueue_failure_policy(
+            test.prefill_scope, test.tile8_required,
+            test.q8_wave32_required);
+        if (got != test.expected) {
+            std::fprintf(stderr,
+                         "Q4 pair pre-enqueue policy %s: "
+                         "expected=%d got=%d FAIL\n",
+                         test.label, test.expected, got);
+            ok = false;
+        }
+    }
+
+    /* Exercise the public selector without a GPU: null tensors reach the
+     * validation rejection only when the pair is selected. */
+    env_snapshot tile8_disable(kPrefillDisable);
+    env_snapshot tile8_require(kPrefillRequire);
+    env_snapshot dense_pair_enable("DS4_ROCM_ENABLE_Q4_DENSE_PAIR");
+    env_snapshot dense_pair_disable("DS4_ROCM_DISABLE_Q4_DENSE_PAIR");
+    env_snapshot wmma_enable(kPrefillWmmaEnable);
+    env_snapshot wmma_disable(kPrefillWmmaDisable);
+    env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot q8_enable(kPrefillQ8Wave32Enable);
+    env_snapshot q8_disable(kPrefillQ8Wave32Disable);
+    env_snapshot q8_require(kPrefillQ8Wave32Require);
+    (void)unsetenv(kPrefillDisable);
+    (void)setenv(kPrefillRequire, "1", 1);
+    (void)unsetenv("DS4_ROCM_ENABLE_Q4_DENSE_PAIR");
+    (void)unsetenv("DS4_ROCM_DISABLE_Q4_DENSE_PAIR");
+    (void)unsetenv(kPrefillWmmaEnable);
+    (void)unsetenv(kPrefillWmmaDisable);
+    (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillQ8Wave32Enable);
+    (void)unsetenv(kPrefillQ8Wave32Disable);
+    (void)unsetenv(kPrefillQ8Wave32Require);
+    const int required_validation = ds4_gpu_matmul_q4_K_pair_tensor(
+        nullptr, nullptr, nullptr, 0u, 0u, 0u,
+        kK, kM0, kM1, nullptr, 9u);
+
+    (void)unsetenv(kPrefillRequire);
+    (void)setenv(kPrefillDisable, "1", 1);
+    const int opt_out = ds4_gpu_matmul_q4_K_pair_tensor(
+        nullptr, nullptr, nullptr, 0u, 0u, 0u,
+        kK, kM0, kM1, nullptr, 9u);
+
+    (void)unsetenv(kPrefillDisable);
+    (void)setenv(kPrefillRequire, "1", 1);
+    (void)setenv("DS4_ROCM_ENABLE_Q4_DENSE_PAIR", "1", 1);
+    const int decode = ds4_gpu_matmul_q4_K_pair_tensor(
+        nullptr, nullptr, nullptr, 0u, 0u, 0u,
+        kK, kM0, kM1, nullptr, 1u);
+    if (required_validation != -1 || opt_out != 0 || decode != 0) {
+        std::fprintf(stderr,
+                     "Q4 pair public pre-enqueue policy: "
+                     "required=%d opt_out=%d decode=%d FAIL\n",
+                     required_validation, opt_out, decode);
+        ok = false;
+    }
+    std::fprintf(stderr,
+                 "ROCm Q4 pair pre-enqueue policy oracle: cases=%zu "
+                 "required=%d opt_out=%d decode=%d %s\n",
+                 sizeof(cases) / sizeof(cases[0]), required_validation,
+                 opt_out, decode, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_prefill_q8_wave32_oracle(const aligned_model &model) {
+#if DS4_TEST_HAS_HIP_RUNTIME
+    int device = 0;
+    hipDeviceProp_t properties = {};
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipGetDeviceProperties(&properties, device) != hipSuccess ||
+        properties.warpSize != 32 ||
+        std::strncmp(properties.gcnArchName, "gfx1151", 7u) != 0) {
+        std::fprintf(stderr,
+                     "ROCm Q4 Q8_K wave32 oracle: SKIP "
+                     "(requires gfx1151 wave32)\n");
+        return true;
+    }
+
+    bool ok = true;
+    constexpr uint32_t n_tokens = 9u;
+    const uint32_t dimensions[] = {256u, 1024u, 4096u};
+    for (uint32_t in_dim : dimensions) {
+        std::vector<float> x;
+        fill_q8_wave32_activation(&x, n_tokens, in_dim);
+        const size_t block_count =
+            (size_t)n_tokens * (in_dim / kQkK);
+        const size_t bytes = block_count * sizeof(block_q8_K_test);
+        tensor_owner x_gpu(x.size() * sizeof(float));
+        tensor_owner legacy_gpu(bytes);
+        tensor_owner wave_gpu(bytes);
+        if (!x_gpu.ptr || !legacy_gpu.ptr || !wave_gpu.ptr ||
+            !write_tensor(x_gpu.ptr, x)) {
+            std::fprintf(stderr,
+                         "Q8_K wave32 raw K=%u allocation/write FAIL\n",
+                         in_dim);
+            ok = false;
+            continue;
+        }
+        const int legacy_rc = ds4_rocm_test_q8_K_quantize_tensor(
+            legacy_gpu.ptr, x_gpu.ptr, in_dim, n_tokens, 0);
+        const int wave_rc = ds4_rocm_test_q8_K_quantize_tensor(
+            wave_gpu.ptr, x_gpu.ptr, in_dim, n_tokens, 1);
+        std::vector<block_q8_K_test> legacy(block_count);
+        std::vector<block_q8_K_test> wave(block_count);
+        std::vector<block_q8_K_test> cpu(block_count);
+        const bool read_ok = legacy_rc != 0 && wave_rc != 0 &&
+            ds4_gpu_tensor_read(legacy_gpu.ptr, 0, legacy.data(), bytes) != 0 &&
+            ds4_gpu_tensor_read(wave_gpu.ptr, 0, wave.data(), bytes) != 0;
+        for (size_t i = 0; i < block_count; i++) {
+            quantize_q8_K_cpu(x.data() + i * kQkK, &cpu[i]);
+        }
+        const bool pair_equal = read_ok &&
+            std::memcmp(legacy.data(), wave.data(), bytes) == 0;
+        const bool cpu_equal = read_ok &&
+            std::memcmp(legacy.data(), cpu.data(), bytes) == 0;
+        std::fprintf(stderr,
+                     "Q8_K wave32 raw K=%u blocks=%zu legacy=%d wave=%d "
+                     "pair=%s cpu=%s %s\n",
+                     in_dim, block_count, legacy_rc, wave_rc,
+                     pair_equal ? "bitwise" : "MISMATCH",
+                     cpu_equal ? "bitwise" : "MISMATCH",
+                     pair_equal && cpu_equal ? "PASS" : "FAIL");
+        ok = pair_equal && cpu_equal && ok;
+    }
+
+    env_snapshot tile8_disable(kPrefillDisable);
+    env_snapshot tile8_require(kPrefillRequire);
+    env_snapshot wmma_disable(kPrefillWmmaDisable);
+    env_snapshot q8_enable(kPrefillQ8Wave32Enable);
+    env_snapshot q8_disable(kPrefillQ8Wave32Disable);
+    env_snapshot q8_require(kPrefillQ8Wave32Require);
+    (void)unsetenv(kPrefillDisable);
+    (void)setenv(kPrefillRequire, "1", 1);
+    (void)setenv(kPrefillWmmaDisable, "1", 1);
+    (void)unsetenv(kPrefillQ8Wave32Enable);
+    (void)unsetenv(kPrefillQ8Wave32Disable);
+    (void)setenv(kPrefillQ8Wave32Require, "1", 1);
+
+    std::vector<float> x;
+    fill_q8_wave32_activation(&x, n_tokens, kK);
+    tensor_owner x_gpu(x.size() * sizeof(float));
+    tensor_owner out_gpu((uint64_t)n_tokens * kM0 * sizeof(float));
+    bool dispatch_ok = x_gpu.ptr && out_gpu.ptr && write_tensor(x_gpu.ptr, x);
+    ds4_rocm_test_q4_prefill_q8_wave32_reset();
+    const int rc = dispatch_ok ? ds4_gpu_matmul_quant_tensor(
+        out_gpu.ptr, model.data, model.size, model.weight0_offset, kQ4Type,
+        kK, kM0, x_gpu.ptr, n_tokens) : 0;
+    const uint64_t calls =
+        ds4_rocm_test_q4_prefill_q8_wave32_get_calls();
+    std::vector<float> got((uint64_t)n_tokens * kM0);
+    dispatch_ok = dispatch_ok && rc != 0 && calls == 1u &&
+                  read_tensor(out_gpu.ptr, &got);
+    if (dispatch_ok) {
+        const std::vector<float> cpu = dense_reference(
+            model.data + model.weight0_offset, x, kM0, n_tokens);
+        dispatch_ok = close_to_cpu(
+            got, cpu, "Q8_K wave32 REQUIRE public dispatch vs CPU");
+    }
+
+    /* Q8 REQUIRE owns only activation quantization.  With TILE8 opted out,
+     * the pair must yield so the graph can issue two dense calls, each of
+     * which still attests the wave32 quantizer. */
+    tensor_owner fallback0((uint64_t)n_tokens * kM0 * sizeof(float));
+    tensor_owner fallback1((uint64_t)n_tokens * kM1 * sizeof(float));
+    (void)setenv(kPrefillDisable, "1", 1);
+    (void)unsetenv(kPrefillRequire);
+    (void)unsetenv(kPrefillQ8Wave32Disable);
+    ds4_rocm_test_q4_prefill_q8_wave32_reset();
+    const int pair_fallback_rc = fallback0.ptr && fallback1.ptr
+        ? ds4_gpu_matmul_q4_K_pair_tensor(
+              fallback0.ptr, fallback1.ptr, model.data, model.size,
+              model.weight0_offset, model.weight1_offset,
+              kK, kM0, kM1, x_gpu.ptr, n_tokens)
+        : -1;
+    const uint64_t pair_fallback_calls =
+        ds4_rocm_test_q4_prefill_q8_wave32_get_calls();
+    const int fallback_rc0 = pair_fallback_rc == 0
+        ? ds4_gpu_matmul_quant_tensor(
+              fallback0.ptr, model.data, model.size, model.weight0_offset,
+              kQ4Type, kK, kM0, x_gpu.ptr, n_tokens)
+        : 0;
+    const int fallback_rc1 = fallback_rc0 != 0
+        ? ds4_gpu_matmul_quant_tensor(
+              fallback1.ptr, model.data, model.size, model.weight1_offset,
+              kQ4Type, kK, kM1, x_gpu.ptr, n_tokens)
+        : 0;
+    const uint64_t dense_fallback_calls =
+        ds4_rocm_test_q4_prefill_q8_wave32_get_calls();
+    const bool pair_fallback = pair_fallback_rc == 0 &&
+        pair_fallback_calls == 0u && fallback_rc0 != 0 &&
+        fallback_rc1 != 0 && dense_fallback_calls == 2u;
+
+    (void)unsetenv(kPrefillDisable);
+    (void)setenv(kPrefillRequire, "1", 1);
+    (void)setenv(kPrefillQ8Wave32Disable, "1", 1);
+    ds4_rocm_test_q4_prefill_q8_wave32_reset();
+    const int rejected_rc = ds4_gpu_matmul_quant_tensor(
+        out_gpu.ptr, model.data, model.size, model.weight0_offset, kQ4Type,
+        kK, kM0, x_gpu.ptr, n_tokens);
+    const uint64_t rejected_calls =
+        ds4_rocm_test_q4_prefill_q8_wave32_get_calls();
+    const bool rejected = rejected_rc == 0 && rejected_calls == 0u;
+    std::fprintf(stderr,
+                 "ROCm Q4 Q8_K wave32 dispatch: rc=%d calls=%llu "
+                 "pair_fallback=%d/%llu dense_fallback=%d,%d/%llu "
+                 "disable+require=%d/%llu %s\n",
+                 rc, (unsigned long long)calls, pair_fallback_rc,
+                 (unsigned long long)pair_fallback_calls,
+                 fallback_rc0, fallback_rc1,
+                 (unsigned long long)dense_fallback_calls,
+                 rejected_rc,
+                 (unsigned long long)rejected_calls,
+                 dispatch_ok && pair_fallback && rejected ? "PASS" : "FAIL");
+    return dispatch_ok && pair_fallback && rejected && ok;
+#else
+    (void)model;
+    return true;
+#endif
+}
+
 bool run_prefill_k1024_tile4_ssd_case(const aligned_model &model) {
     constexpr uint32_t n_tokens = 9u;
     const size_t logical_count = (size_t)n_tokens * kQbOutDim;
@@ -1420,7 +1775,7 @@ bool run_prefill_pair_case(const aligned_model &model, uint32_t n_tokens,
     std::vector<float> legacy1_host(sentinel1.size());
     std::vector<float> pair0_host(sentinel0.size());
     std::vector<float> pair1_host(sentinel1.size());
-    if (legacy_rc0 == 0 || legacy_rc1 == 0 || pair_rc == 0 ||
+    if (legacy_rc0 == 0 || legacy_rc1 == 0 || pair_rc <= 0 ||
         !read_tensor(legacy0.ptr, &legacy0_host) ||
         !read_tensor(legacy1.ptr, &legacy1_host) ||
         !read_tensor(pair0.ptr, &pair0_host) ||
@@ -2032,9 +2387,21 @@ bool run_pair_guards(const aligned_model &model) {
     env_snapshot prefill_enable(kPrefillEnable);
     env_snapshot prefill_disable(kPrefillDisable);
     env_snapshot prefill_require(kPrefillRequire);
+    env_snapshot wmma_enable(kPrefillWmmaEnable);
+    env_snapshot wmma_disable(kPrefillWmmaDisable);
+    env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot q8_enable(kPrefillQ8Wave32Enable);
+    env_snapshot q8_disable(kPrefillQ8Wave32Disable);
+    env_snapshot q8_require(kPrefillQ8Wave32Require);
     (void)unsetenv(kPrefillEnable);
     (void)setenv(kPrefillDisable, "1", 1);
     (void)unsetenv(kPrefillRequire);
+    (void)unsetenv(kPrefillWmmaEnable);
+    (void)unsetenv(kPrefillWmmaDisable);
+    (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillQ8Wave32Enable);
+    (void)unsetenv(kPrefillQ8Wave32Disable);
+    (void)unsetenv(kPrefillQ8Wave32Require);
     const int rc = ds4_gpu_matmul_q4_K_pair_tensor(
         out0.ptr, out1.ptr, model.data, model.size,
         model.weight0_offset, model.weight1_offset,
@@ -2048,6 +2415,80 @@ bool run_pair_guards(const aligned_model &model) {
     ok = unchanged_after_rejected_call(
              out1.ptr, sentinel1, "pair n_tok=9 preserves out1") && ok;
 
+    (void)unsetenv(kPrefillDisable);
+    (void)setenv(kPrefillRequire, "1", 1);
+    if (!write_tensor(out0.ptr, sentinel0) ||
+        !write_tensor(out1.ptr, sentinel1)) {
+        return false;
+    }
+    const int validation_rc = ds4_gpu_matmul_q4_K_pair_tensor(
+        out0.ptr, out1.ptr, model.data, model.size,
+        model.weight0_offset, model.weight1_offset,
+        kK - 1u, kM0, kM1, x_gpu.ptr, n_tokens);
+    ok = validation_rc == -1 && unchanged_after_rejected_call(
+        out0.ptr, sentinel0,
+        "required pair validation preserves out0") && ok;
+    ok = unchanged_after_rejected_call(
+             out1.ptr, sentinel1,
+             "required pair validation preserves out1") && ok;
+    if (validation_rc != -1) {
+        std::fprintf(stderr,
+                     "required pair validation: expected rc=-1 got=%d FAIL\n",
+                     validation_rc);
+    }
+
+    if (!write_tensor(out0.ptr, sentinel0) ||
+        !write_tensor(out1.ptr, sentinel1)) {
+        return false;
+    }
+    const int range_rc = ds4_gpu_matmul_q4_K_pair_tensor(
+        out0.ptr, out1.ptr, model.data, model.size,
+        model.size - 16u, model.weight1_offset,
+        kK, kM0, kM1, x_gpu.ptr, n_tokens);
+    ok = range_rc == -1 && unchanged_after_rejected_call(
+        out0.ptr, sentinel0, "required pair range preserves out0") && ok;
+    ok = unchanged_after_rejected_call(
+             out1.ptr, sentinel1,
+             "required pair range preserves out1") && ok;
+    if (range_rc != -1) {
+        std::fprintf(stderr,
+                     "required pair range: expected rc=-1 got=%d FAIL\n",
+                     range_rc);
+    }
+
+    const size_t strict_shared_count =
+        (size_t)n_tokens * ((size_t)kM0 + kM1);
+    const std::vector<float> strict_shared_sentinel =
+        sentinel_values(strict_shared_count);
+    tensor_owner strict_shared(strict_shared_count * sizeof(float));
+    tensor_owner strict_overlap0(ds4_gpu_tensor_view(
+        strict_shared.ptr, 0u,
+        (uint64_t)n_tokens * kM0 * sizeof(float)));
+    tensor_owner strict_overlap1(ds4_gpu_tensor_view(
+        strict_shared.ptr,
+        ((uint64_t)n_tokens * kM0 - 1u) * sizeof(float),
+        (uint64_t)n_tokens * kM1 * sizeof(float)));
+    if (!strict_shared.ptr || !strict_overlap0.ptr || !strict_overlap1.ptr ||
+        !write_tensor(strict_shared.ptr, strict_shared_sentinel)) {
+        std::fprintf(stderr, "required pair overlap guard: setup FAIL\n");
+        return false;
+    }
+    const int strict_overlap_rc = ds4_gpu_matmul_q4_K_pair_tensor(
+        strict_overlap0.ptr, strict_overlap1.ptr, model.data, model.size,
+        model.weight0_offset, model.weight1_offset,
+        kK, kM0, kM1, x_gpu.ptr, n_tokens);
+    ok = strict_overlap_rc == -1 && unchanged_after_rejected_call(
+        strict_shared.ptr, strict_shared_sentinel,
+        "required pair partial-overlap preserves storage") && ok;
+    if (strict_overlap_rc != -1) {
+        std::fprintf(stderr,
+                     "required pair partial-overlap: "
+                     "expected rc=-1 got=%d FAIL\n",
+                     strict_overlap_rc);
+    }
+
+    (void)setenv(kPrefillDisable, "1", 1);
+    (void)unsetenv(kPrefillRequire);
     const size_t shared_count = (size_t)kM0 + kM1;
     const std::vector<float> shared_sentinel = sentinel_values(shared_count);
     tensor_owner shared(shared_count * sizeof(float));
@@ -2164,6 +2605,9 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     env_snapshot wmma_ssd_enable(kPrefillWmmaSsdEnable);
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
+    env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
+    env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
 
     (void)unsetenv(kPrefillEnable);
     (void)unsetenv(kPrefillDisable);
@@ -2173,6 +2617,9 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     (void)unsetenv(kPrefillWmmaSsdEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillQ8Wave32Enable);
+    (void)unsetenv(kPrefillQ8Wave32Disable);
+    (void)unsetenv(kPrefillQ8Wave32Require);
     ds4_rocm_test_q4_prefill_wmma_reset();
     const int tile8_rc = ds4_gpu_matmul_quant_tensor(
         tile8_gpu.ptr, model.data, model.size, model.weight0_offset, kQ4Type,
@@ -2452,6 +2899,9 @@ int main(int argc, char **argv) {
     env_snapshot wmma_ssd_enable(kPrefillWmmaSsdEnable);
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
+    env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
+    env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
     env_snapshot grouped_enable(kGroupedDecodeEnable);
     env_snapshot grouped_disable(kGroupedDecodeDisable);
     env_snapshot grouped_require(kGroupedDecodeRequire);
@@ -2466,12 +2916,17 @@ int main(int argc, char **argv) {
     (void)unsetenv(kPrefillWmmaSsdEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillQ8Wave32Enable);
+    (void)unsetenv(kPrefillQ8Wave32Disable);
+    (void)unsetenv(kPrefillQ8Wave32Require);
     (void)unsetenv(kGroupedDecodeEnable);
     (void)unsetenv(kGroupedDecodeDisable);
     (void)unsetenv(kGroupedDecodeRequire);
     (void)unsetenv(kGroupedDecodeStats);
 
-    const bool policy_ok = run_prefill_k1024_tile4_policy_oracle();
+    const bool policy_ok = run_prefill_k1024_tile4_policy_oracle() &&
+                           run_prefill_q8_wave32_policy_oracle() &&
+                           run_pair_pre_enqueue_policy_oracle();
     if (run_policy_only || !policy_ok) return policy_ok ? 0 : 1;
 
     if (detect_rocm_device() <= 0) {
@@ -2539,6 +2994,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr,
                      "ROCm Q4 tiled prefill parity "
                      "(forced DISABLE vs default+REQUIRE):\n");
+        const bool q8_wave32_ok = run_prefill_q8_wave32_oracle(model);
         const bool prefill9_ok = run_prefill_parity_case(
             model, 9u, model.weight0_offset, kM0, true,
             "prefill K=4096 M=65 n_tok=9");
@@ -2595,7 +3051,7 @@ int main(int argc, char **argv) {
         const bool output_wmma_ok =
             run_attention_output_wmma_smoke(model);
         const bool gate_ok = run_prefill_gate_guards(model);
-        ok = prefill9_ok && prefill30_ok && prefill128_ok &&
+        ok = q8_wave32_ok && prefill9_ok && prefill30_ok && prefill128_ok &&
              prefill_tail9_ok &&
              prefill_tail128_ok && prefill_single9_ok &&
              prefill_q_b_tile4_ok && q_b_f16_null_qhalf_ok &&

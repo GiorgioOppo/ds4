@@ -19,6 +19,12 @@
 #include <utility>
 #include <vector>
 
+/* Deliberately local to this harness: the backend entry performs only the
+ * selected kernel enqueue after this process has completed all validation. */
+extern "C" void ds4_rocm_bench_q8_K_quantize_enqueue(
+    void *out, const void *x, uint32_t in_dim, uint32_t n_rows,
+    int use_wave32);
+
 namespace {
 
 constexpr uint32_t kQ4Type = 12u;
@@ -35,6 +41,7 @@ constexpr uint32_t kOutputM = 4096u;
 constexpr uint32_t kDefaultSets = 4u;
 constexpr uint32_t kDefaultSamples = 8u;
 constexpr uint32_t kDefaultWarmup = 2u;
+constexpr uint32_t kRawQ8GuardWords = 64u;
 /* Catch a bad N-tail predicate anywhere in the final 64-token WMMA tile,
  * including the widest q_b output used by this harness. */
 constexpr uint32_t kGuardWords = (64u - 1u) * kQbM;
@@ -60,6 +67,12 @@ constexpr const char *kWmmaDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA";
 constexpr const char *kWmmaRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA";
+constexpr const char *kQ8Wave32Enable =
+    "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32";
+constexpr const char *kQ8Wave32Disable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_Q8_K_WAVE32";
+constexpr const char *kQ8Wave32Require =
+    "DS4_ROCM_REQUIRE_Q4_PREFILL_Q8_K_WAVE32";
 
 struct block_q4_K_host {
     uint16_t d;
@@ -70,6 +83,15 @@ struct block_q4_K_host {
 
 static_assert(sizeof(block_q4_K_host) == 144u,
               "Q4_K fixture must match the raw GGUF layout");
+
+struct block_q8_K_host {
+    float d;
+    int8_t qs[kQkK];
+    int16_t bsums[kQkK / 16u];
+};
+
+static_assert(sizeof(block_q8_K_host) == 292u,
+              "Q8_K fixture must match the ROCm activation layout");
 
 enum class bench_case {
     all,
@@ -168,7 +190,9 @@ struct event_timer {
             hipEventElapsedTime(milliseconds, begin, end) != hipSuccess) {
             return false;
         }
-        return true;
+        /* Outside the measured interval: surface an immediate launch/config
+         * error from enqueue-only benchmark hooks instead of false-greening. */
+        return hipGetLastError() == hipSuccess;
     }
 };
 
@@ -183,6 +207,11 @@ struct stats {
     double median = 0.0;
     double p95 = 0.0;
     double mean = 0.0;
+};
+
+enum class benchmark_rate {
+    macs,
+    quantized_values,
 };
 
 uint64_t align_up(uint64_t value, uint64_t alignment) {
@@ -313,20 +342,22 @@ void fill_activation(std::vector<float> *values, uint32_t n_tokens,
     }
 }
 
-std::vector<uint32_t> guard_pattern() {
-    std::vector<uint32_t> guard(kGuardWords);
-    for (uint32_t i = 0; i < kGuardWords; i++) guard[i] = 0x7fc12000u + i;
+std::vector<uint32_t> guard_pattern(uint32_t words = kGuardWords) {
+    std::vector<uint32_t> guard(words);
+    for (uint32_t i = 0; i < words; i++) guard[i] = 0x7fc12000u + i;
     return guard;
 }
 
-bool prepare_guard(ds4_gpu_tensor *tensor, uint64_t logical_bytes) {
-    const std::vector<uint32_t> guard = guard_pattern();
+bool prepare_guard(ds4_gpu_tensor *tensor, uint64_t logical_bytes,
+                   uint32_t guard_words = kGuardWords) {
+    const std::vector<uint32_t> guard = guard_pattern(guard_words);
     return ds4_gpu_tensor_write(tensor, logical_bytes, guard.data(),
                                 guard.size() * sizeof(guard[0])) != 0;
 }
 
 bool poison_output(ds4_gpu_tensor *tensor, uint64_t logical_bytes,
-                   uint32_t pattern) {
+                   uint32_t pattern,
+                   uint32_t guard_words = kGuardWords) {
     if (!tensor || logical_bytes == 0u ||
         logical_bytes % sizeof(uint32_t) != 0u) {
         return false;
@@ -340,12 +371,13 @@ bool poison_output(ds4_gpu_tensor *tensor, uint64_t logical_bytes,
             return false;
         }
     }
-    return prepare_guard(tensor, logical_bytes);
+    return prepare_guard(tensor, logical_bytes, guard_words);
 }
 
 bool check_guard(const ds4_gpu_tensor *tensor, uint64_t logical_bytes,
-                 const char *label) {
-    const std::vector<uint32_t> expected = guard_pattern();
+                 const char *label,
+                 uint32_t guard_words = kGuardWords) {
+    const std::vector<uint32_t> expected = guard_pattern(guard_words);
     std::vector<uint32_t> got(expected.size());
     if (!ds4_gpu_tensor_read(tensor, logical_bytes, got.data(),
                              got.size() * sizeof(got[0]))) {
@@ -453,6 +485,9 @@ void select_legacy() {
     (void)unsetenv(kWmmaSsdEnable);
     (void)unsetenv(kWmmaDisable);
     (void)unsetenv(kWmmaRequire);
+    (void)unsetenv(kQ8Wave32Enable);
+    (void)unsetenv(kQ8Wave32Disable);
+    (void)unsetenv(kQ8Wave32Require);
 }
 
 void select_tile8(bool disable_k1024_tile4) {
@@ -465,6 +500,9 @@ void select_tile8(bool disable_k1024_tile4) {
     (void)unsetenv(kWmmaSsdEnable);
     (void)unsetenv(kWmmaDisable);
     (void)unsetenv(kWmmaRequire);
+    (void)unsetenv(kQ8Wave32Enable);
+    (void)unsetenv(kQ8Wave32Disable);
+    (void)unsetenv(kQ8Wave32Require);
     if (disable_k1024_tile4) {
         (void)setenv(kK1024Tile4Disable, "1", 1);
     } else {
@@ -513,7 +551,8 @@ bool benchmark_arms(const char *case_name, uint32_t n_tokens, uint32_t in_dim,
                     uint32_t out_dim, const config &cfg, const arm &baseline,
                     const arm &candidate,
                     const std::function<bool()> &oracle_prepare,
-                    const std::function<bool()> &oracle) {
+                    const std::function<bool()> &oracle,
+                    benchmark_rate rate = benchmark_rate::macs) {
     // Validate every rotating weight set and prime reusable Q8_K scratch
     // before any timed event.  This catches data-dependent path errors without
     // admitting readback or comparison work into the HIP-event interval.
@@ -596,23 +635,40 @@ bool benchmark_arms(const char *case_name, uint32_t n_tokens, uint32_t in_dim,
     const double paired_median = percentile(paired_delta, 0.5);
     const double median_delta = (b.median / a.median - 1.0) * 100.0;
     const double speedup = (a.median / b.median - 1.0) * 100.0;
-    const double macs = static_cast<double>(n_tokens) * in_dim * out_dim;
-    const double a_gmac_s = macs / (a.median * 1.0e6);
-    const double b_gmac_s = macs / (b.median * 1.0e6);
+    const double work = static_cast<double>(n_tokens) * in_dim *
+        (rate == benchmark_rate::macs ? out_dim : 1u);
+    const double a_rate = work / (a.median * 1.0e6);
+    const double b_rate = work / (b.median * 1.0e6);
 
-    std::printf(
-        "DS4_ROCM_Q4_PREFILL_BENCH case=%s N=%u K=%u M=%u "
-        "baseline=%s candidate=%s samples=%u sets=%u "
-        "baseline_ms_p50=%.6f candidate_ms_p50=%.6f "
-        "baseline_ms_min=%.6f candidate_ms_min=%.6f "
-        "baseline_ms_p95=%.6f candidate_ms_p95=%.6f "
-        "baseline_gmac_s=%.3f candidate_gmac_s=%.3f "
-        "candidate_delta_pct=%.3f paired_delta_pct_p50=%.3f "
-        "speedup_pct=%.3f\n",
-        case_name, n_tokens, in_dim, out_dim, baseline.name, candidate.name,
-        cfg.samples, cfg.sets, a.median, b.median, a.minimum, b.minimum,
-        a.p95, b.p95, a_gmac_s, b_gmac_s, median_delta, paired_median,
-        speedup);
+    if (rate == benchmark_rate::quantized_values) {
+        std::printf(
+            "DS4_ROCM_Q4_PREFILL_BENCH case=%s N=%u K=%u "
+            "baseline=%s candidate=%s samples=%u sets=%u "
+            "baseline_ms_p50=%.6f candidate_ms_p50=%.6f "
+            "baseline_ms_min=%.6f candidate_ms_min=%.6f "
+            "baseline_ms_p95=%.6f candidate_ms_p95=%.6f "
+            "baseline_gvalue_s=%.3f candidate_gvalue_s=%.3f "
+            "candidate_delta_pct=%.3f paired_delta_pct_p50=%.3f "
+            "speedup_pct=%.3f\n",
+            case_name, n_tokens, in_dim, baseline.name, candidate.name,
+            cfg.samples, cfg.sets, a.median, b.median, a.minimum, b.minimum,
+            a.p95, b.p95, a_rate, b_rate, median_delta, paired_median,
+            speedup);
+    } else {
+        std::printf(
+            "DS4_ROCM_Q4_PREFILL_BENCH case=%s N=%u K=%u M=%u "
+            "baseline=%s candidate=%s samples=%u sets=%u "
+            "baseline_ms_p50=%.6f candidate_ms_p50=%.6f "
+            "baseline_ms_min=%.6f candidate_ms_min=%.6f "
+            "baseline_ms_p95=%.6f candidate_ms_p95=%.6f "
+            "baseline_gmac_s=%.3f candidate_gmac_s=%.3f "
+            "candidate_delta_pct=%.3f paired_delta_pct_p50=%.3f "
+            "speedup_pct=%.3f\n",
+            case_name, n_tokens, in_dim, out_dim, baseline.name,
+            candidate.name, cfg.samples, cfg.sets, a.median, b.median,
+            a.minimum, b.minimum, a.p95, b.p95, a_rate, b_rate,
+            median_delta, paired_median, speedup);
+    }
     std::fflush(stdout);
     return true;
 }
@@ -629,6 +685,98 @@ bool allocate_io(uint32_t n_tokens, uint32_t in_dim, uint64_t out_elements,
     const uint64_t logical_bytes = out_elements * sizeof(float);
     return poison_output(out_a->ptr, logical_bytes, 0x7fc10001u) &&
            poison_output(out_b->ptr, logical_bytes, 0x7fc20002u);
+}
+
+bool run_q8_quantizer(const config &cfg, ds4_gpu_tensor *x,
+                      uint32_t n_tokens) {
+    int active_device = -1;
+    hipDeviceProp_t properties{};
+    if (hipGetDevice(&active_device) != hipSuccess || active_device < 0 ||
+        hipGetDeviceProperties(&properties, active_device) != hipSuccess ||
+        properties.warpSize != 32 ||
+        std::strncmp(properties.gcnArchName, "gfx1151", 7u) != 0) {
+        std::fprintf(stderr,
+                     "dense_q8_wave32 N=%u: active device is not "
+                     "gfx1151 wave32\n",
+                     n_tokens);
+        return false;
+    }
+
+    uint64_t block_count = 0;
+    uint64_t logical_bytes = 0;
+    uint64_t x_bytes = 0;
+    if (!x ||
+        !checked_mul(n_tokens, kDenseK / kQkK, &block_count) ||
+        !checked_mul(block_count, sizeof(block_q8_K_host), &logical_bytes) ||
+        !checked_mul(static_cast<uint64_t>(n_tokens) * kDenseK,
+                     sizeof(float), &x_bytes) ||
+        logical_bytes > std::numeric_limits<uint64_t>::max() -
+                            kRawQ8GuardWords * sizeof(uint32_t) ||
+        ds4_gpu_tensor_bytes(x) < x_bytes) {
+        std::fprintf(stderr,
+                     "dense_q8_wave32 N=%u: raw tensor size overflow\n",
+                     n_tokens);
+        return false;
+    }
+
+    const uint64_t allocation_bytes = logical_bytes +
+        kRawQ8GuardWords * sizeof(uint32_t);
+    tensor_owner canonical(allocation_bytes);
+    tensor_owner wave32(allocation_bytes);
+    if (!canonical.ptr || !wave32.ptr) {
+        std::fprintf(stderr,
+                     "dense_q8_wave32 N=%u: raw tensor allocation failed\n",
+                     n_tokens);
+        return false;
+    }
+
+    /* contents() synchronizes; resolve all raw device pointers before any
+     * event is recorded so the timed callbacks contain one launch only. */
+    const void *x_device = ds4_gpu_tensor_contents(x);
+    void *canonical_device = ds4_gpu_tensor_contents(canonical.ptr);
+    void *wave32_device = ds4_gpu_tensor_contents(wave32.ptr);
+    if (!x_device || !canonical_device || !wave32_device) {
+        std::fprintf(stderr,
+                     "dense_q8_wave32 N=%u: device pointer resolution failed\n",
+                     n_tokens);
+        return false;
+    }
+
+    const arm q8_canonical = {
+        "q8_canonical_raw", []() {},
+        [&](uint32_t) {
+            ds4_rocm_bench_q8_K_quantize_enqueue(
+                canonical_device, x_device, kDenseK, n_tokens, 0);
+            return true;
+        }};
+    const arm q8_wave32 = {
+        "q8_wave32_raw", []() {},
+        [&](uint32_t) {
+            ds4_rocm_bench_q8_K_quantize_enqueue(
+                wave32_device, x_device, kDenseK, n_tokens, 1);
+            return true;
+        }};
+
+    config q8_cfg = cfg;
+    q8_cfg.sets = 1u;  // Raw quantization has no rotating weight set.
+    return benchmark_arms(
+        "dense_q8_wave32", n_tokens, kDenseK, 1u, q8_cfg,
+        q8_canonical, q8_wave32,
+        [&]() {
+            return poison_output(canonical.ptr, logical_bytes, 0x5a5a5a5au,
+                                 kRawQ8GuardWords) &&
+                   poison_output(wave32.ptr, logical_bytes, 0xa5a5a5a5u,
+                                 kRawQ8GuardWords);
+        },
+        [&]() {
+            return bitwise_equal(canonical.ptr, wave32.ptr, logical_bytes,
+                                 "raw canonical vs wave32 Q8_K") &&
+                   check_guard(canonical.ptr, logical_bytes,
+                               "raw canonical Q8_K", kRawQ8GuardWords) &&
+                   check_guard(wave32.ptr, logical_bytes,
+                               "raw wave32 Q8_K", kRawQ8GuardWords);
+        },
+        benchmark_rate::quantized_values);
 }
 
 bool run_dense(const model_fixture &model, const config &cfg,
@@ -681,7 +829,10 @@ bool run_dense(const model_fixture &model, const config &cfg,
         !check_guard(tiled.ptr, logical_bytes, "dense tile8")) {
         return false;
     }
-    if (!cfg.wmma_supported || n_tokens < 256u) return true;
+    if (!cfg.wmma_supported) return true;
+    if (!run_q8_quantizer(cfg, x.ptr, n_tokens)) return false;
+
+    if (n_tokens < 256u) return true;
 
     const arm wmma_baseline = {
         "tile8", []() { select_tile8(false); },
@@ -760,7 +911,7 @@ bool run_pair(const model_fixture &model, const config &cfg,
                        pair0.ptr, pair1.ptr, model.data, model.size,
                        model.weights[set].dense_offset,
                        model.weights[set].kv_offset, kDenseK, kDenseM, kKvM,
-                       x.ptr, n_tokens) != 0;
+                       x.ptr, n_tokens) == 1;
         }};
     if (!benchmark_arms(
             "pair", n_tokens, kDenseK, kDenseM + kKvM, cfg, baseline,
@@ -1026,8 +1177,10 @@ void usage(FILE *stream, const char *argv0) {
         "  --samples N                samples/arm, multiple of 4 (default: %u)\n"
         "  --warmup N                 untimed dispatches/arm (default: %u)\n"
         "  -h, --help                 show this help\n\n"
-        "dense compares legacy/TILE8 and, on gfx1151 for N>=256, TILE8/\n"
-        "WMMA64 at K=4096,M=1024. pair compares two TILE8 projections with\n"
+        "dense compares legacy/TILE8, times the raw canonical/wave32 Q8_K\n"
+        "quantizer kernels on gfx1151, and TILE8/WMMA64 there for N>=256\n"
+        "at K=4096,M=1024. pair compares\n"
+        "two TILE8 projections with\n"
         "the fused K=4096,M=(1024+512) path. qb adds TILE4/WMMA64 at the\n"
         "K=1024,M=32768 shape. outb isolates K=8192,M=4096; output measures\n"
         "the production grouped output_a plus output_b API. WMMA comparisons\n"
@@ -1145,6 +1298,12 @@ int main(int argc, char **argv) {
     env_snapshot wmma_ssd_enable_guard(kWmmaSsdEnable);
     env_snapshot wmma_disable_guard(kWmmaDisable);
     env_snapshot wmma_require_guard(kWmmaRequire);
+    env_snapshot q8_wave32_enable_guard(kQ8Wave32Enable);
+    env_snapshot q8_wave32_disable_guard(kQ8Wave32Disable);
+    env_snapshot q8_wave32_require_guard(kQ8Wave32Require);
+    (void)unsetenv(kQ8Wave32Enable);
+    (void)unsetenv(kQ8Wave32Disable);
+    (void)unsetenv(kQ8Wave32Require);
 
     int device_count = 0;
     hipError_t hip_rc = hipGetDeviceCount(&device_count);
@@ -1207,9 +1366,10 @@ int main(int argc, char **argv) {
         std::printf(
             "DS4_ROCM_Q4_PREFILL_SETUP device=%s arch=%s warp=%d sets=%u "
             "resident_mib=%.2f timing=hip_events ssd_streaming=off "
-            "wmma64=%s\n",
+            "wmma64=%s q8_wave32=%s\n",
             properties.name, properties.gcnArchName, properties.warpSize,
             cfg.sets, static_cast<double>(model.resident_bytes) / 1048576.0,
+            cfg.wmma_supported ? "available" : "skipped",
             cfg.wmma_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {

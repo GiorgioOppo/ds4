@@ -921,6 +921,40 @@ static int rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
     return 1;
 }
 
+/* A strict Q8_K-wave32 request belongs to the exact Q4 path.  The F16
+ * sidecars must yield before validation, allocation, dequantization or GEMM;
+ * the caller can then enter the canonical Q4 fallback, whose selector either
+ * launches the required quantizer or fails closed on an unsupported device. */
+enum {
+    ROCM_Q4_ATTN_Q_B_Q8_WAVE32_CONFLICT = -1,
+    ROCM_Q4_ATTN_Q_B_Q8_WAVE32_KEEP_F16 = 0,
+    ROCM_Q4_ATTN_Q_B_Q8_WAVE32_YIELD = 1,
+};
+
+static int rocm_q4_attn_q_b_required_q8_wave32_policy(
+        uint32_t weight_type,
+        uint32_t n_tok,
+        int q8_wave32_required,
+        int f16_cache_required) {
+    if (weight_type != DS4_ROCM_Q4_K_TYPE || n_tok <= 8u ||
+        !q8_wave32_required) {
+        return ROCM_Q4_ATTN_Q_B_Q8_WAVE32_KEEP_F16;
+    }
+    return f16_cache_required
+        ? ROCM_Q4_ATTN_Q_B_Q8_WAVE32_CONFLICT
+        : ROCM_Q4_ATTN_Q_B_Q8_WAVE32_YIELD;
+}
+
+extern "C" int ds4_rocm_test_q4_attn_q_b_yield_to_q8_wave32_policy(
+        uint32_t weight_type,
+        uint32_t n_tok,
+        int q8_wave32_required,
+        int f16_cache_required) {
+    return rocm_q4_attn_q_b_required_q8_wave32_policy(
+        weight_type, n_tok, q8_wave32_required != 0,
+        f16_cache_required != 0);
+}
+
 extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *q_half,
@@ -945,8 +979,24 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
+    const int q8_wave32_required = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_REQUIRE_Q4_PREFILL_Q8_K_WAVE32") == 1;
+    const int f16_cache_required = rocm_q4_attn_q_b_f16_required();
+    const int q8_wave32_policy =
+        rocm_q4_attn_q_b_required_q8_wave32_policy(
+            weight_type, n_tok, q8_wave32_required, f16_cache_required);
+    if (q8_wave32_policy == ROCM_Q4_ATTN_Q_B_Q8_WAVE32_CONFLICT) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "Q4 attn_q_b prefill cannot require both the F16 cache "
+                "and the Q8_K wave32 quantizer\n");
+        return -1;
+    }
+    if (q8_wave32_policy == ROCM_Q4_ATTN_Q_B_Q8_WAVE32_YIELD) {
+        return 0;
+    }
     if (weight_type == DS4_ROCM_Q4_K_TYPE) {
-        const int required = rocm_q4_attn_q_b_f16_required();
+        const int required = f16_cache_required;
         const int persistent_requested =
             required ||
             (rocm_q4_attn_q_b_f16_enabled() &&

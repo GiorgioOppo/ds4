@@ -744,6 +744,196 @@ static int rocm_q4_K_prefill_tile8_required(void) {
 }
 
 enum {
+    ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE = -1,
+    ROCM_Q4_PREFILL_Q8_WAVE32_FALLBACK = 0,
+    ROCM_Q4_PREFILL_Q8_WAVE32_USE = 1,
+};
+
+static uint64_t g_rocm_q4_prefill_q8_wave32_launches;
+
+extern "C" void ds4_rocm_test_q4_prefill_q8_wave32_reset(void) {
+    __atomic_store_n(&g_rocm_q4_prefill_q8_wave32_launches, 0u,
+                     __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t ds4_rocm_test_q4_prefill_q8_wave32_get_calls(void) {
+    return __atomic_load_n(&g_rocm_q4_prefill_q8_wave32_launches,
+                           __ATOMIC_RELAXED);
+}
+
+/* Pure policy kept separate from device discovery so the precedence and
+ * fail-closed contract remain testable on hosts without a visible GPU.
+ * REQUIRE is also an opt-in; DISABLE is authoritative. */
+static int rocm_q4_K_prefill_q8_wave32_policy(
+        int prefill_scope,
+        int runtime_compatible,
+        int enabled,
+        int disabled,
+        int required) {
+    if (!enabled && !required) {
+        return ROCM_Q4_PREFILL_Q8_WAVE32_FALLBACK;
+    }
+    if (disabled || !prefill_scope || !runtime_compatible) {
+        return required ? ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE
+                        : ROCM_Q4_PREFILL_Q8_WAVE32_FALLBACK;
+    }
+    return ROCM_Q4_PREFILL_Q8_WAVE32_USE;
+}
+
+extern "C" int ds4_rocm_test_q4_prefill_q8_wave32_policy(
+        int prefill_scope,
+        int runtime_compatible,
+        int enabled,
+        int disabled,
+        int required) {
+    return rocm_q4_K_prefill_q8_wave32_policy(
+        prefill_scope != 0, runtime_compatible != 0, enabled != 0,
+        disabled != 0, required != 0);
+}
+
+static int rocm_q4_K_prefill_q8_wave32_required(void) {
+    return rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_REQUIRE_Q4_PREFILL_Q8_K_WAVE32") == 1;
+}
+
+static int rocm_q4_K_prefill_q8_wave32_select(uint64_t n_tok) {
+    const int enabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32") == 1;
+    const int disabled = rocm_q4_attn_q_b_env_bool(
+        "DS4_ROCM_DISABLE_Q4_PREFILL_Q8_K_WAVE32") == 1;
+    const int required = rocm_q4_K_prefill_q8_wave32_required();
+    const int prefill_scope = rocm_q4_K_prefill_tile8_scope(n_tok);
+    const int requested = enabled || required;
+    const int runtime_compatible = requested && !disabled && prefill_scope
+        ? rocm_attention_runtime_is_gfx1151_wave32(0)
+        : 0;
+    const int decision = rocm_q4_K_prefill_q8_wave32_policy(
+        prefill_scope, runtime_compatible, enabled, disabled, required);
+    if (decision == ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "required Q4 prefill Q8_K wave32 quantizer is unavailable "
+                "(N=%llu scope=%d compatible=%d disabled=%d)\n",
+                (unsigned long long)n_tok, prefill_scope,
+                runtime_compatible, disabled);
+    }
+    return decision;
+}
+
+static int rocm_q4_K_q8_quantize_launch(
+        cuda_block_q8_K *out,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t n_rows,
+        int q8_wave32,
+        int q8_wave32_required,
+        const char *label) {
+    const uint32_t blocks = in_dim / CUDA_QK_K;
+    if (q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_USE) {
+        /* Re-read the active device immediately before enqueue.  Selection
+         * may have happened before range resolution/allocation, and HIP's
+         * active device is thread-local.  Optional use falls back safely;
+         * REQUIRE cannot silently enqueue either the wrong kernel or the
+         * canonical one. */
+        if (!rocm_attention_runtime_is_gfx1151_wave32(0)) {
+            if (q8_wave32_required) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX
+                        "required Q8_K wave32 quantizer lost its gfx1151 "
+                        "wave32 device before enqueue\n");
+                return 0;
+            }
+            q8_wave32 = ROCM_Q4_PREFILL_Q8_WAVE32_FALLBACK;
+        }
+    }
+    if (q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_USE) {
+        const dim3 grid(
+            (unsigned)((blocks + ROCM_Q8_K_WAVE32_WAVES_PER_BLOCK - 1u) /
+                       ROCM_Q8_K_WAVE32_WAVES_PER_BLOCK),
+            n_rows, 1u);
+        q8_K_quantize_wave32_kernel<<<
+            grid, ROCM_Q8_K_WAVE32_BLOCK_THREADS>>>(
+                out, x, in_dim, n_rows);
+        const int ok = cuda_ok(cudaGetLastError(), label);
+        if (ok) {
+            __atomic_fetch_add(&g_rocm_q4_prefill_q8_wave32_launches, 1u,
+                               __ATOMIC_RELAXED);
+        }
+        return ok;
+    }
+
+    const dim3 grid((unsigned)blocks, n_rows, 1u);
+    q8_K_quantize_kernel<<<grid, 256u>>>(out, x, in_dim, n_rows);
+    return cuda_ok(cudaGetLastError(), label);
+}
+
+/* Raw-layout oracle used only by the ROCm Q4 parity test.  It lets the test
+ * compare every Q8_K byte instead of relying solely on downstream dot
+ * products to expose a quantizer mismatch. */
+extern "C" int ds4_rocm_test_q8_K_quantize_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x,
+        uint32_t in_dim,
+        uint32_t n_rows,
+        int use_wave32) {
+    if (!out || !x || !out->ptr || !x->ptr || in_dim == 0u || n_rows == 0u ||
+        (in_dim % CUDA_QK_K) != 0u) {
+        return 0;
+    }
+    uint64_t x_bytes = 0;
+    uint64_t out_bytes = 0;
+    if (!cuda_u64_mul3_checked(n_rows, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, in_dim / CUDA_QK_K,
+                               sizeof(cuda_block_q8_K), &out_bytes) ||
+        x->bytes < x_bytes || out->bytes < out_bytes) {
+        return 0;
+    }
+    const int decision = use_wave32
+        ? (rocm_attention_runtime_is_gfx1151_wave32(0)
+               ? ROCM_Q4_PREFILL_Q8_WAVE32_USE
+               : ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE)
+        : ROCM_Q4_PREFILL_Q8_WAVE32_FALLBACK;
+    if (decision == ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE) return 0;
+    return rocm_q4_K_q8_quantize_launch(
+        reinterpret_cast<cuda_block_q8_K *>(out->ptr),
+        reinterpret_cast<const float *>(x->ptr), in_dim, n_rows, decision,
+        use_wave32 != 0,
+        use_wave32 ? "Q8_K wave32 raw oracle launch"
+                   : "Q8_K canonical raw oracle launch");
+}
+
+/* Benchmark-only enqueue hook.  The resident ROCm harness validates the
+ * active gfx1151/wave32 device, dimensions, allocations and output guards
+ * before entering its HIP-event interval.  Keep this entry deliberately free
+ * of device queries, allocation, environment parsing and cudaGetLastError so
+ * the measured interval contains only the selected quantizer dispatch.  The
+ * following end event/synchronization reports any asynchronous failure. */
+extern "C" void ds4_rocm_bench_q8_K_quantize_enqueue(
+        void *out,
+        const void *x,
+        uint32_t in_dim,
+        uint32_t n_rows,
+        int use_wave32) {
+    const uint32_t blocks = in_dim / CUDA_QK_K;
+    if (use_wave32) {
+        const dim3 grid(
+            (unsigned)((blocks + ROCM_Q8_K_WAVE32_WAVES_PER_BLOCK - 1u) /
+                       ROCM_Q8_K_WAVE32_WAVES_PER_BLOCK),
+            n_rows, 1u);
+        q8_K_quantize_wave32_kernel<<<
+            grid, ROCM_Q8_K_WAVE32_BLOCK_THREADS>>>(
+                reinterpret_cast<cuda_block_q8_K *>(out),
+                reinterpret_cast<const float *>(x), in_dim, n_rows);
+        return;
+    }
+
+    const dim3 grid((unsigned)blocks, n_rows, 1u);
+    q8_K_quantize_kernel<<<grid, 256u>>>(
+        reinterpret_cast<cuda_block_q8_K *>(out),
+        reinterpret_cast<const float *>(x), in_dim, n_rows);
+}
+
+enum {
     ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE = -1,
     ROCM_Q4_PREFILL_WMMA_FALLBACK = 0,
     ROCM_Q4_PREFILL_WMMA_USE = 1,
@@ -789,7 +979,8 @@ static int rocm_q4_K_prefill_wmma_select(
                            ((ssd_enabled || required) &&
                             weight_device_resident);
     const int eligible = !disabled && shape_ok && storage_ok &&
-        !g_quality_mode && rocm_attention_runtime_is_gfx1151_wave32();
+        !g_quality_mode &&
+        rocm_attention_runtime_is_gfx1151_wave32(requested);
     if (eligible) return ROCM_Q4_PREFILL_WMMA_USE;
     if (!required) return ROCM_Q4_PREFILL_WMMA_FALLBACK;
 
@@ -1076,6 +1267,12 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
     const int prefill_scope = rocm_q4_K_prefill_tile8_scope(n_tok);
     const int prefill_tile8 = rocm_q4_K_prefill_tile8_requested();
     const int prefill_tile8_required = rocm_q4_K_prefill_tile8_required();
+    const int q8_wave32 = rocm_q4_K_prefill_q8_wave32_select(n_tok);
+    const int q8_wave32_required =
+        rocm_q4_K_prefill_q8_wave32_required();
+    if (q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE) {
+        return 0;
+    }
     const int k1024_tile4_shape =
         blocks == ROCM_Q4_PREFILL_K1024_KBLOCK_TILE &&
         out_dim == DS4_ROCM_Q4_ATTN_Q_B_OUT_DIM;
@@ -1109,6 +1306,21 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
     int prefill_wmma = rocm_q4_K_prefill_wmma_select(
         n_tok, in_dim, out_dim, weight_device_resident);
     if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) return 0;
+    if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE &&
+        q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_USE &&
+        q8_wave32_required) {
+        if (rocm_q4_attn_q_b_env_bool(
+                "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4_K prefill cannot require both direct WMMA and "
+                    "the Q8_K wave32 quantizer\n");
+            return 0;
+        }
+        /* The direct F16 WMMA path has no Q8_K RHS.  A strict quantizer
+         * request therefore owns dispatch and retains the exact matmul. */
+        prefill_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    }
     if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE &&
         prefill_scope && prefill_tile8_required) {
         if (rocm_q4_attn_q_b_env_bool(
@@ -1154,11 +1366,13 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
             n_tok, blocks, "q4_K dense prequant");
     if (!xq) return 0;
 
-    const dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1u);
-    q8_K_quantize_kernel<<<qgrid, 256>>>(
+    if (!rocm_q4_K_q8_quantize_launch(
             xq, reinterpret_cast<const float *>(x->ptr),
-            (uint32_t)in_dim, (uint32_t)n_tok);
-    if (!cuda_ok(cudaGetLastError(), "q4_K dense quantize launch")) return 0;
+            (uint32_t)in_dim, (uint32_t)n_tok, q8_wave32,
+            q8_wave32_required,
+            "q4_K dense quantize launch")) {
+        return 0;
+    }
 
     if (prefill_scope && prefill_tile8) {
         if (k1024_tile4 == ROCM_Q4_PREFILL_K1024_TILE4_USE) {
@@ -1201,6 +1415,29 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
     return cuda_ok(cudaGetLastError(), "q4_K dense matmul launch");
 }
 
+/* Only REQUIRE_TILE8 makes the fused pair itself a strict contract.  A
+ * Q8-wave32-only REQUIRE belongs to the quantizer and can still be satisfied
+ * by the graph's two dense fallbacks.  Keep this pre-enqueue policy in one
+ * place so validation, alias/range rejection and scratch allocation cannot
+ * silently weaken the pair contract.  Decode is outside prefill scope and
+ * therefore keeps its legacy optional status. */
+static int rocm_q4_K_pair_pre_enqueue_failure_policy(
+        int prefill_scope,
+        int tile8_required,
+        int q8_wave32_required) {
+    (void)q8_wave32_required;
+    return prefill_scope && tile8_required ? -1 : 0;
+}
+
+extern "C" int ds4_rocm_test_q4_pair_pre_enqueue_failure_policy(
+        int prefill_scope,
+        int tile8_required,
+        int q8_wave32_required) {
+    return rocm_q4_K_pair_pre_enqueue_failure_policy(
+        prefill_scope != 0, tile8_required != 0,
+        q8_wave32_required != 0);
+}
+
 extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
@@ -1214,10 +1451,26 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
     const int prefill_scope = rocm_q4_K_prefill_tile8_scope(n_tok);
-    const int prefill_required = prefill_scope &&
-                                 rocm_q4_K_prefill_tile8_required();
+    const int tile8_required = rocm_q4_K_prefill_tile8_required();
+    const int prefill_required = prefill_scope && tile8_required;
     const int wmma_required = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1;
+    const int q8_wave32 = rocm_q4_K_prefill_q8_wave32_select(n_tok);
+    const int q8_wave32_required =
+        rocm_q4_K_prefill_q8_wave32_required();
+    if (q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE) {
+        return -1;
+    }
+    const int pre_enqueue_failure =
+        rocm_q4_K_pair_pre_enqueue_failure_policy(
+            prefill_scope, tile8_required, q8_wave32_required);
+    if (q8_wave32_required && wmma_required) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "Q4_K prefill pair cannot require both direct WMMA and "
+                "the Q8_K wave32 quantizer\n");
+        return -1;
+    }
 
     /* The fused pair consumes a shared Q8_K activation tile.  When the direct
      * F16 WMMA experiment is selected, return before validation/enqueue so the
@@ -1226,14 +1479,16 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
      * after silently measuring the TILE8 pair.  SSD preflight is deliberately
      * optimistic about residency: it only decides whether to yield; each dense
      * fallback then proves its exact physical device range before enqueue. */
-    if (!prefill_required) {
+    if (!prefill_required && !q8_wave32_required) {
         const int wmma0 = rocm_q4_K_prefill_wmma_select(
             n_tok, in_dim, out0_dim, 1);
         const int wmma1 = rocm_q4_K_prefill_wmma_select(
             n_tok, in_dim, out1_dim, 1);
         if (wmma0 == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE ||
-            wmma1 == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE ||
-            wmma0 == ROCM_Q4_PREFILL_WMMA_USE ||
+            wmma1 == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) {
+            return -1;
+        }
+        if (wmma0 == ROCM_Q4_PREFILL_WMMA_USE ||
             wmma1 == ROCM_Q4_PREFILL_WMMA_USE) {
             return 0;
         }
@@ -1241,7 +1496,7 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX
                 "Q4_K prefill pair cannot require both WMMA and TILE8\n");
-        return 0;
+        return -1;
     }
 
     const int prefill_pair = prefill_scope &&
@@ -1251,7 +1506,7 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
                 "ds4: required ROCm Q4_K prefill tile8 pair is disabled "
                 "(n_tok=%llu)\n",
                 (unsigned long long)n_tok);
-        return 0;
+        return -1;
     }
 
     /* Decode keeps its original, separately gated pair path.  Prefill uses
@@ -1259,10 +1514,12 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
      * one tiled launch across the two projections. */
     const int decode_pair = n_tok <= 8u &&
                             rocm_q4_K_dense_pair_requested();
-    if ((!prefill_pair && !decode_pair) ||
-        !out0 || !out1 || out0 == out1 ||
+    if (!prefill_pair && !decode_pair) {
+        return pre_enqueue_failure;
+    }
+    if (!out0 || !out1 || out0 == out1 ||
         (out0 && out1 && out0->ptr == out1->ptr)) {
-        return 0;
+        return pre_enqueue_failure;
     }
 
     uint64_t blocks0 = 0, blocks1 = 0;
@@ -1275,7 +1532,7 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
                                   in_dim, out1_dim, x, n_tok, &blocks1,
                                   &row_bytes1, &weight1_bytes) ||
         blocks0 != blocks1 || row_bytes0 != row_bytes1) {
-        return 0;
+        return pre_enqueue_failure;
     }
     uint64_t out0_bytes = 0;
     uint64_t out1_bytes = 0;
@@ -1283,24 +1540,24 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         !cuda_u64_mul3_checked(n_tok, out1_dim, sizeof(float), &out1_bytes) ||
         rocm_q4_K_byte_ranges_overlap(out0->ptr, out0_bytes,
                                       out1->ptr, out1_bytes)) {
-        return 0;
+        return pre_enqueue_failure;
     }
 
     const char *w0 = cuda_model_range_ptr(model_map, weight0_offset,
                                           weight0_bytes, "q4_K dense pair0");
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset,
                                           weight1_bytes, "q4_K dense pair1");
-    if (!w0 || !w1) return 0;
+    if (!w0 || !w1) return pre_enqueue_failure;
     cuda_block_q8_K *xq = rocm_q4_K_prequant_alloc(
             n_tok, blocks0, "q4_K dense pair prequant");
-    if (!xq) return 0;
+    if (!xq) return pre_enqueue_failure;
 
-    const dim3 qgrid((unsigned)blocks0, (unsigned)n_tok, 1u);
-    q8_K_quantize_kernel<<<qgrid, 256>>>(
+    if (!rocm_q4_K_q8_quantize_launch(
             xq, reinterpret_cast<const float *>(x->ptr),
-            (uint32_t)in_dim, (uint32_t)n_tok);
-    if (!cuda_ok(cudaGetLastError(), "q4_K dense pair quantize launch")) {
-        return 0;
+            (uint32_t)in_dim, (uint32_t)n_tok, q8_wave32,
+            q8_wave32_required,
+            "q4_K dense pair quantize launch")) {
+        return -1;
     }
 
     if (prefill_pair) {
@@ -1318,7 +1575,7 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
         const int ok = cuda_ok(cudaGetLastError(),
                                "q4_K dense prefill pair tile8 launch");
         if (ok) rocm_q4_K_prefill_tile8_note(0u, 1u, 0u, 0u, n_tok);
-        return ok;
+        return ok ? 1 : -1;
     }
 
     const uint64_t out0_tiles = (out0_dim - 1u) / 32u + 1u;
@@ -1330,7 +1587,8 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
             reinterpret_cast<float *>(out1->ptr), w0, w1, xq,
             row_bytes0, (uint32_t)blocks0, (uint32_t)out0_dim,
             (uint32_t)out1_dim, (uint32_t)n_tok);
-    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch");
+    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch")
+        ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
@@ -1427,6 +1685,8 @@ static int rocm_q4_K_prefill_tile8_quant_launch(
         uint32_t out_dim,
         uint64_t row_bytes,
         int prefill_wmma,
+        int q8_wave32,
+        int q8_wave32_required,
         const char *label) {
     uint64_t n_rows = 0;
     uint64_t xq_token_stride = 0;
@@ -1458,11 +1718,10 @@ static int rocm_q4_K_prefill_tile8_quant_launch(
             n_rows, blocks, label ? label : "q4_K prefill tile8 prequant");
     if (!xq) return 0;
 
-    const dim3 qgrid((unsigned)blocks, (unsigned)n_rows, 1u);
-    q8_K_quantize_kernel<<<qgrid, 256>>>(
-            xq, x, in_dim, (uint32_t)n_rows);
-    if (!cuda_ok(cudaGetLastError(),
-                 "q4_K prefill tile8 quantize launch")) {
+    if (!rocm_q4_K_q8_quantize_launch(
+            xq, x, in_dim, (uint32_t)n_rows, q8_wave32,
+            q8_wave32_required,
+            "q4_K prefill tile8 quantize launch")) {
         return 0;
     }
 
@@ -1503,6 +1762,12 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
     const int tile8_requested = rocm_q4_K_prefill_tile8_requested();
     const int tile8_required = tile8_scope &&
                                rocm_q4_K_prefill_tile8_required();
+    const int q8_wave32 = rocm_q4_K_prefill_q8_wave32_select(n_tokens);
+    const int q8_wave32_required =
+        rocm_q4_K_prefill_q8_wave32_required();
+    if (q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_REQUIRED_FAILURE) {
+        return -1;
+    }
     const int wmma_enabled = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA") == 1;
     const int wmma_ssd_enabled = rocm_q4_attn_q_b_env_bool(
@@ -1516,17 +1781,17 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                            (g_ssd_streaming_mode && wmma_ssd_enabled)));
     if (!tile8_scope) return 0;
     if (!tile8_requested && !wmma_requested) {
-        if (tile8_required) {
+        if (tile8_required || q8_wave32_required) {
             fprintf(stderr,
                     "ds4: required ROCm Q4_K attention-output prefill "
-                    "tile8 is disabled (n_tok=%u)\n",
+                    "exact path is disabled (n_tok=%u)\n",
                     n_tokens);
             return -1;
         }
         return 0;
     }
     const int pre_enqueue_failure =
-        (tile8_required || wmma_required) ? -1 : 0;
+        (tile8_required || wmma_required || q8_wave32_required) ? -1 : 0;
 
     if (!out || !low || !heads || !model_map || group_dim == 0u ||
         rank == 0u || n_groups == 0u || out_dim == 0u ||
@@ -1617,6 +1882,19 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         b_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) {
         return -1;
     }
+    if (q8_wave32_required &&
+        (a_wmma == ROCM_Q4_PREFILL_WMMA_USE ||
+         b_wmma == ROCM_Q4_PREFILL_WMMA_USE)) {
+        if (wmma_required) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "Q4_K attention-output prefill cannot require both "
+                    "direct WMMA and the Q8_K wave32 quantizer\n");
+            return -1;
+        }
+        a_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+        b_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    }
     if (tile8_required &&
         (a_wmma == ROCM_Q4_PREFILL_WMMA_USE ||
          b_wmma == ROCM_Q4_PREFILL_WMMA_USE)) {
@@ -1644,7 +1922,7 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
             reinterpret_cast<float *>(low->ptr), out_a,
             reinterpret_cast<const float *>(heads->ptr), n_tokens, n_groups,
             (uint32_t)group_dim, (uint32_t)rank, row_a_bytes,
-            a_wmma,
+            a_wmma, q8_wave32, q8_wave32_required,
             "q4_K attention output A WMMA64/tile8");
     if (a_rc <= 0) {
         return a_rc < 0 ? -1 : pre_enqueue_failure;
@@ -1656,7 +1934,7 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                 reinterpret_cast<float *>(out->ptr), out_b,
                 reinterpret_cast<const float *>(low->ptr), n_tokens, 1u,
                 (uint32_t)low_dim, (uint32_t)out_dim, row_b_bytes,
-                b_wmma,
+                b_wmma, q8_wave32, q8_wave32_required,
                 "q4_K attention output B WMMA64/tile8");
     } else {
         b_rc = ds4_gpu_matmul_q8_0_tensor(

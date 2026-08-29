@@ -818,6 +818,141 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 
+/* Wave32 Q8_K activation quantizer for the Q4 prefill path.
+ *
+ * A 256-thread workgroup quantizes up to eight independent 256-value blocks,
+ * one per wave.  Each lane owns the eight values lane + 32*k.  The max
+ * reduction carries the original element index so equal absolute maxima keep
+ * the lowest index, matching q8_K_quantize_kernel's left-biased reduction.
+ * The scale, lrintf conversion, clamp and 16-value bsums are otherwise the
+ * canonical operations above.  No cross-wave communication or LDS is used.
+ *
+ * Dispatch is deliberately restricted to a runtime-proven wave32 target in
+ * ds4_rocm_q4.cuh.  Keep the device guard as a second fail-closed boundary in
+ * case a future caller bypasses that host policy. */
+enum {
+    ROCM_Q8_K_WAVE32_WIDTH = 32u,
+    ROCM_Q8_K_WAVE32_BLOCK_THREADS = 256u,
+    ROCM_Q8_K_WAVE32_WAVES_PER_BLOCK =
+        ROCM_Q8_K_WAVE32_BLOCK_THREADS / ROCM_Q8_K_WAVE32_WIDTH,
+};
+
+__global__ static void q8_K_quantize_wave32_kernel(
+        cuda_block_q8_K *out,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t n_rows) {
+    if (warpSize != ROCM_Q8_K_WAVE32_WIDTH) return;
+
+    const uint32_t lane = threadIdx.x & (ROCM_Q8_K_WAVE32_WIDTH - 1u);
+    const uint32_t wave = threadIdx.x / ROCM_Q8_K_WAVE32_WIDTH;
+    const uint32_t blocks_per_row = in_dim / CUDA_QK_K;
+    const uint32_t b = blockIdx.x * ROCM_Q8_K_WAVE32_WAVES_PER_BLOCK + wave;
+    const uint32_t row = blockIdx.y;
+    if (row >= n_rows || b >= blocks_per_row) return;
+
+    const float *xr = x + (uint64_t)row * in_dim +
+                      (uint64_t)b * CUDA_QK_K;
+    cuda_block_q8_K *yb = out + (uint64_t)row * blocks_per_row + b;
+
+    uint32_t max_index = lane;
+    float max_value = xr[max_index];
+    float max_abs = fabsf(max_value);
+    #pragma unroll
+    for (uint32_t k = 1u; k < CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH;
+         k++) {
+        const uint32_t index = lane + k * ROCM_Q8_K_WAVE32_WIDTH;
+        const float value = xr[index];
+        const float value_abs = fabsf(value);
+        if (value_abs > max_abs ||
+            (value_abs == max_abs && index < max_index)) {
+            max_abs = value_abs;
+            max_value = value;
+            max_index = index;
+        }
+    }
+
+    for (uint32_t offset = ROCM_Q8_K_WAVE32_WIDTH / 2u;
+         offset != 0u; offset >>= 1u) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        const float other_abs = __shfl_down(max_abs, offset, 32);
+        const float other_value = __shfl_down(max_value, offset, 32);
+        const uint32_t other_index = __shfl_down(max_index, offset, 32);
+#else
+        const float other_abs = __shfl_down_sync(
+            FULL_WARP_MASK, max_abs, offset, 32);
+        const float other_value = __shfl_down_sync(
+            FULL_WARP_MASK, max_value, offset, 32);
+        const uint32_t other_index = __shfl_down_sync(
+            FULL_WARP_MASK, max_index, offset, 32);
+#endif
+        if (lane + offset < ROCM_Q8_K_WAVE32_WIDTH &&
+            (other_abs > max_abs ||
+             (other_abs == max_abs && other_index < max_index))) {
+            max_abs = other_abs;
+            max_value = other_value;
+            max_index = other_index;
+        }
+    }
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const float amax = __shfl(max_abs, 0, 32);
+    const float signed_max = __shfl(max_value, 0, 32);
+#else
+    const float amax = __shfl_sync(FULL_WARP_MASK, max_abs, 0, 32);
+    const float signed_max = __shfl_sync(
+        FULL_WARP_MASK, max_value, 0, 32);
+#endif
+    if (amax == 0.0f) {
+        #pragma unroll
+        for (uint32_t k = 0u;
+             k < CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH; k++) {
+            yb->qs[lane + k * ROCM_Q8_K_WAVE32_WIDTH] = 0;
+        }
+        if (lane < CUDA_QK_K / 16u) yb->bsums[lane] = 0;
+        if (lane == 0u) yb->d = 0.0f;
+        return;
+    }
+
+    const float iscale = -127.0f / signed_max;
+    int qv[CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH];
+    #pragma unroll
+    for (uint32_t k = 0u;
+         k < CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH; k++) {
+        const uint32_t index = lane + k * ROCM_Q8_K_WAVE32_WIDTH;
+        int q = (int)lrintf(iscale * xr[index]);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        qv[k] = q;
+        yb->qs[index] = (int8_t)q;
+    }
+
+    /* A width-16 reduction simultaneously produces the low- and high-half
+     * bsum for each contiguous 32-value slice.  Only lanes 0 and 16 store. */
+    #pragma unroll
+    for (uint32_t offset = 8u; offset != 0u; offset >>= 1u) {
+        #pragma unroll
+        for (uint32_t k = 0u;
+             k < CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH; k++) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+            qv[k] += __shfl_down(qv[k], offset, 16);
+#else
+            qv[k] += __shfl_down_sync(
+                FULL_WARP_MASK, qv[k], offset, 16);
+#endif
+        }
+    }
+    if (lane == 0u || lane == 16u) {
+        const uint32_t half = lane >> 4u;
+        #pragma unroll
+        for (uint32_t k = 0u;
+             k < CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH; k++) {
+            yb->bsums[2u * k + half] = (int16_t)qv[k];
+        }
+    }
+    if (lane == 0u) yb->d = 1.0f / iscale;
+}
+
 __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_kernel(
         float *gate_out,
         float *up_out,
