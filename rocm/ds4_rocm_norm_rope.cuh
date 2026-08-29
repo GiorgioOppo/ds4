@@ -996,9 +996,8 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         return 0;
     }
     if (weight_type == DS4_ROCM_Q4_K_TYPE) {
-        const int required = f16_cache_required;
         const int persistent_requested =
-            required ||
+            f16_cache_required ||
             (rocm_q4_attn_q_b_f16_enabled() &&
              !rocm_q4_attn_q_b_f16_disabled());
         if (persistent_requested) {
