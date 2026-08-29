@@ -194,6 +194,7 @@ __global__ static void rocm_matmul_q4_K_prefill_wmma64_strided_kernel(
         const cuda_block_q4_K *block = row_blocks + block_index;
         const float block_d = dev_f16_to_f32(block->d);
         const float block_dm = dev_f16_to_f32(block->dmin);
+#pragma unroll
         for (uint32_t qpair = 0u; qpair < 4u; qpair++) {
             /* Adjacent 32-value groups are the low/high nibbles of the same
              * 32 payload bytes.  Keep them in registers across both K tiles
