@@ -4727,6 +4727,7 @@ static int cuda_stream_expert_persistent_plan_build(
         const int32_t *selected_ids,
         uint32_t n_selected,
         cuda_stream_expert_persistent_plan *plan) {
+    enum { dense_expert_stack_capacity = 384 };
     g_stream_expert_persistent_plan_attempts.fetch_add(
         1, std::memory_order_relaxed);
     if (!state || !table || !selected_ids || n_selected == 0 || !plan ||
@@ -4750,28 +4751,44 @@ static int cuda_stream_expert_persistent_plan_build(
         return 0;
     }
 
+    cuda_stream_expert_persistent_key key_template = {};
+    if (!cuda_stream_expert_persistent_key_make(&key_template, table, 0)) {
+        cuda_stream_expert_persistent_note_reject(
+            &g_stream_expert_persistent_overflow_rejects);
+        return 0;
+    }
+
     std::vector<cuda_stream_expert_persistent_key> unique_keys;
     std::vector<uint32_t> input_unique;
+    uint32_t expert_to_unique_stack[dense_expert_stack_capacity];
+    std::vector<uint32_t> expert_to_unique_heap;
+    uint32_t *expert_to_unique = NULL;
     uint32_t duplicate_count = 0;
     try {
-        unique_keys.reserve(n_selected);
+        /* Expert ids form a small dense domain.  Keep only one full key per
+         * expert instead of reserving n_selected keys and scanning them for
+         * every token/top-k pair. */
+        unique_keys.reserve(std::min(n_selected, table->n_total_expert));
         input_unique.reserve(n_selected);
+        if (table->n_total_expert <= dense_expert_stack_capacity) {
+            std::fill_n(expert_to_unique_stack,
+                        table->n_total_expert,
+                        UINT32_MAX);
+            expert_to_unique = expert_to_unique_stack;
+        } else {
+            expert_to_unique_heap.assign(table->n_total_expert, UINT32_MAX);
+            expert_to_unique = expert_to_unique_heap.data();
+        }
         for (uint32_t i = 0; i < n_selected; i++) {
-            cuda_stream_expert_persistent_key key = {};
-            if (!cuda_stream_expert_persistent_key_make(
-                    &key, table, selected_ids[i])) {
+            const int32_t selected_id = selected_ids[i];
+            if (selected_id < 0 ||
+                (uint32_t)selected_id >= key_template.n_total_expert) {
                 cuda_stream_expert_persistent_note_reject(
                     &g_stream_expert_persistent_overflow_rejects);
                 return 0;
             }
-            uint32_t unique_index = UINT32_MAX;
-            for (uint32_t u = 0; u < unique_keys.size(); u++) {
-                if (cuda_stream_expert_persistent_key_equal(
-                        &unique_keys[u], &key)) {
-                    unique_index = u;
-                    break;
-                }
-            }
+            const uint32_t expert_id = (uint32_t)selected_id;
+            uint32_t unique_index = expert_to_unique[expert_id];
             if (unique_index == UINT32_MAX) {
                 if (unique_keys.size() >= UINT32_MAX) {
                     cuda_stream_expert_persistent_note_reject(
@@ -4779,8 +4796,19 @@ static int cuda_stream_expert_persistent_plan_build(
                     return 0;
                 }
                 unique_index = (uint32_t)unique_keys.size();
+                cuda_stream_expert_persistent_key key = key_template;
+                key.expert_id = expert_id;
                 unique_keys.push_back(key);
+                expert_to_unique[expert_id] = unique_index;
             } else {
+                /* The immutable key template was validated before the loop;
+                 * duplicates therefore need only verify the dense map's own
+                 * expert-id invariant. */
+                if (unique_index >= unique_keys.size() ||
+                    unique_keys[unique_index].expert_id != expert_id) {
+                    cuda_stream_expert_persistent_note_reject(NULL);
+                    return 0;
+                }
                 duplicate_count++;
             }
             input_unique.push_back(unique_index);
@@ -4802,9 +4830,21 @@ static int cuda_stream_expert_persistent_plan_build(
         return 0;
     }
     std::vector<uint8_t> protected_slots;
+    uint8_t mismatched_expert_keys_stack[dense_expert_stack_capacity];
+    std::vector<uint8_t> mismatched_expert_keys_heap;
+    uint8_t *mismatched_expert_keys = NULL;
     std::vector<uint32_t> unique_slots;
     try {
         protected_slots.assign(candidate.next.slots.size(), 0u);
+        if (unique_keys.size() <= dense_expert_stack_capacity) {
+            std::fill_n(mismatched_expert_keys_stack,
+                        unique_keys.size(),
+                        (uint8_t)0u);
+            mismatched_expert_keys = mismatched_expert_keys_stack;
+        } else {
+            mismatched_expert_keys_heap.assign(unique_keys.size(), 0u);
+            mismatched_expert_keys = mismatched_expert_keys_heap.data();
+        }
         unique_slots.assign(unique_keys.size(), UINT32_MAX);
         candidate.remap.resize(n_selected);
         candidate.loads.reserve(unique_keys.size());
@@ -4812,9 +4852,34 @@ static int cuda_stream_expert_persistent_plan_build(
         cuda_stream_expert_persistent_note_reject(NULL);
         return 0;
     }
+    /* Derive a request-local exact-key index with one increasing slot scan.
+     * It deliberately does not enter persistent state: commit/rollback stay
+     * unchanged, and keys from other models or layers cannot alias. */
     for (uint32_t slot = 0; slot < candidate.next.slots.size(); slot++) {
-        if (candidate.next.slots[slot].pin_count != 0) {
+        const cuda_stream_expert_persistent_entry *entry =
+            &candidate.next.slots[slot];
+        if (entry->pin_count != 0) {
             protected_slots[slot] = 1u;
+        }
+        if (!entry->valid ||
+            entry->key.expert_id >= key_template.n_total_expert) {
+            continue;
+        }
+        const uint32_t unique_index =
+            expert_to_unique[entry->key.expert_id];
+        if (unique_index == UINT32_MAX ||
+            unique_index >= unique_keys.size()) {
+            continue;
+        }
+        if (cuda_stream_expert_persistent_key_equal(
+                &entry->key, &unique_keys[unique_index])) {
+            /* Preserve the old linear lookup's deterministic first-slot
+             * behaviour if a damaged state ever contains duplicate keys. */
+            if (unique_slots[unique_index] == UINT32_MAX) {
+                unique_slots[unique_index] = slot;
+            }
+        } else {
+            mismatched_expert_keys[unique_index] = 1u;
         }
     }
 
@@ -4827,9 +4892,15 @@ static int cuda_stream_expert_persistent_plan_build(
      * cold miss before a resident key; a one-pass planner would otherwise be
      * able to evict that later requested resident slot. */
     for (uint32_t u = 0; u < unique_keys.size(); u++) {
-        uint32_t slot = 0;
-        if (cuda_stream_expert_persistent_find_key(
-                &candidate.next, &unique_keys[u], &slot)) {
+        const uint32_t slot = unique_slots[u];
+        if (slot != UINT32_MAX) {
+            if (slot >= candidate.next.slots.size() ||
+                !candidate.next.slots[slot].valid ||
+                !cuda_stream_expert_persistent_key_equal(
+                    &candidate.next.slots[slot].key, &unique_keys[u])) {
+                cuda_stream_expert_persistent_note_reject(NULL);
+                return 0;
+            }
             protected_slots[slot] = 1u;
             if (!cuda_stream_expert_persistent_touch(
                     &candidate.next, slot)) {
@@ -4842,16 +4913,7 @@ static int cuda_stream_expert_persistent_plan_build(
             continue;
         }
         miss_count++;
-        for (const cuda_stream_expert_persistent_entry &entry :
-             candidate.next.slots) {
-            if (entry.valid &&
-                entry.key.expert_id == unique_keys[u].expert_id &&
-                !cuda_stream_expert_persistent_key_equal(
-                    &entry.key, &unique_keys[u])) {
-                key_miss_count++;
-                break;
-            }
-        }
+        if (mismatched_expert_keys[u]) key_miss_count++;
     }
 
     /* Only slots outside the complete request hit-set and outside active
@@ -5472,12 +5534,171 @@ static int cuda_stream_expert_persistent_test_rejections(void) {
     return 1;
 }
 
+static int cuda_stream_expert_persistent_test_dense_index(void) {
+    unsigned char model_a = 0;
+    unsigned char model_b = 0;
+    ds4_gpu_stream_expert_table table_a = {};
+    ds4_gpu_stream_expert_table table_b = {};
+    ds4_gpu_stream_expert_table table_c = {};
+    cuda_stream_expert_persistent_state state = {};
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &table_a, &model_a, 3u, 8u, 16u, 8u) ||
+        !cuda_stream_expert_persistent_test_table_make(
+            &table_b, &model_a, 4u, 8u, 16u, 8u) ||
+        !cuda_stream_expert_persistent_test_table_make(
+            &table_c, &model_b, 3u, 8u, 16u, 8u) ||
+        !cuda_stream_expert_persistent_state_init(&state, 4u, 16u, 8u)) {
+        return 0;
+    }
+
+    const int32_t ids_a[2] = {0, 1};
+    cuda_stream_expert_persistent_plan fill_a = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table_a, ids_a, 2u, &fill_a) ||
+        !cuda_stream_expert_persistent_plan_commit(&state, &fill_a)) {
+        return 0;
+    }
+    const int32_t ids_b[2] = {0, 2};
+    cuda_stream_expert_persistent_plan fill_b = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table_b, ids_b, 2u, &fill_b) ||
+        !cuda_stream_expert_persistent_plan_commit(&state, &fill_b)) {
+        return 0;
+    }
+
+    cuda_stream_expert_persistent_state before = {};
+    if (!cuda_stream_expert_persistent_state_copy(&before, &state)) return 0;
+    const uint64_t key_misses_before =
+        g_stream_expert_persistent_key_misses.load();
+
+    /* Slot zero and slot two deliberately contain expert zero from different
+     * layers of the same model.  The dense expert index must still choose the
+     * exact full key, preserve first-seen dedup order, and leave the live
+     * state untouched. */
+    const int32_t repeated_a[6] = {0, 0, 1, 0, 1, 1};
+    cuda_stream_expert_persistent_plan hit_a = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table_a, repeated_a, 6u, &hit_a) ||
+        hit_a.unique_count != 2u || hit_a.hit_count != 2u ||
+        hit_a.miss_count != 0u || hit_a.duplicate_count != 4u ||
+        !hit_a.loads.empty() || hit_a.slot_base != 0u ||
+        hit_a.weight_domain != 2u || hit_a.remap.size() != 6u ||
+        hit_a.remap[0] != 0u || hit_a.remap[1] != 0u ||
+        hit_a.remap[2] != 1u || hit_a.remap[3] != 0u ||
+        hit_a.remap[4] != 1u || hit_a.remap[5] != 1u ||
+        g_stream_expert_persistent_key_misses.load() != key_misses_before ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_plan_rollback(&hit_a);
+
+    const int32_t repeated_b[3] = {0, 2, 0};
+    cuda_stream_expert_persistent_plan hit_b = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table_b, repeated_b, 3u, &hit_b) ||
+        hit_b.unique_count != 2u || hit_b.hit_count != 2u ||
+        hit_b.miss_count != 0u || hit_b.duplicate_count != 1u ||
+        !hit_b.loads.empty() || hit_b.slot_base != 2u ||
+        hit_b.weight_domain != 2u || hit_b.remap.size() != 3u ||
+        hit_b.remap[0] != 0u || hit_b.remap[1] != 1u ||
+        hit_b.remap[2] != 0u ||
+        g_stream_expert_persistent_key_misses.load() != key_misses_before ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_plan_rollback(&hit_b);
+
+    /* A third full key with the same dense expert id is a real miss.  Count
+     * it once even though two resident entries share that expert number. */
+    const int32_t id_c[1] = {0};
+    cuda_stream_expert_persistent_plan miss_c = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table_c, id_c, 1u, &miss_c) ||
+        miss_c.hit_count != 0u || miss_c.miss_count != 1u ||
+        miss_c.loads.size() != 1u || !miss_c.loads[0].had_victim ||
+        g_stream_expert_persistent_key_misses.load() !=
+            key_misses_before + 1u ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    cuda_stream_expert_persistent_plan_rollback(&miss_c);
+    return cuda_stream_expert_persistent_state_equal(&state, &before);
+}
+
+static int cuda_stream_expert_persistent_test_prefill_index(void) {
+    enum {
+        test_n_expert = 384,
+        test_n_selected = 8192 * 6,
+    };
+    unsigned char model_marker = 0;
+    ds4_gpu_stream_expert_table table = {};
+    cuda_stream_expert_persistent_state state = {};
+    cuda_stream_expert_persistent_state before = {};
+    std::vector<int32_t> selected;
+    try {
+        selected.resize(test_n_selected);
+    } catch (...) {
+        return 0;
+    }
+    /* Five is coprime to 384, so the first 384 entries visit every expert
+     * exactly once and subsequent entries exercise dense duplicate lookup. */
+    for (uint32_t i = 0; i < test_n_selected; i++) {
+        selected[i] = (int32_t)((i * 5u) % test_n_expert);
+    }
+    if (!cuda_stream_expert_persistent_test_table_make(
+            &table, &model_marker, 9u, test_n_expert, 16u, 8u) ||
+        !cuda_stream_expert_persistent_state_init(
+            &state, test_n_expert, 16u, 8u) ||
+        !cuda_stream_expert_persistent_state_copy(&before, &state)) {
+        return 0;
+    }
+
+    cuda_stream_expert_persistent_plan prefill = {};
+    if (!cuda_stream_expert_persistent_plan_build(
+            &state, &table, selected.data(), test_n_selected, &prefill) ||
+        prefill.unique_count != test_n_expert ||
+        prefill.hit_count != 0u || prefill.miss_count != test_n_expert ||
+        prefill.duplicate_count != test_n_selected - test_n_expert ||
+        prefill.loads.size() != test_n_expert ||
+        prefill.remap.size() != test_n_selected ||
+        prefill.slot_base != 0u ||
+        prefill.weight_domain != test_n_expert ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < test_n_selected; i++) {
+        if (prefill.remap[i] != i % test_n_expert) return 0;
+    }
+    for (uint32_t u = 0; u < test_n_expert; u++) {
+        if (prefill.loads[u].slot != u ||
+            prefill.loads[u].key.expert_id != (u * 5u) % test_n_expert) {
+            return 0;
+        }
+    }
+    cuda_stream_expert_persistent_plan_rollback(&prefill);
+    if (!cuda_stream_expert_persistent_state_equal(&state, &before)) return 0;
+
+    const int32_t invalid_low[1] = {-1};
+    const int32_t invalid_high[1] = {test_n_expert};
+    cuda_stream_expert_persistent_plan rejected = {};
+    if (cuda_stream_expert_persistent_plan_build(
+            &state, &table, invalid_low, 1u, &rejected) ||
+        cuda_stream_expert_persistent_plan_build(
+            &state, &table, invalid_high, 1u, &rejected) ||
+        !cuda_stream_expert_persistent_state_equal(&state, &before)) {
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_cuda_test_stream_expert_persistent_planner(void) {
     g_stream_expert_persistent_oracle_runs.fetch_add(
         1, std::memory_order_relaxed);
     const int ok = cuda_stream_expert_persistent_test_basic() &&
                    cuda_stream_expert_persistent_test_protection() &&
-                   cuda_stream_expert_persistent_test_rejections();
+                   cuda_stream_expert_persistent_test_rejections() &&
+                   cuda_stream_expert_persistent_test_dense_index() &&
+                   cuda_stream_expert_persistent_test_prefill_index();
     if (!ok) {
         g_stream_expert_persistent_oracle_failures.fetch_add(
             1, std::memory_order_relaxed);
