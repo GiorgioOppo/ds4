@@ -51,6 +51,7 @@ __global__ static void matmul_f16_smallm_wmma_kernel(
     rocwmma::fill_fragment(c, 0.0f);
 
     for (uint32_t k0 = 0; k0 < k; k0 += 16u) {
+#pragma unroll
         for (uint32_t p = tid; p < BM * 8u; p += WAVES * 32u) {
             const uint32_t j = p * 2u;
             const uint32_t kk = j & 15u;
@@ -59,6 +60,7 @@ __global__ static void matmul_f16_smallm_wmma_kernel(
                     *reinterpret_cast<const uint32_t *>(
                             w + (k0 + kk) + (uint64_t)(m0 + row) * k);
         }
+#pragma unroll
         for (uint32_t p = tid; p < 8u * BN; p += WAVES * 32u) {
             const uint32_t j = p * 2u;
             const uint32_t kk = j & 15u;
