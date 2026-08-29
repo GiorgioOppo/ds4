@@ -1429,7 +1429,7 @@ int ds4_mmq_dense_impl(
             ggml_cuda_pool_alloc<char> fixup(ctx->pool());
             if (fixup_bytes != 0u) fixup.alloc(fixup_bytes);
             const int rc = ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
-                W, src1_q8_1.get(), out_f32, fixup.get(), fixup_bytes,
+                W, src1_q8_1, out_f32, fixup.get(), fixup_bytes,
                 M, N, K, nsm, stream);
             if (rc != 0) {
                 fprintf(stderr,
@@ -2710,15 +2710,18 @@ int ds4_mmq_moe_pair_impl(
         }
     }
 
-    if (persistent_pair_maps) {
-        const auto & maps = g_mmq_pair_maps[dev];
-        ids_src1 = maps.ids_src1;
-        ids_dst = maps.ids_dst;
-        expert_bounds = maps.expert_bounds;
-    } else if (!direct_gateup_q8) {
-        ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
-        ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
-        expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
+    if (!direct_gateup_q8) {
+        if (persistent_pair_maps) {
+            const auto & maps = g_mmq_pair_maps[dev];
+            ids_src1 = maps.ids_src1;
+            ids_dst = maps.ids_dst;
+            expert_bounds = maps.expert_bounds;
+        } else {
+            ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
+            ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
+            expert_bounds = expert_bounds_alloc.alloc(
+                ctx->pool(), n_experts + 1);
+        }
     }
 
     const int si1  = n_expert_used;
