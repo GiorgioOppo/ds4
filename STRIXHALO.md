@@ -18,7 +18,7 @@ sudo apt-get update
 sudo apt-get install -y \
   hipcc rocminfo rocm-smi \
   libamdhip64-dev \
-  libhipblas-dev libhipblaslt-dev \
+  libhipblas-dev \
   librocblas-dev \
   librocwmma-dev \
   libhipcub-dev

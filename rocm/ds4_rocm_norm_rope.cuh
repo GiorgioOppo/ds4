@@ -357,12 +357,6 @@ __device__ static float dsv4_e2m1fn_dequant_dev(float x) {
     return sign * dsv4_e2m1fn_value_dev(best);
 }
 
-__device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
-    const char *p = (const char *)base + offset;
-    if (type == 1u) return __half2float(((const __half *)p)[idx]);
-    return ((const float *)p)[idx];
-}
-
 __device__ static float model_ape_value_dev(const void *base, uint64_t offset, uint32_t type,
                                             uint32_t width, uint32_t row, uint32_t col) {
     const char *p = (const char *)base + offset;
@@ -375,38 +369,6 @@ __device__ static float model_ape_value_dev(const void *base, uint64_t offset, u
         return d * (float)q;
     }
     return ((const float *)p)[(uint64_t)row * width + col];
-}
-
-__device__ static float rope_yarn_ramp_cpu_equiv_dev(float low, float high, int i0) {
-    float y = ((float)(i0 / 2) - low) / fmaxf(0.001f, high - low);
-    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
-}
-
-__device__ static DS4_ROCM_UNUSED void rope_tail_one_dev(float *x, uint32_t head_dim, uint32_t n_rot, uint32_t pos, uint32_t n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
-    uint32_t n_nope = head_dim - n_rot;
-    float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        float denom = 2.0f * logf(freq_base);
-        corr0 = fmaxf(0.0f, floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom));
-        corr1 = fminf((float)(n_rot - 1), ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom));
-    }
-    for (uint32_t i = 0; i < n_rot; i += 2) {
-        float theta_extrap = (float)pos * powf(freq_base, -((float)i) / (float)n_rot);
-        float theta_interp = freq_scale * theta_extrap;
-        float theta = theta_interp;
-        float mscale = attn_factor;
-        if (ext_factor != 0.0f) {
-            float mix = rope_yarn_ramp_cpu_equiv_dev(corr0, corr1, (int)i) * ext_factor;
-            theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
-            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-        }
-        float c = cosf(theta) * mscale;
-        float s = sinf(theta) * mscale;
-        float x0 = x[n_nope + i];
-        float x1 = x[n_nope + i + 1];
-        x[n_nope + i] = x0 * c - x1 * s;
-        x[n_nope + i + 1] = x0 * s + x1 * c;
-    }
 }
 
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {

@@ -8234,26 +8234,6 @@ static void matvec_q8_0_3d_slice_prequant(
     ds4_parallel_for(out_dim, matvec_q8_0_worker, &ctx);
 }
 
-static DS4_MAYBE_UNUSED void matvec_q8_0_3d_slice(
-        float           * out,
-        const ds4_model * m,
-        const ds4_tensor * w,
-        const float     * x,
-        uint64_t          slice) {
-    if (w->type != DS4_TENSOR_Q8_0 || w->ndim != 3) ds4_die("expected a 3D Q8_0 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)blocks * 32);
-    float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
-
-    quantize_q8_0_activation(x, xq, xscale, in_dim);
-    matvec_q8_0_3d_slice_prequant(out, m, w, xq, xscale, slice);
-
-    free(xscale);
-    free(xq);
-}
-
 /* Compute two Q8_0 projections from the same input, used by gate/up and
  * compressor kv/score pairs. */
 static void matvec_q8_0_pair_prequant(
@@ -10062,40 +10042,6 @@ static void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
 }
 
 typedef struct {
-    float *down_pair;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_q2_k_batch_down_ctx;
-
-static DS4_MAYBE_UNUSED void matvec_q2_k_batch_down_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q2_k_batch_down_ctx *ctx = vctx;
-
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-        const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-            ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim,
-                                  ctx->down_pair + (uint64_t)pair_id * ctx->out_dim + row,
-                                  br, xq);
-        }
-    }
-}
-
-typedef struct {
     float *moe;
     const uint8_t *base[DS4_MAX_EXPERT];
     const block_q8_K *midq;
@@ -10892,27 +10838,6 @@ static void matvec_q8_0_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
                 ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
             }
         }
-    }
-}
-
-typedef struct {
-    float *moe;
-    const float *down_pair;
-    uint32_t n_tok;
-    uint64_t out_dim;
-} sum_down_pairs_ctx;
-
-static DS4_MAYBE_UNUSED void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    sum_down_pairs_ctx *ctx = vctx;
-    for (uint64_t idx = row0; idx < row1; idx++) {
-        const uint32_t token = (uint32_t)(idx / ctx->out_dim);
-        const uint64_t row = idx - (uint64_t)token * ctx->out_dim;
-        float acc = 0.0f;
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint64_t pair_id = (uint64_t)token * DS4_N_EXPERT_USED + slot;
-            acc += ctx->down_pair[pair_id * ctx->out_dim + row];
-        }
-        ctx->moe[idx] = acc;
     }
 }
 
@@ -39755,8 +39680,6 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM_METAL_FULL_ATTN_DEFAULT_CONTEXT 4096u
 #define DS4_GLM_METAL_STREAMING_FULL_ATTN_CONTEXT 8192u
 #define DS4_GLM_METAL_FULL_ATTN_LAYER_FLUSH_CONTEXT 2048u
-#define DS4_GLM_METAL_DISPLAY_PROGRESS_LAYER_TOKENS 32u
-#define DS4_GLM_METAL_SMALL_PREFILL_STAGE_SYNC_TOKENS 0u
 #define DS4_GLM_METAL_LONG_CONTEXT_THRESHOLD 65536u
 #define DS4_GLM_METAL_LONG_CONTEXT_FULL_ATTN_CONTEXT 4096u
 #define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 4096u
@@ -44322,14 +44245,6 @@ static void glm_graph_report_prefill_display_progress(
                      (int)((uint64_t)absolute_base + (uint64_t)work_total));
 }
 
-static bool glm_graph_small_prefill_stage_sync(
-        uint32_t n_tokens,
-        bool     logits_requested) {
-    return logits_requested &&
-           n_tokens > 0 &&
-           n_tokens <= DS4_GLM_METAL_SMALL_PREFILL_STAGE_SYNC_TOKENS;
-}
-
 static uint32_t glm_graph_indexed_decode_split_min_block_rows(void) {
     return 32u;
 }
@@ -44364,11 +44279,6 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
            DS4_N_ROT == 64u &&
            glm_graph_compact_cache_is_f16();
 #endif
-}
-
-static bool glm_graph_prefill_stage_sync_boundary(void) {
-    if (ds4_gpu_end_commands() == 0) return false;
-    return ds4_gpu_begin_commands() != 0;
 }
 
 static bool glm_graph_indexed_prefill_attention_boundary(void) {
@@ -45547,10 +45457,7 @@ static bool glm_graph_warm_compact_indexer_store(
         return false;
     }
 
-    const bool profile = false;
-    const double t0 = 0.0;
     bool ok = ds4_gpu_begin_commands() != 0;
-    uint32_t warmed = 0;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         if (!glm_graph_layer_uses_full_indexer(il)) continue;
         const ds4_layer_weights *l = &weights->layer[il];
@@ -45583,18 +45490,9 @@ static bool glm_graph_warm_compact_indexer_store(
                 DS4_ROPE_YARN_BETA_FAST,
                 DS4_ROPE_YARN_BETA_SLOW,
                 glm_graph_compact_cache_is_f16()) != 0;
-        if (ok) warmed++;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-
-    if (profile) {
-        fprintf(stderr,
-                "ds4: GLM compact indexer warmup pos=%u layers=%u %.3f ms\n",
-                warm_pos,
-                warmed,
-                (now_sec() - t0) * 1000.0);
-    }
     return ok;
 }
 
@@ -46879,7 +46777,6 @@ static bool glm_graph_profile_router_selection_batch(
 
 static bool glm_graph_prefill_stage_boundary(
         bool        stage_profile,
-        bool        stage_sync,
         const char *part,
         const char *stage,
         uint32_t    il,
@@ -46889,7 +46786,6 @@ static bool glm_graph_prefill_stage_boundary(
     if (stage_profile) {
         return glm_graph_profile_stage(true, part, stage, il, pos0, n_tokens, stage_t0);
     }
-    if (stage_sync) return glm_graph_prefill_stage_sync_boundary();
     return true;
 }
 
@@ -48675,7 +48571,6 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         ds4_gpu_tensor          *next,
         uint32_t                 n_tokens,
         bool                     stage_profile,
-        bool                     stage_sync,
         double                  *stage_t0) {
     const char *failed_stage = "setup";
     if (!g || !model || !l || !after_attn || !next ||
@@ -48766,7 +48661,6 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         ds4_gpu_tensor_free(logits_view);
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_indexed_ffn",
                                                   "router",
                                                   il,
@@ -48828,7 +48722,6 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                 !use_grouped_moe) != 0;
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_indexed_ffn",
                                                   "routed_moe",
                                                   il,
@@ -48978,7 +48871,6 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         ds4_gpu_tensor_free(after_attn_view);
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_indexed_ffn",
                                                   "shared_expert",
                                                   il,
@@ -49005,7 +48897,6 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         }
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_indexed_ffn",
                                                   "residual",
                                                   il,
@@ -49063,7 +48954,6 @@ static bool glm_graph_encode_ffn_batch(
         uint32_t                 n_tokens,
         bool                     full_layer_prefill,
         bool                     stage_profile,
-        bool                     stage_sync,
         double                  *stage_t0) {
     if (!g || !model || !weights || !l || !after_attn || !next || n_tokens == 0) return false;
 
@@ -49077,7 +48967,6 @@ static bool glm_graph_encode_ffn_batch(
                                              n_tokens,
                                              DS4_RMS_EPS) != 0;
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_ffn",
                                                   "ffn_norm",
                                                   il,
@@ -49114,7 +49003,6 @@ static bool glm_graph_encode_ffn_batch(
                 g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f);
         if (fused_gate_up) {
             ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_ffn",
                                                   "dense_gate_up_swiglu",
                                                   il,
@@ -49137,7 +49025,6 @@ static bool glm_graph_encode_ffn_batch(
                                                       g->batch_ffn_norm,
                                                       n_tokens);
             if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                          stage_sync,
                                                           "glm_ffn",
                                                           "dense_gate_up",
                                                           il,
@@ -49151,7 +49038,6 @@ static bool glm_graph_encode_ffn_batch(
                                                g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f,
                                                1.0f) != 0;
             if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                          stage_sync,
                                                           "glm_ffn",
                                                           "dense_swiglu",
                                                           il,
@@ -49177,7 +49063,6 @@ static bool glm_graph_encode_ffn_batch(
                     (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
         }
         if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                      stage_sync,
                                                       "glm_ffn",
                                                       "dense_down",
                                                       il,
@@ -49197,7 +49082,6 @@ static bool glm_graph_encode_ffn_batch(
                                     (uint32_t)residual_elems) != 0;
         }
         if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                      stage_sync,
                                                       "glm_ffn",
                                                       "residual",
                                                       il,
@@ -49260,7 +49144,6 @@ static bool glm_graph_encode_ffn_batch(
         }
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_ffn",
                                                   "router",
                                                   il,
@@ -49328,7 +49211,6 @@ static bool glm_graph_encode_ffn_batch(
                     g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f); \
             if (fused_shared) { \
                 ok = glm_graph_prefill_stage_boundary(stage_profile, \
-                                                      stage_sync, \
                                                       "glm_ffn", \
                                                       "shared_gate_up_swiglu", \
                                                       il, \
@@ -49351,7 +49233,6 @@ static bool glm_graph_encode_ffn_batch(
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
                 if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile, \
-                                                              stage_sync, \
                                                               "glm_ffn", \
                                                               "shared_gate_up", \
                                                               il, \
@@ -49365,7 +49246,6 @@ static bool glm_graph_encode_ffn_batch(
                                                    g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f, \
                                                    1.0f) != 0; \
                 if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile, \
-                                                              stage_sync, \
                                                               "glm_ffn", \
                                                               "shared_swiglu", \
                                                               il, \
@@ -49382,7 +49262,6 @@ static bool glm_graph_encode_ffn_batch(
                                                   g->batch_shared_mid, \
                                                   n_tokens); \
         if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile, \
-                                                      stage_sync, \
                                                       "glm_ffn", \
                                                       "shared_down", \
                                                       il, \
@@ -49456,7 +49335,6 @@ static bool glm_graph_encode_ffn_batch(
         if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_ffn",
                                                   "routed_moe",
                                                   il,
@@ -49501,7 +49379,6 @@ static bool glm_graph_encode_ffn_batch(
                                         (uint32_t)residual_elems) != 0;
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
-                                                  stage_sync,
                                                   "glm_ffn",
                                                   "residual",
                                                   il,
@@ -50368,7 +50245,6 @@ static bool glm_graph_verify_rows(
                                                 n,
                                                 false,
                                                 false,
-                                                false,
                                                 NULL);
         if (ok) {
             ds4_gpu_tensor *tmp = cur;
@@ -50625,9 +50501,7 @@ static bool glm_graph_forward_tokens(
                                               work_total,
                                               true);
 
-    const bool stage_sync =
-        glm_graph_small_prefill_stage_sync(n_tokens, logits_out != NULL);
-    const uint32_t layer_flush_interval = stage_sync ? 0u :
+    const uint32_t layer_flush_interval =
         glm_graph_full_prefill_layer_flush_interval(n_tokens,
                                                     n_rows,
                                                     logits_out != NULL);
@@ -50698,10 +50572,9 @@ static bool glm_graph_forward_tokens(
         metal_graph_stream_prefill_layer_prepare_ahead() : 1u;
     if (trace) {
         glm_graph_full_prefill_tracef(
-                "mode pos=%u tokens=%u stage_sync=%u layer_flush_interval=%u progress_flush_interval=%u drain_interval=%u",
+                "mode pos=%u tokens=%u layer_flush_interval=%u progress_flush_interval=%u drain_interval=%u",
                 pos0,
                 n_tokens,
-                stage_sync ? 1u : 0u,
                 layer_flush_interval,
                 progress_flush_interval,
                 drain_interval);
@@ -50825,8 +50698,6 @@ static bool glm_graph_forward_tokens(
 #define DS4_GLM_PROFILE_PREFILL_STAGE(part_, name_) do { \
         if (ok && layer_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary((part_), (name_), il, pos0, n_tokens, &layer_stage_t0); \
-        } else if (ok && stage_sync) { \
-            ok = glm_graph_prefill_stage_sync_boundary(); \
         } \
     } while (0)
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
@@ -51444,7 +51315,6 @@ glm53_batch_attention_done:
                                             n_tokens,
                                             full_layer_prefill,
                                             layer_stage_profile,
-                                            stage_sync,
                                             layer_stage_profile ? &layer_stage_t0 : NULL);
         }
         if (ok && g->glm53) {
@@ -51972,9 +51842,7 @@ static bool glm_graph_forward_indexed_tokens(
     const bool use_batch_indexer_weights_proj = true;
     const bool use_batch_attn_out_proj = true;
     const bool use_batch_ffn = glm_graph_indexed_prefill_batch_ffn();
-    const bool stage_sync =
-        glm_graph_small_prefill_stage_sync(n_tokens, logits_out != NULL);
-    const uint32_t layer_flush_interval = stage_sync ? 0u :
+    const uint32_t layer_flush_interval =
         glm_graph_full_prefill_layer_flush_interval(n_tokens,
                                                     n_tokens,
                                                     logits_out != NULL);
@@ -52107,8 +51975,6 @@ static bool glm_graph_forward_indexed_tokens(
         } \
         if (ok && layer_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary((part_), (name_), il, pos0, n_tokens, &layer_stage_t0); \
-        } else if (ok && stage_sync) { \
-            ok = glm_graph_prefill_stage_sync_boundary(); \
         } \
     } while (0)
     ds4_gpu_tensor *last_indexer_selected = NULL;
@@ -53077,7 +52943,6 @@ glm53_indexed_attention_done:
                                             n_tokens,
                                             false,
                                             layer_stage_profile,
-                                            stage_sync,
                                             layer_stage_profile ? &layer_stage_t0 : NULL);
         } else if (ok) {
             const bool use_batch_ffn_norm =
@@ -53109,7 +52974,6 @@ glm53_indexed_attention_done:
                         next,
                         n_tokens,
                         layer_stage_profile,
-                        stage_sync,
                         layer_stage_profile ? &layer_stage_t0 : NULL);
             } else for (uint32_t t = 0; ok && t < n_tokens; t++) {
                 ds4_gpu_tensor *after_attn_view =
@@ -53931,13 +53795,8 @@ static bool glm_graph_forward_token(
         }
     }
 
-    const bool decode_output_profile = false;
     const bool merge_indexed_output =
-        logits_out != NULL && use_indexed_attention && !decode_output_profile;
-    double decode_output_stage_t0 = decode_output_profile ? now_sec() : 0.0;
-    const bool decode_flush_profile = false;
-    uint32_t decode_flush_layer0 = 0;
-    double decode_flush_stage_t0 = decode_flush_profile ? now_sec() : 0.0;
+        logits_out != NULL && use_indexed_attention;
 
     const bool static_decode_map =
         !input_hc &&
@@ -54852,24 +54711,7 @@ glm53_attention_done:
             decode_layer_flush_interval != 0 &&
             il < g->layer_end &&
             (slice_layer_done % decode_layer_flush_interval) == 0) {
-            if (decode_flush_profile) {
-                ok = ds4_gpu_flush_commands() != 0;
-                if (ok) ok = ds4_gpu_synchronize() != 0;
-                if (ok) {
-                    const double now = now_sec();
-                    fprintf(stderr,
-                            "ds4: GLM decode layer flush pos=%u layers=%u..%u %.3f ms\n",
-                            pos,
-                            decode_flush_layer0,
-                            il,
-                            (now - decode_flush_stage_t0) * 1000.0);
-                    decode_flush_layer0 = il + 1u;
-                    decode_flush_stage_t0 = now;
-                    ok = ds4_gpu_begin_commands() != 0;
-                }
-            } else {
-                ok = ds4_gpu_flush_commands() != 0;
-            }
+            ok = ds4_gpu_flush_commands() != 0;
         }
         if (streaming_decode_sync_each_layer) {
             if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -54898,14 +54740,6 @@ glm53_attention_done:
     } else if (!ok) {
         (void)ds4_gpu_synchronize();
     }
-    if (decode_output_profile) {
-        const double now = now_sec();
-        fprintf(stderr,
-                "ds4: GLM decode output profile pos=%u layers=%.3f ms\n",
-                pos,
-                (now - decode_output_stage_t0) * 1000.0);
-        decode_output_stage_t0 = now;
-    }
     if (ok && output_hc && !defer_completion) {
         ok = ds4_gpu_tensor_read(g->glm53 ? g->hc_cur : g->cur,
                                  0,
@@ -54916,23 +54750,6 @@ glm53_attention_done:
     }
     if (ok && logits_out && !defer_completion) {
         if (use_indexed_attention) {
-            if (!merge_indexed_output) {
-                if (g->ssd_streaming && !static_decode_map) {
-                    ok = glm_graph_stream_map_output(g, model, weights);
-                }
-                if (ok) ok = glm_graph_begin_commands_if_needed();
-                if (ok) ok = glm_graph_encode_output_head(g, model, weights);
-                if (ok) ok = glm_graph_end_commands_if_active();
-                else (void)ds4_gpu_synchronize();
-                if (decode_output_profile) {
-                    const double now = now_sec();
-                    fprintf(stderr,
-                            "ds4: GLM decode output profile pos=%u output_head=%.3f ms\n",
-                            pos,
-                            (now - decode_output_stage_t0) * 1000.0);
-                    decode_output_stage_t0 = now;
-                }
-            }
             if (ok) {
                 if (glm_debug_hidden_dump_layer() < 0)
                     glm_debug_dump_hidden_row(g->cur, 0);
@@ -54940,13 +54757,6 @@ glm53_attention_done:
                                          0,
                                          logits_out,
                                          (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-                if (decode_output_profile) {
-                    const double now = now_sec();
-                    fprintf(stderr,
-                            "ds4: GLM decode output profile pos=%u logits_read=%.3f ms\n",
-                            pos,
-                            (now - decode_output_stage_t0) * 1000.0);
-                }
             }
         } else {
             if (g->ssd_streaming && !static_decode_map) {
@@ -54961,13 +54771,6 @@ glm53_attention_done:
                 weights,
                 g->glm53 ? g->hc_cur : g->cur,
                 logits_out);
-            if (decode_output_profile) {
-                const double now = now_sec();
-                fprintf(stderr,
-                        "ds4: GLM decode output profile pos=%u fallback_output=%.3f ms\n",
-                        pos,
-                        (now - decode_output_stage_t0) * 1000.0);
-            }
         }
     }
     if (ok &&
@@ -54992,482 +54795,6 @@ glm53_attention_done:
     (void)glm_ft_fail_il;
     return ok;
 #undef DS4_GLM_FT_FAIL
-}
-
-static int glm_metal_first_token_logits(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        int                token,
-        float             *logits_out) {
-    if (!model || !weights || !logits_out) return 1;
-    if (token < 0 || token >= (int)DS4_N_VOCAB) {
-        fprintf(stderr, "ds4: GLM token %d is outside vocab\n", token);
-        return 1;
-    }
-    if (!weights->token_embd || weights->token_embd->type != DS4_TENSOR_Q8_0 ||
-        !weights->output_norm || weights->output_norm->type != DS4_TENSOR_F32 ||
-        !weights->output || weights->output->type != DS4_TENSOR_Q8_0 ||
-        weights->output_norm->dim[0] != DS4_N_EMBD ||
-        weights->output->dim[0] != DS4_N_EMBD ||
-        weights->output->dim[1] != DS4_N_VOCAB) {
-        fprintf(stderr, "ds4: GLM Metal first-token path found unexpected embedding/output layout\n");
-        return 1;
-    }
-    if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT) {
-        fprintf(stderr, "ds4: GLM Metal first-token path has no normal transformer layers\n");
-        return 1;
-    }
-
-    const uint32_t normal_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
-    const uint64_t heads_dim = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_MLA;
-    uint64_t kv_raw_dim = 0;
-    uint64_t dense_hidden_max = DS4_N_FF_EXP;
-    bool generic_routed_moe = false;
-    for (uint32_t il = 0; il < normal_layers; il++) {
-        const ds4_layer_weights *l = &weights->layer[il];
-        if (l->attn_kv_a_mqa && l->attn_kv_a_mqa->dim[1] > kv_raw_dim) {
-            kv_raw_dim = l->attn_kv_a_mqa->dim[1];
-        }
-        if (il < DS4_N_LEADING_DENSE && l->ffn_gate &&
-            l->ffn_gate->dim[1] > dense_hidden_max) {
-            dense_hidden_max = l->ffn_gate->dim[1];
-        }
-        if (glm_graph_layer_uses_generic_routed_moe(l)) generic_routed_moe = true;
-    }
-    if (kv_raw_dim < DS4_N_KV_LORA) {
-        fprintf(stderr, "ds4: GLM Metal first-token path found no valid KV projection\n");
-        return 1;
-    }
-
-    const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t sparse_mid_elems = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-    const uint64_t ffn_mid_elems =
-        dense_hidden_max > sparse_mid_elems ? dense_hidden_max : sparse_mid_elems;
-    const uint64_t routed_mid_bytes =
-        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
-    const uint64_t routed_down_bytes =
-        (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
-    const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
-
-    ds4_gpu_tensor *cur = NULL;
-    ds4_gpu_tensor *attn_norm = NULL;
-    ds4_gpu_tensor *kv_raw = NULL;
-    ds4_gpu_tensor *kv_norm = NULL;
-    ds4_gpu_tensor *heads = NULL;
-    ds4_gpu_tensor *attn_out = NULL;
-    ds4_gpu_tensor *after_attn = NULL;
-    ds4_gpu_tensor *ffn_norm = NULL;
-    ds4_gpu_tensor *ffn_gate = NULL;
-    ds4_gpu_tensor *ffn_up = NULL;
-    ds4_gpu_tensor *ffn_mid = NULL;
-    ds4_gpu_tensor *routed_gate = NULL;
-    ds4_gpu_tensor *routed_up = NULL;
-    ds4_gpu_tensor *routed_down = NULL;
-    ds4_gpu_tensor *ffn_out = NULL;
-    ds4_gpu_tensor *ffn_sum = NULL;
-    ds4_gpu_tensor *next = NULL;
-    ds4_gpu_tensor *router_logits = NULL;
-    ds4_gpu_tensor *router_probs = NULL;
-    ds4_gpu_tensor *router_selected = NULL;
-    ds4_gpu_tensor *router_weights = NULL;
-    ds4_gpu_tensor *logits = NULL;
-
-    int ok = 1;
-#define DS4_GLM_FIRST_ALLOC_TENSOR(var, bytes_) \
-    do { \
-        (var) = ds4_gpu_tensor_alloc((bytes_)); \
-        if (!(var)) { \
-            fprintf(stderr, "ds4: GLM Metal first-token path could not allocate %s\n", #var); \
-            ok = 0; \
-        } \
-    } while (0)
-
-    DS4_GLM_FIRST_ALLOC_TENSOR(cur, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(attn_norm, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(kv_raw, kv_raw_dim * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(kv_norm, (uint64_t)DS4_N_KV_LORA * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(heads, heads_dim * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(attn_out, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(after_attn, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(ffn_norm, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(ffn_gate, dense_hidden_max * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(ffn_up, dense_hidden_max * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(ffn_mid, ffn_mid_elems * sizeof(float));
-    if (generic_routed_moe) {
-        DS4_GLM_FIRST_ALLOC_TENSOR(routed_gate, routed_mid_bytes);
-        DS4_GLM_FIRST_ALLOC_TENSOR(routed_up, routed_mid_bytes);
-        DS4_GLM_FIRST_ALLOC_TENSOR(routed_down, routed_down_bytes);
-    }
-    DS4_GLM_FIRST_ALLOC_TENSOR(ffn_out, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(ffn_sum, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(next, emb_bytes);
-    DS4_GLM_FIRST_ALLOC_TENSOR(router_logits, (uint64_t)DS4_N_EXPERT * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(router_probs, (uint64_t)DS4_N_EXPERT * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(router_selected, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
-    DS4_GLM_FIRST_ALLOC_TENSOR(router_weights, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
-    DS4_GLM_FIRST_ALLOC_TENSOR(logits, logits_bytes);
-#undef DS4_GLM_FIRST_ALLOC_TENSOR
-
-    if (ok) {
-        ok = ds4_gpu_embed_token_q8_0_tensor(cur,
-                                             model->map,
-                                             model->size,
-                                             weights->token_embd->abs_offset,
-                                             DS4_N_VOCAB,
-                                             (uint32_t)token,
-                                             DS4_N_EMBD);
-    }
-    for (uint32_t il = 0; ok && il < normal_layers; il++) {
-        const ds4_layer_weights *gl = &weights->layer[il];
-        const uint64_t gl_kv_raw_dim = gl->attn_kv_a_mqa ? gl->attn_kv_a_mqa->dim[1] : 0;
-        if (!gl->attn_norm ||
-            !gl->attn_kv_a_mqa ||
-            !gl->attn_kv_a_norm ||
-            !gl->attn_v_b ||
-            !gl->attn_output ||
-            !gl->ffn_norm ||
-            gl_kv_raw_dim < DS4_N_KV_LORA ||
-            gl_kv_raw_dim > kv_raw_dim ||
-            gl->attn_kv_a_mqa->type != DS4_TENSOR_Q8_0 ||
-            gl->attn_kv_a_mqa->dim[0] != DS4_N_EMBD ||
-            gl->attn_v_b->type != DS4_TENSOR_Q8_0 ||
-            gl->attn_v_b->dim[0] != DS4_N_KV_LORA ||
-            gl->attn_v_b->dim[1] != DS4_N_VALUE_MLA ||
-            gl->attn_v_b->dim[2] != DS4_N_HEAD ||
-            gl->attn_output->type != DS4_TENSOR_Q8_0 ||
-            gl->attn_output->dim[0] != heads_dim ||
-            gl->attn_output->dim[1] != DS4_N_EMBD) {
-            fprintf(stderr,
-                    "ds4: GLM Metal first-token path found unexpected attention layout in layer %u\n",
-                    il);
-            ok = 0;
-            break;
-        }
-
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(attn_norm, cur,
-                                                    model->map, model->size,
-                                                    gl->attn_norm->abs_offset,
-                                                    DS4_N_EMBD, DS4_RMS_EPS);
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(kv_raw,
-                                                model->map,
-                                                model->size,
-                                                gl->attn_kv_a_mqa->abs_offset,
-                                                DS4_N_EMBD,
-                                                gl_kv_raw_dim,
-                                                attn_norm,
-                                                1);
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(kv_norm, kv_raw,
-                                                    model->map, model->size,
-                                                    gl->attn_kv_a_norm->abs_offset,
-                                                    DS4_N_KV_LORA, DS4_RMS_EPS);
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(heads,
-                                                model->map,
-                                                model->size,
-                                                gl->attn_v_b->abs_offset,
-                                                DS4_N_KV_LORA,
-                                                heads_dim,
-                                                kv_norm,
-                                                1);
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(attn_out,
-                                                model->map,
-                                                model->size,
-                                                gl->attn_output->abs_offset,
-                                                heads_dim,
-                                                DS4_N_EMBD,
-                                                heads,
-                                                1);
-        if (ok) ok = ds4_gpu_add_tensor(after_attn, cur, attn_out, DS4_N_EMBD);
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(ffn_norm, after_attn,
-                                                    model->map, model->size,
-                                                    gl->ffn_norm->abs_offset,
-                                                    DS4_N_EMBD, DS4_RMS_EPS);
-        if (il < DS4_N_LEADING_DENSE) {
-            const uint64_t gl_ffn_hidden = gl->ffn_gate ? gl->ffn_gate->dim[1] : 0;
-            if (!gl->ffn_gate ||
-                !gl->ffn_up ||
-                !gl->ffn_down ||
-                gl->ffn_gate->type != DS4_TENSOR_Q8_0 ||
-                gl->ffn_up->type != DS4_TENSOR_Q8_0 ||
-                gl->ffn_down->type != DS4_TENSOR_Q8_0 ||
-                gl->ffn_gate->dim[0] != DS4_N_EMBD ||
-                gl->ffn_up->dim[0] != DS4_N_EMBD ||
-                gl->ffn_up->dim[1] != gl_ffn_hidden ||
-                gl->ffn_down->dim[0] != gl_ffn_hidden ||
-                gl->ffn_down->dim[1] != DS4_N_EMBD ||
-                gl_ffn_hidden > dense_hidden_max) {
-                fprintf(stderr,
-                        "ds4: GLM Metal first-token path found unexpected dense FFN layout in layer %u\n",
-                        il);
-                ok = 0;
-                break;
-            }
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(ffn_gate,
-                                                    model->map,
-                                                    model->size,
-                                                    gl->ffn_gate->abs_offset,
-                                                    DS4_N_EMBD,
-                                                    gl_ffn_hidden,
-                                                    ffn_norm,
-                                                    1);
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(ffn_up,
-                                                    model->map,
-                                                    model->size,
-                                                    gl->ffn_up->abs_offset,
-                                                    DS4_N_EMBD,
-                                                    gl_ffn_hidden,
-                                                    ffn_norm,
-                                                    1);
-            if (ok) ok = ds4_gpu_swiglu_tensor(ffn_mid, ffn_gate, ffn_up,
-                                               (uint32_t)gl_ffn_hidden, 0.0f, 1.0f);
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(ffn_out,
-                                                    model->map,
-                                                    model->size,
-                                                    gl->ffn_down->abs_offset,
-                                                    gl_ffn_hidden,
-                                                    DS4_N_EMBD,
-                                                    ffn_mid,
-                                                    1);
-            if (ok) ok = ds4_gpu_add_tensor(next, after_attn, ffn_out, DS4_N_EMBD);
-        } else {
-            const uint32_t gl_gate_type = gl->ffn_gate_exps ? gl->ffn_gate_exps->type : 0;
-            const uint32_t gl_up_type = gl->ffn_up_exps ? gl->ffn_up_exps->type : 0;
-            const bool gl_gate_pair_supported =
-                glm_graph_gate_pair_type_supported(gl_gate_type, gl_up_type);
-            uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
-            uint64_t up_in = 0, up_out = 0, up_row_bytes = 0;
-            uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
-
-            if (!gl->ffn_gate_inp ||
-                !gl->ffn_exp_probs_b ||
-                !gl->ffn_gate_exps ||
-                !gl->ffn_up_exps ||
-                !gl->ffn_down_exps ||
-                !gl->ffn_gate_shexp ||
-                !gl->ffn_up_shexp ||
-                !gl->ffn_down_shexp ||
-                gl->ffn_gate_inp->type != DS4_TENSOR_F32 ||
-                gl->ffn_gate_inp->dim[0] != DS4_N_EMBD ||
-                gl->ffn_gate_inp->dim[1] != DS4_N_EXPERT ||
-                gl->ffn_exp_probs_b->type != DS4_TENSOR_F32 ||
-                gl->ffn_exp_probs_b->dim[0] != DS4_N_EXPERT ||
-                !gl_gate_pair_supported ||
-                !glm_graph_down_type_supported(gl->ffn_down_exps->type) ||
-                gl->ffn_gate_shexp->type != DS4_TENSOR_Q8_0 ||
-                gl->ffn_up_shexp->type != DS4_TENSOR_Q8_0 ||
-                gl->ffn_down_shexp->type != DS4_TENSOR_Q8_0 ||
-                gl->ffn_gate_shexp->dim[0] != DS4_N_EMBD ||
-                gl->ffn_gate_shexp->dim[1] != DS4_N_FF_EXP ||
-                gl->ffn_up_shexp->dim[0] != DS4_N_EMBD ||
-                gl->ffn_up_shexp->dim[1] != DS4_N_FF_EXP ||
-                gl->ffn_down_shexp->dim[0] != DS4_N_FF_EXP ||
-                gl->ffn_down_shexp->dim[1] != DS4_N_EMBD ||
-                sparse_mid_elems > ffn_mid_elems) {
-                fprintf(stderr,
-                        "ds4: GLM Metal first-token path found unexpected sparse FFN layout in layer %u\n",
-                        il);
-                ok = 0;
-                break;
-            }
-
-            (void)tensor_expert_bytes(model, gl->ffn_gate_exps, 0,
-                                      &gate_in, &gate_out, &gate_row_bytes);
-            (void)tensor_expert_bytes(model, gl->ffn_up_exps, 0,
-                                      &up_in, &up_out, &up_row_bytes);
-            (void)tensor_expert_bytes(model, gl->ffn_down_exps, 0,
-                                      &down_in, &down_out, &down_row_bytes);
-            if (gate_in != DS4_N_EMBD ||
-                up_in != DS4_N_EMBD ||
-                down_in != DS4_N_FF_EXP ||
-                gate_out != DS4_N_FF_EXP ||
-                up_out != DS4_N_FF_EXP ||
-                down_out != DS4_N_EMBD) {
-                fprintf(stderr,
-                        "ds4: GLM Metal first-token path found unexpected expert strides in layer %u\n",
-                        il);
-                ok = 0;
-                break;
-            }
-
-            if (ok) ok = ds4_gpu_matmul_f32_tensor(router_logits,
-                                                   model->map,
-                                                   model->size,
-                                                   gl->ffn_gate_inp->abs_offset,
-                                                   DS4_N_EMBD,
-                                                   DS4_N_EXPERT,
-                                                   ffn_norm,
-                                                   1);
-            if (ok) ok = ds4_gpu_glm_router_select_tensor(router_selected,
-                                                          router_weights,
-                                                          router_probs,
-                                                          model->map,
-                                                          model->size,
-                                                          gl->ffn_exp_probs_b->abs_offset,
-                                                          router_logits,
-                                                          DS4_N_EXPERT,
-                                                          DS4_N_EXPERT_USED,
-                                                          DS4_EXPERT_WEIGHT_SCALE);
-            if (ok) {
-                const ds4_gpu_stream_expert_table table = {
-                    .model_map = model->map,
-                    .model_size = model->size,
-                    .layer = il,
-                    .n_total_expert = DS4_N_EXPERT,
-                    .gate_offset = gl->ffn_gate_exps->abs_offset,
-                    .up_offset = gl->ffn_up_exps->abs_offset,
-                    .down_offset = gl->ffn_down_exps->abs_offset,
-                    .gate_expert_bytes = gate_out * gate_row_bytes,
-                    .down_expert_bytes = down_out * down_row_bytes,
-                };
-                ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-                        &table,
-                        router_selected,
-                        DS4_N_EXPERT_USED) != 0;
-            }
-            ds4_glm_gpu_graph route_g = {
-                .routed_gate = routed_gate,
-                .routed_up = routed_up,
-                .routed_down = routed_down,
-                .ssd_streaming = false,
-                .glm53 = ds4_model_is_glm53(),
-            };
-            if (ok) ok = glm_graph_routed_moe_one_dispatch(
-                    &route_g,
-                    model,
-                    gl,
-                    il,
-                    ffn_out,
-                    ffn_mid,
-                    gate_out * gate_row_bytes,
-                    gate_row_bytes,
-                    up_out * up_row_bytes,
-                    up_row_bytes,
-                    down_out * down_row_bytes,
-                    down_row_bytes,
-                    router_selected,
-                    router_weights,
-                    ffn_norm,
-                    false);
-            if (ok) ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
-                    ffn_gate,
-                    ffn_up,
-                    ffn_mid,
-                    model->map,
-                    model->size,
-                    gl->ffn_gate_shexp->abs_offset,
-                    gl->ffn_up_shexp->abs_offset,
-                    DS4_N_EMBD,
-                    DS4_N_FF_EXP,
-                    ffn_norm,
-                    DS4_SWIGLU_CLAMP_EXP);
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(ffn_sum,
-                                                    model->map,
-                                                    model->size,
-                                                    gl->ffn_down_shexp->abs_offset,
-                                                    DS4_N_FF_EXP,
-                                                    DS4_N_EMBD,
-                                                    ffn_mid,
-                                                    1);
-            if (ok) ok = ds4_gpu_add_tensor(attn_out, ffn_out, ffn_sum, DS4_N_EMBD);
-            if (ok) ok = ds4_gpu_add_tensor(next, after_attn, attn_out, DS4_N_EMBD);
-        }
-
-        if (ok) {
-            ds4_gpu_tensor *tmp = cur;
-            cur = next;
-            next = tmp;
-        }
-    }
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(ffn_norm, cur,
-                                                model->map, model->size,
-                                                weights->output_norm->abs_offset,
-                                                DS4_N_EMBD, DS4_RMS_EPS);
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits,
-                                            model->map,
-                                            model->size,
-                                            weights->output->abs_offset,
-                                            DS4_N_EMBD,
-                                            DS4_N_VOCAB,
-                                            ffn_norm,
-                                            1);
-    if (ok) ok = ds4_gpu_tensor_read(logits, 0, logits_out, logits_bytes) != 0;
-
-    ds4_gpu_tensor_free(router_weights);
-    ds4_gpu_tensor_free(router_selected);
-    ds4_gpu_tensor_free(router_probs);
-    ds4_gpu_tensor_free(router_logits);
-    ds4_gpu_tensor_free(logits);
-    ds4_gpu_tensor_free(next);
-    ds4_gpu_tensor_free(ffn_sum);
-    ds4_gpu_tensor_free(ffn_out);
-    ds4_gpu_tensor_free(routed_down);
-    ds4_gpu_tensor_free(routed_up);
-    ds4_gpu_tensor_free(routed_gate);
-    ds4_gpu_tensor_free(ffn_mid);
-    ds4_gpu_tensor_free(ffn_up);
-    ds4_gpu_tensor_free(ffn_gate);
-    ds4_gpu_tensor_free(ffn_norm);
-    ds4_gpu_tensor_free(after_attn);
-    ds4_gpu_tensor_free(attn_out);
-    ds4_gpu_tensor_free(heads);
-    ds4_gpu_tensor_free(kv_norm);
-    ds4_gpu_tensor_free(kv_raw);
-    ds4_gpu_tensor_free(attn_norm);
-    ds4_gpu_tensor_free(cur);
-    return ok ? 0 : 1;
-}
-
-static DS4_MAYBE_UNUSED int generate_glm_metal_first_token(
-        const ds4_model   * model,
-        const ds4_vocab   * vocab,
-        const ds4_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        ds4_token_emit_fn   emit,
-        ds4_generation_done_fn done,
-        void              * emit_ud) {
-    fprintf(stderr, "ds4: using GLM Metal first-token generation path\n");
-
-    if (prompt->len != 1 || prompt->len > ctx_size) {
-        fprintf(stderr,
-                "ds4: GLM Metal generation currently supports exactly one prompt token; "
-                "multi-token prefill needs the GLM KV/DSA graph\n");
-        return 1;
-    }
-    if (n_predict <= 0) {
-        if (done) done(emit_ud);
-        return 0;
-    }
-    if (n_predict > 1) {
-        fprintf(stderr,
-                "ds4: GLM Metal generation currently emits only the first generated token; "
-                "stopping after one token\n");
-    }
-
-    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    const double t0 = now_sec();
-    const int rc = glm_metal_first_token_logits(model, weights, prompt->v[0], logits);
-    const double t1 = now_sec();
-    if (rc != 0) {
-        free(logits);
-        return 1;
-    }
-
-    if (getenv("DS4_TRACE_TOP") != NULL) {
-        print_top_logits(stderr, "GLM first-token", vocab, logits, DS4_N_VOCAB, 10);
-    }
-    const int token = sample_argmax(logits, DS4_N_VOCAB);
-    if (!vocab_token_is_generation_stop(vocab, token) && emit) emit(emit_ud, token);
-    if (done) done(emit_ud);
-
-    const double eval_s = t1 - t0;
-    ds4_log(stderr,
-            DS4_LOG_TIMING,
-            "ds4: GLM first-token eval: %.2f t/s\n",
-            eval_s > 0.0 ? 1.0 / eval_s : 0.0);
-
-    free(logits);
-    return 0;
 }
 
 static int generate_glm_metal_argmax(
@@ -61170,187 +60497,6 @@ static int glm_metal_compare_i32_list(
 }
 
 #ifndef DS4_NO_GPU
-static void glm_metal_q8_diag_fill_input(float *x, uint64_t n_tok, uint64_t in_dim) {
-    for (uint64_t t = 0; t < n_tok; t++) {
-        for (uint64_t i = 0; i < in_dim; i++) {
-            uint32_t s = (uint32_t)(0x9e3779b9u ^ (uint32_t)(t * 0x85ebca6bu) ^
-                                    (uint32_t)(i * 0xc2b2ae35u));
-            s ^= s >> 16;
-            s *= 0x7feb352du;
-            s ^= s >> 15;
-            s *= 0x846ca68bu;
-            s ^= s >> 16;
-            const float centered = ((float)(int32_t)(s & 0xffffu) - 32768.0f) / 32768.0f;
-            const float scale = 0.25f + 0.015625f * (float)((i + 3u * t) & 31u);
-            x[t * in_dim + i] = centered * scale;
-        }
-    }
-}
-
-static void glm_metal_q8_diag_reference(
-        float            *out,
-        const ds4_model  *model,
-        const ds4_tensor *w,
-        const float      *x,
-        uint64_t          n_tok) {
-    const uint64_t out_dim = w->elements / w->dim[0];
-    for (uint64_t t = 0; t < n_tok; t++) {
-        matvec_q8_0_f32_ref(out + t * out_dim,
-                            model,
-                            w,
-                            x + t * w->dim[0]);
-    }
-}
-
-static int glm_metal_graph_test_q8_prefill_one(
-        ds4_engine       *e,
-        const char       *name,
-        const ds4_tensor *w,
-        int               strict) {
-    if (!w) return 1;
-    if (w->type != DS4_TENSOR_Q8_0 || w->ndim < 2 || w->dim[0] == 0) {
-        fprintf(stderr, "ds4: GLM Q8 prefill diagnostic found unexpected %s layout\n",
-                name);
-        return 0;
-    }
-
-    const ds4_model *model = &e->model;
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t out_dim = w->elements / in_dim;
-    const uint32_t cases[] = { 16u, 17u, 31u, 32u };
-    int ok = 1;
-
-    printf("  q8_prefill_diag: %s ndim=%u in=%llu out=%llu strict=%d\n",
-           name,
-           w->ndim,
-           (unsigned long long)in_dim,
-           (unsigned long long)out_dim,
-           strict);
-
-    for (uint32_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
-        const uint32_t n_tok = cases[ci];
-        if (in_dim > UINT64_MAX / n_tok / sizeof(float) ||
-            out_dim > UINT64_MAX / n_tok / sizeof(float) ||
-            out_dim > UINT32_MAX / n_tok) {
-            fprintf(stderr, "ds4: GLM Q8 prefill diagnostic size overflow in %s token case %u\n",
-                    name,
-                    n_tok);
-            ok = 0;
-            if (strict) break;
-            continue;
-        }
-
-        const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
-        const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
-        if (x_bytes > SIZE_MAX || out_bytes > SIZE_MAX) {
-            fprintf(stderr, "ds4: GLM Q8 prefill diagnostic host allocation is too large in %s token case %u\n",
-                    name,
-                    n_tok);
-            ok = 0;
-            if (strict) break;
-            continue;
-        }
-
-        char label[128];
-        snprintf(label, sizeof(label), "q8_prefill_diag_%s_tok%u", name, n_tok);
-
-        float *x_host = xmalloc((size_t)x_bytes);
-        float *cpu_out = xmalloc((size_t)out_bytes);
-        float *gpu_out = xmalloc((size_t)out_bytes);
-        ds4_gpu_tensor *x_gpu = ds4_gpu_tensor_alloc(x_bytes);
-        ds4_gpu_tensor *out_gpu = ds4_gpu_tensor_alloc(out_bytes);
-        int case_ok = x_gpu && out_gpu;
-
-        if (!case_ok) {
-            fprintf(stderr, "ds4: GLM Q8 prefill diagnostic could not allocate %s token case %u\n",
-                    name,
-                    n_tok);
-        }
-        if (case_ok) {
-            glm_metal_q8_diag_fill_input(x_host, n_tok, in_dim);
-            glm_metal_q8_diag_reference(cpu_out, model, w, x_host, n_tok);
-            case_ok = ds4_gpu_tensor_write(x_gpu, 0, x_host, x_bytes) != 0;
-        }
-        if (case_ok) {
-            case_ok = ds4_gpu_matmul_q8_0_tensor(out_gpu,
-                                                 model->map,
-                                                 model->size,
-                                                 w->abs_offset,
-                                                 in_dim,
-                                                 out_dim,
-                                                 x_gpu,
-                                                 n_tok);
-        }
-        if (case_ok) {
-            case_ok = ds4_gpu_tensor_read(out_gpu, 0, gpu_out, out_bytes) != 0;
-        }
-        if (case_ok) {
-            case_ok = glm_metal_compare_f32(label,
-                                            cpu_out,
-                                            gpu_out,
-                                            (uint32_t)((uint64_t)n_tok * out_dim),
-                                            strict ? 5.0e-2f : 3.0e38f);
-        }
-
-        ds4_gpu_tensor_free(out_gpu);
-        ds4_gpu_tensor_free(x_gpu);
-        free(gpu_out);
-        free(cpu_out);
-        free(x_host);
-
-        if (!case_ok) {
-            ok = 0;
-            if (strict) break;
-        }
-    }
-
-    return ok || !strict;
-}
-
-static int glm_metal_graph_test_q8_prefill(
-        ds4_engine              *e,
-        const ds4_layer_weights *layer) {
-    return 1;
-
-    if (!layer) {
-        fprintf(stderr, "ds4: GLM Q8 prefill diagnostic requires layer weights\n");
-        return 0;
-    }
-
-    const int strict = 0;
-    int ok = 1;
-    const ds4_layer_weights *sparse =
-        DS4_N_LEADING_DENSE < DS4_N_LAYER ? &e->weights.layer[DS4_N_LEADING_DENSE] : NULL;
-
-#define DS4_GLM_Q8_DIAG_ONE(label, tensor)                                      \
-    do {                                                                        \
-        if (!glm_metal_graph_test_q8_prefill_one(e, label, tensor, strict)) {   \
-            ok = 0;                                                             \
-            if (strict) goto done;                                              \
-        }                                                                       \
-    } while (0)
-
-    DS4_GLM_Q8_DIAG_ONE("layer0.attn_q_a", layer->attn_q_a);
-    DS4_GLM_Q8_DIAG_ONE("layer0.attn_q_b", layer->attn_q_b);
-    DS4_GLM_Q8_DIAG_ONE("layer0.attn_kv_a_mqa", layer->attn_kv_a_mqa);
-    DS4_GLM_Q8_DIAG_ONE("layer0.attn_k_b", layer->attn_k_b);
-    DS4_GLM_Q8_DIAG_ONE("layer0.attn_v_b", layer->attn_v_b);
-    DS4_GLM_Q8_DIAG_ONE("layer0.attn_output", layer->attn_output);
-    DS4_GLM_Q8_DIAG_ONE("layer0.ffn_gate", layer->ffn_gate);
-    DS4_GLM_Q8_DIAG_ONE("layer0.ffn_up", layer->ffn_up);
-    DS4_GLM_Q8_DIAG_ONE("layer0.ffn_down", layer->ffn_down);
-
-    if (sparse) {
-        DS4_GLM_Q8_DIAG_ONE("layer3.ffn_gate_shexp", sparse->ffn_gate_shexp);
-        DS4_GLM_Q8_DIAG_ONE("layer3.ffn_up_shexp", sparse->ffn_up_shexp);
-        DS4_GLM_Q8_DIAG_ONE("layer3.ffn_down_shexp", sparse->ffn_down_shexp);
-    }
-
-done:
-#undef DS4_GLM_Q8_DIAG_ONE
-    return strict ? ok : 1;
-}
-
 static int glm_metal_graph_test_multitok_attention(
         ds4_engine              *e,
         const ds4_tokens        *prompt,
@@ -62258,8 +61404,6 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
     }
     if (ok) ok = glm_metal_graph_test_multitok_attention(e, prompt, layer);
     if (ok) ok = glm_metal_graph_test_decode_attention(e, prompt, layer);
-    if (ok) ok = glm_metal_graph_test_q8_prefill(e, layer);
-
     if (ok) {
         memcpy(cpu_cur, cpu_emb, emb_bytes);
         for (uint32_t il = 0; il < sparse_il; il++) {
@@ -72271,7 +71415,6 @@ static bool glm53_graph_encode_native_session_batch(
                                                 after_attn,
                                                 next,
                                                 rows,
-                                                false,
                                                 false,
                                                 false,
                                                 NULL);

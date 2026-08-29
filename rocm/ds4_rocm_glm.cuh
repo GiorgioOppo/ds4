@@ -1103,31 +1103,6 @@ __global__ static void glm_store_indexer_k_kernel(
     }
 }
 
-__global__ static void glm_k_b_project_q8_0_kernel(
-        float *out,
-        const unsigned char *weight,
-        const float *kv_norm,
-        uint32_t n_tokens,
-        uint32_t kv_lora_dim,
-        uint32_t qk_nope,
-        uint32_t n_head,
-        uint32_t row_bytes) {
-    const uint32_t token = blockIdx.x;
-    const uint32_t head = blockIdx.y;
-    const uint32_t q = threadIdx.x + blockIdx.z * blockDim.x;
-    if (token >= n_tokens || head >= n_head || q >= qk_nope) return;
-    const float *kv = kv_norm + (uint64_t)token * kv_lora_dim;
-    float acc = 0.0f;
-    const uint32_t b = q >> 5u;
-    const uint32_t j_in_block = q & 31u;
-    for (uint32_t j = 0; j < kv_lora_dim; j++) {
-        const unsigned char *row = weight + ((uint64_t)head * kv_lora_dim + j) * row_bytes;
-        const unsigned char *blk = row + (uint64_t)b * 34u;
-        acc += q8_0_scale_scalar(blk) * (float)((const int8_t *)(blk + 2u))[j_in_block] * kv[j];
-    }
-    out[((uint64_t)token * n_head + head) * qk_nope + q] = acc;
-}
-
 __global__ static void glm_k_b_project_q8_0_head_kernel(
         float *out,
         const unsigned char *weight,
@@ -1159,46 +1134,6 @@ __global__ static void glm_k_b_project_q8_0_head_kernel(
                    x[j];
         }
         dst[q] = acc;
-    }
-}
-
-__global__ static void glm_q8_project_rows_kernel(
-        float *out,
-        const unsigned char *weight,
-        const float *x,
-        uint32_t n_tokens,
-        uint32_t n_head,
-        uint32_t in_dim,
-        uint32_t out_dim,
-        uint32_t x_stride,
-        uint32_t x_head_stride,
-        uint32_t row_bytes) {
-    const uint32_t out_row = blockIdx.x;
-    const uint32_t token = blockIdx.y;
-    if (token >= n_tokens || out_row >= n_head * out_dim) return;
-    const uint32_t head = out_row / out_dim;
-    const uint32_t d = out_row - head * out_dim;
-    const float *xr = x + (uint64_t)token * x_stride + (uint64_t)head * x_head_stride;
-    const unsigned char *row = weight + ((uint64_t)head * out_dim + d) * row_bytes;
-    float acc = 0.0f;
-    const uint32_t blocks = (in_dim + 31u) >> 5u;
-    for (uint32_t b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const uint32_t base = b << 5u;
-        const uint32_t count = min(32u, in_dim - base);
-        const unsigned char *blk = row + (uint64_t)b * 34u;
-        const float scale = q8_0_scale_scalar(blk);
-        const int8_t *qs = (const int8_t *)(blk + 2u);
-        for (uint32_t i = 0; i < count; i++) acc += scale * (float)qs[i] * xr[base + i];
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0u) {
-        out[((uint64_t)token * n_head + head) * out_dim + d] = partial[0];
     }
 }
 

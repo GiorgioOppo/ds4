@@ -333,16 +333,6 @@ static void *ds4_mmq_aligned_q81_scratch(int device, size_t bytes) {
         ? g_aligned_q81_scratch_ptr : nullptr;
 }
 
-// Legacy generic-scratch ABI.  It must stay false: the grouped arena has a
-// stricter lease contract and callers should inspect its counters/report API.
-extern "C" int ds4_mmq_q81_persistent_enabled(void) {
-    return 0;
-}
-
-extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
-    return g_q81_scratch_ptr;
-}
-
 /* Test-only preflight hook.  It deliberately traverses the production
  * acquire path (including owner/default-stream/capture checks and resize
  * retirement) without enqueueing a synthetic large MMQ fixture. */
@@ -669,10 +659,6 @@ static int64_t d2r_min_cols() {
         }
     }
     return cached;
-}
-
-extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
-    return g_q81_scratch_bytes;
 }
 
 extern "C" int ds4_mmq_init(int device) {

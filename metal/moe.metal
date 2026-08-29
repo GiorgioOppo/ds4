@@ -880,20 +880,6 @@ void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg
     }
 }
 
-static inline float ds4_glm_q2_K_value(device const block_q2_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q2_K *xb = blocks + block;
-    const uint group = idx / 16u;
-    const uint l = idx - group * 16u;
-    const uint q_base = 32u * (group / 8u) + 16u * (group & 1u);
-    const uint shift = ((group / 2u) & 3u) * 2u;
-    const uint q = ((uint)xb->qs[q_base + l] >> shift) & 0x03u;
-    const uint sc = (uint)xb->scales[group];
-    return (float)xb->d * (float)(sc & 0x0fu) * (float)q -
-           (float)xb->dmin * (float)(sc >> 4u);
-}
-
 static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
     return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
@@ -912,115 +898,6 @@ static inline float ds4_glm_q4_K_value(device const block_q4_K *blocks, uint k) 
     const uint q = (xb->qs[byte_off] >> shift) & 0x0Fu;
     return (float)xb->d * (float)sm.x * (float)q -
            (float)xb->dmin * (float)sm.y;
-}
-
-static inline float ds4_glm_q5_K_value(device const block_q5_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q5_K *xb = blocks + block;
-    const uint group = idx / 32u;
-    const uint l = idx - group * 32u;
-    const uchar2 sm = get_scale_min_k4_just2((int)group, 0, xb->scales);
-    const uint ql_base = (group >> 1u) * 32u + l;
-    const uint shift = (group & 1u) * 4u;
-    uint q = (xb->qs[ql_base] >> shift) & 0x0Fu;
-    q += (xb->qh[l] & (uchar)(1u << group)) ? 16u : 0u;
-    return (float)xb->d * (float)sm.x * (float)q -
-           (float)xb->dmin * (float)sm.y;
-}
-
-static inline float ds4_glm_q6_K_value(device const block_q6_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q6_K *xb = blocks + block;
-    const uint n128 = idx >> 7u;
-    const uint r = idx & 127u;
-    const uint l = r & 31u;
-    const uint quarter = r >> 5u;
-    const uint ql_base = n128 * 64u;
-    const uint qh_base = n128 * 32u;
-    const uint sc_base = n128 * 8u;
-    uint q;
-    int sc;
-
-    if (quarter == 0u) {
-        q = (xb->ql[ql_base + l] & 0x0Fu) | (((xb->qh[qh_base + l] >> 0u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 0u];
-    } else if (quarter == 1u) {
-        q = (xb->ql[ql_base + 32u + l] & 0x0Fu) | (((xb->qh[qh_base + l] >> 2u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 2u];
-    } else if (quarter == 2u) {
-        q = (xb->ql[ql_base + l] >> 4u) | (((xb->qh[qh_base + l] >> 4u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 4u];
-    } else {
-        q = (xb->ql[ql_base + 32u + l] >> 4u) | (((xb->qh[qh_base + l] >> 6u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 6u];
-    }
-
-    return (float)xb->d * (float)sc * (float)((int)q - 32);
-}
-
-kernel void kernel_glm_q4_K_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const int32_t *selected,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]]) {
-    const uint ntg = 256u;
-    const uint row = tgpig.x;
-    const uint slot = tgpig.y;
-    const uint token = tgpig.z;
-    if (row >= args.mid_dim || slot >= args.n_expert_used || token >= args.n_tokens) return;
-
-    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    const uint64_t mid_off = (uint64_t)token * args.mid_token_stride +
-                             (uint64_t)slot * args.mid_dim + row;
-    const int expert = selected[selected_off];
-    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
-                            args.tp_rank, args.tp_world)) {
-        if (tid == 0u) mid[mid_off] = 0.0f;
-        return;
-    }
-    const int local_expert = expert - args.tp_expert_base;
-
-    device const block_q4_K *gate_row =
-        (device const block_q4_K *)(gate +
-            (uint64_t)(uint)local_expert * args.gate_expert_bytes +
-            (uint64_t)row * args.gate_row_bytes);
-    device const block_q4_K *up_row =
-        (device const block_q4_K *)(up +
-            (uint64_t)(uint)local_expert * args.up_expert_bytes +
-            (uint64_t)row * args.up_row_bytes);
-
-    float acc_gate = 0.0f;
-    float acc_up = 0.0f;
-    device const float *token_x = x + (uint64_t)token * args.in_dim;
-    for (uint k = tid; k < args.in_dim; k += ntg) {
-        const float xv = token_x[k];
-        acc_gate += ds4_glm_q4_K_value(gate_row, k) * xv;
-        acc_up += ds4_glm_q4_K_value(up_row, k) * xv;
-    }
-
-    scratch[tid] = acc_gate;
-    scratch[ntg + tid] = acc_up;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-            scratch[ntg + tid] += scratch[ntg + tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u) {
-        mid[mid_off] = ds4_glm_swiglu(scratch[0], scratch[ntg],
-                                      args.swiglu_clamp) * weights[selected_off];
-    }
 }
 
 template <short N_R0>
@@ -1646,71 +1523,6 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32(
         expert - args.tp_expert_base, tiisg, sgitg);
 }
 
-kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    if (expert >= args.n_total_expert) return;
-    if (!ds4_tp_owns_expert((int)expert, args.n_total_expert,
-                            args.tp_rank, args.tp_world)) return;
-    const uint count = htpe[expert];
-    const uint map_base = tgpig.y * 32u;
-    for (uint i = 0; i < 32u; i++) {
-        const uint map_row = map_base + i;
-        if (map_row >= count) break;
-        const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-        if (id < 0) continue;
-        const uint token = (uint)id / args.n_expert_used;
-        const uint slot = (uint)id - token * args.n_expert_used;
-        if (slot >= args.n_expert_used || token >= args.n_tokens) continue;
-        const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-        glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K>(
-            args, gate, up, x, weights, mid, scratch,
-            tgpig, slot, token, selected_off,
-            (int)expert - args.tp_expert_base, tiisg, sgitg);
-    }
-}
-
-kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    const uint map_row = tgpig.y;
-    if (expert >= args.n_total_expert || map_row >= htpe[expert]) return;
-    if (!ds4_tp_owns_expert((int)expert, args.n_total_expert,
-                            args.tp_rank, args.tp_world)) return;
-    const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-    if (id < 0) return;
-    const uint token = (uint)id / args.n_expert_used;
-    const uint slot = (uint)id - token * args.n_expert_used;
-    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
-    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K>(
-        args, gate, up, x, weights, mid, scratch,
-        tgpig, slot, token, selected_off,
-        (int)expert - args.tp_expert_base, tiisg, sgitg);
-}
-
 static inline void glm_q5_K_pair_swiglu_f32_impl(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *gate,
@@ -1908,65 +1720,6 @@ kernel void kernel_glm_q5_K_pair_swiglu_f32(
     glm_q5_K_pair_swiglu_f32_impl(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off, expert, tiisg, sgitg);
-}
-
-kernel void kernel_glm_q5_K_pair_swiglu_mapped_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    if (expert >= args.n_total_expert) return;
-    const uint count = htpe[expert];
-    const uint map_base = tgpig.y * 32u;
-    for (uint i = 0; i < 32u; i++) {
-        const uint map_row = map_base + i;
-        if (map_row >= count) break;
-        const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-        if (id < 0) continue;
-        const uint token = (uint)id / args.n_expert_used;
-        const uint slot = (uint)id - token * args.n_expert_used;
-        if (slot >= args.n_expert_used || token >= args.n_tokens) continue;
-        const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-        glm_q5_K_pair_swiglu_f32_impl(
-            args, gate, up, x, weights, mid, scratch,
-            tgpig, slot, token, selected_off, (int)expert, tiisg, sgitg);
-    }
-}
-
-kernel void kernel_glm_q5_K_pair_swiglu_mapped_row_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    const uint map_row = tgpig.y;
-    if (expert >= args.n_total_expert || map_row >= htpe[expert]) return;
-    const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-    if (id < 0) return;
-    const uint token = (uint)id / args.n_expert_used;
-    const uint slot = (uint)id - token * args.n_expert_used;
-    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
-    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    glm_q5_K_pair_swiglu_f32_impl(
-        args, gate, up, x, weights, mid, scratch,
-        tgpig, slot, token, selected_off, (int)expert, tiisg, sgitg);
 }
 
 kernel void kernel_glm_q5_K_down_f32(
@@ -2912,10 +2665,6 @@ struct ds4_metal_q4_gather_slots6_args {
 
 struct ds4_metal_q4_expert_table {
     array<device const char *, 384> experts [[id(0)]];
-};
-
-struct ds4_metal_expert_address_table {
-    device const uint64_t *addrs;
 };
 
 struct ds4_metal_stream_expert_validate_args {

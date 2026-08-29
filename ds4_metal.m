@@ -101,7 +101,6 @@ static id<MTLComputePipelineState> g_cpy_f16_f16_pipeline;
 static id<MTLComputePipelineState> g_cpy_contig_f16_f32_pipeline;
 static id<MTLComputePipelineState> g_cpy_contig_f16_f16_pipeline;
 static id<MTLComputePipelineState> g_flash_kv_stage_f16_pipeline;
-static id<MTLComputePipelineState> g_swiglu_pipeline;
 static id<MTLComputePipelineState> g_swiglu_flat_pipeline;
 static id<MTLComputePipelineState> g_add_pipeline;
 static id<MTLComputePipelineState> g_add2_pipeline;
@@ -252,13 +251,11 @@ static id<MTLComputePipelineState> g_glm_indexer_score_one_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_score_one_direct_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_pipeline;
-static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_sg_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_glm52_t4_pipeline;
-static id<MTLComputePipelineState> g_glm_value_project_q8_0_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_batch_heads_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_batch_heads_mma_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_decode_pipeline;
@@ -275,11 +272,8 @@ static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline;
-static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu2_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu4_f32_pipeline;
-static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline;
-static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline;
@@ -290,8 +284,6 @@ static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_f32_pipeline;
-static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_mapped_f32_pipeline;
-static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_mapped_row_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q5_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q6_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_batch_pipeline;
@@ -376,7 +368,6 @@ typedef struct {
     __strong id<MTLBuffer> flash_attn_pad_buffer;
     __strong id<MTLBuffer> flash_attn_tmp_buffer;
     __strong id<MTLBuffer> flash_attn_blk_buffer;
-    __strong id<MTLBuffer> flash_attn_ring_buffer;
     __strong id<MTLBuffer> flash_attn_kv_buffer;
     __strong id<MTLBuffer> glm_flash_attn_mask_buffer;
     __strong id<MTLBuffer> compressor_pool_kv_buffer;
@@ -410,7 +401,6 @@ typedef struct {
     NSUInteger flash_attn_pad_bytes;
     NSUInteger flash_attn_tmp_bytes;
     NSUInteger flash_attn_blk_bytes;
-    NSUInteger flash_attn_ring_bytes;
     NSUInteger flash_attn_kv_bytes;
     NSUInteger glm_flash_attn_mask_bytes;
     NSUInteger compressor_pool_kv_bytes;
@@ -447,7 +437,6 @@ static ds4_gpu_stream_scratch_state
 #define g_flash_attn_pad_buffer DS4_STREAM_SCRATCH(flash_attn_pad_buffer)
 #define g_flash_attn_tmp_buffer DS4_STREAM_SCRATCH(flash_attn_tmp_buffer)
 #define g_flash_attn_blk_buffer DS4_STREAM_SCRATCH(flash_attn_blk_buffer)
-#define g_flash_attn_ring_buffer DS4_STREAM_SCRATCH(flash_attn_ring_buffer)
 #define g_flash_attn_kv_buffer DS4_STREAM_SCRATCH(flash_attn_kv_buffer)
 #define g_glm_flash_attn_mask_buffer DS4_STREAM_SCRATCH(glm_flash_attn_mask_buffer)
 #define g_compressor_pool_kv_buffer DS4_STREAM_SCRATCH(compressor_pool_kv_buffer)
@@ -478,7 +467,6 @@ static ds4_gpu_stream_scratch_state
 #define g_flash_attn_pad_bytes DS4_STREAM_SCRATCH(flash_attn_pad_bytes)
 #define g_flash_attn_tmp_bytes DS4_STREAM_SCRATCH(flash_attn_tmp_bytes)
 #define g_flash_attn_blk_bytes DS4_STREAM_SCRATCH(flash_attn_blk_bytes)
-#define g_flash_attn_ring_bytes DS4_STREAM_SCRATCH(flash_attn_ring_bytes)
 #define g_flash_attn_kv_bytes DS4_STREAM_SCRATCH(flash_attn_kv_bytes)
 #define g_glm_flash_attn_mask_bytes DS4_STREAM_SCRATCH(glm_flash_attn_mask_bytes)
 #define g_compressor_pool_kv_bytes DS4_STREAM_SCRATCH(compressor_pool_kv_bytes)
@@ -4782,7 +4770,6 @@ void ds4_gpu_print_memory_report(const char *label) {
     uint64_t flash_pad = 0;
     uint64_t flash_tmp = 0;
     uint64_t flash_blk = cached_prefill_blk_bytes;
-    uint64_t flash_ring = 0;
     uint64_t flash_kv = 0;
     uint64_t compressor = 0;
     uint64_t router = 0;
@@ -4800,7 +4787,6 @@ void ds4_gpu_print_memory_report(const char *label) {
         flash_pad += (uint64_t)scratch_state->flash_attn_pad_bytes;
         flash_tmp += (uint64_t)scratch_state->flash_attn_tmp_bytes;
         flash_blk += (uint64_t)scratch_state->flash_attn_blk_bytes;
-        flash_ring += (uint64_t)scratch_state->flash_attn_ring_bytes;
         flash_kv += (uint64_t)scratch_state->flash_attn_kv_bytes;
         compressor += (uint64_t)scratch_state->compressor_pool_kv_bytes +
                       (uint64_t)scratch_state->compressor_pool_score_bytes +
@@ -4828,7 +4814,7 @@ void ds4_gpu_print_memory_report(const char *label) {
         raw_store += (uint64_t)scratch_state->raw_store_round_bytes;
     }
     const uint64_t scratch = flash_mask + flash_pad + flash_tmp + flash_blk +
-                             flash_ring + flash_kv + compressor + router +
+                             flash_kv + compressor + router +
                              indexer + moe + q4_pair_rhs + f16_round +
                              raw_store;
 
@@ -5126,13 +5112,12 @@ void ds4_gpu_print_memory_report(const char *label) {
                 (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
             g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
     fprintf(stderr,
-            "ds4:   scratch %.2f MiB (flash mask %.2f, pad %.2f, tmp %.2f, blk %.2f, ring %.2f, kv %.2f, compressor %.2f, router %.2f, indexer %.2f, moe %.2f, q4-pair-rhs %.2f, f16 %.2f, raw-store %.2f)\n",
+            "ds4:   scratch %.2f MiB (flash mask %.2f, pad %.2f, tmp %.2f, blk %.2f, kv %.2f, compressor %.2f, router %.2f, indexer %.2f, moe %.2f, q4-pair-rhs %.2f, f16 %.2f, raw-store %.2f)\n",
             ds4_gpu_mib(scratch),
             ds4_gpu_mib(flash_mask),
             ds4_gpu_mib(flash_pad),
             ds4_gpu_mib(flash_tmp),
             ds4_gpu_mib(flash_blk),
-            ds4_gpu_mib(flash_ring),
             ds4_gpu_mib(flash_kv),
             ds4_gpu_mib(compressor),
             ds4_gpu_mib(router),
@@ -5264,7 +5249,6 @@ static const char *ds4_gpu_source =
 "#endif\n"
 "#define N_SIMDWIDTH 32\n"
 "#define N_R0_Q8_0 2\n"
-"#define N_SG_Q8_0 4\n"
 "#define FC_MUL_MV 600\n"
 "#define FC_MUL_MM 700\n"
 "#define FC_BIN 1300\n"
@@ -7897,23 +7881,6 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        fn = [library newFunctionWithName:@"kernel_swiglu_f32"];
-        if (!fn) {
-            fprintf(stderr, "ds4: Metal kernel_swiglu_f32 function not found\n");
-            g_queue = nil;
-            g_device = nil;
-            return 0;
-        }
-
-        g_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
-        if (!g_swiglu_pipeline) {
-            fprintf(stderr, "ds4: Metal kernel_swiglu_f32 pipeline failed: %s\n",
-                    [[error localizedDescription] UTF8String]);
-            g_queue = nil;
-            g_device = nil;
-            return 0;
-        }
-
         fn = [library newFunctionWithName:@"kernel_swiglu_flat_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_swiglu_flat_f32 function not found\n");
@@ -9603,8 +9570,6 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_indexer_scores_batch");
         g_glm_indexer_scores_tiled_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled");
-        g_glm_indexer_scores_tiled_f32_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled_f32");
         g_glm_qk_lowrank_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0");
         g_glm_qk_lowrank_glm52_pipeline =
@@ -9615,8 +9580,6 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch");
         g_glm_qk_lowrank_batch_glm52_t4_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_glm52_t4");
-        g_glm_value_project_q8_0_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm_value_project_q8_0");
         g_glm_value_project_q8_0_batch_heads_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_value_project_q8_0_batch_heads");
         g_glm_value_project_q8_0_batch_heads_mma_pipeline =
@@ -9649,16 +9612,10 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_causal");
         g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads");
-        g_glm_q4_k_pair_swiglu_f32_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu_f32");
         g_glm_q4_k_pair_swiglu2_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu2_f32");
         g_glm_q4_k_pair_swiglu4_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32");
-        g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu2_mapped_f32");
-        g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu2_mapped_row_f32");
         g_glm_q2_k_pair_swiglu_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_pair_swiglu_f32");
         g_glm_q2_k_addr_pair_swiglu2_f32_pipeline =
@@ -9679,10 +9636,6 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q4_K_addr_down_simd_f32");
         g_glm_q5_k_pair_swiglu_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q5_K_pair_swiglu_f32");
-        g_glm_q5_k_pair_swiglu_mapped_f32_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm_q5_K_pair_swiglu_mapped_f32");
-        g_glm_q5_k_pair_swiglu_mapped_row_f32_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm_q5_K_pair_swiglu_mapped_row_f32");
         g_glm_q5_k_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q5_K_down_f32");
         g_glm_q6_k_down_f32_pipeline =
@@ -9727,13 +9680,11 @@ int ds4_gpu_init(void) {
             !g_glm_indexer_score_one_direct_pipeline ||
             !g_glm_indexer_scores_batch_pipeline ||
             !g_glm_indexer_scores_tiled_pipeline ||
-            !g_glm_indexer_scores_tiled_f32_pipeline ||
             !g_glm_qk_lowrank_pipeline ||
             !g_glm_qk_lowrank_glm52_pipeline ||
             !g_glm_qk_lowrank_glm52_sg_pipeline ||
             !g_glm_qk_lowrank_batch_pipeline ||
             !g_glm_qk_lowrank_batch_glm52_t4_pipeline ||
-            !g_glm_value_project_q8_0_pipeline ||
             !g_glm_value_project_q8_0_batch_heads_pipeline ||
             !g_glm_value_project_q8_0_batch_heads_mma_pipeline ||
             !g_glm_attention_indexed_decode_pipeline ||
@@ -9750,11 +9701,8 @@ int ds4_gpu_init(void) {
             !g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline ||
-            !g_glm_q4_k_pair_swiglu_f32_pipeline ||
             !g_glm_q4_k_pair_swiglu2_f32_pipeline ||
             !g_glm_q4_k_pair_swiglu4_f32_pipeline ||
-            !g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline ||
-            !g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline ||
             !g_glm_q2_k_pair_swiglu_f32_pipeline ||
             !g_glm_q2_k_addr_pair_swiglu2_f32_pipeline ||
             !g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline ||
@@ -9765,8 +9713,6 @@ int ds4_gpu_init(void) {
             !g_glm_q2_k_addr_down_f32_pipeline ||
             !g_glm_q4_k_addr_down_f32_pipeline ||
             !g_glm_q5_k_pair_swiglu_f32_pipeline ||
-            !g_glm_q5_k_pair_swiglu_mapped_f32_pipeline ||
-            !g_glm_q5_k_pair_swiglu_mapped_row_f32_pipeline ||
             !g_glm_q5_k_down_f32_pipeline ||
             !g_glm_q6_k_down_f32_pipeline ||
             !g_dsv4_hc_expand4_pipeline) {
@@ -11826,7 +11772,6 @@ void ds4_gpu_cleanup(void) {
         g_cpy_contig_f16_f32_pipeline = nil;
         g_cpy_contig_f16_f16_pipeline = nil;
         g_flash_kv_stage_f16_pipeline = nil;
-        g_swiglu_pipeline = nil;
         g_swiglu_flat_pipeline = nil;
         g_add_pipeline = nil;
         g_add2_pipeline = nil;
@@ -11976,13 +11921,11 @@ void ds4_gpu_cleanup(void) {
         g_glm_indexer_score_one_direct_pipeline = nil;
         g_glm_indexer_scores_batch_pipeline = nil;
         g_glm_indexer_scores_tiled_pipeline = nil;
-        g_glm_indexer_scores_tiled_f32_pipeline = nil;
         g_glm_qk_lowrank_pipeline = nil;
         g_glm_qk_lowrank_glm52_pipeline = nil;
         g_glm_qk_lowrank_glm52_sg_pipeline = nil;
         g_glm_qk_lowrank_batch_pipeline = nil;
         g_glm_qk_lowrank_batch_glm52_t4_pipeline = nil;
-        g_glm_value_project_q8_0_pipeline = nil;
         g_glm_value_project_q8_0_batch_heads_pipeline = nil;
         g_glm_value_project_q8_0_batch_heads_mma_pipeline = nil;
         g_glm_attention_indexed_decode_pipeline = nil;
@@ -11999,11 +11942,8 @@ void ds4_gpu_cleanup(void) {
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline = nil;
-        g_glm_q4_k_pair_swiglu_f32_pipeline = nil;
         g_glm_q4_k_pair_swiglu2_f32_pipeline = nil;
         g_glm_q4_k_pair_swiglu4_f32_pipeline = nil;
-        g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline = nil;
-        g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline = nil;
         g_glm_q2_k_pair_swiglu_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline = nil;
@@ -12014,8 +11954,6 @@ void ds4_gpu_cleanup(void) {
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
         g_glm_q5_k_pair_swiglu_f32_pipeline = nil;
-        g_glm_q5_k_pair_swiglu_mapped_f32_pipeline = nil;
-        g_glm_q5_k_pair_swiglu_mapped_row_f32_pipeline = nil;
         g_glm_q5_k_down_f32_pipeline = nil;
         g_glm_q6_k_down_f32_pipeline = nil;
         g_dsv4_router_weights_batch_pipeline = nil;
@@ -12031,7 +11969,6 @@ void ds4_gpu_cleanup(void) {
             g_flash_attn_pad_buffer = nil;
             g_flash_attn_tmp_buffer = nil;
             g_flash_attn_blk_buffer = nil;
-            g_flash_attn_ring_buffer = nil;
             g_flash_attn_kv_buffer = nil;
             g_glm_flash_attn_mask_buffer = nil;
             g_compressor_pool_kv_buffer = nil;
@@ -12085,7 +12022,6 @@ void ds4_gpu_cleanup(void) {
             g_flash_attn_pad_bytes = 0;
             g_flash_attn_tmp_bytes = 0;
             g_flash_attn_blk_bytes = 0;
-            g_flash_attn_ring_bytes = 0;
             g_flash_attn_kv_bytes = 0;
             g_glm_flash_attn_mask_bytes = 0;
             g_compressor_pool_kv_bytes = 0;
@@ -41720,15 +41656,12 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         }
 
         const bool force_scalar = g_quality_mode;
-        const bool use_tiled_f32 = false;
         const bool use_tiled = !force_scalar && n_tokens >= 8u &&
                                n_head == 32u && head_dim == 128u;
         id<MTLComputePipelineState> pipeline =
             use_tiled
-                ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
-                                                     : g_glm_indexer_scores_tiled_pipeline,
-                                       use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
-                                                     : "kernel_glm_indexer_scores_tiled")
+                ? ds4_gpu_hot_pipeline(g_glm_indexer_scores_tiled_pipeline,
+                                       "kernel_glm_indexer_scores_tiled")
                 : ds4_gpu_hot_pipeline(g_glm_indexer_scores_batch_pipeline,
                                        "kernel_glm_indexer_scores_batch");
         if (!pipeline) return 0;
@@ -41765,13 +41698,8 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
             const NSUInteger dot_shared = 8u * 32u;
-            if (use_tiled_f32) {
-                [enc setThreadgroupMemoryLength:(q_shared + k_shared + dot_shared) *
-                                                sizeof(float) atIndex:0];
-            } else {
-                [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
-                                                dot_shared * sizeof(float) atIndex:0];
-            }
+            [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
+                                            dot_shared * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
@@ -44334,11 +44262,6 @@ static bool ds4_gpu_glm_routed_moe_batch_grouped_available(
            ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) != nil;
 }
 
-static bool ds4_gpu_glm_grouped_moe_layer_enabled(uint32_t layer_index) {
-    (void)layer_index;
-    return true;
-}
-
 static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -44364,7 +44287,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   swiglu_clamp,
-        uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens) {
     if (!ds4_gpu_glm_routed_moe_batch_grouped_available(gate_type,
@@ -44389,14 +44311,13 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         return 0;
     }
 
-    const bool mid_f16 = true;
     const NSUInteger mm_id_threadgroup_bytes = 8192u;
     const uint64_t compact_mid_values = (uint64_t)pair_rows * expert_mid_dim;
     const uint64_t down_values = (uint64_t)pair_rows * out_dim;
     const uint64_t x_values = (uint64_t)n_tokens * expert_in_dim;
     const uint64_t out_values = (uint64_t)n_tokens * out_dim;
     if (compact_mid_values > UINT64_MAX / sizeof(float) ||
-        compact_mid_values > UINT64_MAX / (mid_f16 ? sizeof(uint16_t) : sizeof(float)) ||
+        compact_mid_values > UINT64_MAX / sizeof(uint16_t) ||
         down_values > UINT64_MAX / sizeof(float) ||
         x_values > UINT64_MAX / sizeof(float) ||
         out_values > UINT64_MAX / sizeof(float)) {
@@ -44404,7 +44325,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
     }
 
     const uint64_t gate_scratch_bytes = compact_mid_values * sizeof(float);
-    const uint64_t mid_bytes = compact_mid_values * (mid_f16 ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t mid_bytes = compact_mid_values * sizeof(uint16_t);
     const uint64_t down_scratch_bytes = down_values * sizeof(float);
     const uint64_t x_bytes = x_values * sizeof(float);
     const uint64_t out_bytes = out_values * sizeof(float);
@@ -44495,7 +44416,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
             ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, n_total_expert,
                                                     down_row_bytes, down_expert_bytes,
                                                     n_expert, n_expert, n_tokens,
-                                                    mid_f16 ? sizeof(uint16_t) : sizeof(float));
+                                                    sizeof(uint16_t));
         gate_args.tp_rank = g_tp_split_rank;
         gate_args.tp_world = g_tp_split_world;
         gate_args.tp_expert_base = (int32_t)first_expert;
@@ -44509,57 +44430,13 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        const bool glm_moe_stage_profile = false;
-        const char *glm_moe_stage_filter = NULL;
-        double glm_moe_stage_t0 = 0.0;
-        if (glm_moe_stage_profile) {
-            if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-                return 0;
-            }
-            cb = ds4_gpu_command_buffer(&owned);
-            if (!cb) return 0;
-            glm_moe_stage_t0 = ds4_gpu_now_ms();
-        }
-
         int ok = 1;
-#define DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE(name) do { \
-            if (ok && glm_moe_stage_profile) { \
-                if (ds4_gpu_end_commands() == 0) { \
-                    ok = 0; \
-                } else { \
-                    const char *stage_name = (name); \
-                    const double now_ms = ds4_gpu_now_ms(); \
-                    const int print_stage = \
-                        !glm_moe_stage_filter || !glm_moe_stage_filter[0] || \
-                        strstr(stage_name, glm_moe_stage_filter) != NULL; \
-                    if (print_stage) { \
-                        fprintf(stderr, \
-                                "ds4: Metal GLM grouped routed MoE stage layer=%u tokens=%u pairs=%u experts=%u " \
-                                "gate=%s down=%s mid=%s %s=%.3f ms\n", \
-                                layer_index, n_tokens, pair_rows, n_expert, \
-                                ds4_gpu_metal_tensor_type_name(gate_type), \
-                                ds4_gpu_metal_tensor_type_name(down_type), \
-                                mid_f16 ? "f16" : "f32", \
-                                stage_name, now_ms - glm_moe_stage_t0); \
-                    } \
-                    glm_moe_stage_t0 = now_ms; \
-                    if (ds4_gpu_begin_commands() == 0) { \
-                        ok = 0; \
-                    } else { \
-                        cb = ds4_gpu_command_buffer(&owned); \
-                        if (!cb) ok = 0; \
-                    } \
-                } \
-            } \
-        } while (0)
-
         ok = ds4_gpu_encode_mul_mm_id_map(cb,
                                            map_pipeline,
                                            &map_args,
                                            &gate_args,
                                            selectedbuf,
                                            ds4_gpu_tensor_offset(selected));
-        DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("map");
         if (ok) {
             ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
                                                        gate_pipeline,
@@ -44572,7 +44449,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        0,
                                                        mm_id_threadgroup_bytes);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("gate");
         if (ok) {
             ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
                                                        up_pipeline,
@@ -44585,7 +44461,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        (NSUInteger)gate_scratch_bytes,
                                                        mm_id_threadgroup_bytes);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("up");
         if (ok) {
             ok = ds4_gpu_encode_moe_swiglu_weight(cb,
                                                    g_moe_gate_scratch_buffer,
@@ -44599,10 +44474,8 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                    expert_mid_dim,
                                                    pair_rows,
                                                    swiglu_clamp,
-                                                   mid_f16);
+                                                   true);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("activation_weight");
-
         id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : g_moe_down_scratch_buffer;
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) : 0;
         if (ok) {
@@ -44617,7 +44490,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        down_dst_off,
                                                        mm_id_threadgroup_bytes);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("down");
         if (ok && n_expert > 1) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
                                                  down_dst,
@@ -44628,13 +44500,11 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                  n_expert,
                                                  n_tokens);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("sum");
         if (!ok) return 0;
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM grouped routed batch MoE")) {
             return 0;
         }
-#undef DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE
     }
 
     return 1;
@@ -44666,7 +44536,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
         uint32_t               n_total_expert,
         uint32_t               n_expert,
         float                  swiglu_clamp,
-        uint32_t               layer_index,
         const ds4_gpu_tensor *x,
         uint32_t               n_tokens,
         ds4_gpu_stream_expert_cache_entry * const *resources,
@@ -44689,7 +44558,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
         return 0;
     }
 
-    const bool mid_f16 = true;
     const NSUInteger mm_id_threadgroup_bytes = 8192u;
     const uint64_t compact_mid_values = (uint64_t)pair_rows * expert_mid_dim;
     const uint64_t down_values = (uint64_t)pair_rows * out_dim;
@@ -44784,56 +44652,13 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        const bool glm_moe_stage_profile = false;
-        const char *glm_moe_stage_filter = NULL;
-        double glm_moe_stage_t0 = 0.0;
-        if (glm_moe_stage_profile) {
-            if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-                return 0;
-            }
-            cb = ds4_gpu_command_buffer(&owned);
-            if (!cb) return 0;
-            glm_moe_stage_t0 = ds4_gpu_now_ms();
-        }
-
         int ok = 1;
-#define DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE(name) do { \
-            if (ok && glm_moe_stage_profile) { \
-                if (ds4_gpu_end_commands() == 0) { \
-                    ok = 0; \
-                } else { \
-                    const char *stage_name = (name); \
-                    const double now_ms = ds4_gpu_now_ms(); \
-                    const int print_stage = \
-                        !glm_moe_stage_filter || !glm_moe_stage_filter[0] || \
-                        strstr(stage_name, glm_moe_stage_filter) != NULL; \
-                    if (print_stage) { \
-                        fprintf(stderr, \
-                                "ds4: Metal GLM grouped-address routed MoE stage layer=%u tokens=%u pairs=%u experts=%u " \
-                                "gate=%s down=%s mid=f16 %s=%.3f ms\n", \
-                                layer_index, n_tokens, pair_rows, n_expert, \
-                                ds4_gpu_metal_tensor_type_name(gate_type), \
-                                ds4_gpu_metal_tensor_type_name(down_type), \
-                                stage_name, now_ms - glm_moe_stage_t0); \
-                    } \
-                    glm_moe_stage_t0 = now_ms; \
-                    if (ds4_gpu_begin_commands() == 0) { \
-                        ok = 0; \
-                    } else { \
-                        cb = ds4_gpu_command_buffer(&owned); \
-                        if (!cb) ok = 0; \
-                    } \
-                } \
-            } \
-        } while (0)
-
         ok = ds4_gpu_encode_mul_mm_id_map(cb,
                                            map_pipeline,
                                            &map_args,
                                            &gate_args,
                                            selectedbuf,
                                            ds4_gpu_tensor_offset(selected));
-        DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE("map");
         if (ok) {
             ok = ds4_gpu_encode_mul_mm_id_addr_mapped_tile(cb,
                                                            gate_pipeline,
@@ -44849,7 +44674,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
                                                            0,
                                                            overflow_gate);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE("gate");
         if (ok) {
             ok = ds4_gpu_encode_mul_mm_id_addr_mapped_tile(cb,
                                                            up_pipeline,
@@ -44865,7 +44689,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
                                                            1,
                                                            overflow_up);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE("up");
         if (ok) {
             ok = ds4_gpu_encode_moe_swiglu_weight(cb,
                                                    g_moe_gate_scratch_buffer,
@@ -44879,10 +44702,8 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
                                                    expert_mid_dim,
                                                    pair_rows,
                                                    swiglu_clamp,
-                                                   mid_f16);
+                                                   true);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE("activation_weight");
-
         id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : g_moe_down_scratch_buffer;
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) : 0;
         if (ok) {
@@ -44900,7 +44721,6 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
                                                            2,
                                                            overflow_down);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE("down");
         if (ok && n_expert > 1) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
                                                  down_dst,
@@ -44911,14 +44731,12 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
                                                  n_expert,
                                                  n_tokens);
         }
-        DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE("sum");
         if (!ok) return 0;
 
         if (!ds4_gpu_finish_command_buffer(cb, owned,
                                            "GLM grouped-address routed batch MoE")) {
             return 0;
         }
-#undef DS4_METAL_PROFILE_GLM_GROUPED_ADDR_MOE_STAGE
     }
 
     return 1;
@@ -44953,8 +44771,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride,
-        bool                    allow_grouped,
-        bool                    force_scalar_q4_pair) {
+        bool                    allow_grouped) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_tokens == 0 ||
@@ -45007,7 +44824,6 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
     if (allow_grouped &&
         (!g_ssd_streaming_mode ||
          ds4_gpu_glm_streaming_prefill_full_layer_active()) &&
-        ds4_gpu_glm_grouped_moe_layer_enabled(layer_index) &&
         ds4_gpu_glm_routed_moe_batch_grouped_available(gate_type,
                                                        up_type,
                                                        down_type,
@@ -45037,7 +44853,6 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                                            n_total_expert,
                                                            n_expert,
                                                            swiglu_clamp,
-                                                           layer_index,
                                                            x,
                                                            n_tokens);
     }
@@ -45149,12 +44964,6 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                                            down_type,
                                                            n_expert,
                                                            n_tokens);
-        const BOOL enable_q4_pair4 = true;
-        const BOOL q4_scalar_pair = false;
-        const BOOL q4_pair2 =
-            !use_stream_expert_addr_table &&
-            !gate_pair_q5 && !q4_scalar_pair &&
-            (force_scalar_q4_pair || !enable_q4_pair4);
         id<MTLComputePipelineState> pair_pipeline =
             use_stream_expert_addr_table ?
              (gate_pair_q2 ?
@@ -45168,14 +44977,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             gate_pair_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_pair_swiglu_f32_pipeline,
                                   "kernel_glm_q5_K_pair_swiglu_f32") :
-            (q4_scalar_pair ?
-             ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu_f32_pipeline,
-                                  "kernel_glm_q4_K_pair_swiglu_f32") :
-             q4_pair2 ?
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu2_f32") :
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu4_f32"));
+             ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
+                                  "kernel_glm_q4_K_pair_swiglu4_f32");
         id<MTLComputePipelineState> down_pipeline =
             use_stream_expert_addr_table ?
              (down_scalar_q2 ?
@@ -45261,7 +45064,6 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         n_total_expert,
                         n_expert,
                         swiglu_clamp,
-                        layer_index,
                         x,
                         n_tokens,
                         stream_resources,
@@ -45283,63 +45085,6 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
-
-        const bool glm_moe_stage_profile = false;
-        const char *glm_moe_stage_filter = NULL;
-        const char *glm_pair_path = use_stream_expert_addr_table ?
-                                    (gate_pair_q2 ? "q2_stream_addr_swiglu" :
-                                                    "q4_stream_addr_swiglu") :
-                                    gate_pair_q2 ? "q2_scalar_swiglu" :
-                                    gate_pair_q5 ? "q5_pair_simd_swiglu" :
-                                    (q4_scalar_pair ? "q4_scalar_swiglu" :
-                                    (q4_pair2 ? "q4_pair2_simd_swiglu" :
-                                                "q4_pair4_simd_swiglu"));
-        const char *glm_down_path =
-            use_stream_expert_addr_table ?
-            (down_scalar_q2 ? "q2_stream_addr_down" : "q4_stream_addr_down_simd") :
-            down_scalar_q2 ? "q2_down_scalar" :
-            down_scalar_q4 ? "q4_down_simd" :
-            down_simd_q5 ? "q5_down_simd" : "q6_down_simd";
-        double glm_moe_stage_t0 = 0.0;
-        if (glm_moe_stage_profile) {
-            if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-                return 0;
-            }
-            cb = ds4_gpu_command_buffer(&owned);
-            if (!cb) return 0;
-            glm_moe_stage_t0 = ds4_gpu_now_ms();
-        }
-        int ok = 1;
-#define DS4_METAL_PROFILE_GLM_MOE_BATCH_STAGE(name) do { \
-            if (ok && glm_moe_stage_profile) { \
-                if (ds4_gpu_end_commands() == 0) { \
-                    ok = 0; \
-                } else { \
-                    const char *stage_name = (name); \
-                    const double now_ms = ds4_gpu_now_ms(); \
-                    const int print_stage = \
-                        !glm_moe_stage_filter || !glm_moe_stage_filter[0] || \
-                        strstr(stage_name, glm_moe_stage_filter) != NULL; \
-                    if (print_stage) { \
-                        fprintf(stderr, \
-                                "ds4: Metal GLM routed MoE batch stage layer=%u tokens=%u experts=%u " \
-                                "gate=%s down=%s pair=%s down_path=%s %s=%.3f ms\n", \
-                                layer_index, n_tokens, n_expert, \
-                                ds4_gpu_metal_tensor_type_name(gate_type), \
-                                ds4_gpu_metal_tensor_type_name(down_type), \
-                                glm_pair_path, glm_down_path, \
-                                stage_name, now_ms - glm_moe_stage_t0); \
-                    } \
-                    glm_moe_stage_t0 = now_ms; \
-                    if (ds4_gpu_begin_commands() == 0) { \
-                        ok = 0; \
-                    } else { \
-                        cb = ds4_gpu_command_buffer(&owned); \
-                        if (!cb) ok = 0; \
-                    } \
-                } \
-            } \
-        } while (0)
 
         ds4_gpu_glm_routed_moe_args args = {
             .tp_rank = g_tp_split_rank,
@@ -45367,13 +45112,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                             (NSUInteger)((expert_mid_dim + 7u) / 8u)) :
             gate_pair_q5 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
             use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
-            q4_scalar_pair ? (NSUInteger)expert_mid_dim :
-            q4_pair2 ? (NSUInteger)((expert_mid_dim + 1u) / 2u) :
             (NSUInteger)((expert_mid_dim + 7u) / 8u);
-        const NSUInteger pair_threadgroup_bytes =
-            q4_scalar_pair ? 512u * sizeof(float) : 0u;
-        const NSUInteger pair_threads =
-            q4_scalar_pair ? 256u : 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
             down_simd_q4 ? (NSUInteger)((out_dim + 3u) / 4u) :
@@ -45412,16 +45151,11 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             if (stream_overflow_gate) [enc useResource:stream_overflow_gate usage:MTLResourceUsageRead];
             if (stream_overflow_up) [enc useResource:stream_overflow_up usage:MTLResourceUsageRead];
         }
-        if (pair_threadgroup_bytes != 0u) {
-            [enc setThreadgroupMemoryLength:pair_threadgroup_bytes atIndex:0];
-        }
         [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups,
                                               (NSUInteger)n_expert,
                                               (NSUInteger)n_tokens)
-             threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(64u, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_GLM_MOE_BATCH_STAGE("pair");
-
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:down_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -45445,11 +45179,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                               1)
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_GLM_MOE_BATCH_STAGE("down");
-
-        if (!ok) return 0;
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed batch MoE")) return 0;
-#undef DS4_METAL_PROFILE_GLM_MOE_BATCH_STAGE
     }
 
     return 1;
@@ -45514,8 +45244,7 @@ int ds4_gpu_glm_routed_moe_batch_tensor(
                                                     x,
                                                     n_tokens,
                                                     mid_token_stride,
-                                                    true,
-                                                    false);
+                                                    true);
 }
 
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
@@ -45575,7 +45304,6 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
                                                     x,
                                                     n_tokens,
                                                     mid_token_stride,
-                                                    false,
                                                     false);
 }
 

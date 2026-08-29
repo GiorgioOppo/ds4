@@ -147,10 +147,6 @@ extern "C" void ds4_pool_set_stream(cudaStream_t stream) {
     t_ds4_pool_stream = stream;
 }
 
-extern "C" cudaStream_t ds4_pool_get_stream(void) {
-    return t_ds4_pool_stream;
-}
-
 namespace {
 
 struct ds4_naive_pool : public ggml_cuda_pool {

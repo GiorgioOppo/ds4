@@ -1,6 +1,5 @@
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm.h"
-#include <hipblaslt/hipblaslt.h>
 #include <rocblas/rocblas.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
@@ -65,7 +64,6 @@ extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
 #endif
 
 #define CUDA_QK_K 256
-#define DS4_ROCM_UNUSED __attribute__((unused))
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -113,13 +111,6 @@ typedef struct {
 } cuda_block_mxfp4;
 
 static_assert(sizeof(cuda_block_mxfp4) == 17, "cuda_block_mxfp4 must match the GGUF MXFP4 block layout");
-
-/* Twice the MXFP4 values so each 32-value sub-block can use signed-int8
- * dp4a; the factor of 1/2 is folded into the sub-block scale. */
-__device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
-     0,  1,  2,  3,  4,  6,  8,  12,
-     0, -1, -2, -3, -4, -6, -8, -12,
-};
 
 #include "ds4_iq2_tables_cuda.inc"
 
