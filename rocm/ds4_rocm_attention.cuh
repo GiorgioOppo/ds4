@@ -1717,6 +1717,8 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
             }
             sh_qp[hl * STRIDE + kl] = __float2half(p);
         }
+        }
+        __syncthreads();
 #pragma unroll
         for (uint32_t delta = 1u; delta < 16u; delta <<= 1u) {
             block_sum += __shfl_xor_sync(FULL_WARP_MASK, block_sum, delta, 32);
