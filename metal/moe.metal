@@ -9954,7 +9954,7 @@ kernel void kernel_mul_mm_id_mpp(
         device const block_q * xb = x_base + (chunk / nl);
 
         if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
-            for (short i = 0; i < 16; i++) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
                 const short sy = (tiitg/NL0)/8;
                 const short lx = i%8;
