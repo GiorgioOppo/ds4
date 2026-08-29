@@ -343,7 +343,7 @@ static int encode_pair(fixture *f, ds4_gpu_tensor *out0,
     return ds4_gpu_matmul_q4_K_pair_tensor(
         out0, out1, f->model, f->model_size,
         f->weight0_offset, f->weight1_offset,
-        IN_DIM, OUT0_DIM, OUT1_DIM, x, rows);
+        IN_DIM, OUT0_DIM, OUT1_DIM, x, rows) > 0;
 }
 
 static int run_arm_once_with_options(fixture *f, test_arm arm,

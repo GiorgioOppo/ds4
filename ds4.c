@@ -23959,7 +23959,7 @@ static bool metal_graph_encode_decode_layer_phase(
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused && qkv_proj_q4 &&
         g->cuda_qkv_pair &&
         !qkv_pair_projected && !metal_graph_use_reference_qkv_pair_proj()) {
-        qkv_pair_projected = ds4_gpu_matmul_q4_K_pair_tensor(
+        const int pair_rc = ds4_gpu_matmul_q4_K_pair_tensor(
                 metal_graph_qr(g),
                 metal_graph_kv_raw(g),
                 model->map,
@@ -23970,7 +23970,12 @@ static bool metal_graph_encode_decode_layer_phase(
                 q_rank,
                 DS4_N_HEAD_DIM,
                 metal_graph_attn_norm(g),
-                1) != 0;
+                1);
+        if (pair_rc < 0) {
+            ok = false;
+        } else {
+            qkv_pair_projected = pair_rc > 0;
+        }
     }
     if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
         ok = metal_graph_matmul_dense_quant_tensor(metal_graph_qr(g),
@@ -30177,12 +30182,17 @@ static bool metal_graph_encode_layer_attention_batch(
         !metal_graph_use_reference_qkv_pair_proj() && n_tokens >= 2u &&
         layer->attn_q_a->type == DS4_TENSOR_Q4_K &&
         layer->attn_kv->type == DS4_TENSOR_Q4_K) {
-        qkv_q4_pair_projected = ds4_gpu_matmul_q4_K_pair_tensor(
+        const int pair_rc = ds4_gpu_matmul_q4_K_pair_tensor(
             metal_graph_batch_qr(g), metal_graph_batch_kv_raw(g),
             model->map, model->size,
             layer->attn_q_a->abs_offset, layer->attn_kv->abs_offset,
             DS4_N_EMBD, q_rank, DS4_N_HEAD_DIM,
-            metal_graph_batch_attn_norm(g), n_tokens) != 0;
+            metal_graph_batch_attn_norm(g), n_tokens);
+        if (pair_rc < 0) {
+            ok = false;
+        } else {
+            qkv_q4_pair_projected = pair_rc > 0;
+        }
     }
     if (ok && !qkv_q4_pair_projected) {
         ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",

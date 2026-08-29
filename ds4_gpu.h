@@ -1125,8 +1125,8 @@ int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         const ds4_gpu_tensor *x);
 
 /* Optional dense Q4_K pair for decode, microbatch, and prefill. Backends
- * without a beneficial paired kernel return zero and request separate
- * fallback matmuls from the graph. */
+ * return 1 when the pair was encoded, 0 to request separate fallback
+ * matmuls from the graph, and -1 after a required/attempted-path error. */
 int ds4_gpu_matmul_q4_K_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

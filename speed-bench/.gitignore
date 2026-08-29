@@ -4,4 +4,5 @@ local-runs/
 metal_decode_schedule_bench
 metal_prefill_variant_bench
 metal_q4_dense_pair_bench
+metal_q4_prefill_pair_bench
 metal_q4_mm_tail_cull_bench

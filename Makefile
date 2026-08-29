@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-ssd environment-docs test-quantizer-indexer-q4 test-rocm test-glm53-kda-rocm test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-indexer-q4 test-metal-q4-attn-exactn test-metal-q4-qb-f16-cache test-metal-q4-qb-f16-cache-timing test-metal-exactn-oracle test-metal-dspark-capture test-metal-argmax-top1 bench-metal-argmax-top1 test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-metal test-mxfp4-cuda test-mxfp4-rocm test-mmq-parity-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cuda-iq2-moe-prefill-bench cuda-q4-prefill-bench rocm-iq2-moe-prefill-bench rocm-q4-prefill-bench
+.PHONY: all help clean test test-ssd environment-docs test-quantizer-indexer-q4 test-rocm test-glm53-kda-rocm test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-q4-prefill-pair test-metal-indexer-q4 test-metal-q4-attn-exactn test-metal-q4-qb-f16-cache test-metal-q4-qb-f16-cache-timing test-metal-exactn-oracle test-metal-dspark-capture test-metal-argmax-top1 bench-metal-argmax-top1 test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-metal test-mxfp4-cuda test-mxfp4-rocm test-mmq-parity-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cuda-iq2-moe-prefill-bench cuda-q4-prefill-bench rocm-iq2-moe-prefill-bench rocm-q4-prefill-bench
 
 gguf-tools/deepseek4-quantize: gguf-tools/deepseek4-quantize.c gguf-tools/quants.c gguf-tools/quants.h
 	$(MAKE) -C gguf-tools deepseek4-quantize
@@ -81,7 +81,7 @@ test-quantizer-indexer-q4: gguf-tools/deepseek4-quantize tests/test_quantizer_in
 	./tests/test_quantizer_indexer_q4 ./gguf-tools/deepseek4-quantize
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench metal-q4-mm-tail-cull-bench metal-iq2-moe-tail-cull-bench check-mxfp4-half-lut test-mxfp4-metal
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench metal-q4-prefill-pair-bench metal-q4-mm-tail-cull-bench metal-iq2-moe-tail-cull-bench check-mxfp4-half-lut test-mxfp4-metal
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -95,6 +95,7 @@ help:
 	@echo "  make environment-docs  Generate and verify the environment variable inventory"
 	@echo "  make test-metal-session-batch-ssd  Exact-logit Metal SSD union control/candidate oracle"
 	@echo "  make test-metal-q4-streams  Check resident Q4 Metal stream overlap"
+	@echo "  make test-metal-q4-prefill-pair  Runtime oracle for the M1-M4 Q4 prefill pair"
 	@echo "  make test-metal-indexer-q4  Check the production-shape Q4_K indexer projection"
 	@echo "  make test-metal-q4-attn-exactn  Bitwise/canary oracle for M1-M4 SSD-prefill Q4 attention output"
 	@echo "  make test-metal-q4-qb-f16-cache  Oracle for M1-M4 Q4 q_b sidecar and transient F16 paths"
@@ -109,6 +110,7 @@ help:
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make metal-q4-dense-pair-bench  Build the resident Q4 decode pair kernel benchmark"
+	@echo "  make metal-q4-prefill-pair-bench  Build the resident Q4 prefill pair F16-RHS benchmark"
 	@echo "  make metal-q4-mm-tail-cull-bench  Build the resident Q4 prefill tail-cull kernel benchmark"
 	@echo "  make metal-iq2-moe-tail-cull-bench  Build the resident IQ2 pair MoE tail-cull benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
@@ -180,6 +182,30 @@ tests/test_metal_q4_streams: tests/test_metal_q4_streams.o ds4_metal_test_hooks.
 test-metal-q4-streams: tests/test_metal_q4_streams
 	env -u DS4_METAL_MODEL_UNTRACKED ./tests/test_metal_q4_streams
 	DS4_METAL_MODEL_UNTRACKED=1 ./tests/test_metal_q4_streams
+
+tests/test_metal_q4_prefill_pair.o: tests/test_metal_q4_prefill_pair.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_metal_q4_prefill_pair: tests/test_metal_q4_prefill_pair.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-metal-q4-prefill-pair: tests/test_metal_q4_prefill_pair
+	env -u DS4_METAL_ENABLE_Q4_PREFILL_PAIR_F16_RHS \
+		-u DS4_METAL_DISABLE_Q4_PREFILL_PAIR_F16_RHS \
+		-u DS4_METAL_REQUIRE_Q4_PREFILL_PAIR_F16_RHS \
+		-u DS4_METAL_DISABLE_Q4_DENSE_PAIR \
+		-u DS4_METAL_DISABLE_CONTIG_F32_F16_COPY \
+		-u DS4_METAL_MODEL_UNTRACKED \
+		-u DS4_METAL_UNRETAINED_COMMAND_BUFFERS \
+		./tests/test_metal_q4_prefill_pair
+	env -u DS4_METAL_ENABLE_Q4_PREFILL_PAIR_F16_RHS \
+		-u DS4_METAL_DISABLE_Q4_PREFILL_PAIR_F16_RHS \
+		-u DS4_METAL_REQUIRE_Q4_PREFILL_PAIR_F16_RHS \
+		-u DS4_METAL_DISABLE_Q4_DENSE_PAIR \
+		-u DS4_METAL_DISABLE_CONTIG_F32_F16_COPY \
+		-u DS4_METAL_MODEL_UNTRACKED \
+		DS4_METAL_UNRETAINED_COMMAND_BUFFERS=1 \
+		./tests/test_metal_q4_prefill_pair
 
 tests/test_metal_indexer_q4.o: tests/test_metal_indexer_q4.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -329,6 +355,11 @@ speed-bench/metal_q4_dense_pair_bench: speed-bench/metal_q4_dense_pair_bench.m $
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 
 metal-q4-dense-pair-bench: speed-bench/metal_q4_dense_pair_bench
+
+speed-bench/metal_q4_prefill_pair_bench: speed-bench/metal_q4_prefill_pair_bench.m $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+metal-q4-prefill-pair-bench: speed-bench/metal_q4_prefill_pair_bench
 
 speed-bench/metal_q4_mm_tail_cull_bench: speed-bench/metal_q4_mm_tail_cull_bench.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
@@ -970,4 +1001,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_q4_dense_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_iq2_moe_tail_cull_bench speed-bench/gpu_iq2_moe_prefill_bench_rocm speed-bench/gpu_iq2_moe_prefill_bench_cuda speed-bench/rocm_q4_prefill_bench speed-bench/cuda_q4_prefill_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_quantizer_indexer_q4 tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/bench_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_q4_dense_pair tests/test_metal_session_batch tests/test_metal_q4_streams tests/test_metal_indexer_q4 tests/test_metal_q4_attn_exactn tests/test_metal_q4_qb_f16_cache tests/test_metal_exactn_oracle tests/test_metal_dspark_capture tests/test_metal_argmax_top1 tests/test_metal_iq2_midonly tests/test_metal_iq2_ssd_grouped_mm tests/test_metal_iq2_live_index tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_q4_dense_pair_bench speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_iq2_moe_tail_cull_bench speed-bench/gpu_iq2_moe_prefill_bench_rocm speed-bench/gpu_iq2_moe_prefill_bench_cuda speed-bench/rocm_q4_prefill_bench speed-bench/cuda_q4_prefill_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_quantizer_indexer_q4 tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/bench_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_q4_dense_pair tests/test_metal_session_batch tests/test_metal_q4_streams tests/test_metal_q4_prefill_pair tests/test_metal_indexer_q4 tests/test_metal_q4_attn_exactn tests/test_metal_q4_qb_f16_cache tests/test_metal_exactn_oracle tests/test_metal_dspark_capture tests/test_metal_argmax_top1 tests/test_metal_iq2_midonly tests/test_metal_iq2_ssd_grouped_mm tests/test_metal_iq2_live_index tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o cuda/mmq/*.o cuda/mmq/test/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
