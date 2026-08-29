@@ -1631,7 +1631,6 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
             }
             sh_qp[hl * STRIDE + kl] = __float2half(p);
         }
-        }
         __syncthreads();
 #pragma unroll
         for (uint32_t delta = 1u; delta < 16u; delta <<= 1u) {
