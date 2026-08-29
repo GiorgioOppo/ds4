@@ -1606,6 +1606,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         frag_c score_acc;
         if (wave < HEAD_TILES * KEY_TILES) rocwmma::fill_fragment(score_acc, 0.0f);
 
+#pragma unroll
         for (uint32_t d0 = 0; d0 < 512u; d0 += TILE) {
             if (tid < HEADS * TILE) {
                 const uint32_t hl = tid / TILE;
