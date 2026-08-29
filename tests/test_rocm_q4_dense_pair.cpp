@@ -36,6 +36,8 @@ extern "C" int ds4_rocm_test_q4_prefill_k1024_tile4_policy(
     int disabled, int required);
 extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
+extern "C" uint32_t ds4_rocm_test_q4_prefill_wmma_row_tile(
+    uint32_t out_dim);
 extern "C" int ds4_rocm_test_q4_prefill_q8_wave32_policy(
     int prefill_scope, int runtime_compatible, int enabled, int disabled,
     int required);
@@ -99,6 +101,8 @@ constexpr const char *kPrefillWmmaDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA";
 constexpr const char *kPrefillWmmaRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA";
+constexpr const char *kPrefillWmmaRowTile =
+    "DS4_ROCM_Q4_PREFILL_WMMA_ROW_TILE";
 constexpr const char *kPrefillQ8Wave32Enable =
     "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32";
 constexpr const char *kPrefillQ8Wave32Disable =
@@ -1147,6 +1151,51 @@ bool run_q_b_f16_null_qhalf_case(const aligned_model &model) {
     return ok;
 }
 
+bool run_prefill_wmma_row_tile_policy_oracle() {
+    struct row_tile_case {
+        const char *label;
+        const char *value;
+        uint32_t out_dim;
+        uint32_t expected;
+    };
+    const row_tile_case cases[] = {
+        {"automatic small", nullptr, 1023u, 64u},
+        {"automatic normal lower boundary", nullptr, 1024u, 128u},
+        {"automatic normal upper boundary", nullptr, 8191u, 128u},
+        {"automatic large", nullptr, 8192u, 256u},
+        {"explicit 64", "64", 32768u, 64u},
+        {"explicit 128", "128", 32768u, 128u},
+        {"explicit 256", "256", 1024u, 256u},
+        {"non-whitelisted integer", "257", 1024u, 128u},
+        {"negative integer", "-1", 1024u, 128u},
+        {"negative wrapped whitelist", "-18446744073709551552", 1024u,
+         128u},
+        {"malformed", "128x", 1024u, 128u},
+        {"empty", "", 8192u, 256u},
+    };
+
+    env_snapshot row_tile(kPrefillWmmaRowTile);
+    bool ok = true;
+    for (const row_tile_case &test : cases) {
+        const int env_rc = test.value
+            ? setenv(kPrefillWmmaRowTile, test.value, 1)
+            : unsetenv(kPrefillWmmaRowTile);
+        const uint32_t got = env_rc == 0
+            ? ds4_rocm_test_q4_prefill_wmma_row_tile(test.out_dim)
+            : 0u;
+        if (env_rc != 0 || got != test.expected) {
+            std::fprintf(stderr,
+                         "Q4 WMMA row-tile policy %s: expected=%u got=%u "
+                         "env_rc=%d FAIL\n",
+                         test.label, test.expected, got, env_rc);
+            ok = false;
+        }
+    }
+    std::fprintf(stderr, "Q4 WMMA row-tile policy: %s\n",
+                 ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool run_prefill_k1024_tile4_policy_oracle() {
     struct policy_case {
         const char *label;
@@ -1300,6 +1349,7 @@ bool run_pair_pre_enqueue_policy_oracle() {
     env_snapshot wmma_enable(kPrefillWmmaEnable);
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
     env_snapshot q8_enable(kPrefillQ8Wave32Enable);
     env_snapshot q8_disable(kPrefillQ8Wave32Disable);
     env_snapshot q8_require(kPrefillQ8Wave32Require);
@@ -1310,6 +1360,7 @@ bool run_pair_pre_enqueue_policy_oracle() {
     (void)unsetenv(kPrefillWmmaEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillWmmaRowTile);
     (void)unsetenv(kPrefillQ8Wave32Enable);
     (void)unsetenv(kPrefillQ8Wave32Disable);
     (void)unsetenv(kPrefillQ8Wave32Require);
@@ -2569,7 +2620,8 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
         properties.warpSize != 32 ||
         std::strncmp(properties.gcnArchName, "gfx1151", 7u) != 0) {
         std::fprintf(stderr,
-                     "ROCm Q4 WMMA64 prefill: SKIP (requires gfx1151 wave32)\n");
+                     "ROCm Q4 direct-WMMA prefill: SKIP "
+                     "(requires gfx1151 wave32)\n");
         return true;
     }
 #else
@@ -2593,7 +2645,7 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     if (!x_gpu.ptr || !tile8_gpu.ptr || !wmma_gpu.ptr ||
         !write_tensor(x_gpu.ptr, x) || !write_tensor(tile8_gpu.ptr, sentinel) ||
         !write_tensor(wmma_gpu.ptr, sentinel)) {
-        std::fprintf(stderr, "ROCm Q4 WMMA64 prefill: setup FAIL\n");
+        std::fprintf(stderr, "ROCm Q4 direct-WMMA prefill: setup FAIL\n");
         return false;
     }
 
@@ -2605,6 +2657,7 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     env_snapshot wmma_ssd_enable(kPrefillWmmaSsdEnable);
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
     env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
     env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
     env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
@@ -2617,6 +2670,7 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     (void)unsetenv(kPrefillWmmaSsdEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillWmmaRowTile);
     (void)unsetenv(kPrefillQ8Wave32Enable);
     (void)unsetenv(kPrefillQ8Wave32Disable);
     (void)unsetenv(kPrefillQ8Wave32Require);
@@ -2646,17 +2700,17 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
         read_tensor(wmma_gpu.ptr, &wmma);
     if (ok) {
         ok = output_body_overwritten(tile8, sentinel, logical_count,
-                                     "WMMA64 TILE8 output body") && ok;
+                                     "direct-WMMA TILE8 output body") && ok;
         ok = output_body_overwritten(wmma, sentinel, logical_count,
-                                     "WMMA64 candidate output body") && ok;
+                                     "direct-WMMA candidate output body") && ok;
         ok = output_guard_unchanged(tile8, sentinel, logical_count,
-                                    "WMMA64 TILE8 output canary") && ok;
+                                    "direct-WMMA TILE8 output canary") && ok;
         ok = output_guard_unchanged(wmma, sentinel, logical_count,
-                                    "WMMA64 candidate output canary") && ok;
+                                    "direct-WMMA candidate output canary") && ok;
         tile8.resize(logical_count);
         wmma.resize(logical_count);
         ok = close_with_tolerance(wmma, tile8, 2.0f, 3.0e-2f,
-                                  "WMMA64 vs TILE8 N/M tail") && ok;
+                                  "direct-WMMA vs TILE8 N/M tail") && ok;
     }
 
     (void)setenv(kPrefillWmmaDisable, "1", 1);
@@ -2667,9 +2721,9 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     ok = rejected_rc == 0 &&
          unchanged_after_rejected_call(
              wmma_gpu.ptr, sentinel,
-             "WMMA64 DISABLE+REQUIRE preserves output") && ok;
+             "direct-WMMA DISABLE+REQUIRE preserves output") && ok;
     std::fprintf(stderr,
-                 "ROCm Q4 WMMA64 prefill: tile8=%d/%llu wmma=%d/%llu "
+                 "ROCm Q4 direct-WMMA prefill: tile8=%d/%llu wmma=%d/%llu "
                  "rejected=%d %s\n",
                  tile8_rc, (unsigned long long)tile8_wmma_calls,
                  wmma_rc, (unsigned long long)wmma_calls,
@@ -2684,7 +2738,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
         properties.warpSize != 32 ||
         std::strncmp(properties.gcnArchName, "gfx1151", 7u) != 0) {
         std::fprintf(stderr,
-                     "ROCm Q4 production output WMMA64: SKIP "
+                     "ROCm Q4 production output direct-WMMA: SKIP "
                      "(requires gfx1151 wave32)\n");
         return true;
     }
@@ -2721,7 +2775,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
         !write_tensor(wmma_low.ptr, low_sentinel) ||
         !write_tensor(wmma_out.ptr, out_sentinel)) {
         std::fprintf(stderr,
-                     "ROCm Q4 production output WMMA64: setup FAIL\n");
+                     "ROCm Q4 production output direct-WMMA: setup FAIL\n");
         return false;
     }
 
@@ -2733,6 +2787,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
     env_snapshot wmma_ssd_enable(kPrefillWmmaSsdEnable);
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
 
     ds4_gpu_set_ssd_streaming(false);
     (void)unsetenv(kPrefillEnable);
@@ -2743,6 +2798,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
     (void)unsetenv(kPrefillWmmaSsdEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillWmmaRowTile);
     ds4_rocm_test_q4_prefill_wmma_reset();
     const int tile8_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
         tile8_out.ptr, tile8_low.ptr, nullptr, nullptr,
@@ -2786,10 +2842,10 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
                  "production output-B TILE8 body") && ok;
         ok = output_body_overwritten(
                  wmma_low_host, low_sentinel, low_count,
-                 "production output-A WMMA64 body") && ok;
+                 "production output-A direct-WMMA body") && ok;
         ok = output_body_overwritten(
                  wmma_out_host, out_sentinel, out_count,
-                 "production output-B WMMA64 body") && ok;
+                 "production output-B direct-WMMA body") && ok;
         ok = output_guard_unchanged(
                  tile8_low_host, low_sentinel, low_count,
                  "production output-A TILE8 N-tail") && ok;
@@ -2798,23 +2854,23 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
                  "production output-B TILE8 N-tail") && ok;
         ok = output_guard_unchanged(
                  wmma_low_host, low_sentinel, low_count,
-                 "production output-A WMMA64 N-tail") && ok;
+                 "production output-A direct-WMMA N-tail") && ok;
         ok = output_guard_unchanged(
                  wmma_out_host, out_sentinel, out_count,
-                 "production output-B WMMA64 N-tail") && ok;
+                 "production output-B direct-WMMA N-tail") && ok;
         tile8_low_host.resize(low_count);
         tile8_out_host.resize(out_count);
         wmma_low_host.resize(low_count);
         wmma_out_host.resize(out_count);
         ok = close_with_tolerance(
                  wmma_low_host, tile8_low_host, 2.0f, 3.0e-2f,
-                 "production output-A WMMA64 vs TILE8") && ok;
+                 "production output-A direct-WMMA vs TILE8") && ok;
         ok = close_with_tolerance(
                  wmma_out_host, tile8_out_host, 16.0f, 8.0e-2f,
-                 "production output-A+B WMMA64 vs TILE8") && ok;
+                 "production output-A+B direct-WMMA vs TILE8") && ok;
     }
     std::fprintf(stderr,
-                 "ROCm Q4 production output WMMA64: tile8=%d/%llu "
+                 "ROCm Q4 production output direct-WMMA: tile8=%d/%llu "
                  "wmma=%d/%llu %s\n",
                  tile8_rc, (unsigned long long)tile8_wmma_calls,
                  wmma_rc, (unsigned long long)wmma_calls,
@@ -2899,6 +2955,7 @@ int main(int argc, char **argv) {
     env_snapshot wmma_ssd_enable(kPrefillWmmaSsdEnable);
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
+    env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
     env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
     env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
     env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
@@ -2916,6 +2973,7 @@ int main(int argc, char **argv) {
     (void)unsetenv(kPrefillWmmaSsdEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillWmmaRowTile);
     (void)unsetenv(kPrefillQ8Wave32Enable);
     (void)unsetenv(kPrefillQ8Wave32Disable);
     (void)unsetenv(kPrefillQ8Wave32Require);
@@ -2924,7 +2982,8 @@ int main(int argc, char **argv) {
     (void)unsetenv(kGroupedDecodeRequire);
     (void)unsetenv(kGroupedDecodeStats);
 
-    const bool policy_ok = run_prefill_k1024_tile4_policy_oracle() &&
+    const bool policy_ok = run_prefill_wmma_row_tile_policy_oracle() &&
+                           run_prefill_k1024_tile4_policy_oracle() &&
                            run_prefill_q8_wave32_policy_oracle() &&
                            run_pair_pre_enqueue_policy_oracle();
     if (run_policy_only || !policy_ok) return policy_ok ? 0 : 1;

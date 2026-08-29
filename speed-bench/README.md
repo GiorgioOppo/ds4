@@ -156,6 +156,9 @@ make rocm-q4-prefill-bench ROCM_ARCH=gfx1151
 The fixture copies four rotating sets of synthetic GGUF-layout Q4_K weights
 to device memory before warmup and forces SSD streaming off. HIP events then
 measure only activation conversion/quantization and projection kernels. The
+row-geometry and activation-loader comparisons use resident pointers plus an
+explicit enqueue-only hook, excluding environment parsing, model lookup, and
+policy selection. The
 comparisons are:
 
 - `dense`: legacy versus TILE8 at the Flash Q-A `K=4096,M=1024` shape;
@@ -163,38 +166,53 @@ comparisons are:
   `K=4096,M=(1024+512)` path;
 - `qb`: TILE8 versus TILE4 at the production `attn_q_b`
   `K=1024,M=32768` shape.
-- `outb`: TILE8 versus the experimental compressed WMMA64 kernel at the
+- `outb`: TILE8 versus the experimental compressed direct-Q4 WMMA kernel at the
   production `output_b` `K=8192,M=4096` shape;
 - `output`: the complete grouped `output_a` plus `output_b` production API,
-  comparing two TILE8 projections with two direct WMMA64 projections.
+  comparing two TILE8 projections with two direct WMMA projections.
 
-On gfx1151 wave32, `dense` and `qb` also emit a second WMMA64 comparison for
+On gfx1151 wave32, `dense` and `qb` also emit a direct-Q4 WMMA comparison for
 `N>=256`. The candidate keeps Q4_K weights compressed, rounds each transient
 32-value weight group and the activation tile to F16 in the kernel, accumulates
 through WMMA in F32, and avoids both Q8_K activation scratch and persistent F16
-weight sidecars. It remains opt-in in the runtime; the benchmark uses the
-strict REQUIRE gate so a rejected dispatch fails instead of timing a fallback.
+weight sidecars. Its shape-selected row tile uses 64 rows below output dimension
+1024, 128 below 8192, and 256 otherwise; the wider variants stage two adjacent
+F32 activations into one F16 pair, matching the established Q8 WMMA loader.
+`dense`, `outb`, and `output` also emit a bit-exact 64-row versus shape-selected
+scalar-loader A/B. The large `q_b` shape instead reports adjacent scalar-loader
+64→128 and 128→256 comparisons, so
+register pressure in the 512-thread candidate cannot hide a better midpoint.
+These direct comparisons measure the net effect of the broader row geometry,
+including its changed workgroup and occupancy contract, separately from the
+candidate's arithmetic change versus TILE8. `q_b` additionally compares scalar
+versus two-wide activation staging at fixed 128- and 256-row geometry.
+The direct hook receives both tile and loader explicitly, so every arm attests
+its own configuration. It remains opt-in in the runtime; the production-API
+comparison uses the strict REQUIRE gate so a rejected dispatch fails instead
+of timing a fallback.
 The benchmark always keeps SSD streaming disabled. Runtime SSD experiments
 need the separate `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD=1` gate and only accept
 projection ranges already backed by physical device memory, so model I/O is
 never folded into the kernel result.
 
-The default token set is `9,17,33,128,257,512`, covering the first row after
-the small TILE8 boundaries and the first token after a 64-token WMMA boundary.
-Use `--full` for `9,16,17,31,32,33,128,257,512,4096`, or select a focused run
-such as:
+The default token set is `9,17,33,128,256,257,512`, covering the first row
+after the small TILE8 boundaries plus both the exact 256-token occupancy case
+and the first token after a 64-token WMMA boundary. Use `--full` for
+`9,16,17,31,32,33,128,256,257,512,4096`, or select a focused run such as:
 
 ```
 ./speed-bench/rocm_q4_prefill_bench \
-  --case output --tokens 256,257,512,1024,2048,4096 --samples 8
+  --case qb --tokens 256,257,512,1024,2048,2049,4096 \
+  --sets 4 --warmup 4 --samples 12
 ```
 
 Every case rotates identical resident weight sets between arms, alternates
-ABBA/BAAB, and verifies allocation guards. Comparisons among the integer Q4
-paths remain bit-exact. WMMA64 has a deliberate F16 arithmetic boundary, so
-those comparisons require finite results within an explicit absolute/relative
-smoke tolerance; a model-logit or prompt oracle is still required before
-enabling the kernel by default.
+ABBA/BAAB, and verifies allocation guards both before and after timing.
+Comparisons among the integer Q4
+paths remain bit-exact. Direct-Q4 WMMA has a deliberate F16 arithmetic
+boundary, so those comparisons require finite results within an explicit
+absolute/relative smoke tolerance; a model-logit or prompt oracle is still
+required before enabling the kernel by default.
 Fixture creation, the host-to-device residency copy, warmup, oracle readback,
 and environment-gate changes are outside the reported HIP-event intervals.
 `candidate_delta_pct` is negative when the candidate is faster; the companion
