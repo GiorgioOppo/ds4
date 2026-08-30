@@ -48,6 +48,7 @@ constexpr size_t kWeightTileBytes =
 constexpr size_t kYTileBytes =
     (size_t)kNTile * sizeof(block_q8_1_mmq);
 constexpr size_t kSharedBytes = kWeightTileBytes + kYTileBytes;
+constexpr int kYTileVectors = (int)(kYTileBytes / sizeof(int4));
 
 static_assert(kWarps == 16, "Q4 16-warp decomposition changed");
 static_assert(kThreads == 512, "Q4 16-warp CTA must have 512 threads");
@@ -57,6 +58,8 @@ static_assert(kNFragPerWarp == 4, "Q4 split-N fragment count changed");
 static_assert(kWeightStride == 76, "canonical Q4_K MMA row stride changed");
 static_assert(kYStrideInts == 36, "canonical Q8_1 DS4 stride changed");
 static_assert(kYChunks16 == 9, "canonical Q8_1 DS4 block size changed");
+static_assert(kYTileBytes % sizeof(int4) == 0,
+              "Q8_1 tile must support vectorized copies");
 static_assert(MMQ_ITER_K % QK_K == 0 && MMQ_ITER_K / QK_K == 1,
               "Stream-K scheduler must restore canonical K alignment");
 static_assert(kSharedBytes == 57344, "Q4 16-warp shared-memory model changed");
@@ -134,6 +137,26 @@ __device__ __forceinline__ void load_y_tile(
         int col0,
         int k128) {
     const int tid = linear_tid();
+
+    // The production selector admits complete N128 tiles.  Copy those as one
+    // contiguous vector range, matching canonical MMQ's flat cooperative
+    // load.  The former column-major mapping made every warp issue 144-byte-
+    // strided global loads; flattening turns each warp's accesses into adjacent
+    // 16-byte vectors while preserving the shared representation byte-for-byte.
+    if (col0 <= N - kNTile) {
+        const int4 * __restrict__ src = reinterpret_cast<const int4 *>(
+            q8 + (uint64_t)k128 * (uint64_t)N + (uint64_t)col0);
+        int4 * __restrict__ dst = reinterpret_cast<int4 *>(tile);
+#pragma unroll
+        for (int vector = tid; vector < kYTileVectors;
+             vector += kThreads) {
+            dst[vector] = src[vector];
+        }
+        return;
+    }
+
+    // Keep the guarded per-column copy for the N tail accepted by the direct
+    // oracle hook.  Production never takes this path.
     constexpr int threads_per_col = kThreads / kNTile;
     static_assert(threads_per_col == 4,
                   "Q8_1 DS4 copy mapping changed");
