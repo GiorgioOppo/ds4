@@ -116,6 +116,28 @@ ABBA/BAAB, and requires bit-exact outputs plus intact input/output canaries.
 No GGUF access, SSD I/O, upload, readback, or CPU wall time is included in a
 measured command buffer.
 
+### Metal Q4_K attention output-A direct routing
+
+Build and run the production-shape, resident GPU comparison with:
+
+```
+make metal-q4-attn-out-a-direct-bench
+./speed-bench/metal_q4_attn_out_a_direct_bench \
+  --n 512,1024,2048,4096 --samples 8 --warmup 2
+```
+
+The fixed `4096 -> 1024 x 8` geometry compares the current map-plus-routed
+path, the routed kernel with a prebuilt map, and the fixed-route direct kernel
+on the production Apple M1–M4 and N=512–4096 scope. All three pairwise
+comparisons are scheduled in balanced ABBA/BAAB blocks and timed only with Metal
+GPU start/end timestamps. The harness requires all three full outputs to be
+bit-identical, hashes immutable weights, heads, ids, and the prebuilt map, and
+checks prefix/suffix canaries around every allocation. Fixture construction,
+map prebuilding, and validation are outside the samples. There is no GGUF,
+SSD I/O, model upload, GPU readback, or CPU wall timing in measured command
+buffers, so these numbers isolate the kernel and routing overhead rather than
+SSD-streaming noise.
+
 ### Metal resident IQ2/Q2 routed MoE
 
 Build the production top-6 tail-cull fixture or the GLM-shape top-8 pair-fusion

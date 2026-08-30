@@ -6401,6 +6401,17 @@ static int ds4_gpu_encode_attn_out_low_mpp(
         id<MTLBuffer>                  dst,
         NSUInteger                     dst_off);
 
+static int ds4_gpu_encode_attn_out_low_q4_direct(
+        id<MTLCommandBuffer>           cb,
+        id<MTLComputePipelineState>    pipeline,
+        const ds4_gpu_mul_mm_id_args *mm_args,
+        id<MTLBuffer>                  src0,
+        NSUInteger                     src0_off,
+        id<MTLBuffer>                  src1,
+        NSUInteger                     src1_off,
+        id<MTLBuffer>                  dst,
+        NSUInteger                     dst_off);
+
 static ds4_gpu_mul_mm_id_map_args ds4_gpu_make_mul_mm_id_map_args(
         uint32_t src0_cols,
         uint32_t src0_experts,
@@ -31545,8 +31556,13 @@ static int ds4_gpu_attention_output_q4_K_batch_impl(
         ds4_gpu_env_bool("DS4_METAL_REQUIRE_Q4_ATTN_OUT_B_F16_RHS") == 1;
     const bool disable_f16_rhs =
         ds4_gpu_env_bool("DS4_METAL_DISABLE_Q4_ATTN_OUT_B_F16_RHS") == 1;
+    const bool require_direct_low =
+        getenv("DS4_METAL_REQUIRE_Q4_ATTN_OUT_A_DIRECT") != NULL;
+    const bool disable_direct_low =
+        getenv("DS4_METAL_DISABLE_Q4_ATTN_OUT_A_DIRECT") != NULL;
 
-    if (!require_f16_rhs && n_tokens >= 6u && n_tokens <= 31u) {
+    if (!require_f16_rhs && !require_direct_low &&
+        n_tokens >= 6u && n_tokens <= 31u) {
         const int exactn_rc =
             ds4_gpu_attention_output_q4_K_ssd_prefill_exactn_tensor(
                 out,
@@ -31569,7 +31585,8 @@ static int ds4_gpu_attention_output_q4_K_batch_impl(
     const bool require_tiny =
         tiny_scope &&
         ds4_gpu_env_bool("DS4_METAL_REQUIRE_Q4_ATTN_OUT_TINY_BATCH") == 1;
-    const int failure_rc = (require_tiny || require_f16_rhs) ? -1 : 0;
+    const int failure_rc =
+        (require_tiny || require_f16_rhs || require_direct_low) ? -1 : 0;
     if (!g_initialized && !ds4_gpu_init()) return failure_rc;
     if (!out || !low || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0 ||
@@ -31768,9 +31785,62 @@ static int ds4_gpu_attention_output_q4_K_batch_impl(
                 use_mpp_low = false;
             }
         }
+
+        /* On pre-M5 GPUs the production attention output-A route is fixed:
+         * slot g always consumes Q4 weight group g.  The generic MoE kernel
+         * nevertheless builds and reads an expert-major route map and work
+         * list before scattering back to the same token/group layout.  The
+         * direct kernel removes only those indirections; its dequantization,
+         * F16 staging, MMA order, and final stores are bit-identical.  Keep
+         * the default to the measured long-prefill range and leave Metal4 on
+         * its cooperative-tensor path. */
+        const bool direct_low_eligible =
+            !use_mpp_low && !use_tiny_exact &&
+            n_tokens >= 512u && n_tokens <= 4096u &&
+            group_dim == 4096u && rank == 1024u && n_groups == 8u &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            g_tp_split_world == 1 &&
+            !g_batch_encoder_concurrent;
+        bool use_direct_low =
+            direct_low_eligible && !disable_direct_low;
+        id<MTLComputePipelineState> direct_low_pipeline = nil;
+        if (use_direct_low) {
+            direct_low_pipeline = ds4_gpu_get_pipeline(
+                "kernel_attn_out_low_q4_K_legacy_direct");
+            const NSUInteger max_tgmem =
+                (NSUInteger)[g_device maxThreadgroupMemoryLength];
+            const NSUInteger static_tgmem = direct_low_pipeline
+                ? direct_low_pipeline.staticThreadgroupMemoryLength
+                : 0u;
+            if (!direct_low_pipeline ||
+                direct_low_pipeline.threadExecutionWidth != 32u ||
+                direct_low_pipeline.maxTotalThreadsPerThreadgroup < 128u ||
+                static_tgmem > max_tgmem ||
+                8192u > max_tgmem - static_tgmem) {
+                use_direct_low = false;
+            }
+        }
+        if (require_direct_low && !use_direct_low) {
+            fprintf(stderr,
+                    "ds4: required Metal Q4 attention output-A direct path "
+                    "is ineligible (rows=%u shape=%llux%llux%u disabled=%u "
+                    "pre_m5=%u tp_world=%d concurrent=%u mpp=%u tiny=%u)\n",
+                    n_tokens,
+                    (unsigned long long)group_dim,
+                    (unsigned long long)rank,
+                    n_groups,
+                    disable_direct_low ? 1u : 0u,
+                    ds4_gpu_device_is_pre_m5_apple_silicon() ? 1u : 0u,
+                    g_tp_split_world,
+                    g_batch_encoder_concurrent ? 1u : 0u,
+                    use_mpp_low ? 1u : 0u,
+                    use_tiny_exact ? 1u : 0u);
+            return -1;
+        }
+        const int selected_failure_rc = use_direct_low ? -1 : failure_rc;
         const NSUInteger ids_bytes = (NSUInteger)n_tokens * (NSUInteger)n_groups * sizeof(int32_t);
         id<MTLBuffer> group_ids_buffer = nil;
-        if (!use_mpp_low && !use_tiny_exact) {
+        if (!use_mpp_low && !use_direct_low && !use_tiny_exact) {
             if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
                 group_ids_buffer =
                     ds4_gpu_new_transient_buffer(ids_bytes, "attention output Q4 group ids");
@@ -31798,7 +31868,9 @@ static int ds4_gpu_attention_output_q4_K_batch_impl(
         if (!out_a_buf) return failure_rc;
 
         const bool had_batch = g_batch_cb != nil;
-        if (!had_batch && ds4_gpu_begin_commands() == 0) return failure_rc;
+        if (!had_batch && ds4_gpu_begin_commands() == 0) {
+            return selected_failure_rc;
+        }
 
         bool ok = true;
         int owned = 0;
@@ -31861,6 +31933,17 @@ static int ds4_gpu_attention_output_q4_K_batch_impl(
                 ok = ds4_gpu_encode_attn_out_low_mpp(
                         cb,
                         mpp_low_pipeline,
+                        &mm_args,
+                        out_a_buf,
+                        (NSUInteger)out_a_inner,
+                        ds4_gpu_tensor_buffer(heads),
+                        ds4_gpu_tensor_offset(heads),
+                        ds4_gpu_tensor_buffer(low),
+                        ds4_gpu_tensor_offset(low)) != 0;
+            } else if (use_direct_low) {
+                ok = ds4_gpu_encode_attn_out_low_q4_direct(
+                        cb,
+                        direct_low_pipeline,
                         &mm_args,
                         out_a_buf,
                         (NSUInteger)out_a_inner,
@@ -31970,7 +32053,7 @@ static int ds4_gpu_attention_output_q4_K_batch_impl(
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
-        return ok ? 1 : failure_rc;
+        return ok ? 1 : selected_failure_rc;
     }
 }
 
@@ -39050,6 +39133,39 @@ static int ds4_gpu_encode_mul_mm_id_mapped(
                                                   dst,
                                                   dst_off,
                                                   8192u);
+}
+
+static int ds4_gpu_encode_attn_out_low_q4_direct(
+        id<MTLCommandBuffer>           cb,
+        id<MTLComputePipelineState>    pipeline,
+        const ds4_gpu_mul_mm_id_args *mm_args,
+        id<MTLBuffer>                  src0,
+        NSUInteger                     src0_off,
+        id<MTLBuffer>                  src1,
+        NSUInteger                     src1_off,
+        id<MTLBuffer>                  dst,
+        NSUInteger                     dst_off) {
+    if (!cb || !pipeline || !mm_args || !src0 || !src1 || !dst ||
+        mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
+        mm_args->ne02 <= 0 || mm_args->ne1 <= 0 || mm_args->ne21 <= 0) {
+        return 0;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:mm_args length:sizeof(*mm_args) atIndex:0];
+    [enc setBuffer:src0 offset:src0_off atIndex:1];
+    [enc setBuffer:src1 offset:src1_off atIndex:2];
+    [enc setBuffer:dst offset:dst_off atIndex:3];
+    [enc setThreadgroupMemoryLength:8192u atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(
+            ((NSUInteger)mm_args->ne21 + 31u) / 32u,
+            ((NSUInteger)mm_args->ne0 + 63u) / 64u,
+            (NSUInteger)mm_args->ne02)
+         threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
 }
 
 static int ds4_gpu_encode_attn_out_low_mpp(

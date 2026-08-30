@@ -8975,6 +8975,140 @@ kernel void kernel_mul_mm_id(
     }
 }
 
+// Fixed-routing Q4_K attention output-A projection for the production
+// [token][group][K] -> [token][group][rank] layout.  The generic routed
+// matmul builds an expert-major map, work list, and scatter description even
+// though attention output-A always routes slot g to weight group g.  Keep the
+// same Q4 dequantization, F32->F16 staging, K-loop order, simdgroup MMA, and
+// final scatter arithmetic while deriving that fixed route directly from the
+// dispatch coordinates.
+kernel void kernel_attn_out_low_q4_K_legacy_direct(
+        constant ds4_metal_args_mul_mm_id & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short Q4_NL = 16;
+    constexpr int SA_BYTES = NR0*NR1*(int)sizeof(half);
+
+    const int group = (int)tgpig.z;
+    const int r0 = (int)tgpig.y*NR0;
+    const int r1 = (int)tgpig.x*NR1;
+    if (group >= args.ne02 || r0 >= args.ne0 || r1 >= args.ne21) return;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne21 - r1 < NR1) ? (args.ne21 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ?
+        ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ?
+        ((short)tiitg/NL1) : nr1 - 1;
+    const short il0 = tiitg % NL0;
+    short il = il0;
+
+    threadgroup half *sa = (threadgroup half *)shmem;
+    threadgroup half *sb =
+        (threadgroup half *)(shmem + SA_BYTES);
+
+    const uint64_t offset0 = (uint64_t)group*args.nb02;
+    const short offset1 = il0/Q4_NL;
+    device const block_q4_K *x =
+        (device const block_q4_K *)(src0 + args.nb01*(r0 + lr0) + offset0) +
+        offset1;
+
+    const short iy = 8*(tiitg % NL1);
+    device const float *y = (device const float *)(src1
+        + args.nb12*(r1 + lr1)
+        + args.nb11*group
+        + args.nb10*iy);
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    FOR_UNROLL (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        half4x4 temp_a;
+        dequantize_q4_K(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        const short sx = tiitg%NL1;
+        const short sy = (tiitg/NL1)/8;
+        const short ly = (tiitg/NL1)%8;
+        const short ib = 4*sx + sy;
+        *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) =
+            half2x4(*((device float2x4 *)y));
+
+        il = (il + 2 < Q4_NL) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + Q4_NL - 1)/Q4_NL : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *lsma = sa + 4*64*(sgitg%2);
+        threadgroup const half *lsmb = sb + 2*64*(sgitg/2);
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float *temp_str =
+        ((threadgroup float *)shmem) + 32*(sgitg&1) +
+        (16*(sgitg >> 1))*NR0;
+    FOR_UNROLL (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) +
+            8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short j = sgitg; j < nr1; j += 4) {
+        device float *D = (device float *)dst + r0 + group*args.ne0 +
+            (uint64_t)(r1 + j)*args.ne1*args.ne0;
+        device float4 *D4 = (device float4 *)D;
+        threadgroup float *C = (threadgroup float *)shmem + j*NR0;
+        threadgroup float4 *C4 = (threadgroup float4 *)C;
+
+        int i = tiisg;
+        for (; i < nr0/4; i += 32) D4[i] = C4[i];
+        i = 4*(nr0/4) + tiisg;
+        for (; i < nr0; i += 32) D[i] = C[i];
+    }
+}
+
 // Address-table variant used by SSD streaming.  The routing ids remain the
 // model's original expert ids, but each expert's resident buffer is found via a
 // GPU-address table instead of a contiguous full-layer tensor.

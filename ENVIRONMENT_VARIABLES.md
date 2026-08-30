@@ -43,6 +43,8 @@ changing them.  Unless a row says otherwise:
 | `DS4_METAL_ENABLE_Q4_PREFILL_PAIR_F16_RHS=1` | On Apple M1–M4, opt into the Q-A/KV prefill pair that materializes their shared F32 activation as F16 once for exact 32-token tiles through N=128. |
 | `DS4_METAL_DISABLE_Q4_PREFILL_PAIR_F16_RHS=1` | Dominant rollback to two standalone Q4_K/F32-RHS prefill projections. |
 | `DS4_METAL_REQUIRE_Q4_PREFILL_PAIR_F16_RHS=1` | Request the shared-F16-RHS pair and fail closed if its device, shape, storage, or buffer contract is unavailable. Intended for strict A/B oracles. |
+| `DS4_METAL_DISABLE_Q4_ATTN_OUT_A_DIRECT=1` | Restore the generic route-map/work-list Q4 attention output-A path. Unset uses the bit-identical fixed-route direct kernel by default for eligible Apple M1–M4 `4096 -> 1024`, eight-group prefills at N=512–4096. Any defined value, including `0`, disables the specialization. |
+| `DS4_METAL_REQUIRE_Q4_ATTN_OUT_A_DIRECT=1` | Require the fixed-route Q4 attention output-A kernel and fail closed before dispatch if its device, shape, concurrency, pipeline, or memory contract is unavailable. Intended for production-shape correctness and performance oracles; `DISABLE` wins. |
 | `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` | Restore the canonical IQ2 address-table gate/up producer on the exact M1 SSD-streaming decode shape. The specialization is automatic by default. |
 | `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` | Fail closed when an otherwise eligible M1 IQ2 mid-only dispatch cannot use the specialization. |
 | `DS4_METAL_ENABLE_M1_IQ2_MID_ONLY=1` | Legacy spelling retained for migration notes only. The runtime does not read it; the path is automatic and this setting is ignored. |
@@ -150,13 +152,13 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1077 `DS4_*` runtime variables** and
+Inventory totals: **1079 `DS4_*` runtime variables** and
 **6 external runtime variables**.
 The auxiliary inventories contain **118 test/test-fixture entries**
 and **19 tool/wrapper entries**.
 
 <details>
-<summary><strong>Metal (445)</strong></summary>
+<summary><strong>Metal (447)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -280,8 +282,9 @@ and **19 tool/wrapper entries**.
 | `DS4_METAL_DISABLE_PRE_M5_ROUTER_SIMD_WEIGHTS_FUSION` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables pre M5 router simd weights fusion. | [ds4_metal.m:35836](ds4_metal.m#L35836) |
 | `DS4_METAL_DISABLE_PRE_M5_ROUTER_TRANSFORM_FINALIZE_FUSION` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables pre M5 router transform finalize fusion. | [ds4_metal.m:35840](ds4_metal.m#L35840) |
 | `DS4_METAL_DISABLE_PRO_Q4_EXPERT_ADDRESS_AUTO` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables pro Q4 expert address auto. | [ds4_metal.m:19710](ds4_metal.m#L19710) |
-| `DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables pro Q4 expert table auto. | [ds4.c:21040](ds4.c#L21040) |
-| `DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_PRELOAD` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables pro Q4 expert table preload. | [ds4.c:58780](ds4.c#L58780) |
+| `DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables pro Q4 expert table auto. | [ds4.c:21568](ds4.c#L21568) |
+| `DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_PRELOAD` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables pro Q4 expert table preload. | [ds4.c:63088](ds4.c#L63088) |
+| `DS4_METAL_DISABLE_Q4_ATTN_OUT_A_DIRECT` | presence rollback; unset enables the automatic fixed-route path for eligible Apple M1-M4 long prefills; any defined value including 0 disables | Restore the generic route-map/work-list Q4 attention output-A path instead of the bit-identical fixed-route direct kernel. | [ds4_metal.m:31562](ds4_metal.m#L31562) |
 | `DS4_METAL_DISABLE_Q4_ATTN_OUT_HC_FUSE` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 attn out HC fuse. | [ds4_metal.m:47624](ds4_metal.m#L47624) |
 | `DS4_METAL_DISABLE_Q4_ATTN_OUT_TINY_BATCH` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Disables Q4 attn out tiny batch. | [ds4_metal.m:28396](ds4_metal.m#L28396) |
 | `DS4_METAL_DISABLE_Q4_BATCH_EXPERT_TABLE` | presence rollback; unset: automatic/default path; any value including 0 disables | Disables Q4 batch expert table. | [ds4_metal.m:44883](ds4_metal.m#L44883) |
@@ -540,6 +543,7 @@ and **19 tool/wrapper entries**.
 | `DS4_METAL_REQUIRE_IQ2_XXS_SSD_PREFILL_MM` | value-aware boolean; default implicit fail-closed only with complete selected-address domain; explicit 1 is strict, 0 permits fallback | Makes eligible IQ2_XXS/Q2_K grouped SSD-prefill MM fail closed. | [ds4_metal.m:44782](ds4_metal.m#L44782) |
 | `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY` | presence strict check; unset: fallback allowed; any value including 0 requires the path | Requires M1 IQ2 mid only and makes eligible fallback fail closed. | [ds4_metal.m:42074](ds4_metal.m#L42074) |
 | `DS4_METAL_REQUIRE_OUTPUT_HC_WEIGHTS4` | presence strict check; unset: fallback allowed; any value including 0 requires the path | Requires output HC weights4 and makes eligible fallback fail closed. | [ds4_metal.m:46789](ds4_metal.m#L46789) |
+| `DS4_METAL_REQUIRE_Q4_ATTN_OUT_A_DIRECT` | presence strict check; unset permits the automatic path or fallback; any defined value including 0 requires the direct kernel and DISABLE wins | Require the bit-identical fixed-route Q4 attention output-A kernel and fail closed before dispatch when its production contract is unavailable. | [ds4_metal.m:31560](ds4_metal.m#L31560) |
 | `DS4_METAL_REQUIRE_Q4_ATTN_OUT_TINY_BATCH` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Requires Q4 attn out tiny batch and makes eligible fallback fail closed. | [ds4_metal.m:28373](ds4_metal.m#L28373) |
 | `DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_EXACTN` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Requires Q4 SSD prefill attn out exactn and makes eligible fallback fail closed. | [ds4_metal.m:28089](ds4_metal.m#L28089) |
 | `DS4_METAL_REQUIRE_Q4_SSD_PREFILL_ATTN_OUT_SCALE_META` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Requires shared scale/min metadata in the Q4 SSD prefill attention-output exact-N kernel and makes fallback fail closed. | [ds4_metal.m:28209](ds4_metal.m#L28209) |
