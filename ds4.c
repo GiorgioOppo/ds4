@@ -77422,7 +77422,7 @@ static int ds4_session_eval_speculative_argmax_impl(
             accepted[0] = first_token;
             return 1;
         }
-        if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
+        if (!ignore_eos && s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
             s->glm_graph_ready) {
             if (ds4_session_tp_leader(s)) {
                 ds4_engine *ge = s->engine;
@@ -77532,7 +77532,7 @@ static int ds4_session_eval_speculative_argmax_impl(
                                                           errlen);
     }
 
-    if (metal_graph_cuda_splitkv_spec_requested() &&
+    if (!ignore_eos && metal_graph_cuda_splitkv_spec_requested() &&
         (!e->mtp_ready || e->mtp_draft_tokens <= 1)) {
         int extra = ds4_session_eval_splitkv_spec_after_first(
                 s,
