@@ -166,7 +166,7 @@ comparisons are:
   `K=4096,M=(1024+512)` path;
 - `qb`: TILE8 versus TILE4 at the production `attn_q_b`
   `K=1024,M=32768` shape.
-- `outb`: TILE8 versus the experimental compressed direct-Q4 WMMA kernel at the
+- `outb`: TILE8 versus the compressed direct-Q4 WMMA kernel at the
   production `output_b` `K=8192,M=4096` shape;
 - `output`: the complete grouped `output_a` plus `output_b` production API,
   comparing two TILE8 projections with two direct WMMA projections.
@@ -187,9 +187,10 @@ including its changed workgroup and occupancy contract, separately from the
 candidate's arithmetic change versus TILE8. `q_b` additionally compares scalar
 versus two-wide activation staging at fixed 128- and 256-row geometry.
 The direct hook receives both tile and loader explicitly, so every arm attests
-its own configuration. It remains opt-in in the runtime; the production-API
-comparison uses the strict REQUIRE gate so a rejected dispatch fails instead
-of timing a fallback.
+its own configuration. Eligible resident runtime calls use direct-Q4 WMMA by
+default; set `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` to opt out. The
+production-API comparison still uses the strict REQUIRE gate so a rejected
+dispatch fails instead of timing a fallback.
 The benchmark always keeps SSD streaming disabled. Runtime SSD experiments
 need the separate `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD=1` gate and only accept
 projection ranges already backed by physical device memory, so model I/O is
@@ -211,8 +212,8 @@ ABBA/BAAB, and verifies allocation guards both before and after timing.
 Comparisons among the integer Q4
 paths remain bit-exact. Direct-Q4 WMMA has a deliberate F16 arithmetic
 boundary, so those comparisons require finite results within an explicit
-absolute/relative smoke tolerance; a model-logit or prompt oracle is still
-required before enabling the kernel by default.
+absolute/relative smoke tolerance; release validation must also include the
+model-logit or prompt oracle that guards the automatic policy.
 Fixture creation, the host-to-device residency copy, warmup, oracle readback,
 and environment-gate changes are outside the reported HIP-event intervals.
 `candidate_delta_pct` is negative when the candidate is faster; the companion

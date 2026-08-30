@@ -124,7 +124,7 @@ static_assert((sizeof(cuda_block_q8_K) % sizeof(uint32_t)) == 0u,
               "ROCm Q8_K LDS copies require a whole number of words");
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-/* Experimental direct-Q4 WMMA for resident gfx1151 prefill.
+/* Direct-Q4 WMMA for resident gfx1151 prefill.
  *
  * This deliberately mirrors the live Q8 WMMA kernel: each wave32 owns 16
  * output rows, the workgroup computes 64 tokens, K advances by 32, only the
@@ -139,8 +139,9 @@ static_assert((sizeof(cuda_block_q8_K) % sizeof(uint32_t)) == 0u,
  *
  * Arithmetic is not bit-identical to Q4_K x Q8_K: activations and transient
  * weights round to F16 before F32 WMMA accumulation.  Host policy therefore
- * keeps this path opt-in, physically device-resident, gfx1151-only, and out of
- * quality mode until device-side A/B plus a prompt-level oracle promote it.
+ * enables this path by default only for physically device-resident, gfx1151
+ * wave32 prefill outside quality mode.  SSD streaming remains separately
+ * gated, and DISABLE provides an authoritative rollback.
  */
 enum {
     ROCM_Q4_WMMA_TOKEN_TILE = 64u,
@@ -1009,21 +1010,66 @@ extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void) {
                            __ATOMIC_RELAXED);
 }
 
+/* Resident execution is automatic after validation.  Preserve an explicit
+ * ENABLE=0 as a compatibility opt-out, while REQUIRE remains a strict
+ * assertion rather than the switch that turns the candidate on.  SSD
+ * streaming deliberately keeps its separate opt-in and residency contract. */
+static int rocm_q4_K_prefill_wmma_requested_policy(
+        int ssd_streaming,
+        int enabled,
+        int ssd_enabled,
+        int disabled,
+        int required) {
+    if (required) return 1;
+    if (disabled) return 0;
+    return ssd_streaming ? ssd_enabled == 1 : enabled != 0;
+}
+
+/* An explicitly selected exact Q8_K quantizer owns an optional WMMA default.
+ * REQUIRE_WMMA is the only control that may override an optional Q8 request;
+ * dual REQUIRE is rejected by each public dispatch before enqueue. */
+static int rocm_q4_K_prefill_wmma_yields_to_q8_wave32(
+        int q8_wave32,
+        int wmma_required) {
+    return q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_USE && !wmma_required;
+}
+
+extern "C" int ds4_rocm_test_q4_prefill_wmma_yields_to_q8_wave32(
+        int q8_selected,
+        int wmma_required) {
+    const int q8_wave32 = q8_selected
+        ? ROCM_Q4_PREFILL_Q8_WAVE32_USE
+        : ROCM_Q4_PREFILL_Q8_WAVE32_FALLBACK;
+    return rocm_q4_K_prefill_wmma_yields_to_q8_wave32(
+        q8_wave32, wmma_required != 0);
+}
+
+extern "C" int ds4_rocm_test_q4_prefill_wmma_requested_policy(
+        int ssd_streaming,
+        int enabled,
+        int ssd_enabled,
+        int disabled,
+        int required) {
+    return rocm_q4_K_prefill_wmma_requested_policy(
+        ssd_streaming != 0, enabled, ssd_enabled, disabled != 0,
+        required != 0);
+}
+
 static int rocm_q4_K_prefill_wmma_select(
         uint64_t n_tok,
         uint64_t in_dim,
         uint64_t out_dim,
         int weight_device_resident) {
     const int enabled = rocm_q4_attn_q_b_env_bool(
-        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA") == 1;
+        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA");
     const int ssd_enabled = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD") == 1;
     const int disabled = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA") == 1;
     const int required = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1;
-    const int requested = enabled || required ||
-                          (g_ssd_streaming_mode && ssd_enabled);
+    const int requested = rocm_q4_K_prefill_wmma_requested_policy(
+        g_ssd_streaming_mode, enabled, ssd_enabled, disabled, required);
     if (!requested) return ROCM_Q4_PREFILL_WMMA_FALLBACK;
 
     const int shape_ok =
@@ -1034,9 +1080,10 @@ static int rocm_q4_K_prefill_wmma_select(
     const int storage_ok = !g_ssd_streaming_mode ||
                            ((ssd_enabled || required) &&
                             weight_device_resident);
+    const int explicit_request = enabled == 1 || ssd_enabled || required;
     const int eligible = !disabled && shape_ok && storage_ok &&
         !g_quality_mode &&
-        rocm_attention_runtime_is_gfx1151_wave32(requested);
+        rocm_attention_runtime_is_gfx1151_wave32(explicit_request);
     if (eligible) return ROCM_Q4_PREFILL_WMMA_USE;
     if (!required) return ROCM_Q4_PREFILL_WMMA_FALLBACK;
 
@@ -1494,19 +1541,22 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
         n_tok, in_dim, out_dim, weight_device_resident);
     if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) return 0;
     if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE &&
-        q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_USE &&
-        q8_wave32_required) {
-        if (rocm_q4_attn_q_b_env_bool(
-                "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1) {
+        q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_USE) {
+        const int wmma_required = rocm_q4_attn_q_b_env_bool(
+            "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1;
+        if (wmma_required && q8_wave32_required) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX
                     "Q4_K prefill cannot require both direct WMMA and "
                     "the Q8_K wave32 quantizer\n");
             return 0;
         }
-        /* The direct F16 WMMA path has no Q8_K RHS.  A strict quantizer
-         * request therefore owns dispatch and retains the exact matmul. */
-        prefill_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+        /* The direct F16 WMMA path has no Q8_K RHS.  An explicitly selected
+         * exact quantizer therefore owns an optional automatic WMMA path. */
+        if (rocm_q4_K_prefill_wmma_yields_to_q8_wave32(
+                q8_wave32, wmma_required)) {
+            prefill_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+        }
     }
     if (prefill_wmma == ROCM_Q4_PREFILL_WMMA_USE &&
         prefill_scope && prefill_tile8_required) {
@@ -1660,13 +1710,15 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
     }
 
     /* The fused pair consumes a shared Q8_K activation tile.  When the direct
-     * F16 WMMA experiment is selected, return before validation/enqueue so the
+     * F16 WMMA path is selected, return before validation/enqueue so the
      * graph's established fallback issues two dense calls and both can take
      * the strict WMMA path.  This also prevents REQUIRE from falsely passing
      * after silently measuring the TILE8 pair.  SSD preflight is deliberately
      * optimistic about residency: it only decides whether to yield; each dense
      * fallback then proves its exact physical device range before enqueue. */
-    if (!prefill_required && !q8_wave32_required) {
+    if (!prefill_required &&
+        !rocm_q4_K_prefill_wmma_yields_to_q8_wave32(
+            q8_wave32, wmma_required)) {
         const int wmma0 = rocm_q4_K_prefill_wmma_select(
             n_tok, in_dim, out0_dim, 1);
         const int wmma1 = rocm_q4_K_prefill_wmma_select(
@@ -1956,16 +2008,16 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         return -1;
     }
     const int wmma_enabled = rocm_q4_attn_q_b_env_bool(
-        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA") == 1;
+        "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA");
     const int wmma_ssd_enabled = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD") == 1;
     const int wmma_disabled = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA") == 1;
     const int wmma_required = rocm_q4_attn_q_b_env_bool(
         "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1;
-    const int wmma_requested = wmma_required ||
-        (!wmma_disabled && ((!g_ssd_streaming_mode && wmma_enabled) ||
-                           (g_ssd_streaming_mode && wmma_ssd_enabled)));
+    const int wmma_requested = rocm_q4_K_prefill_wmma_requested_policy(
+        g_ssd_streaming_mode, wmma_enabled, wmma_ssd_enabled,
+        wmma_disabled, wmma_required);
     if (!tile8_scope) return 0;
     if (!tile8_requested && !wmma_requested) {
         if (tile8_required || q8_wave32_required) {
@@ -2069,18 +2121,21 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         b_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) {
         return -1;
     }
-    if (q8_wave32_required &&
+    if (q8_wave32 == ROCM_Q4_PREFILL_Q8_WAVE32_USE &&
         (a_wmma == ROCM_Q4_PREFILL_WMMA_USE ||
          b_wmma == ROCM_Q4_PREFILL_WMMA_USE)) {
-        if (wmma_required) {
+        if (wmma_required && q8_wave32_required) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX
                     "Q4_K attention-output prefill cannot require both "
                     "direct WMMA and the Q8_K wave32 quantizer\n");
             return -1;
         }
-        a_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
-        b_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+        if (rocm_q4_K_prefill_wmma_yields_to_q8_wave32(
+                q8_wave32, wmma_required)) {
+            a_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+            b_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+        }
     }
     if (tile8_required &&
         (a_wmma == ROCM_Q4_PREFILL_WMMA_USE ||

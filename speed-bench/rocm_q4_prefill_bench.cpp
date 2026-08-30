@@ -523,7 +523,7 @@ void select_legacy() {
     (void)unsetenv(kK1024Tile4Require);
     (void)unsetenv(kWmmaEnable);
     (void)unsetenv(kWmmaSsdEnable);
-    (void)unsetenv(kWmmaDisable);
+    (void)setenv(kWmmaDisable, "1", 1);
     (void)unsetenv(kWmmaRequire);
     (void)unsetenv(kWmmaRowTile);
     (void)unsetenv(kQ8Wave32Enable);
@@ -539,7 +539,7 @@ void select_tile8(bool disable_k1024_tile4) {
     (void)unsetenv(kK1024Tile4Require);
     (void)unsetenv(kWmmaEnable);
     (void)unsetenv(kWmmaSsdEnable);
-    (void)unsetenv(kWmmaDisable);
+    (void)setenv(kWmmaDisable, "1", 1);
     (void)unsetenv(kWmmaRequire);
     (void)unsetenv(kWmmaRowTile);
     (void)unsetenv(kQ8Wave32Enable);
