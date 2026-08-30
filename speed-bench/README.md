@@ -278,29 +278,51 @@ and then the resident prequantized A/B benchmark:
 make test-mmq-q4-16warp-cuda CUDA_ARCH=sm_121
 make cuda-q4-prefill-bench CUDA_ARCH=sm_121
 ./speed-bench/cuda_q4_prefill_bench \
-  --path mmq --kernel-16warp --case qb \
-  --tokens 512,1024,2048,2049,4096 --sets 4 --samples 16 --warmup 4
+  --path mmq --kernel-16warp --case dense \
+  --tokens 512,1024,2048,2049,4096,6144,8192 \
+  --sets 4 --samples 16 --warmup 4
+./speed-bench/cuda_q4_prefill_bench \
+  --path mmq --kernel-16warp --case pair \
+  --tokens 512,1024,2048,2049,4096,6144,8192 \
+  --sets 4 --samples 16 --warmup 4
 ```
 
 The benchmark quantizes X to canonical Q8_1 DS4 once, before timing, and uses
-CUDA events around only the complete-K reference GEMM or the raw 16-warp GEMM.
-It alternates the two arms ABBA/BAAB over resident Q4_K weight sets, compares
-their complete outputs bit-for-bit, checks finite values and canaries, and
-samples a CPU Q4_K oracle before and after timing. Results attest
+CUDA events around only the production-policy Stream-K reference or the
+16-warp kernel with the same partition/fixup policy. Both arms therefore
+include fixup whenever the canonical dispatcher would use it, including the
+GB10 `M=1024,N=4096` case. One guarded fixup allocation is created before the
+samples and reused by both A/B arms and by the two pair legs, so CUDA pool
+allocation/free nodes cannot bias the kernel delta.
+The dense case is the production Q-A shape `K=4096,M=1024`; the pair case
+reuses that same prequantized activation across the asymmetric Q-A/KV shapes
+`M0=1024,M1=512` and times two GEMMs in each arm. It alternates the
+arms ABBA/BAAB over resident Q4_K weight sets, compares every complete output
+bit-for-bit, checks finite values and independent output canaries, and samples
+a CPU Q4_K oracle before and after timing. Results attest
 `timing=kernel_only_prequant`; SSD streaming, model upload, Q8_1 quantization,
 allocation, host copies, and oracle work are outside the samples. Use
-`--case dense` as an exploratory `K=4096,M=1024` datapoint; the initial
-production admission gate is deliberately limited to larger, complete
-128x128 projections such as q_b.
+`--case qb` for the additional `K=1024,M=32768` large-projection datapoint.
+The focused test also invokes the real standalone dense and pair dispatchers in
+required mode at `N=4096`, so fallback fails instead of producing a misleading
+canonical-path pass. A negative pair case verifies that an ineligible 384-row
+leg returns `DS4_MMQ_NOT_APPLICABLE` without touching either guarded output.
+The CLI accepts contexts through 8192 tokens; the default kernel-only sweep
+adds 6144 and 8192 to expose long-context scaling. A custom token tail must
+also make the canonical picker select `m128n128`; the harness checks the real
+device selector up front and reports `SKIP` instead of running a mismatched
+Stream-K partition.
 
 The production path remains opt-in until the NVIDIA oracle passes and the
 paired median is a repeatable win. `DS4_CUDA_Q4_MMQ_16WARP=1` requests it and
 falls back on ineligible shapes. For an attested production benchmark,
 `DS4_CUDA_REQUIRE_Q4_MMQ_16WARP=1` also prevents a Q8_K/MMQ fallback;
 `DS4_CUDA_NO_Q4_MMQ_16WARP=1` is the value-aware rollback. The strict path
-requires Ampere or newer, N and M divisible by 128, `M>=2048`, `N>=512`,
-`1024<=K<=4096`, the default 128-column MMQ selector, and a canonical tiling
-that owns complete K without stream-K fixup.
+requires Ampere or newer, complete 128x128 output tiles, `N>=512`,
+`1024<=K<=4096`, the default 128-column MMQ selector, and at least 80% final-wave
+grid efficiency. Single dense admission starts at `M=1024`; the Q-A/KV pair
+admission also accepts its `M1=512` leg when both projections select the
+16-warp path.
 
 On GB10, isolate the production Flash attention-output A geometry
 (`groups=8`, `K=4096`, `rank=1024`) and its 127/128/129 token tails with:

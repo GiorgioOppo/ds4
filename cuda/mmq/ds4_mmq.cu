@@ -982,6 +982,49 @@ static bool ds4_q4_test_q8_1_layout(
     return true;
 }
 
+/* The candidate and its caller-owned fixup buffer model canonical m128n128.
+ * Confirm the real canonical picker chooses that tile: a width limit alone is
+ * insufficient because resource constraints or a ceil-division plateau can
+ * retain a narrower width and change both partitioning and scratch size. */
+static bool ds4_q4_test_reference_uses_m128n128(
+        int device, int cc, int N) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || N <= 0 ||
+        get_mmq_y_host(cc) != 128) {
+        return false;
+    }
+    const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int nwarps = mmq_get_nwarps_host(cc, warp_size);
+    const int mmq_x_max = get_mmq_x_max_host(cc);
+    int mmq_x_best = 0;
+    int64_t ntiles_x_best = INT64_MAX;
+    for (int mmq_x = 8;
+         mmq_x <= mmq_x_max && ntiles_x_best > 1;
+         mmq_x += 8) {
+        const int granularity = mmq_get_granularity_host(mmq_x, cc);
+        if (mmq_x % granularity != 0 ||
+            mmq_get_nbytes_shared<GGML_TYPE_Q4_K>(
+                mmq_x, 128, cc, warp_size, nwarps) > smpbo) {
+            continue;
+        }
+        const int64_t ntiles_x =
+            ((int64_t)N + mmq_x - 1) / mmq_x;
+        if (ntiles_x < ntiles_x_best) {
+            mmq_x_best = mmq_x;
+            ntiles_x_best = ntiles_x;
+        }
+    }
+    return mmq_x_best == 128;
+}
+
+extern "C" int
+ds4_mmq_q4_K_dense_preq_reference_m128n128_for_test(int N) {
+    const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return 0;
+    return ds4_q4_test_reference_uses_m128n128(
+        dev, ggml_cuda_info().devices[dev].cc, N) ? 1 : 0;
+}
+
 extern "C" size_t ds4_mmq_q4_K_q8_1_scratch_bytes(int N, int K) {
     size_t total = 0;
     return ds4_q4_test_q8_1_layout(N, K, nullptr, &total) ? total : 0;
@@ -1010,6 +1053,7 @@ extern "C" int ds4_mmq_q4_K_quantize_q8_1_for_test(
 extern "C" int ds4_mmq_q4_K_dense_preq_reference_for_test(
         const void *W_q4_K, const void *q8_ds4, size_t q8_bytes,
         float *out_f32, int M, int N, int K, int use_stream_k,
+        void *stream_k_fixup, size_t stream_k_fixup_bytes,
         cudaStream_t stream) {
     size_t payload = 0, total = 0;
     if (!W_q4_K || !q8_ds4 || !out_f32 || M <= 0 ||
@@ -1018,6 +1062,7 @@ extern "C" int ds4_mmq_q4_K_dense_preq_reference_for_test(
         return -1;
     }
     const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return -1;
     const int cc = ggml_cuda_info().devices[dev].cc;
     if (!ds4_mmq_k_tile_supported<GGML_TYPE_Q4_K>(
             "ds4_mmq_q4_K_dense_preq_reference_for_test", K, cc)) {
@@ -1025,6 +1070,22 @@ extern "C" int ds4_mmq_q4_K_dense_preq_reference_for_test(
     }
     ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
     if (!ctx) return -1;
+    if ((stream_k_fixup == nullptr && stream_k_fixup_bytes != 0u) ||
+        (stream_k_fixup != nullptr &&
+         ((uintptr_t)stream_k_fixup % alignof(float)) != 0) ||
+        (stream_k_fixup_bytes % sizeof(float)) != 0u) {
+        return -1;
+    }
+    if (stream_k_fixup != nullptr) {
+        if (!use_stream_k) return -1;
+        if (!ds4_q4_test_reference_uses_m128n128(dev, cc, N)) {
+            return DS4_MMQ_NOT_APPLICABLE;
+        }
+        const size_t required =
+            ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+                M, N, ggml_cuda_info().devices[dev].nsm);
+        if (required > stream_k_fixup_bytes) return -1;
+    }
     ds4_pool_set_stream(stream);
     const int64_t stride_row_x = (int64_t)K / QK_K;
     const int64_t stride_y = (int64_t)(payload / sizeof(int));
@@ -1047,6 +1108,10 @@ extern "C" int ds4_mmq_q4_K_dense_preq_reference_for_test(
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k != 0,
         /*ncols_max=*/(int64_t)N,
+        /*x_soa=*/nullptr,
+        /*soa_blocks=*/0,
+        /*stream_k_fixup=*/static_cast<float *>(stream_k_fixup),
+        /*stream_k_fixup_elements=*/stream_k_fixup_bytes / sizeof(float),
     };
     mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args, stream);
     const cudaError_t err = cudaGetLastError();
@@ -1064,7 +1129,7 @@ extern "C" int ds4_mmq_q4_K_dense_preq_16warp_for_test(
         q8_bytes < total) {
         return -1;
     }
-    // This direct oracle hook deliberately accepts an N tail (the production
+    // This Stream-K oracle hook deliberately accepts an N tail (the production
     // selector is stricter until NVIDIA measurements justify broadening it),
     // but it must reject shapes that cannot be represented by this kernel
     // before enqueueing any work.
@@ -1078,8 +1143,17 @@ extern "C" int ds4_mmq_q4_K_dense_preq_16warp_for_test(
         ds4_q4_16warp_prepare_once(dev) != 0) {
         return DS4_MMQ_NOT_APPLICABLE;
     }
-    return ds4_mmq_q4_K_dense_16warp_enqueue(
-        W_q4_K, q8_ds4, out_f32, M, N, K, stream);
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return DS4_MMQ_NOT_APPLICABLE;
+    ds4_pool_set_stream(stream);
+    const int nsm = ggml_cuda_info().devices[dev].nsm;
+    const size_t fixup_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(M, N, nsm);
+    ggml_cuda_pool_alloc<char> fixup(ctx->pool());
+    if (fixup_bytes != 0u) fixup.alloc(fixup_bytes);
+    return ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+        W_q4_K, q8_ds4, out_f32, fixup.get(), fixup_bytes,
+        M, N, K, nsm, stream);
 }
 
 enum {
@@ -1127,7 +1201,12 @@ static int ds4_q4_16warp_prepare_once(int device) {
     return rc;
 }
 
-static bool ds4_q4_canonical_owns_complete_k(int M, int N, int nsm) {
+/* Keep the 16-warp experiment on geometries with enough independent output
+ * tiles to occupy the device well.  Below canonical's 90% whole-tile cutoff,
+ * the candidate mirrors canonical stream-K partitioning and fixup; this 80%
+ * gate is therefore only an admission/performance heuristic, not a numerical
+ * shortcut.  On GB10 the Q-A/KV N=4096 shapes score 88%. */
+static bool ds4_q4_16warp_grid_efficient(int M, int N, int nsm) {
     if (M <= 0 || N <= 0 || nsm <= 0) return false;
     const int64_t tiles_m = ((int64_t)M + 127) / 128;
     const int64_t tiles_n = ((int64_t)N + 127) / 128;
@@ -1135,7 +1214,70 @@ static bool ds4_q4_canonical_owns_complete_k(int M, int N, int nsm) {
     const int64_t tiles = tiles_m * tiles_n;
     const int64_t waves = (tiles + nsm - 1) / nsm;
     if (waves <= 0 || (int64_t)nsm > INT64_MAX / waves) return false;
-    return (100 * tiles) / ((int64_t)nsm * waves) >= 90;
+    return (100 * tiles) / ((int64_t)nsm * waves) >= 80;
+}
+
+static bool ds4_q4_16warp_pair_leg_shape_supported(
+        int cc, int M, int N, int K) {
+    return ds4_mmq_q4_K_dense_16warp_available(cc) &&
+           M >= 512 && (M % 128) == 0 &&
+           N >= 512 && (N % 128) == 0 &&
+           K >= 1024 && K <= 4096 && (K % QK_K) == 0;
+}
+
+/* Resolve the experiment before allocation or enqueue. The standalone path
+ * uses the public M>=1024 gate; a dense-pair leg may go down to M=512 because
+ * Q-A/KV pairs contain a 512-row leg. Each candidate grid must retain at least
+ * 80% whole-tile SM-wave efficiency; scheduling itself follows canonical
+ * stream-K whenever canonical would split K. */
+static int ds4_q4_16warp_select(
+        const char *tag, int device, int cc, int M, int N, int K,
+        bool pair_leg, bool *selected) {
+    if (!selected) return DS4_MMQ_NOT_APPLICABLE;
+    *selected = false;
+    const int mode = ds4_q4_16warp_mode();
+    const bool disabled = (mode & DS4_Q4_16WARP_DISABLE) != 0;
+    const bool requested = (mode & DS4_Q4_16WARP_REQUEST) != 0;
+    const bool required = (mode & DS4_Q4_16WARP_REQUIRE) != 0;
+    if (!requested) return 0;
+
+    const bool shape_supported = pair_leg
+        ? ds4_q4_16warp_pair_leg_shape_supported(cc, M, N, K)
+        : ds4_mmq_q4_K_dense_16warp_supported(cc, M, N, K) != 0;
+    // The exact oracle models canonical m128n128 MMQ. Check the selector's
+    // actual result, not only its upper bound: resource limits and equal
+    // ceil-division plateaus can make it retain a narrower tile.
+    const bool canonical_x128 =
+        ds4_q4_test_reference_uses_m128n128(device, cc, N);
+    const bool grid_efficient = ds4_q4_16warp_grid_efficient(
+        M, N, ggml_cuda_info().devices[device].nsm);
+    if (required && (disabled || !shape_supported || !canonical_x128 ||
+                     !grid_efficient)) {
+        fprintf(stderr,
+                "%s: required Q4 16-warp path is ineligible "
+                "(scope=%s disabled=%d shape=%d x128=%d grid_eff=%d "
+                "M=%d N=%d K=%d)\n",
+                tag, pair_leg ? "pair-leg" : "dense",
+                disabled ? 1 : 0, shape_supported ? 1 : 0,
+                canonical_x128 ? 1 : 0, grid_efficient ? 1 : 0, M, N, K);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if (disabled || !shape_supported || !canonical_x128 || !grid_efficient) {
+        return 0;
+    }
+
+    const int prep = ds4_q4_16warp_prepare_once(device);
+    if (prep == 0) {
+        *selected = true;
+        return 0;
+    }
+    if (required) {
+        fprintf(stderr, "%s: required Q4 16-warp preflight failed: %d\n",
+                tag, prep);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    (void)cudaGetLastError();
+    return 0;
 }
 #endif
 
@@ -1169,44 +1311,14 @@ int ds4_mmq_dense_impl(
     const int cc  = ggml_cuda_info().devices[dev].cc;
     if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
 
-    bool use_q4_16warp = false;
 #if !defined(GGML_USE_HIP)
+    bool use_q4_16warp = false;
     if constexpr (type == GGML_TYPE_Q4_K) {
-        const int mode = ds4_q4_16warp_mode();
-        const bool disabled = (mode & DS4_Q4_16WARP_DISABLE) != 0;
-        const bool requested = (mode & DS4_Q4_16WARP_REQUEST) != 0;
-        const bool required = (mode & DS4_Q4_16WARP_REQUIRE) != 0;
-        const bool shape_supported =
-            ds4_mmq_q4_K_dense_16warp_supported(cc, M, N, K) != 0;
-        // The complete-K parity gate below models canonical m128n128 MMQ.
-        // A DS4_CUDA_MMQ_X_MAX sweep can make the reference choose a smaller
-        // X tile and therefore a different stream-K/fixup decision.
-        const bool canonical_x128 = get_mmq_x_max_host(cc) == 128;
-        const bool complete_k = ds4_q4_canonical_owns_complete_k(
-            M, N, ggml_cuda_info().devices[dev].nsm);
-        if (required && (disabled || !shape_supported || !canonical_x128 ||
-                         !complete_k)) {
-            fprintf(stderr,
-                    "%s: required Q4 16-warp path is ineligible "
-                    "(disabled=%d shape=%d x128=%d complete_k=%d "
-                    "M=%d N=%d K=%d)\n",
-                    tag, disabled ? 1 : 0, shape_supported ? 1 : 0,
-                    canonical_x128 ? 1 : 0, complete_k ? 1 : 0, M, N, K);
-            return DS4_MMQ_NOT_APPLICABLE;
-        }
-        if (requested && !disabled && shape_supported && canonical_x128 &&
-            complete_k) {
-            const int prep = ds4_q4_16warp_prepare_once(dev);
-            if (prep == 0) {
-                use_q4_16warp = true;
-            } else if (required) {
-                fprintf(stderr,
-                        "%s: required Q4 16-warp preflight failed: %d\n",
-                        tag, prep);
-                return DS4_MMQ_NOT_APPLICABLE;
-            } else {
-                (void)cudaGetLastError();
-            }
+        const int select_rc = ds4_q4_16warp_select(
+            tag, dev, cc, M, N, K, /*pair_leg=*/false,
+            &use_q4_16warp);
+        if (select_rc != 0) {
+            return select_rc;
         }
     }
 #endif
@@ -1310,10 +1422,19 @@ int ds4_mmq_dense_impl(
 #if !defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_Q4_K) {
         if (use_q4_16warp) {
-            const int rc = ds4_mmq_q4_K_dense_16warp_enqueue(
-                W, src1_q8_1.get(), out_f32, M, N, K, stream);
+            const int nsm = ggml_cuda_info().devices[dev].nsm;
+            const size_t fixup_bytes =
+                ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+                    M, N, nsm);
+            ggml_cuda_pool_alloc<char> fixup(ctx->pool());
+            if (fixup_bytes != 0u) fixup.alloc(fixup_bytes);
+            const int rc = ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+                W, src1_q8_1.get(), out_f32, fixup.get(), fixup_bytes,
+                M, N, K, nsm, stream);
             if (rc != 0) {
-                fprintf(stderr, "%s: Q4 16-warp launch failed: %d\n", tag, rc);
+                fprintf(stderr,
+                        "%s: Q4 16-warp stream-K launch failed: %d\n",
+                        tag, rc);
                 return -3;
             }
             return 0;
@@ -1399,6 +1520,19 @@ int ds4_mmq_q4_K_dense_pair_impl(
         return DS4_MMQ_NOT_APPLICABLE;
     }
 
+#if !defined(GGML_USE_HIP)
+    bool use_q4_16warp0 = false;
+    bool use_q4_16warp1 = false;
+    int select_rc = ds4_q4_16warp_select(
+        tag, dev, cc, M0, N, K, /*pair_leg=*/true,
+        &use_q4_16warp0);
+    if (select_rc != 0) return select_rc;
+    select_rc = ds4_q4_16warp_select(
+        tag, dev, cc, M1, N, K, /*pair_leg=*/true,
+        &use_q4_16warp1);
+    if (select_rc != 0) return select_rc;
+#endif
+
     ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
     if (!ctx) {
         fprintf(stderr, "%s: failed to get cuda context for device %d\n",
@@ -1449,6 +1583,27 @@ int ds4_mmq_q4_K_dense_pair_impl(
          ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
+#if !defined(GGML_USE_HIP)
+    const int q4_16warp_nsm = ggml_cuda_info().devices[dev].nsm;
+    const size_t q4_16warp_fixup0 = use_q4_16warp0
+        ? ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+              M0, N, q4_16warp_nsm)
+        : 0u;
+    const size_t q4_16warp_fixup1 = use_q4_16warp1
+        ? ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+              M1, N, q4_16warp_nsm)
+        : 0u;
+    const size_t q4_16warp_fixup_bytes =
+        q4_16warp_fixup0 > q4_16warp_fixup1
+            ? q4_16warp_fixup0 : q4_16warp_fixup1;
+    // Both legs are ordered on the same stream, so one allocation can be
+    // cleared and reused after the first leg's fixup has consumed it.
+    ggml_cuda_pool_alloc<char> q4_16warp_fixup(ctx->pool());
+    if (q4_16warp_fixup_bytes != 0u) {
+        q4_16warp_fixup.alloc(q4_16warp_fixup_bytes);
+    }
+#endif
+
     if (out_memset_enabled()) {
         cudaMemsetAsync(out0_f32, 0, out0_bytes, stream);
     }
@@ -1478,12 +1633,28 @@ int ds4_mmq_q4_K_dense_pair_impl(
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/(int64_t)N,
     };
-    mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args0, stream);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: first mul_mat_q_case launch failed: %s\n",
-                tag, cudaGetErrorString(err));
-        return -3;
+#if !defined(GGML_USE_HIP)
+    if (use_q4_16warp0) {
+        const int rc = ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+            W0, src1_q8_1.get(), out0_f32,
+            q4_16warp_fixup.get(), q4_16warp_fixup_bytes,
+            M0, N, K, q4_16warp_nsm, stream);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "%s: first Q4 16-warp stream-K launch failed: %d\n",
+                    tag, rc);
+            return -3;
+        }
+    } else
+#endif
+    {
+        mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args0, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: first mul_mat_q_case launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -3;
+        }
     }
 
     if (out_memset_enabled()) {
@@ -1515,12 +1686,28 @@ int ds4_mmq_q4_K_dense_pair_impl(
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/(int64_t)N,
     };
-    mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args1, stream);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: second mul_mat_q_case launch failed: %s\n",
-                tag, cudaGetErrorString(err));
-        return -4;
+#if !defined(GGML_USE_HIP)
+    if (use_q4_16warp1) {
+        const int rc = ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+            W1, src1_q8_1.get(), out1_f32,
+            q4_16warp_fixup.get(), q4_16warp_fixup_bytes,
+            M1, N, K, q4_16warp_nsm, stream);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "%s: second Q4 16-warp stream-K launch failed: %d\n",
+                    tag, rc);
+            return -4;
+        }
+    } else
+#endif
+    {
+        mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args1, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: second mul_mat_q_case launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -4;
+        }
     }
     return 0;
 }

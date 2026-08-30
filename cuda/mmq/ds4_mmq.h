@@ -188,6 +188,7 @@ int ds4_mmq_q4_K_dense(
     int           K,
     cudaStream_t  stream);
 
+#if !defined(GGML_USE_HIP)
 // CUDA benchmark/test boundary for separating activation quantization from
 // the Q4_K MMQ kernel.  The scratch layout is canonical block_q8_1_mmq DS4
 // ([K/128][N]) plus a zeroed 128-column tail.  These helpers never transfer
@@ -202,9 +203,17 @@ int ds4_mmq_q4_K_quantize_q8_1_for_test(
     int           K,
     cudaStream_t  stream);
 
+// Return non-zero only when the current device's canonical Q4_K MMQ picker
+// selects m128n128 for this activation-column count. Kernel A/B harnesses use
+// this to reject tail geometries whose Stream-K tile partition is different.
+int ds4_mmq_q4_K_dense_preq_reference_m128n128_for_test(int N);
+
 // Enqueue-only A/B arms over a caller-owned, already-quantized activation.
-// The reference can disable stream-K to give the 16-warp candidate the same
-// complete-K reduction tree.  Zero is success; nonzero is rejection/failure.
+// The reference may disable stream-K for a complete-K control; the 16-warp
+// candidate helper follows the production canonical stream-K/fixup policy.
+// Passing caller-owned reference fixup storage keeps pool alloc/free nodes out
+// of CUDA-event kernel benchmarks; null/zero retains the production pool.
+// Zero is success; nonzero is rejection/failure.
 int ds4_mmq_q4_K_dense_preq_reference_for_test(
     const void  * W_q4_K,
     const void  * q8_ds4,
@@ -214,6 +223,8 @@ int ds4_mmq_q4_K_dense_preq_reference_for_test(
     int           N,
     int           K,
     int           use_stream_k,
+    void        * stream_k_fixup,
+    size_t        stream_k_fixup_bytes,
     cudaStream_t  stream);
 
 int ds4_mmq_q4_K_dense_preq_16warp_for_test(
@@ -225,12 +236,18 @@ int ds4_mmq_q4_K_dense_preq_16warp_for_test(
     int           N,
     int           K,
     cudaStream_t  stream);
+#endif
 
 // Two dense Q4_K MMQ projections that share one token-tiled Q8_1
 // activation buffer.  This is the prefill sibling of
 // ds4_mmq_q4_K_dense_pair_vec: N is not limited to the MMVQ batch ceiling,
 // M0 and M1 may differ, and each leg preserves ds4_mmq_q4_K_dense's
 // reduction and output layout. The two output ranges must be disjoint.
+// On CUDA, the opt-in 16-warp experiment selects each leg independently
+// (down to M=512) when its output-tile grid retains at least 80% SM-wave
+// efficiency; below canonical's whole-tile cutoff it mirrors canonical
+// stream-K partitioning and fixup. REQUIRE rejects the pair before allocation
+// unless both legs can use the candidate.
 // Shape/capability rejection returns DS4_MMQ_NOT_APPLICABLE before enqueue;
 // negative values report an attempted-path launch failure.
 int ds4_mmq_q4_K_dense_pair(

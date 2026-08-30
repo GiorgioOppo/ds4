@@ -20,6 +20,7 @@
 //        -o test_mmq_parity
 
 #include "ds4_mmq.h"
+#include "ds4_mmq_q4_16warp.cuh"
 #include "iq2_host_tables.h"
 
 // Pull in the block_* struct definitions.  We use the CUDA decl/impl mode
@@ -103,6 +104,34 @@ private:
     bool had_original_ = false;
     bool active_ = false;
 };
+
+cudaError_t enqueue_scratch_guard_copy(
+        const void *storage, size_t payload_bytes, size_t guard_bytes,
+        uint8_t *host_guards, cudaStream_t stream) {
+    if (!storage || !host_guards || guard_bytes == 0) {
+        // cudaError_t is an integer-compatible type in both the CUDA runtime and
+        // the host-only syntax-check stub; avoid depending on a stubbed enum.
+        return static_cast<cudaError_t>(1);
+    }
+    const auto *bytes = static_cast<const uint8_t *>(storage);
+    cudaError_t err = cudaMemcpyAsync(
+        host_guards, bytes, guard_bytes, cudaMemcpyDeviceToHost, stream);
+    if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(
+            host_guards + guard_bytes, bytes + guard_bytes + payload_bytes,
+            guard_bytes, cudaMemcpyDeviceToHost, stream);
+    }
+    return err;
+}
+
+size_t scratch_guard_mismatches(
+        const std::vector<uint8_t> &guards, uint8_t expected) {
+    size_t bad = 0;
+    for (uint8_t value : guards) {
+        if (value != expected) bad++;
+    }
+    return bad;
+}
 
 // --------------------------------------------------------------------------
 // Half-precision conversion (standalone, no CUDA host fp16 needed).
@@ -549,18 +578,20 @@ bool run_q4_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.20f) {
 }
 
 // Resident-kernel oracle for the opt-in m128n128/16-warp Q4_K prefill
-// candidate. All arms consume the same caller-owned DS4 Q8_1 activation.
-// The complete-K reference is always checked; for a no-fixup shape the real
-// stream-K production arm must also be bit-identical. Guard regions catch
-// output overruns independently of numerical parity.
+// candidate. The raw canonical/candidate arms consume the same caller-owned
+// DS4 Q8_1 activation. The canonical arm uses the production stream-K policy,
+// including fixup when selected. The production API can be checked as a third,
+// independently guarded output without folding its quantizer into the raw
+// kernel comparison.
 bool run_q4_K_dense_16warp_parity(
-        int M, int N, int K, uint32_t seed,
-        bool check_production, bool check_rejection) {
+        int M, int N, int K, int nsm, uint32_t seed,
+        bool check_public_dense, bool check_rejection) {
     fprintf(stderr,
             "=== Q4_K/DENSE_16WARP  M=%d N=%d K=%d seed=%u%s ===\n",
-            M, N, K, seed, check_production ? " stream-k" : "");
+            M, N, K, seed, check_public_dense ? " production" : "");
 
-    if (M <= 0 || N <= 0 || K <= 0 || K % QK_K_LOCAL != 0 ||
+    if (M <= 0 || N <= 0 || K <= 0 || nsm <= 0 ||
+        K % QK_K_LOCAL != 0 ||
         (size_t)M > SIZE_MAX / (size_t)N / sizeof(float)) {
         fprintf(stderr, "invalid 16-warp parity shape\n\n");
         return false;
@@ -585,10 +616,18 @@ bool run_q4_K_dense_16warp_parity(
     constexpr uint8_t prod_guard_byte = 0xc3;
     constexpr uint8_t got_guard_byte = 0x5a;
     constexpr uint8_t reject_byte = 0x3c;
+    constexpr uint8_t scratch_guard_byte = 0x7d;
     const size_t output_count = (size_t)M * N;
     const size_t output_bytes = output_count * sizeof(float);
     const size_t guard_bytes = guard_floats * sizeof(float);
     const size_t guarded_bytes = output_bytes + 2u * guard_bytes;
+    const size_t scratch_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(M, N, nsm);
+    if (scratch_bytes > SIZE_MAX - 2u * guard_bytes) {
+        fprintf(stderr, "Q4_K 16-warp scratch guard size overflow\n\n");
+        return false;
+    }
+    const size_t scratch_guarded_bytes = scratch_bytes + 2u * guard_bytes;
 
     cudaStream_t stream = nullptr;
     void *dW = nullptr;
@@ -597,15 +636,18 @@ bool run_q4_K_dense_16warp_parity(
     float *dRefStorage = nullptr;
     float *dProdStorage = nullptr;
     float *dGotStorage = nullptr;
+    void *dScratchStorage = nullptr;
     const bool allocated = cudaStreamCreate(&stream) == cudaSuccess &&
         cudaMalloc(&dW, W.size() * sizeof(block_q4_K)) == cudaSuccess &&
         cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
         cudaMalloc(&dQ8, q8_bytes) == cudaSuccess &&
         cudaMalloc(&dRefStorage, guarded_bytes) == cudaSuccess &&
-        (!check_production ||
+        (!check_public_dense ||
          cudaMalloc(&dProdStorage, guarded_bytes) == cudaSuccess) &&
-        cudaMalloc(&dGotStorage, guarded_bytes) == cudaSuccess;
+        cudaMalloc(&dGotStorage, guarded_bytes) == cudaSuccess &&
+        cudaMalloc(&dScratchStorage, scratch_guarded_bytes) == cudaSuccess;
     const auto cleanup = [&]() {
+        if (dScratchStorage) cudaFree(dScratchStorage);
         if (dGotStorage) cudaFree(dGotStorage);
         if (dProdStorage) cudaFree(dProdStorage);
         if (dRefStorage) cudaFree(dRefStorage);
@@ -622,9 +664,11 @@ bool run_q4_K_dense_16warp_parity(
     }
 
     float *const dRef = dRefStorage + guard_floats;
-    float *const dProd = check_production
+    float *const dProd = check_public_dense
         ? dProdStorage + guard_floats : nullptr;
     float *const dGot = dGotStorage + guard_floats;
+    void *const dScratch =
+        static_cast<uint8_t *>(dScratchStorage) + guard_bytes;
     cudaError_t enqueue_err = cudaMemcpyAsync(
         dW, W.data(), W.size() * sizeof(block_q4_K),
         cudaMemcpyHostToDevice, stream);
@@ -637,13 +681,18 @@ bool run_q4_K_dense_16warp_parity(
         enqueue_err = cudaMemsetAsync(
             dRefStorage, ref_guard_byte, guarded_bytes, stream);
     }
-    if (enqueue_err == cudaSuccess && check_production) {
+    if (enqueue_err == cudaSuccess && check_public_dense) {
         enqueue_err = cudaMemsetAsync(
             dProdStorage, prod_guard_byte, guarded_bytes, stream);
     }
     if (enqueue_err == cudaSuccess) {
         enqueue_err = cudaMemsetAsync(
             dGotStorage, got_guard_byte, guarded_bytes, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dScratchStorage, scratch_guard_byte, scratch_guarded_bytes,
+            stream);
     }
 
     const int rc_quant = enqueue_err == cudaSuccess
@@ -653,28 +702,43 @@ bool run_q4_K_dense_16warp_parity(
     const int rc_ref = rc_quant == 0
         ? ds4_mmq_q4_K_dense_preq_reference_for_test(
               dW, dQ8, q8_bytes, dRef, M, N, K,
-              /*use_stream_k=*/0, stream)
+              /*use_stream_k=*/1,
+              dScratch, scratch_bytes,
+              stream)
         : -100;
-    const int rc_prod = rc_ref != 0 ? -100 : check_production
-        ? ds4_mmq_q4_K_dense_preq_reference_for_test(
-              dW, dQ8, q8_bytes, dProd, M, N, K,
-              /*use_stream_k=*/1, stream)
+    std::vector<uint8_t> ref_scratch_guards(2u * guard_bytes);
+    if (enqueue_err == cudaSuccess && rc_ref == 0) {
+        enqueue_err = enqueue_scratch_guard_copy(
+            dScratchStorage, scratch_bytes, guard_bytes,
+            ref_scratch_guards.data(), stream);
+    }
+    const int rc_prod = rc_ref != 0 || enqueue_err != cudaSuccess
+        ? -100 : check_public_dense
+        ? ds4_mmq_q4_K_dense(
+              dW, dX, dProd, M, N, K, stream)
         : 0;
     const int rc_got = rc_prod == 0
-        ? ds4_mmq_q4_K_dense_preq_16warp_for_test(
-              dW, dQ8, q8_bytes, dGot, M, N, K, stream)
+        ? ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+              dW, dQ8, dGot, dScratch, scratch_bytes,
+              M, N, K, nsm, stream)
         : -100;
+    std::vector<uint8_t> got_scratch_guards(2u * guard_bytes);
+    if (enqueue_err == cudaSuccess && rc_got == 0) {
+        enqueue_err = enqueue_scratch_guard_copy(
+            dScratchStorage, scratch_bytes, guard_bytes,
+            got_scratch_guards.data(), stream);
+    }
 
     std::vector<uint8_t> ref_guarded(guarded_bytes);
     std::vector<uint8_t> prod_guarded(
-        check_production ? guarded_bytes : 0u);
+        check_public_dense ? guarded_bytes : 0u);
     std::vector<uint8_t> got_guarded(guarded_bytes);
     if (rc_got == 0) {
         enqueue_err = cudaMemcpyAsync(
             ref_guarded.data(), dRefStorage, guarded_bytes,
             cudaMemcpyDeviceToHost, stream);
     }
-    if (enqueue_err == cudaSuccess && rc_got == 0 && check_production) {
+    if (enqueue_err == cudaSuccess && rc_got == 0 && check_public_dense) {
         enqueue_err = cudaMemcpyAsync(
             prod_guarded.data(), dProdStorage, guarded_bytes,
             cudaMemcpyDeviceToHost, stream);
@@ -703,7 +767,7 @@ bool run_q4_K_dense_16warp_parity(
                 ref_guarded.data() + guard_bytes + i * sizeof(float);
             const uint8_t *const got_bits_ptr =
                 got_guarded.data() + guard_bytes + i * sizeof(float);
-            const uint8_t *const prod_bits_ptr = check_production
+            const uint8_t *const prod_bits_ptr = check_public_dense
                 ? prod_guarded.data() + guard_bytes + i * sizeof(float)
                 : nullptr;
             float ref_value = 0.0f;
@@ -711,11 +775,11 @@ bool run_q4_K_dense_16warp_parity(
             float got_value = 0.0f;
             std::memcpy(&ref_value, ref_bits_ptr, sizeof(ref_value));
             std::memcpy(&got_value, got_bits_ptr, sizeof(got_value));
-            if (check_production) {
+            if (check_public_dense) {
                 std::memcpy(&prod_value, prod_bits_ptr, sizeof(prod_value));
             }
             if (!std::isfinite(ref_value)) nonfinite_ref++;
-            if (check_production && !std::isfinite(prod_value)) {
+            if (check_public_dense && !std::isfinite(prod_value)) {
                 nonfinite_prod++;
             }
             if (!std::isfinite(got_value)) nonfinite_got++;
@@ -729,7 +793,7 @@ bool run_q4_K_dense_16warp_parity(
                 }
                 ref_got_mismatches++;
             }
-            if (check_production &&
+            if (check_public_dense &&
                 std::memcmp(ref_bits_ptr, prod_bits_ptr, sizeof(float)) != 0) {
                 if (first_ref_prod_bad == SIZE_MAX) {
                     first_ref_prod_bad = i;
@@ -738,7 +802,7 @@ bool run_q4_K_dense_16warp_parity(
                 }
                 ref_prod_mismatches++;
             }
-            if (check_production &&
+            if (check_public_dense &&
                 std::memcmp(prod_bits_ptr, got_bits_ptr, sizeof(float)) != 0) {
                 prod_got_mismatches++;
             }
@@ -757,9 +821,13 @@ bool run_q4_K_dense_16warp_parity(
         return bad;
     };
     const size_t ref_canary = guard_mismatches(ref_guarded, ref_guard_byte);
-    const size_t prod_canary = check_production
+    const size_t prod_canary = check_public_dense
         ? guard_mismatches(prod_guarded, prod_guard_byte) : 0;
     const size_t got_canary = guard_mismatches(got_guarded, got_guard_byte);
+    const size_t ref_scratch_canary =
+        scratch_guard_mismatches(ref_scratch_guards, scratch_guard_byte);
+    const size_t got_scratch_canary =
+        scratch_guard_mismatches(got_scratch_guards, scratch_guard_byte);
 
     int rc_reject = DS4_MMQ_NOT_APPLICABLE;
     size_t reject_writes = 0;
@@ -791,24 +859,27 @@ bool run_q4_K_dense_16warp_parity(
     const bool rejection_ok = !check_rejection ||
         (rc_reject == DS4_MMQ_NOT_APPLICABLE &&
          reject_sync == cudaSuccess && reject_writes == 0);
-    const bool production_ok = !check_production ||
+    const bool production_ok = !check_public_dense ||
         (ref_prod_mismatches == 0 && prod_got_mismatches == 0 &&
          nonfinite_prod == 0 && prod_canary == 0);
     const bool ok = rc_quant == 0 && rc_ref == 0 && rc_prod == 0 &&
         rc_got == 0 && enqueue_err == cudaSuccess &&
         sync_err == cudaSuccess && ref_got_mismatches == 0 &&
         nonfinite_ref == 0 && nonfinite_got == 0 && ref_canary == 0 &&
-        got_canary == 0 && production_ok && rejection_ok;
+        got_canary == 0 && ref_scratch_canary == 0 &&
+        got_scratch_canary == 0 && production_ok && rejection_ok;
     fprintf(stderr,
-            "quant/ref/stream/16w=%d/%d/%d/%d enqueue=%s sync=%s "
-            "bits(ref-16w/ref-stream/stream-16w)=%zu/%zu/%zu "
+            "quant/ref/production/16w=%d/%d/%d/%d enqueue=%s sync=%s "
+            "bits(ref-16w/ref-production/production-16w)=%zu/%zu/%zu "
             "nonfinite=%zu/%zu/%zu canary=%zu/%zu/%zu "
-            "reject=%d/%zu: %s\n",
+            "scratch_canary(ref/16w)=%zu/%zu reject=%d/%zu: %s\n",
             rc_quant, rc_ref, rc_prod, rc_got,
             cudaGetErrorString(enqueue_err), cudaGetErrorString(sync_err),
             ref_got_mismatches, ref_prod_mismatches, prod_got_mismatches,
             nonfinite_ref, nonfinite_prod, nonfinite_got,
-            ref_canary, prod_canary, got_canary, rc_reject, reject_writes,
+            ref_canary, prod_canary, got_canary,
+            ref_scratch_canary, got_scratch_canary,
+            rc_reject, reject_writes,
             ok ? "PASS" : "FAIL");
     if (first_ref_got_bad != SIZE_MAX) {
         fprintf(stderr,
@@ -822,9 +893,427 @@ bool run_q4_K_dense_16warp_parity(
             first_ref_prod_bad * sizeof(float);
         std::memcpy(&ref_bits, ptr, sizeof(ref_bits));
         fprintf(stderr,
-                "first ref/stream mismatch at output[%zu]: "
-                "ref=0x%08x stream=0x%08x\n",
+                "first ref/production mismatch at output[%zu]: "
+                "ref=0x%08x production=0x%08x\n",
                 first_ref_prod_bad, ref_bits, first_prod_bits);
+    }
+    fputc('\n', stderr);
+    cleanup();
+    return ok;
+}
+
+// Kernel-only Q-A/KV pair oracle. Quantize X exactly once, then compare two
+// canonical stream-K launches against two 16-warp stream-K launches over the
+// same immutable Q8_1 DS4 buffer and the real required production pair API.
+// Keeping every output independently guarded catches a bad M0/M1 stride or a
+// cross-leg overwrite as well as a numerical mismatch.
+bool run_q4_K_dense_pair_16warp_parity(
+        int M0, int M1, int N, int K, int nsm, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/DENSE_PAIR_16WARP  M0=%d M1=%d N=%d K=%d seed=%u ===\n",
+            M0, M1, N, K, seed);
+
+    if (M0 <= 0 || M1 <= 0 || N <= 0 || K <= 0 || nsm <= 0 ||
+        K % QK_K_LOCAL != 0 ||
+        (size_t)M0 > SIZE_MAX / (size_t)N / sizeof(float) ||
+        (size_t)M1 > SIZE_MAX / (size_t)N / sizeof(float)) {
+        fprintf(stderr, "invalid 16-warp pair parity shape\n\n");
+        return false;
+    }
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    std::vector<block_q4_K> W0((size_t)M0 * blocks_per_row);
+    std::vector<block_q4_K> W1((size_t)M1 * blocks_per_row);
+    for (auto &blk : W0) generate_random_block_q4_K(&blk, rng);
+    for (auto &blk : W1) generate_random_block_q4_K(&blk, rng);
+    std::vector<float> X((size_t)N * K);
+    for (float &v : X) v = nd(rng);
+
+    const size_t q8_bytes = ds4_mmq_q4_K_q8_1_scratch_bytes(N, K);
+    if (q8_bytes == 0) {
+        fprintf(stderr, "Q4_K 16-warp pair scratch-size query rejected shape\n\n");
+        return false;
+    }
+
+    constexpr size_t guard_floats = 64;
+    constexpr size_t guard_bytes = guard_floats * sizeof(float);
+    constexpr uint8_t ref0_guard_byte = 0xa5;
+    constexpr uint8_t ref1_guard_byte = 0xb6;
+    constexpr uint8_t got0_guard_byte = 0x5a;
+    constexpr uint8_t got1_guard_byte = 0x69;
+    constexpr uint8_t prod0_guard_byte = 0xc3;
+    constexpr uint8_t prod1_guard_byte = 0xd4;
+    constexpr uint8_t reject_guard_byte = 0x3c;
+    constexpr uint8_t scratch_guard_byte = 0x7d;
+    const size_t count0 = (size_t)M0 * N;
+    const size_t count1 = (size_t)M1 * N;
+    const size_t bytes0 = count0 * sizeof(float);
+    const size_t bytes1 = count1 * sizeof(float);
+    const size_t guarded0 = bytes0 + 2u * guard_bytes;
+    const size_t guarded1 = bytes1 + 2u * guard_bytes;
+    const size_t scratch0_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(M0, N, nsm);
+    const size_t scratch1_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(M1, N, nsm);
+    const size_t scratch_bytes =
+        scratch0_bytes > scratch1_bytes ? scratch0_bytes : scratch1_bytes;
+    if (scratch_bytes > SIZE_MAX - 2u * guard_bytes) {
+        fprintf(stderr, "Q4_K 16-warp pair scratch guard size overflow\n\n");
+        return false;
+    }
+    const size_t scratch_guarded_bytes = scratch_bytes + 2u * guard_bytes;
+
+    cudaStream_t stream = nullptr;
+    void *dW0 = nullptr;
+    void *dW1 = nullptr;
+    float *dX = nullptr;
+    void *dQ8 = nullptr;
+    float *dRef0Storage = nullptr;
+    float *dRef1Storage = nullptr;
+    float *dGot0Storage = nullptr;
+    float *dGot1Storage = nullptr;
+    float *dProd0Storage = nullptr;
+    float *dProd1Storage = nullptr;
+    void *dScratchStorage = nullptr;
+    const bool allocated = cudaStreamCreate(&stream) == cudaSuccess &&
+        cudaMalloc(&dW0, W0.size() * sizeof(block_q4_K)) == cudaSuccess &&
+        cudaMalloc(&dW1, W1.size() * sizeof(block_q4_K)) == cudaSuccess &&
+        cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&dQ8, q8_bytes) == cudaSuccess &&
+        cudaMalloc(&dRef0Storage, guarded0) == cudaSuccess &&
+        cudaMalloc(&dRef1Storage, guarded1) == cudaSuccess &&
+        cudaMalloc(&dGot0Storage, guarded0) == cudaSuccess &&
+        cudaMalloc(&dGot1Storage, guarded1) == cudaSuccess &&
+        cudaMalloc(&dProd0Storage, guarded0) == cudaSuccess &&
+        cudaMalloc(&dProd1Storage, guarded1) == cudaSuccess &&
+        cudaMalloc(&dScratchStorage, scratch_guarded_bytes) == cudaSuccess;
+    const auto cleanup = [&]() {
+        if (dScratchStorage) cudaFree(dScratchStorage);
+        if (dProd1Storage) cudaFree(dProd1Storage);
+        if (dProd0Storage) cudaFree(dProd0Storage);
+        if (dGot1Storage) cudaFree(dGot1Storage);
+        if (dGot0Storage) cudaFree(dGot0Storage);
+        if (dRef1Storage) cudaFree(dRef1Storage);
+        if (dRef0Storage) cudaFree(dRef0Storage);
+        if (dQ8) cudaFree(dQ8);
+        if (dX) cudaFree(dX);
+        if (dW1) cudaFree(dW1);
+        if (dW0) cudaFree(dW0);
+        if (stream) cudaStreamDestroy(stream);
+    };
+    if (!allocated) {
+        fprintf(stderr, "Q4_K 16-warp pair allocation failed: %s\n\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cleanup();
+        return false;
+    }
+
+    float *const dRef0 = dRef0Storage + guard_floats;
+    float *const dRef1 = dRef1Storage + guard_floats;
+    float *const dGot0 = dGot0Storage + guard_floats;
+    float *const dGot1 = dGot1Storage + guard_floats;
+    float *const dProd0 = dProd0Storage + guard_floats;
+    float *const dProd1 = dProd1Storage + guard_floats;
+    void *const dScratch =
+        static_cast<uint8_t *>(dScratchStorage) + guard_bytes;
+    cudaError_t enqueue_err = cudaMemcpyAsync(
+        dW0, W0.data(), W0.size() * sizeof(block_q4_K),
+        cudaMemcpyHostToDevice, stream);
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemcpyAsync(
+            dW1, W1.data(), W1.size() * sizeof(block_q4_K),
+            cudaMemcpyHostToDevice, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemcpyAsync(
+            dX, X.data(), X.size() * sizeof(float),
+            cudaMemcpyHostToDevice, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dRef0Storage, ref0_guard_byte, guarded0, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dRef1Storage, ref1_guard_byte, guarded1, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dGot0Storage, got0_guard_byte, guarded0, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dGot1Storage, got1_guard_byte, guarded1, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dProd0Storage, prod0_guard_byte, guarded0, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dProd1Storage, prod1_guard_byte, guarded1, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dScratchStorage, scratch_guard_byte, scratch_guarded_bytes,
+            stream);
+    }
+
+    const int rc_quant = enqueue_err == cudaSuccess
+        ? ds4_mmq_q4_K_quantize_q8_1_for_test(
+              dX, dQ8, q8_bytes, N, K, stream)
+        : -100;
+    const int rc_ref0 = rc_quant == 0
+        ? ds4_mmq_q4_K_dense_preq_reference_for_test(
+              dW0, dQ8, q8_bytes, dRef0, M0, N, K,
+              /*use_stream_k=*/1,
+              dScratch, scratch_bytes,
+              stream)
+        : -100;
+    const int rc_ref1 = rc_ref0 == 0
+        ? ds4_mmq_q4_K_dense_preq_reference_for_test(
+              dW1, dQ8, q8_bytes, dRef1, M1, N, K,
+              /*use_stream_k=*/1,
+              dScratch, scratch_bytes,
+              stream)
+        : -100;
+    std::vector<uint8_t> ref_scratch_guards(2u * guard_bytes);
+    if (enqueue_err == cudaSuccess && rc_ref1 == 0) {
+        enqueue_err = enqueue_scratch_guard_copy(
+            dScratchStorage, scratch_bytes, guard_bytes,
+            ref_scratch_guards.data(), stream);
+    }
+    const int rc_got0 = rc_ref1 == 0 && enqueue_err == cudaSuccess
+        ? ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+              dW0, dQ8, dGot0, dScratch, scratch_bytes,
+              M0, N, K, nsm, stream)
+        : -100;
+    const int rc_got1 = rc_got0 == 0
+        ? ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+              dW1, dQ8, dGot1, dScratch, scratch_bytes,
+              M1, N, K, nsm, stream)
+        : -100;
+    std::vector<uint8_t> got_scratch_guards(2u * guard_bytes);
+    if (enqueue_err == cudaSuccess && rc_got1 == 0) {
+        enqueue_err = enqueue_scratch_guard_copy(
+            dScratchStorage, scratch_bytes, guard_bytes,
+            got_scratch_guards.data(), stream);
+    }
+    const int rc_pair = rc_got1 == 0 && enqueue_err == cudaSuccess
+        ? ds4_mmq_q4_K_dense_pair(
+              dW0, dW1, dX, dProd0, dProd1, M0, M1, N, K, stream)
+        : -100;
+
+    std::vector<uint8_t> ref0_guarded(guarded0);
+    std::vector<uint8_t> ref1_guarded(guarded1);
+    std::vector<uint8_t> got0_guarded(guarded0);
+    std::vector<uint8_t> got1_guarded(guarded1);
+    std::vector<uint8_t> prod0_guarded(guarded0);
+    std::vector<uint8_t> prod1_guarded(guarded1);
+    if (rc_pair == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            ref0_guarded.data(), dRef0Storage, guarded0,
+            cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess && rc_pair == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            ref1_guarded.data(), dRef1Storage, guarded1,
+            cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess && rc_pair == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            got0_guarded.data(), dGot0Storage, guarded0,
+            cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess && rc_pair == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            got1_guarded.data(), dGot1Storage, guarded1,
+            cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess && rc_pair == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            prod0_guarded.data(), dProd0Storage, guarded0,
+            cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess && rc_pair == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            prod1_guarded.data(), dProd1Storage, guarded1,
+            cudaMemcpyDeviceToHost, stream);
+    }
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+    struct leg_result {
+        size_t mismatches = 0;
+        size_t nonfinite_ref = 0;
+        size_t nonfinite_got = 0;
+        size_t ref_canary = 0;
+        size_t got_canary = 0;
+        size_t first_bad = SIZE_MAX;
+        uint32_t first_ref_bits = 0;
+        uint32_t first_got_bits = 0;
+    };
+    const auto inspect_leg = [&](const std::vector<uint8_t> &ref,
+                                  const std::vector<uint8_t> &got,
+                                  size_t count, size_t output_bytes,
+                                  uint8_t expected_ref,
+                                  uint8_t expected_got) {
+        leg_result result;
+        if (enqueue_err != cudaSuccess || sync_err != cudaSuccess ||
+            rc_pair != 0) {
+            return result;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const uint8_t *const ref_ptr =
+                ref.data() + guard_bytes + i * sizeof(float);
+            const uint8_t *const got_ptr =
+                got.data() + guard_bytes + i * sizeof(float);
+            float ref_value = 0.0f;
+            float got_value = 0.0f;
+            std::memcpy(&ref_value, ref_ptr, sizeof(ref_value));
+            std::memcpy(&got_value, got_ptr, sizeof(got_value));
+            if (!std::isfinite(ref_value)) result.nonfinite_ref++;
+            if (!std::isfinite(got_value)) result.nonfinite_got++;
+            if (std::memcmp(ref_ptr, got_ptr, sizeof(float)) != 0) {
+                if (result.first_bad == SIZE_MAX) {
+                    result.first_bad = i;
+                    std::memcpy(&result.first_ref_bits, ref_ptr,
+                                sizeof(result.first_ref_bits));
+                    std::memcpy(&result.first_got_bits, got_ptr,
+                                sizeof(result.first_got_bits));
+                }
+                result.mismatches++;
+            }
+        }
+        for (size_t i = 0; i < guard_bytes; ++i) {
+            if (ref[i] != expected_ref) result.ref_canary++;
+            if (got[i] != expected_got) result.got_canary++;
+        }
+        for (size_t i = guard_bytes + output_bytes; i < ref.size(); ++i) {
+            if (ref[i] != expected_ref) result.ref_canary++;
+        }
+        for (size_t i = guard_bytes + output_bytes; i < got.size(); ++i) {
+            if (got[i] != expected_got) result.got_canary++;
+        }
+        return result;
+    };
+
+    const leg_result leg0 = inspect_leg(
+        ref0_guarded, got0_guarded, count0, bytes0,
+        ref0_guard_byte, got0_guard_byte);
+    const leg_result leg1 = inspect_leg(
+        ref1_guarded, got1_guarded, count1, bytes1,
+        ref1_guard_byte, got1_guard_byte);
+    const leg_result prod0 = inspect_leg(
+        ref0_guarded, prod0_guarded, count0, bytes0,
+        ref0_guard_byte, prod0_guard_byte);
+    const leg_result prod1 = inspect_leg(
+        ref1_guarded, prod1_guarded, count1, bytes1,
+        ref1_guard_byte, prod1_guard_byte);
+    const size_t ref_scratch_canary =
+        scratch_guard_mismatches(ref_scratch_guards, scratch_guard_byte);
+    const size_t got_scratch_canary =
+        scratch_guard_mismatches(got_scratch_guards, scratch_guard_byte);
+
+    // REQUIRE must reject the whole pair before either leg can enqueue. A
+    // 384-row second leg is aligned but below the pair admission floor; poison
+    // both complete guarded ranges so even a partial first-leg launch is seen.
+    int rc_reject = -100;
+    size_t reject_writes = SIZE_MAX;
+    cudaError_t reject_sync = cudaSuccess;
+    if (enqueue_err == cudaSuccess && sync_err == cudaSuccess && rc_pair == 0) {
+        cudaError_t reject_err = cudaMemsetAsync(
+            dProd0Storage, reject_guard_byte, guarded0, stream);
+        if (reject_err == cudaSuccess) {
+            reject_err = cudaMemsetAsync(
+                dProd1Storage, reject_guard_byte, guarded1, stream);
+        }
+        rc_reject = reject_err == cudaSuccess
+            ? ds4_mmq_q4_K_dense_pair(
+                  dW0, dW1, dX, dProd0, dProd1,
+                  M0, /*M1=*/384, N, K, stream)
+            : -100;
+        std::vector<uint8_t> rejected0(guarded0);
+        std::vector<uint8_t> rejected1(guarded1);
+        if (reject_err == cudaSuccess) {
+            reject_err = cudaMemcpyAsync(
+                rejected0.data(), dProd0Storage, guarded0,
+                cudaMemcpyDeviceToHost, stream);
+        }
+        if (reject_err == cudaSuccess) {
+            reject_err = cudaMemcpyAsync(
+                rejected1.data(), dProd1Storage, guarded1,
+                cudaMemcpyDeviceToHost, stream);
+        }
+        reject_sync = cudaStreamSynchronize(stream);
+        if (reject_err == cudaSuccess && reject_sync == cudaSuccess) {
+            reject_writes = 0;
+            for (uint8_t byte : rejected0) {
+                if (byte != reject_guard_byte) reject_writes++;
+            }
+            for (uint8_t byte : rejected1) {
+                if (byte != reject_guard_byte) reject_writes++;
+            }
+        }
+    }
+    const bool rejection_ok =
+        rc_reject == DS4_MMQ_NOT_APPLICABLE &&
+        reject_sync == cudaSuccess && reject_writes == 0;
+    const bool ok = rc_quant == 0 && rc_ref0 == 0 && rc_ref1 == 0 &&
+        rc_got0 == 0 && rc_got1 == 0 && rc_pair == 0 &&
+        enqueue_err == cudaSuccess &&
+        sync_err == cudaSuccess && leg0.mismatches == 0 &&
+        leg1.mismatches == 0 && prod0.mismatches == 0 &&
+        prod1.mismatches == 0 && leg0.nonfinite_ref == 0 &&
+        leg0.nonfinite_got == 0 && leg1.nonfinite_ref == 0 &&
+        leg1.nonfinite_got == 0 && prod0.nonfinite_got == 0 &&
+        prod1.nonfinite_got == 0 && leg0.ref_canary == 0 &&
+        leg0.got_canary == 0 && leg1.ref_canary == 0 &&
+        leg1.got_canary == 0 && prod0.got_canary == 0 &&
+        prod1.got_canary == 0 && ref_scratch_canary == 0 &&
+        got_scratch_canary == 0 && rejection_ok;
+    fprintf(stderr,
+            "quant/ref0/ref1/16w0/16w1/pair=%d/%d/%d/%d/%d/%d "
+            "enqueue=%s sync=%s bits(raw/prod)=%zu/%zu,%zu/%zu "
+            "nonfinite(ref/raw/prod)=%zu/%zu/%zu,%zu/%zu/%zu "
+            "canary(ref/raw/prod)=%zu/%zu/%zu,%zu/%zu/%zu "
+            "scratch_canary(ref/16w)=%zu/%zu "
+            "reject=%d/%zu reject_sync=%s: %s\n",
+            rc_quant, rc_ref0, rc_ref1, rc_got0, rc_got1, rc_pair,
+            cudaGetErrorString(enqueue_err), cudaGetErrorString(sync_err),
+            leg0.mismatches, prod0.mismatches,
+            leg1.mismatches, prod1.mismatches,
+            leg0.nonfinite_ref, leg0.nonfinite_got, prod0.nonfinite_got,
+            leg1.nonfinite_ref, leg1.nonfinite_got, prod1.nonfinite_got,
+            leg0.ref_canary, leg0.got_canary, prod0.got_canary,
+            leg1.ref_canary, leg1.got_canary, prod1.got_canary,
+            ref_scratch_canary, got_scratch_canary,
+            rc_reject, reject_writes, cudaGetErrorString(reject_sync),
+            ok ? "PASS" : "FAIL");
+    if (leg0.first_bad != SIZE_MAX) {
+        fprintf(stderr,
+                "first pair leg0 mismatch at output[%zu]: "
+                "ref=0x%08x got=0x%08x\n",
+                leg0.first_bad, leg0.first_ref_bits, leg0.first_got_bits);
+    }
+    if (leg1.first_bad != SIZE_MAX) {
+        fprintf(stderr,
+                "first pair leg1 mismatch at output[%zu]: "
+                "ref=0x%08x got=0x%08x\n",
+                leg1.first_bad, leg1.first_ref_bits, leg1.first_got_bits);
+    }
+    if (prod0.first_bad != SIZE_MAX) {
+        fprintf(stderr,
+                "first pair production leg0 mismatch at output[%zu]: "
+                "ref=0x%08x got=0x%08x\n",
+                prod0.first_bad, prod0.first_ref_bits, prod0.first_got_bits);
+    }
+    if (prod1.first_bad != SIZE_MAX) {
+        fprintf(stderr,
+                "first pair production leg1 mismatch at output[%zu]: "
+                "ref=0x%08x got=0x%08x\n",
+                prod1.first_bad, prod1.first_ref_bits, prod1.first_got_bits);
     }
     fputc('\n', stderr);
     cleanup();
@@ -2725,15 +3214,30 @@ bool run_q4_K_grouped_vec_parity(
 } // namespace
 
 int main(int argc, char ** argv) {
+    const bool q4_16warp_oracle =
+        argc == 2 && std::strcmp(argv[1], "--q4-16warp") == 0;
+    scoped_env_override require_16warp(
+        "DS4_CUDA_REQUIRE_Q4_MMQ_16WARP");
+    scoped_env_override disable_16warp(
+        "DS4_CUDA_NO_Q4_MMQ_16WARP");
+    // Production dense/pair oracles must fail closed if any leg falls back.
+    // Set the required mode before initialization can observe its process-wide
+    // cache, and neutralize an inherited rollback request.
+    if (q4_16warp_oracle &&
+        (!require_16warp.set("1") || !disable_16warp.set("0"))) {
+        fprintf(stderr, "Q4 16-warp oracle environment setup failed\n");
+        return 1;
+    }
+
     int rc = ds4_mmq_init(0);
     if (rc != 0) { fprintf(stderr, "ds4_mmq_init failed: %d\n", rc); return 1; }
 
     bool all_ok = true;
 
-    if (argc == 2 && std::strcmp(argv[1], "--q4-16warp") == 0) {
-        // The production arm must select mmq_x=128 for the no-fixup proof.
-        // Mirror get_mmq_x_max_host's numeric-prefix parsing and reject a
-        // narrower experiment override before MMQ caches it.
+    if (q4_16warp_oracle) {
+        // The canonical production baseline must select mmq_x=128. Mirror
+        // get_mmq_x_max_host's numeric-prefix parsing and reject a narrower
+        // experiment override before MMQ caches it.
         const char *const mmq_x_env = std::getenv("DS4_CUDA_MMQ_X_MAX");
         if (mmq_x_env && mmq_x_env[0]) {
             char *end = nullptr;
@@ -2758,6 +3262,35 @@ int main(int argc, char ** argv) {
                     cudaGetErrorString(prop_err));
             return 1;
         }
+        const int cc = prop.major * 100 + prop.minor * 10;
+        if (!ds4_mmq_q4_K_dense_16warp_available(cc)) {
+            fprintf(stderr,
+                    "Q4 16-warp oracle unsupported on cc=%d.%d\n",
+                    prop.major, prop.minor);
+            return 77;
+        }
+        const int prepare_rc = ds4_mmq_q4_K_dense_16warp_prepare();
+        if (prepare_rc != 0) {
+            fprintf(stderr,
+                    "Q4 16-warp oracle prepare failed: %d\n", prepare_rc);
+            return 1;
+        }
+
+        const auto grid_efficiency = [&](int M, int N) {
+            const int64_t tiles_m = ((int64_t)M + 127) / 128;
+            const int64_t tiles_n = ((int64_t)N + 127) / 128;
+            const int64_t tiles = tiles_m * tiles_n;
+            const int64_t waves =
+                (tiles + prop.multiProcessorCount - 1) /
+                prop.multiProcessorCount;
+            return (int)(100 * tiles /
+                         ((int64_t)prop.multiProcessorCount * waves));
+        };
+        const int dense_4096_eff = grid_efficiency(1024, 4096);
+        const int kv_4096_eff = grid_efficiency(512, 4096);
+        const bool public_dense_4096 = dense_4096_eff >= 80;
+        const bool public_pair_4096 =
+            public_dense_4096 && kv_4096_eff >= 80;
 
         // N=512 and mmq_x=128 give four N tiles. Choose the smallest M-tile
         // count >=16 for which 4*tiles_m is divisible by nSM. Stream-K then
@@ -2777,23 +3310,59 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const int no_fixup_M = (int)(128 * tiles_m);
+
         fprintf(stderr,
                 "Q4 16-warp no-fixup geometry: nsm=%d tiles_m=%lld "
                 "tiles=%lld M=%d\n",
                 prop.multiProcessorCount, (long long)tiles_m,
                 (long long)(4 * tiles_m), no_fixup_M);
 
-        // Exact N tile with a device-dependent, provably no-fixup M, plus an
-        // N-tail case at the top of the K envelope. Keep the larger K=4096
-        // case at two arms so the focused oracle remains reasonably small.
+        // Cover a device-dependent no-fixup baseline, an N tail, and the real
+        // 4096-token production dense/pair envelope.
         all_ok &= run_q4_K_dense_16warp_parity(
-            /*M=*/no_fixup_M, /*N=*/512, /*K=*/1024, 0xC4160001u,
-            /*check_production=*/true,
+            /*M=*/no_fixup_M, /*N=*/512, /*K=*/1024,
+            prop.multiProcessorCount, 0xC4160001u,
+            /*check_public_dense=*/false,
             /*check_rejection=*/true);
         all_ok &= run_q4_K_dense_16warp_parity(
-            /*M=*/2176, /*N=*/513, /*K=*/4096, 0xC4160002u,
-            /*check_production=*/false,
+            // N=601 keeps the canonical selector on m128n128 while retaining
+            // an N-tail, so external-scratch Stream-K remains bit-comparable.
+            /*M=*/2176, /*N=*/601, /*K=*/4096,
+            prop.multiProcessorCount, 0xC4160002u,
+            /*check_public_dense=*/false,
             /*check_rejection=*/false);
+        // Production Q-A and Q-A/KV-pair envelope: exercise the newly admitted
+        // M=1024 dense leg at a full 4096-token context, then validate the
+        // asymmetric 1024+512 pair with one shared Q8_1 activation.
+        all_ok &= run_q4_K_dense_16warp_parity(
+            /*M=*/1024, /*N=*/4096, /*K=*/4096,
+            prop.multiProcessorCount, 0xC4160003u,
+            /*check_public_dense=*/public_dense_4096,
+            /*check_rejection=*/false);
+        if (!public_dense_4096) {
+            fprintf(stderr,
+                    "Q4 16-warp public dense N=4096 SKIP: grid efficiency "
+                    "%d%% < 80%% (nsm=%d)\n",
+                    dense_4096_eff, prop.multiProcessorCount);
+        }
+        if (public_pair_4096) {
+            all_ok &= run_q4_K_dense_pair_16warp_parity(
+                /*M0=*/1024, /*M1=*/512, /*N=*/4096, /*K=*/4096,
+                prop.multiProcessorCount, 0xC4160004u);
+        } else {
+            // Keep raw coverage of the pair-only 512-row leg even when this
+            // device's SM geometry makes the required public pair ineligible.
+            all_ok &= run_q4_K_dense_16warp_parity(
+                /*M=*/512, /*N=*/4096, /*K=*/4096,
+                prop.multiProcessorCount, 0xC4160005u,
+                /*check_public_dense=*/false,
+                /*check_rejection=*/false);
+            fprintf(stderr,
+                    "Q4 16-warp public pair N=4096 SKIP: grid efficiency "
+                    "dense=%d%% kv=%d%% (need both >=80%%, nsm=%d)\n",
+                    dense_4096_eff, kv_4096_eff,
+                    prop.multiProcessorCount);
+        }
         fprintf(stderr, "===================\n");
         fprintf(stderr, "Q4 16-WARP %s\n", all_ok ? "PASS" : "FAILED");
         return all_ok ? 0 : 1;

@@ -133,6 +133,75 @@ struct cuda_buffer {
     cuda_buffer &operator=(const cuda_buffer &) = delete;
 };
 
+struct guarded_cuda_buffer {
+    void *storage = nullptr;
+    void *ptr = nullptr;
+    size_t logical_bytes = 0;
+    uint32_t salt = 0;
+    cudaError_t status = cudaSuccess;
+
+    guarded_cuda_buffer(size_t bytes, uint32_t guard_salt)
+        : logical_bytes(bytes), salt(guard_salt) {
+        if (bytes == 0u) return;
+        constexpr size_t guard_bytes = kGuardWords * sizeof(uint32_t);
+        if (bytes > std::numeric_limits<size_t>::max() - 2u * guard_bytes) {
+            status = static_cast<cudaError_t>(1);
+            return;
+        }
+        status = cudaMalloc(&storage, bytes + 2u * guard_bytes);
+        if (status != cudaSuccess) return;
+        ptr = static_cast<uint8_t *>(storage) + guard_bytes;
+        std::vector<uint32_t> prefix(kGuardWords);
+        std::vector<uint32_t> suffix(kGuardWords);
+        for (uint32_t i = 0; i < kGuardWords; ++i) {
+            prefix[i] = 0x6b8b4567u ^ salt ^ (i * 0x00010101u);
+            suffix[i] = 0x327b23c6u ^ salt ^ (i * 0x01000101u);
+        }
+        status = cudaMemcpy(storage, prefix.data(), guard_bytes,
+                            cudaMemcpyHostToDevice);
+        if (status == cudaSuccess) {
+            status = cudaMemcpy(
+                static_cast<uint8_t *>(ptr) + bytes, suffix.data(),
+                guard_bytes, cudaMemcpyHostToDevice);
+        }
+    }
+
+    ~guarded_cuda_buffer() {
+        if (storage) (void)cudaFree(storage);
+    }
+
+    bool intact(const char *label) const {
+        if (logical_bytes == 0u) return true;
+        constexpr size_t guard_bytes = kGuardWords * sizeof(uint32_t);
+        std::vector<uint32_t> prefix(kGuardWords);
+        std::vector<uint32_t> suffix(kGuardWords);
+        if (cudaMemcpy(prefix.data(), storage, guard_bytes,
+                       cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(suffix.data(),
+                       static_cast<const uint8_t *>(ptr) + logical_bytes,
+                       guard_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::fprintf(stderr, "%s: scratch guard read failed\n", label);
+            return false;
+        }
+        for (uint32_t i = 0; i < kGuardWords; ++i) {
+            const uint32_t expected_prefix =
+                0x6b8b4567u ^ salt ^ (i * 0x00010101u);
+            const uint32_t expected_suffix =
+                0x327b23c6u ^ salt ^ (i * 0x01000101u);
+            if (prefix[i] != expected_prefix || suffix[i] != expected_suffix) {
+                std::fprintf(stderr,
+                             "%s: scratch guard overwritten at word %u\n",
+                             label, i);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    guarded_cuda_buffer(const guarded_cuda_buffer &) = delete;
+    guarded_cuda_buffer &operator=(const guarded_cuda_buffer &) = delete;
+};
+
 struct env_snapshot {
     const char *name;
     bool existed;
@@ -211,6 +280,23 @@ uint64_t align_up(uint64_t value, uint64_t alignment) {
 bool checked_mul(uint64_t a, uint64_t b, uint64_t *out) {
     if (a != 0u && b > std::numeric_limits<uint64_t>::max() / a) return false;
     *out = a * b;
+    return true;
+}
+
+bool current_device_nsm(int *nsm) {
+    if (!nsm) return false;
+    int device = -1;
+    cudaDeviceProp prop = {};
+    const cudaError_t device_err = cudaGetDevice(&device);
+    const cudaError_t prop_err = device_err == cudaSuccess
+        ? cudaGetDeviceProperties(&prop, device) : device_err;
+    if (prop_err != cudaSuccess || prop.multiProcessorCount <= 0) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: CUDA geometry query failed: %s\n",
+                     cudaGetErrorString(prop_err));
+        return false;
+    }
+    *nsm = prop.multiProcessorCount;
     return true;
 }
 
@@ -652,7 +738,8 @@ const char *path_name(cuda_path path) {
 const char *case_scope(const config &cfg) {
     switch (cfg.selected) {
         case bench_case::all:
-            return cfg.kernel_16warp ? "dense,q_b" : "dense,pair,q_b,outa";
+            return cfg.kernel_16warp ? "dense,pair,q_b"
+                                     : "dense,pair,q_b,outa";
         case bench_case::dense: return "dense";
         case bench_case::pair: return "pair";
         case bench_case::qb: return "q_b";
@@ -894,24 +981,33 @@ bool run_q4_16warp_kernel(
                      case_name, n_tokens, in_dim);
         return false;
     }
+    int nsm = 0;
+    if (!current_device_nsm(&nsm)) return false;
+    const size_t fixup_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+            static_cast<int>(out_dim), static_cast<int>(n_tokens), nsm);
 
     tensor_owner x(x_bytes + guard_bytes);
     tensor_owner reference(out_bytes + guard_bytes);
     tensor_owner candidate(out_bytes + guard_bytes);
     cuda_buffer prequant(q8_bytes);
+    guarded_cuda_buffer fixup(fixup_bytes, 0x1a000u);
     std::vector<float> activation;
     fill_activation(&activation, n_tokens, in_dim);
     if (!x.ptr || !reference.ptr || !candidate.ptr || !prequant.ptr ||
-        prequant.status != cudaSuccess ||
+        prequant.status != cudaSuccess || fixup.status != cudaSuccess ||
+        (fixup_bytes != 0u && !fixup.ptr) ||
         !ds4_gpu_tensor_write(x.ptr, 0, activation.data(), x_bytes) ||
         !prepare_guard(x.ptr, x_bytes, 0x12000u)) {
         std::fprintf(stderr,
                      "cuda-q4-prefill-bench: %s N=%u kernel-only tensor/"
                      "scratch setup failed (%s)\n",
                      case_name, n_tokens,
-                     prequant.status == cudaSuccess
-                         ? "tensor setup"
-                         : cudaGetErrorString(prequant.status));
+                     prequant.status != cudaSuccess
+                         ? cudaGetErrorString(prequant.status)
+                         : fixup.status != cudaSuccess
+                               ? cudaGetErrorString(fixup.status)
+                               : "tensor setup");
         return false;
     }
 
@@ -944,9 +1040,9 @@ bool run_q4_16warp_kernel(
         }
     }
 
-    // Quantize exactly once.  Both A/B arms consume this immutable canonical
-    // DS4 Q8_1 buffer, and no quantizer, memset, allocation, or copy is issued
-    // by either timed dispatch.
+    // Quantize exactly once. Both A/B arms consume this immutable canonical
+    // DS4 Q8_1 buffer. Timed work is restricted to each GEMM's scheduling,
+    // required stream-K scratch clear, producer, and fixup kernels.
     const int quant_rc = ds4_mmq_q4_K_quantize_q8_1_for_test(
         x_device, prequant.ptr, q8_bytes, static_cast<int>(n_tokens),
         static_cast<int>(in_dim), /*stream=*/nullptr);
@@ -961,31 +1057,33 @@ bool run_q4_16warp_kernel(
     }
 
     const arm baseline = {
-        "canonical_preq_complete_k",
+        "canonical_preq_stream_k",
         [&](uint32_t set) {
             return ds4_mmq_q4_K_dense_preq_reference_for_test(
                        weight_device[set], prequant.ptr, q8_bytes,
                        reference_device, static_cast<int>(out_dim),
                        static_cast<int>(n_tokens), static_cast<int>(in_dim),
-                       /*use_stream_k=*/0, /*stream=*/nullptr) == 0;
+                       /*use_stream_k=*/1, fixup.ptr, fixup_bytes,
+                       /*stream=*/nullptr) == 0;
         },
         {}};
     const arm candidate_arm = {
-        "q4_16warp_m128n128",
+        "q4_16warp_m128n128_stream_k",
         [&](uint32_t set) {
-            return ds4_mmq_q4_K_dense_16warp_enqueue(
+            return ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
                        weight_device[set], prequant.ptr, candidate_device,
+                       fixup.ptr, fixup_bytes,
                        static_cast<int>(out_dim),
                        static_cast<int>(n_tokens), static_cast<int>(in_dim),
-                       /*stream=*/nullptr) == 0;
+                       nsm, /*stream=*/nullptr) == 0;
         },
         {},
         [&](uint32_t set) {
-            return ds4_mmq_q4_K_dense_preq_16warp_for_test(
-                       weight_device[set], prequant.ptr, q8_bytes,
-                       candidate_device, static_cast<int>(out_dim),
+            return ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+                       weight_device[set], prequant.ptr, candidate_device,
+                       fixup.ptr, fixup_bytes, static_cast<int>(out_dim),
                        static_cast<int>(n_tokens), static_cast<int>(in_dim),
-                       /*stream=*/nullptr) == 0;
+                       nsm, /*stream=*/nullptr) == 0;
         }};
     const bool ok = benchmark_pair_arms(
         case_name, n_tokens, in_dim, out_dim,
@@ -1001,7 +1099,7 @@ bool run_q4_16warp_kernel(
             const uint64_t offset =
                 model.weights[set].*weight_offset_member;
             return bitwise_equal(reference.ptr, candidate.ptr, out_bytes,
-                                 "16-warp vs canonical complete-K") &&
+                                 "16-warp vs canonical stream-K") &&
                    output_is_finite(reference.ptr, out_bytes,
                                     "16-warp canonical output") &&
                    output_is_finite(candidate.ptr, out_bytes,
@@ -1014,7 +1112,8 @@ bool run_q4_16warp_kernel(
                    check_guard(reference.ptr, out_bytes, 0x13000u,
                                "16-warp canonical output") &&
                    check_guard(candidate.ptr, out_bytes, 0x14000u,
-                               "16-warp candidate output");
+                               "16-warp candidate output") &&
+                   fixup.intact("16-warp Stream-K scratch");
         },
         "kernel_only_prequant");
     return ok &&
@@ -1023,7 +1122,232 @@ bool run_q4_16warp_kernel(
            check_guard(reference.ptr, out_bytes, 0x13000u,
                        "16-warp canonical output final") &&
            check_guard(candidate.ptr, out_bytes, 0x14000u,
-                       "16-warp candidate output final");
+                       "16-warp candidate output final") &&
+           fixup.intact("16-warp Stream-K scratch final");
+}
+
+bool run_q4_16warp_pair_kernel(
+        const model_fixture &model, const config &cfg, uint32_t n_tokens) {
+    uint64_t x_elements = 0;
+    uint64_t out0_elements = 0;
+    uint64_t out1_elements = 0;
+    if (!checked_mul(n_tokens, kDenseK, &x_elements) ||
+        !checked_mul(n_tokens, kDenseM, &out0_elements) ||
+        !checked_mul(n_tokens, kKvM, &out1_elements)) {
+        return false;
+    }
+    const uint64_t x_bytes = x_elements * sizeof(float);
+    const uint64_t out0_bytes = out0_elements * sizeof(float);
+    const uint64_t out1_bytes = out1_elements * sizeof(float);
+    const uint64_t guard_bytes = kGuardWords * sizeof(uint32_t);
+    const uint64_t weight0_bytes = q4_weight_bytes(kDenseK, kDenseM);
+    const uint64_t weight1_bytes = q4_weight_bytes(kDenseK, kKvM);
+    const size_t q8_bytes = ds4_mmq_q4_K_q8_1_scratch_bytes(
+        static_cast<int>(n_tokens), static_cast<int>(kDenseK));
+    if (q8_bytes == 0u) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: pair kernel-only Q8_1 scratch "
+                     "shape rejected for N=%u K=%u\n",
+                     n_tokens, kDenseK);
+        return false;
+    }
+    int nsm = 0;
+    if (!current_device_nsm(&nsm)) return false;
+    const size_t fixup0_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+            static_cast<int>(kDenseM), static_cast<int>(n_tokens), nsm);
+    const size_t fixup1_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+            static_cast<int>(kKvM), static_cast<int>(n_tokens), nsm);
+    const size_t fixup_bytes = fixup0_bytes > fixup1_bytes
+        ? fixup0_bytes : fixup1_bytes;
+
+    tensor_owner x(x_bytes + guard_bytes);
+    tensor_owner reference0(out0_bytes + guard_bytes);
+    tensor_owner reference1(out1_bytes + guard_bytes);
+    tensor_owner candidate0(out0_bytes + guard_bytes);
+    tensor_owner candidate1(out1_bytes + guard_bytes);
+    cuda_buffer prequant(q8_bytes);
+    guarded_cuda_buffer fixup(fixup_bytes, 0x1b000u);
+    std::vector<float> activation;
+    fill_activation(&activation, n_tokens, kDenseK);
+    if (!x.ptr || !reference0.ptr || !reference1.ptr || !candidate0.ptr ||
+        !candidate1.ptr || !prequant.ptr || prequant.status != cudaSuccess ||
+        fixup.status != cudaSuccess ||
+        (fixup_bytes != 0u && !fixup.ptr) ||
+        !ds4_gpu_tensor_write(x.ptr, 0, activation.data(), x_bytes) ||
+        !prepare_guard(x.ptr, x_bytes, 0x15000u)) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: pair N=%u kernel-only tensor/"
+                     "scratch setup failed (%s)\n",
+                     n_tokens,
+                     prequant.status != cudaSuccess
+                         ? cudaGetErrorString(prequant.status)
+                         : fixup.status != cudaSuccess
+                               ? cudaGetErrorString(fixup.status)
+                               : "tensor setup");
+        return false;
+    }
+
+    const auto *x_device = static_cast<const float *>(
+        ds4_gpu_tensor_contents(x.ptr));
+    auto *reference0_device = static_cast<float *>(
+        ds4_gpu_tensor_contents(reference0.ptr));
+    auto *reference1_device = static_cast<float *>(
+        ds4_gpu_tensor_contents(reference1.ptr));
+    auto *candidate0_device = static_cast<float *>(
+        ds4_gpu_tensor_contents(candidate0.ptr));
+    auto *candidate1_device = static_cast<float *>(
+        ds4_gpu_tensor_contents(candidate1.ptr));
+    if (!x_device || !reference0_device || !reference1_device ||
+        !candidate0_device || !candidate1_device) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: pair N=%u device tensor pointer "
+                     "lookup failed\n",
+                     n_tokens);
+        return false;
+    }
+
+    std::vector<const void *> weight0_device(cfg.sets, nullptr);
+    std::vector<const void *> weight1_device(cfg.sets, nullptr);
+    for (uint32_t set = 0; set < cfg.sets; set++) {
+        if (!ds4_cuda_test_model_range_device_ptr(
+                model.data, model.size, model.weights[set].dense_offset,
+                weight0_bytes, /*logical_tier=*/0, &weight0_device[set]) ||
+            !weight0_device[set] ||
+            !ds4_cuda_test_model_range_device_ptr(
+                model.data, model.size, model.weights[set].kv_offset,
+                weight1_bytes, /*logical_tier=*/0, &weight1_device[set]) ||
+            !weight1_device[set]) {
+            std::fprintf(stderr,
+                         "cuda-q4-prefill-bench: pair N=%u resident weight "
+                         "pointer lookup failed for set %u\n",
+                         n_tokens, set);
+            return false;
+        }
+    }
+
+    // One immutable activation quantization is shared by both Q-A/KV legs and
+    // is deliberately outside every event interval.
+    const int quant_rc = ds4_mmq_q4_K_quantize_q8_1_for_test(
+        x_device, prequant.ptr, q8_bytes, static_cast<int>(n_tokens),
+        static_cast<int>(kDenseK), /*stream=*/nullptr);
+    if (quant_rc != 0 || !ds4_gpu_synchronize() ||
+        !check_guard(x.ptr, x_bytes, 0x15000u,
+                     "kernel-only pair prequant input")) {
+        std::fprintf(stderr,
+                     "cuda-q4-prefill-bench: pair N=%u prequantization "
+                     "failed rc=%d\n",
+                     n_tokens, quant_rc);
+        return false;
+    }
+
+    const arm baseline = {
+        "two_canonical_preq_stream_k",
+        [&](uint32_t set) {
+            return ds4_mmq_q4_K_dense_preq_reference_for_test(
+                       weight0_device[set], prequant.ptr, q8_bytes,
+                       reference0_device, static_cast<int>(kDenseM),
+                       static_cast<int>(n_tokens), static_cast<int>(kDenseK),
+                       /*use_stream_k=*/1, fixup.ptr, fixup_bytes,
+                       /*stream=*/nullptr) == 0 &&
+                   ds4_mmq_q4_K_dense_preq_reference_for_test(
+                       weight1_device[set], prequant.ptr, q8_bytes,
+                       reference1_device, static_cast<int>(kKvM),
+                       static_cast<int>(n_tokens), static_cast<int>(kDenseK),
+                       /*use_stream_k=*/1, fixup.ptr, fixup_bytes,
+                       /*stream=*/nullptr) == 0;
+        },
+        {}};
+    const arm candidate = {
+        "two_q4_16warp_m128n128_stream_k",
+        [&](uint32_t set) {
+            return ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+                       weight0_device[set], prequant.ptr, candidate0_device,
+                       fixup.ptr, fixup_bytes,
+                       static_cast<int>(kDenseM),
+                       static_cast<int>(n_tokens), static_cast<int>(kDenseK),
+                       nsm, /*stream=*/nullptr) == 0 &&
+                   ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+                       weight1_device[set], prequant.ptr, candidate1_device,
+                       fixup.ptr, fixup_bytes,
+                       static_cast<int>(kKvM),
+                       static_cast<int>(n_tokens), static_cast<int>(kDenseK),
+                       nsm, /*stream=*/nullptr) == 0;
+        },
+        {},
+        [&](uint32_t set) {
+            return ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+                       weight0_device[set], prequant.ptr, candidate0_device,
+                       fixup.ptr, fixup_bytes, static_cast<int>(kDenseM),
+                       static_cast<int>(n_tokens), static_cast<int>(kDenseK),
+                       nsm, /*stream=*/nullptr) == 0 &&
+                   ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+                       weight1_device[set], prequant.ptr, candidate1_device,
+                       fixup.ptr, fixup_bytes, static_cast<int>(kKvM),
+                       static_cast<int>(n_tokens), static_cast<int>(kDenseK),
+                       nsm, /*stream=*/nullptr) == 0;
+        }};
+    const bool ok = benchmark_pair_arms(
+        "pair", n_tokens, kDenseK, kDenseM + kKvM,
+        static_cast<uint64_t>(kDenseK) * (kDenseM + kKvM), 0u, cfg,
+        baseline, candidate,
+        [&]() {
+            return poison_output(reference0.ptr, out0_bytes, 0x7fc70007u,
+                                 0x16000u) &&
+                   poison_output(reference1.ptr, out1_bytes, 0x7fc80008u,
+                                 0x17000u) &&
+                   poison_output(candidate0.ptr, out0_bytes, 0x7fc90009u,
+                                 0x18000u) &&
+                   poison_output(candidate1.ptr, out1_bytes, 0x7fca000au,
+                                 0x19000u);
+        },
+        [&](uint32_t set) {
+            return bitwise_equal(reference0.ptr, candidate0.ptr, out0_bytes,
+                                 "16-warp pair q_a vs canonical") &&
+                   bitwise_equal(reference1.ptr, candidate1.ptr, out1_bytes,
+                                 "16-warp pair kv vs canonical") &&
+                   output_is_finite(reference0.ptr, out0_bytes,
+                                    "16-warp pair q_a canonical") &&
+                   output_is_finite(reference1.ptr, out1_bytes,
+                                    "16-warp pair kv canonical") &&
+                   output_is_finite(candidate0.ptr, out0_bytes,
+                                    "16-warp pair q_a candidate") &&
+                   output_is_finite(candidate1.ptr, out1_bytes,
+                                    "16-warp pair kv candidate") &&
+                   sampled_cpu_oracle(
+                       reference0.ptr, model,
+                       model.weights[set].dense_offset, activation, n_tokens,
+                       kDenseK, kDenseM, "16-warp pair q_a canonical") &&
+                   sampled_cpu_oracle(
+                       reference1.ptr, model, model.weights[set].kv_offset,
+                       activation, n_tokens, kDenseK, kKvM,
+                       "16-warp pair kv canonical") &&
+                   check_guard(x.ptr, x_bytes, 0x15000u,
+                               "16-warp pair input") &&
+                   check_guard(reference0.ptr, out0_bytes, 0x16000u,
+                               "16-warp pair q_a canonical") &&
+                   check_guard(reference1.ptr, out1_bytes, 0x17000u,
+                               "16-warp pair kv canonical") &&
+                   check_guard(candidate0.ptr, out0_bytes, 0x18000u,
+                               "16-warp pair q_a candidate") &&
+                   check_guard(candidate1.ptr, out1_bytes, 0x19000u,
+                               "16-warp pair kv candidate") &&
+                   fixup.intact("16-warp pair Stream-K scratch");
+        },
+        "kernel_only_prequant");
+    return ok &&
+           check_guard(x.ptr, x_bytes, 0x15000u,
+                       "16-warp pair input final") &&
+           check_guard(reference0.ptr, out0_bytes, 0x16000u,
+                       "16-warp pair q_a canonical final") &&
+           check_guard(reference1.ptr, out1_bytes, 0x17000u,
+                       "16-warp pair kv canonical final") &&
+           check_guard(candidate0.ptr, out0_bytes, 0x18000u,
+                       "16-warp pair q_a candidate final") &&
+           check_guard(candidate1.ptr, out1_bytes, 0x19000u,
+                       "16-warp pair kv candidate final") &&
+           fixup.intact("16-warp pair Stream-K scratch final");
 }
 
 bool run_dense(const model_fixture &model, const config &cfg,
@@ -1375,9 +1699,9 @@ void usage(FILE *stream, const char *argv0) {
         "  --path mmq|legacy         process-wide path (default: mmq)\n"
         "  --case all|dense|pair|qb|outa\n"
         "                             case to run (default: all)\n"
-        "  --tokens N[,N...]         token counts, each 9..4096\n"
+        "  --tokens N[,N...]         token counts, each 9..8192\n"
         "  --full                    use 9,16,17,31,32,33,127,128,129,256,"
-        "257,512,1024,2048,2049,4096\n"
+        "257,512,1024,2048,2049,4096,6144,8192\n"
         "  --sets N                  rotating resident weight sets (default: %u)\n"
         "  --samples N               samples/arm, multiple of 4 (default: %u)\n"
         "  --warmup N                untimed dispatches/arm (default: %u)\n"
@@ -1395,9 +1719,11 @@ void usage(FILE *stream, const char *argv0) {
         "DS4_CUDA_MMQ_X_MAX\nmay explicitly select an 8..128 multiple-of-8 "
         "sweep point; the setup line\nattests it, or prints auto when the "
         "variable is unset. --kernel-16warp requires\n--path mmq and "
-        "--case dense/qb; with --case all it runs only dense and q_b. Its "
-        "token\ncounts must be >=512; without --tokens/--full it uses "
-        "512,1024,2048,2049,4096.\n",
+        "--case dense/pair/qb; with --case all it runs dense, pair, and q_b. Its "
+        "pair arm\nshares one prequantized activation across M=1024+512. Token "
+        "counts must be\n>=512 and select canonical m128n128 on the active "
+        "device; without --tokens/--full it uses "
+        "512,1024,2048,2049,4096,6144,8192.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);
 }
 
@@ -1412,6 +1738,11 @@ uint32_t parse_u32(const char *text, const char *option, uint32_t minimum,
         std::exit(2);
     }
     return static_cast<uint32_t>(value);
+}
+
+bool env_value_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
 }
 
 const char *need_value(int *index, int argc, char **argv) {
@@ -1430,7 +1761,7 @@ std::vector<uint32_t> parse_tokens(const char *text) {
         const std::string item(cursor,
                                comma ? static_cast<size_t>(comma - cursor)
                                      : std::strlen(cursor));
-        result.push_back(parse_u32(item.c_str(), "--tokens", 9u, 4096u));
+        result.push_back(parse_u32(item.c_str(), "--tokens", 9u, 8192u));
         if (!comma) break;
         cursor = comma + 1;
         if (!*cursor) {
@@ -1484,7 +1815,7 @@ config parse_options(int argc, char **argv) {
         } else if (!std::strcmp(argv[i], "--full")) {
             cfg.tokens = {9u,   16u,  17u,  31u,  32u,  33u, 127u,
                           128u, 129u, 256u, 257u, 512u, 1024u, 2048u,
-                          2049u, 4096u};
+                          2049u, 4096u, 6144u, 8192u};
             tokens_explicit = true;
         } else if (!std::strcmp(argv[i], "--sets")) {
             cfg.sets = parse_u32(need_value(&i, argc, argv), "--sets", 1u,
@@ -1509,7 +1840,7 @@ config parse_options(int argc, char **argv) {
         std::exit(2);
     }
     if (cfg.kernel_16warp && !tokens_explicit) {
-        cfg.tokens = {512u, 1024u, 2048u, 2049u, 4096u};
+        cfg.tokens = {512u, 1024u, 2048u, 2049u, 4096u, 6144u, 8192u};
     }
     if (cfg.kernel_16warp) {
         const auto below_minimum = std::find_if(
@@ -1528,12 +1859,10 @@ config parse_options(int argc, char **argv) {
                      "--kernel-16warp requires --path mmq\n");
         std::exit(2);
     }
-    if (cfg.kernel_16warp &&
-        (cfg.selected == bench_case::pair ||
-         cfg.selected == bench_case::outa)) {
+    if (cfg.kernel_16warp && cfg.selected == bench_case::outa) {
         std::fprintf(stderr,
-                     "--kernel-16warp supports only --case dense, qb, or "
-                     "all (all runs dense+qb only)\n");
+                     "--kernel-16warp supports only --case dense, pair, qb, "
+                     "or all (all runs dense+pair+qb)\n");
         std::exit(2);
     }
     if (cfg.path == cuda_path::legacy &&
@@ -1551,7 +1880,7 @@ bool includes(bench_case selected, bench_case wanted) {
     return selected == bench_case::all || selected == wanted;
 }
 
-std::string mmq_x_max_attestation() {
+std::string mmq_x_max_attestation(bool require_m128n128) {
     const char *value = std::getenv("DS4_CUDA_MMQ_X_MAX");
     if (!value || !value[0]) return "auto";
     const uint32_t parsed =
@@ -1560,6 +1889,13 @@ std::string mmq_x_max_attestation() {
         std::fprintf(stderr,
                      "invalid DS4_CUDA_MMQ_X_MAX: %s (must be a multiple "
                      "of 8)\n",
+                     value);
+        std::exit(2);
+    }
+    if (require_m128n128 && parsed != 128u) {
+        std::fprintf(stderr,
+                     "--kernel-16warp requires DS4_CUDA_MMQ_X_MAX=128 "
+                     "when the variable is set (got %s)\n",
                      value);
         std::exit(2);
     }
@@ -1629,10 +1965,11 @@ bool verify_resident_weight_ranges(const model_fixture &model) {
 }
 
 bool verify_mmq_prefill_dispatch(const model_fixture &model) {
-    // For N > 8 the public pair API succeeds only through MMQ.  Probe it
-    // before printing any timing to initialize and attest the process-wide
-    // decision.  Strict mode separately rejects fallback on every measured
-    // dense, pair, and q_b dispatch.
+    // For N > 8 the public pair API succeeds only through MMQ. Non-required
+    // production runs use this small probe to initialize and attest the
+    // process-wide decision. The caller skips it for raw-kernel and required
+    // 16-warp runs, whose measured dispatches provide their own fail-closed
+    // proof at an eligible shape.
     constexpr uint32_t n_tokens = 9u;
     const uint64_t x_bytes = static_cast<uint64_t>(n_tokens) * kDenseK *
                              sizeof(float);
@@ -1662,7 +1999,8 @@ int main(int argc, char **argv) {
     // and validate the inherited sweep request before backend initialization,
     // then attest it in the setup record instead of silently contaminating a
     // supposedly default run.
-    const std::string mmq_x_max = mmq_x_max_attestation();
+    const std::string mmq_x_max =
+        mmq_x_max_attestation(cfg.kernel_16warp);
     env_snapshot mmq_guard("DS4_CUDA_MMQ");
     env_snapshot copy_guard("DS4_CUDA_COPY_MODEL");
     env_snapshot pair_guard("DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
@@ -1739,6 +2077,18 @@ int main(int argc, char **argv) {
             ds4_gpu_cleanup();
             return 1;
         }
+        for (uint32_t tokens : cfg.tokens) {
+            if (!ds4_mmq_q4_K_dense_preq_reference_m128n128_for_test(
+                    static_cast<int>(tokens))) {
+                std::fprintf(
+                    stderr,
+                    "cuda-q4-prefill-bench: SKIP (--kernel-16warp N=%u "
+                    "does not select canonical m128n128 on this device)\n",
+                    tokens);
+                ds4_gpu_cleanup();
+                return 77;
+            }
+        }
     }
     ds4_cuda_test_set_q4_mmq_strict(
         cfg.path == cuda_path::mmq ? 1 : 0);
@@ -1769,7 +2119,13 @@ int main(int argc, char **argv) {
             ok = false;
         }
     }
-    if (ok && cfg.path == cuda_path::mmq &&
+    // The N=9 probe is intentionally outside the 16-warp admission envelope.
+    // Kernel-only runs prove their raw path directly; required production runs
+    // fail closed at each measured dispatch, so probing here would be a false
+    // failure before the requested shape is reached.
+    const bool skip_mmq_probe = cfg.kernel_16warp || env_value_enabled(
+        "DS4_CUDA_REQUIRE_Q4_MMQ_16WARP");
+    if (ok && cfg.path == cuda_path::mmq && !skip_mmq_probe &&
         !verify_mmq_prefill_dispatch(model)) {
         std::fprintf(stderr,
                      "cuda-q4-prefill-bench: MMQ prefill proof probe failed; "
@@ -1807,9 +2163,11 @@ int main(int argc, char **argv) {
                                 &weight_set::dense_offset, "dense")
                           : run_dense(model, cfg, n_tokens)) && ok;
             }
-            if (ok && !cfg.kernel_16warp &&
-                includes(cfg.selected, bench_case::pair)) {
-                ok = run_pair(model, cfg, n_tokens) && ok;
+            if (ok && includes(cfg.selected, bench_case::pair)) {
+                ok = (cfg.kernel_16warp
+                          ? run_q4_16warp_pair_kernel(
+                                model, cfg, n_tokens)
+                          : run_pair(model, cfg, n_tokens)) && ok;
             }
             if (ok && includes(cfg.selected, bench_case::qb)) {
                 ok = (cfg.kernel_16warp

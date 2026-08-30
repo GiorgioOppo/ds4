@@ -40366,6 +40366,8 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
 
     const int gb10_canonical = cuda_q4_gb10_fast_path_enabled(
         logical_tier, "DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
+    const int require_q4_16warp = n_tok > 8u && cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_MMQ_16WARP", 0);
     if (cuda_use_mmq()) {
         /* Share one canonical Q8_1 activation across both projections:
          * MMVQ covers decode/speculative widths and token-tiled MMQ covers
@@ -40393,13 +40395,26 @@ static int cuda_matmul_q4_K_pair_tensor_impl(
                 (unsigned long long)out1_dim,
                 (unsigned long long)n_tok,
                 rc == DS4_MMQ_NOT_APPLICABLE
-                    ? (g_cuda_test_q4_mmq_strict
+                    ? (require_q4_16warp
+                           ? "; required 16-warp path rejects fallback"
+                           : g_cuda_test_q4_mmq_strict
                            ? "; strict benchmark mode rejects fallback"
                            : "; falling back")
                     : "; attempted path failed closed");
         if (rc != DS4_MMQ_NOT_APPLICABLE) return -1;
+        if (require_q4_16warp) return -1;
         if (g_cuda_test_q4_mmq_strict) return -1;
         if (gb10_canonical) return 0;
+    }
+    if (require_q4_16warp) {
+        fprintf(stderr,
+                "ds4: required Q4 16-warp prefill found no pair MMQ "
+                "dispatch (in=%llu out0=%llu out1=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out0_dim,
+                (unsigned long long)out1_dim,
+                (unsigned long long)n_tok);
+        return -1;
     }
     if (g_cuda_test_q4_mmq_strict) {
         fprintf(stderr,

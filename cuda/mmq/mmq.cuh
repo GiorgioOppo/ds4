@@ -4238,6 +4238,10 @@ struct mmq_args {
     // ignored; soa_blocks = pair count (Q2_K) or block count (IQ2_XXS).
     // Trailing fields so existing aggregate initializers value-init them.
     const char * x_soa; int64_t soa_blocks;
+    // Optional caller-owned Stream-K fixup tile storage.  Production callers
+    // normally leave this null and use the CUDA pool; kernel-only A/B harnesses
+    // provide it so cudaMallocAsync/cudaFreeAsync are outside their events.
+    float * stream_k_fixup; size_t stream_k_fixup_elements;
 };
 
 template<ggml_type type>
@@ -4326,12 +4330,19 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
+    float * tmp_fixup_ptr = nullptr;
     if (fixup_needed) {
-        tmp_fixup.alloc((size_t)block_nums_stream_k.x * (size_t)block_nums_stream_k.z * mmq_x*mmq_y);
-        CUDA_CHECK(cudaMemsetAsync(tmp_fixup.ptr, 0,
-                    (size_t)block_nums_stream_k.x * (size_t)block_nums_stream_k.z *
-                        (size_t)mmq_x * (size_t)mmq_y * sizeof(float),
-                    stream));
+        const size_t fixup_elements =
+            (size_t)block_nums_stream_k.x *
+            (size_t)block_nums_stream_k.z * mmq_x * mmq_y;
+        if (args.stream_k_fixup != nullptr) {
+            GGML_ASSERT(args.stream_k_fixup_elements >= fixup_elements);
+            tmp_fixup_ptr = args.stream_k_fixup;
+        } else {
+            tmp_fixup_ptr = tmp_fixup.alloc(fixup_elements);
+        }
+        CUDA_CHECK(cudaMemsetAsync(
+            tmp_fixup_ptr, 0, fixup_elements * sizeof(float), stream));
     }
 
     const dim3 block_nums_fixup(block_nums_stream_k.x, mmq_y/warp_size, block_nums_stream_k.z);
@@ -4340,7 +4351,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if (args.nrows_x % mmq_y == 0) {
         constexpr bool need_check = false;
         mul_mat_q<type, mmq_x, need_check, grid_z_channels><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup_ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4352,13 +4363,13 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
         CUDA_CHECK(cudaGetLastError());
         mul_mat_q_stream_k_fixup<type, mmq_x, need_check, grid_z_channels><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup_ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
              args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
              ntx_fd);
     } else {
         constexpr bool need_check = true;
         mul_mat_q<type, mmq_x, need_check, grid_z_channels><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup_ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4370,7 +4381,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
         CUDA_CHECK(cudaGetLastError());
         mul_mat_q_stream_k_fixup<type, mmq_x, need_check, grid_z_channels><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup_ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
              args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
              ntx_fd);
     }
