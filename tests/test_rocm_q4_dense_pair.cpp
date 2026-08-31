@@ -39,6 +39,9 @@ extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
 extern "C" int ds4_rocm_test_q4_prefill_wmma_requested_policy(
     int ssd_streaming, int enabled, int ssd_enabled, int disabled,
     int required);
+extern "C" int ds4_rocm_test_q4_prefill_wmma_b_requested_policy(
+    int ssd_streaming, int enabled, int ssd_enabled, int disabled,
+    int required);
 extern "C" int ds4_rocm_test_q4_prefill_wmma_yields_to_q8_wave32(
     int q8_selected, int wmma_required);
 extern "C" uint32_t ds4_rocm_test_q4_prefill_wmma_row_tile(
@@ -440,8 +443,8 @@ void fill_activation(std::vector<float> *x, uint32_t n_tokens,
     }
 }
 
-/* Exercise the two canonical edge cases for max selection: all-zero blocks
- * and equal absolute maxima with opposite signs at different indices. */
+/* Exercise the canonical max-selection edge cases: all-zero blocks and equal
+ * opposite-sign maxima spanning both the per-lane and cross-lane tree. */
 void fill_q8_wave32_activation(std::vector<float> *x, uint32_t n_tokens,
                                uint32_t in_dim) {
     x->resize((uint64_t)n_tokens * in_dim);
@@ -458,22 +461,46 @@ void fill_q8_wave32_activation(std::vector<float> *x, uint32_t n_tokens,
                 block[i] = (float)value / 16.0f;
             }
             const float first = ((token + b) & 1u) ? 4.0f : -4.0f;
-            block[5] = first;
-            block[224] = -first;
+            uint32_t first_index = 5u;
+            uint32_t second_index = 224u;
+            switch ((token + b) % 3u) {
+                case 1u:
+                    first_index = 0u;
+                    second_index = 128u;
+                    break;
+                case 2u:
+                    first_index = 1u;
+                    second_index = 16u;
+                    break;
+                default:
+                    break;
+            }
+            block[first_index] = first;
+            block[second_index] = -first;
         }
     }
 }
 
 void quantize_q8_K_cpu(const float *x, block_q8_K_test *out) {
-    float amax = 0.0f;
-    float maxv = 0.0f;
+    float abs_part[kQkK];
+    float val_part[kQkK];
     for (uint32_t i = 0; i < kQkK; i++) {
-        const float av = std::fabs(x[i]);
-        if (av > amax) {
-            amax = av;
-            maxv = x[i];
+        abs_part[i] = std::fabs(x[i]);
+        val_part[i] = x[i];
+    }
+    /* Mirror the canonical GPU reduction literally.  A linear scan chooses a
+     * different signed maximum when equal magnitudes occur, which changes the
+     * raw Q8_K bytes even though the resulting dot product is equivalent. */
+    for (uint32_t stride = kQkK >> 1u; stride != 0u; stride >>= 1u) {
+        for (uint32_t i = 0; i < stride; i++) {
+            if (abs_part[i + stride] > abs_part[i]) {
+                abs_part[i] = abs_part[i + stride];
+                val_part[i] = val_part[i + stride];
+            }
         }
     }
+    const float amax = abs_part[0];
+    const float maxv = val_part[0];
     if (amax == 0.0f) {
         std::memset(out, 0, sizeof(*out));
         return;
@@ -1213,19 +1240,20 @@ bool run_prefill_wmma_requested_policy_oracle() {
         int disabled;
         int required;
         int expected;
+        int b_expected;
     };
     const policy_case cases[] = {
-        {"resident unset is automatic", 0, -1, 0, 0, 0, 1},
-        {"resident ENABLE=0 compatibility opt-out", 0, 0, 0, 0, 0, 0},
-        {"resident ENABLE=1 remains accepted", 0, 1, 0, 0, 0, 1},
-        {"resident DISABLE opts out", 0, -1, 0, 1, 0, 0},
-        {"resident REQUIRE requests after ENABLE=0", 0, 0, 0, 0, 1, 1},
-        {"DISABLE+REQUIRE reaches strict rejection", 0, -1, 0, 1, 1, 1},
-        {"SSD default stays conservative", 1, -1, 0, 0, 0, 0},
-        {"generic ENABLE does not bypass SSD gate", 1, 1, 0, 0, 0, 0},
-        {"SSD gate requests the candidate", 1, -1, 1, 0, 0, 1},
-        {"SSD DISABLE opts out", 1, -1, 1, 1, 0, 0},
-        {"SSD REQUIRE requests strict validation", 1, -1, 0, 0, 1, 1},
+        {"resident unset is automatic", 0, -1, 0, 0, 0, 1, 0},
+        {"resident ENABLE=0 compatibility opt-out", 0, 0, 0, 0, 0, 0, 0},
+        {"resident ENABLE=1 remains accepted", 0, 1, 0, 0, 0, 1, 1},
+        {"resident DISABLE opts out", 0, -1, 0, 1, 0, 0, 0},
+        {"resident REQUIRE requests after ENABLE=0", 0, 0, 0, 0, 1, 1, 1},
+        {"DISABLE+REQUIRE reaches strict rejection", 0, -1, 0, 1, 1, 1, 1},
+        {"SSD default stays conservative", 1, -1, 0, 0, 0, 0, 0},
+        {"generic ENABLE does not bypass SSD gate", 1, 1, 0, 0, 0, 0, 0},
+        {"SSD gate requests the candidate", 1, -1, 1, 0, 0, 1, 1},
+        {"SSD DISABLE opts out", 1, -1, 1, 1, 0, 0, 0},
+        {"SSD REQUIRE requests strict validation", 1, -1, 0, 0, 1, 1, 1},
     };
 
     bool ok = true;
@@ -1238,6 +1266,17 @@ bool run_prefill_wmma_requested_policy_oracle() {
                          "Q4 WMMA request policy %s: expected=%d got=%d "
                          "FAIL\n",
                          test.label, test.expected, got);
+            ok = false;
+        }
+        const int b_got =
+            ds4_rocm_test_q4_prefill_wmma_b_requested_policy(
+                test.ssd_streaming, test.enabled, test.ssd_enabled,
+                test.disabled, test.required);
+        if (b_got != test.b_expected) {
+            std::fprintf(stderr,
+                         "Q4 attention-output B WMMA policy %s: "
+                         "expected=%d got=%d FAIL\n",
+                         test.label, test.b_expected, b_got);
             ok = false;
         }
     }
@@ -2036,6 +2075,21 @@ bool run_attention_prefill_case(const aligned_model &model,
         !write_tensor(group_tmp.ptr, group_tmp_sentinel) ||
         !write_tensor(low_tmp.ptr, low_tmp_sentinel)) {
         std::fprintf(stderr, "%s: setup FAIL\n", label);
+        return false;
+    }
+
+    /* Register/copy A as one contiguous tensor before the row-wise oracle
+     * requests eight contained group views.  Reversing that order creates
+     * overlapping cache registrations (eight subranges followed by their
+     * superset) and can fail before either candidate kernel is launched. */
+    const uint64_t out_a_row_bytes =
+        (kAttnGroupDim / kQkK) * sizeof(block_q4_K_test);
+    const uint64_t out_a_bytes =
+        (uint64_t)kAttnGroups * kAttnRank * out_a_row_bytes;
+    if (!ds4_gpu_cache_model_range(
+            model.data, model.size, model.attn_a_offset, out_a_bytes,
+            "ROCm Q4 attention-prefill fixture A")) {
+        std::fprintf(stderr, "%s: attention-output-A preload FAIL\n", label);
         return false;
     }
 
@@ -2924,7 +2978,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
     std::vector<float> wmma_low_host(low_sentinel.size());
     std::vector<float> wmma_out_host(out_sentinel.size());
     bool ok = tile8_rc == 1 && wmma_rc == 1 &&
-        tile8_wmma_calls == 0u && wmma_calls == 2u &&
+        tile8_wmma_calls == 0u && wmma_calls == 1u &&
         read_tensor(tile8_low.ptr, &tile8_low_host) &&
         read_tensor(tile8_out.ptr, &tile8_out_host) &&
         read_tensor(wmma_low.ptr, &wmma_low_host) &&
@@ -2941,7 +2995,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
                  "production output-A direct-WMMA body") && ok;
         ok = output_body_overwritten(
                  wmma_out_host, out_sentinel, out_count,
-                 "production output-B direct-WMMA body") && ok;
+                 "production output-B A-WMMA/B-TILE8 body") && ok;
         ok = output_guard_unchanged(
                  tile8_low_host, low_sentinel, low_count,
                  "production output-A TILE8 N-tail") && ok;
@@ -2953,7 +3007,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
                  "production output-A direct-WMMA N-tail") && ok;
         ok = output_guard_unchanged(
                  wmma_out_host, out_sentinel, out_count,
-                 "production output-B direct-WMMA N-tail") && ok;
+                 "production output-B A-WMMA/B-TILE8 N-tail") && ok;
         tile8_low_host.resize(low_count);
         tile8_out_host.resize(out_count);
         wmma_low_host.resize(low_count);
@@ -2963,11 +3017,11 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
                  "production output-A direct-WMMA vs TILE8") && ok;
         ok = close_with_tolerance(
                  wmma_out_host, tile8_out_host, 16.0f, 8.0e-2f,
-                 "production output-A+B direct-WMMA vs TILE8") && ok;
+                 "production output A-WMMA/B-TILE8 vs all-TILE8") && ok;
     }
     std::fprintf(stderr,
-                 "ROCm Q4 production output direct-WMMA: tile8=%d/%llu "
-                 "wmma=%d/%llu %s\n",
+                 "ROCm Q4 production output WMMA safety default: "
+                 "tile8=%d/%llu A-WMMA/B-TILE8=%d/%llu %s\n",
                  tile8_rc, (unsigned long long)tile8_wmma_calls,
                  wmma_rc, (unsigned long long)wmma_calls,
                  ok ? "PASS" : "FAIL");

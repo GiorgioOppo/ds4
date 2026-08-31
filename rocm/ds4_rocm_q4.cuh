@@ -1025,6 +1025,20 @@ static int rocm_q4_K_prefill_wmma_requested_policy(
     return ssd_streaming ? ssd_enabled == 1 : enabled != 0;
 }
 
+/* A direct attention-output B consumes the already approximate output of A.
+ * Unlike standalone dense and attention-output A, do not select it from the
+ * resident automatic default: require an explicit resident or SSD request. */
+static int rocm_q4_K_prefill_wmma_b_requested_policy(
+        int ssd_streaming,
+        int enabled,
+        int ssd_enabled,
+        int disabled,
+        int required) {
+    if (required) return 1;
+    if (disabled) return 0;
+    return ssd_streaming ? ssd_enabled == 1 : enabled == 1;
+}
+
 /* An explicitly selected exact Q8_K quantizer owns an optional WMMA default.
  * REQUIRE_WMMA is the only control that may override an optional Q8 request;
  * dual REQUIRE is rejected by each public dispatch before enqueue. */
@@ -1051,6 +1065,17 @@ extern "C" int ds4_rocm_test_q4_prefill_wmma_requested_policy(
         int disabled,
         int required) {
     return rocm_q4_K_prefill_wmma_requested_policy(
+        ssd_streaming != 0, enabled, ssd_enabled, disabled != 0,
+        required != 0);
+}
+
+extern "C" int ds4_rocm_test_q4_prefill_wmma_b_requested_policy(
+        int ssd_streaming,
+        int enabled,
+        int ssd_enabled,
+        int disabled,
+        int required) {
+    return rocm_q4_K_prefill_wmma_b_requested_policy(
         ssd_streaming != 0, enabled, ssd_enabled, disabled != 0,
         required != 0);
 }
@@ -2113,7 +2138,13 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
      * the graph replay a fallback over an already submitted A projection. */
     int a_wmma = rocm_q4_K_prefill_wmma_select(
         n_tokens, group_dim, rank, out_a_device_resident);
-    int b_wmma = out_b_type == 12u
+    /* The all-Q4 A+B direct path compounds two F16 input/dequantization
+     * approximations.  Keep the validated A candidate automatic, but leave B
+     * on exact Q8_K+TILE8 unless the user explicitly requests WMMA. */
+    const int b_wmma_requested = rocm_q4_K_prefill_wmma_b_requested_policy(
+        g_ssd_streaming_mode, wmma_enabled, wmma_ssd_enabled, wmma_disabled,
+        wmma_required);
+    int b_wmma = out_b_type == 12u && b_wmma_requested
         ? rocm_q4_K_prefill_wmma_select(
               n_tokens, low_dim, out_dim, out_b_device_resident)
         : ROCM_Q4_PREFILL_WMMA_FALLBACK;
@@ -2185,8 +2216,10 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
     }
     if (b_rc <= 0) return -1;
 
-    if (a_wmma != ROCM_Q4_PREFILL_WMMA_USE &&
-        b_wmma != ROCM_Q4_PREFILL_WMMA_USE) {
+    const int used_q4_tile8 =
+        a_wmma != ROCM_Q4_PREFILL_WMMA_USE ||
+        (out_b_type == 12u && b_wmma != ROCM_Q4_PREFILL_WMMA_USE);
+    if (used_q4_tile8) {
         rocm_q4_K_prefill_tile8_note(0u, 0u, 1u, 0u, n_tokens);
     }
     return 1;

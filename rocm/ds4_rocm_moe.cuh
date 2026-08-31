@@ -758,11 +758,12 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
 /* Wave32 Q8_K activation quantizer for the Q4 prefill path.
  *
  * A 256-thread workgroup quantizes up to eight independent 256-value blocks,
- * one per wave.  Each lane owns the eight values lane + 32*k.  The max
- * reduction carries the original element index so equal absolute maxima keep
- * the lowest index, matching q8_K_quantize_kernel's left-biased reduction.
- * The scale, lrintf conversion, clamp and 16-value bsums are otherwise the
- * canonical operations above.  No cross-wave communication or LDS is used.
+ * one per wave.  Each lane owns the eight values lane + 32*k.  Visiting those
+ * values in three-bit reversed order, then reducing lanes with strict-greater
+ * shuffle comparisons, reproduces q8_K_quantize_kernel's complete 256-thread
+ * reduction tree including its tie behavior.  The scale, lrintf conversion,
+ * clamp and 16-value bsums are otherwise the canonical operations above.  No
+ * cross-wave communication or LDS is used.
  *
  * Dispatch is deliberately restricted to a runtime-proven wave32 target in
  * ds4_rocm_q4.cuh.  Keep the device guard as a second fail-closed boundary in
@@ -792,20 +793,23 @@ __global__ static void q8_K_quantize_wave32_kernel(
                       (uint64_t)b * CUDA_QK_K;
     cuda_block_q8_K *yb = out + (uint64_t)row * blocks_per_row + b;
 
-    uint32_t max_index = lane;
-    float max_value = xr[max_index];
+    float max_value = xr[lane];
     float max_abs = fabsf(max_value);
     #pragma unroll
-    for (uint32_t k = 1u; k < CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH;
-         k++) {
+    for (uint32_t order = 1u;
+         order < CUDA_QK_K / ROCM_Q8_K_WAVE32_WIDTH; order++) {
+        /* q8_K_quantize_kernel compares strides 128, 64 and 32 before
+         * crossing lanes.  Bit-reversing the local k bits gives the same
+         * priority order: 0,4,2,6,1,5,3,7. */
+        const uint32_t k = ((order & 1u) << 2u) |
+                           (order & 2u) |
+                          ((order & 4u) >> 2u);
         const uint32_t index = lane + k * ROCM_Q8_K_WAVE32_WIDTH;
         const float value = xr[index];
         const float value_abs = fabsf(value);
-        if (value_abs > max_abs ||
-            (value_abs == max_abs && index < max_index)) {
+        if (value_abs > max_abs) {
             max_abs = value_abs;
             max_value = value;
-            max_index = index;
         }
     }
 
@@ -814,21 +818,16 @@ __global__ static void q8_K_quantize_wave32_kernel(
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         const float other_abs = __shfl_down(max_abs, offset, 32);
         const float other_value = __shfl_down(max_value, offset, 32);
-        const uint32_t other_index = __shfl_down(max_index, offset, 32);
 #else
         const float other_abs = __shfl_down_sync(
             FULL_WARP_MASK, max_abs, offset, 32);
         const float other_value = __shfl_down_sync(
             FULL_WARP_MASK, max_value, offset, 32);
-        const uint32_t other_index = __shfl_down_sync(
-            FULL_WARP_MASK, max_index, offset, 32);
 #endif
         if (lane + offset < ROCM_Q8_K_WAVE32_WIDTH &&
-            (other_abs > max_abs ||
-             (other_abs == max_abs && other_index < max_index))) {
+            other_abs > max_abs) {
             max_abs = other_abs;
             max_value = other_value;
-            max_index = other_index;
         }
     }
 
