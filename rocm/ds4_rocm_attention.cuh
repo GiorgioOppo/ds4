@@ -1519,7 +1519,6 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         frag_c score_acc;
         if (wave < HEAD_TILES * KEY_TILES) rocwmma::fill_fragment(score_acc, 0.0f);
 
-#pragma unroll
         for (uint32_t d0 = 0; d0 < 512u; d0 += TILE) {
             if (tid < HEADS * TILE) {
                 const uint32_t hl = tid / TILE;
@@ -1630,7 +1629,6 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
             }
             sh_qp[hl * STRIDE + kl] = __float2half(p);
         }
-        __syncthreads();
 #pragma unroll
         for (uint32_t delta = 1u; delta < 16u; delta <<= 1u) {
             block_sum += __shfl_xor_sync(FULL_WARP_MASK, block_sum, delta, 32);
@@ -1648,7 +1646,6 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
             accum[i] *= old_scale[out_idx / 512u];
         }
 
-#pragma unroll
         for (uint32_t dim0 = 0; dim0 < 512u; dim0 += DIMS) {
             if constexpr (F32_VEC2) {
                 for (uint32_t idx = tid; idx < KEYS * (DIMS / 2u); idx += blockDim.x) {
