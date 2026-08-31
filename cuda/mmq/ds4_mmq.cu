@@ -1134,7 +1134,7 @@ extern "C" int ds4_mmq_q4_K_dense_preq_16warp_for_test(
     // but it must reject shapes that cannot be represented by this kernel
     // before enqueueing any work.
     if (M < 128 || (M % 128) != 0 || N < 512 ||
-        K < 1024 || K > 4096 || (K % QK_K) != 0) {
+        K < 1024 || K > 8192 || (K % QK_K) != 0) {
         return DS4_MMQ_NOT_APPLICABLE;
     }
     const int dev = ggml_cuda_get_device();

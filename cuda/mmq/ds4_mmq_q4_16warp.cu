@@ -492,7 +492,7 @@ extern "C" int ds4_mmq_q4_K_dense_16warp_supported(
     }
     return M >= 1024 && (M % q4w16::kMTile) == 0 &&
            N >= 512 && (N % q4w16::kNTile) == 0 &&
-           K >= 1024 && K <= 4096 && (K % QK_K) == 0;
+           K >= 1024 && K <= 8192 && (K % QK_K) == 0;
 }
 
 extern "C" int ds4_mmq_q4_K_dense_16warp_prepare(void) {

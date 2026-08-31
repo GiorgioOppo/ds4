@@ -25,6 +25,7 @@ int ds4_mmq_q4_K_dense_16warp_available(int cc);
 
 // Conservative standalone production admission gate. Availability and shape
 // are both checked; it admits M>=1024 and only complete 128x128 output tiles.
+// The K envelope covers the production 8192-wide attention output projection.
 // The dispatcher separately enforces the m128n128 reference selector and its
 // candidate-grid efficiency gate. A false result must fall back. The pair
 // dispatcher has a separate per-leg M>=512 gate.

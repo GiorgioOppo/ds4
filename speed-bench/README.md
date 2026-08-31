@@ -308,6 +308,11 @@ make cuda-q4-prefill-bench CUDA_ARCH=sm_121
   --path mmq --kernel-16warp --case pair \
   --tokens 512,1024,2048,2049,4096,6144,8192 \
   --sets 4 --samples 16 --warmup 4
+DS4_CUDA_MMQ_X_MAX=128 \
+./speed-bench/cuda_q4_prefill_bench \
+  --path mmq --kernel-16warp --case outb \
+  --tokens 2048 \
+  --sets 4 --samples 16 --warmup 4
 ```
 
 The benchmark quantizes X to canonical Q8_1 DS4 once, before timing, and uses
@@ -325,7 +330,10 @@ bit-for-bit, checks finite values and independent output canaries, and samples
 a CPU Q4_K oracle before and after timing. Results attest
 `timing=kernel_only_prequant`; SSD streaming, model upload, Q8_1 quantization,
 allocation, host copies, and oracle work are outside the samples. Use
-`--case qb` for the additional `K=1024,M=32768` large-projection datapoint.
+`--case qb` for the additional `K=1024,M=32768` large-projection datapoint and
+`--case outb` for the real attention output-B `K=8192,M=4096` geometry. The
+focused oracle covers that wider K with complete N128 tiles; the resident
+benchmark retains the real `N=2048` prefill geometry for performance claims.
 The focused test also invokes the real standalone dense and pair dispatchers in
 required mode at `N=4096`, so fallback fails instead of producing a misleading
 canonical-path pass. A negative pair case verifies that an ineligible 384-row
@@ -342,10 +350,11 @@ falls back on ineligible shapes. For an attested production benchmark,
 `DS4_CUDA_REQUIRE_Q4_MMQ_16WARP=1` also prevents a Q8_K/MMQ fallback;
 `DS4_CUDA_NO_Q4_MMQ_16WARP=1` is the value-aware rollback. The strict path
 requires Ampere or newer, complete 128x128 output tiles, `N>=512`,
-`1024<=K<=4096`, the default 128-column MMQ selector, and at least 80% final-wave
-grid efficiency. Single dense admission starts at `M=1024`; the Q-A/KV pair
-admission also accepts its `M1=512` leg when both projections select the
-16-warp path.
+`1024<=K<=8192`, the default 128-column MMQ selector, and at least 80% final-wave
+grid efficiency. Single dense admission starts at `M=1024`, including the
+`K=8192` output-B projection; the Q-A/KV pair admission also accepts its
+`M1=512` leg when both projections select the 16-warp path, and remains bounded
+to `K<=4096`.
 
 On GB10, isolate the production Flash attention-output A geometry
 (`groups=8`, `K=4096`, `rank=1024`) and its 127/128/129 token tails with:

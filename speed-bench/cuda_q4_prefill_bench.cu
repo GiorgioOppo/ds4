@@ -33,6 +33,7 @@ constexpr uint32_t kOutputGroups = 8u;
 constexpr uint32_t kOutputRank = 1024u;
 constexpr uint32_t kOutputLowDim = kOutputGroups * kOutputRank;
 constexpr uint32_t kOutputMinB = 256u;
+constexpr uint32_t kOutputM = 4096u;
 constexpr uint32_t kDefaultSets = 4u;
 constexpr uint32_t kDefaultSamples = 8u;
 constexpr uint32_t kDefaultWarmup = 2u;
@@ -71,6 +72,7 @@ enum class bench_case {
     pair,
     qb,
     outa,
+    outb,
 };
 
 enum class cuda_path {
@@ -101,6 +103,7 @@ struct model_fixture {
     uint8_t *data = nullptr;
     uint64_t size = 0;
     uint64_t payload_bytes = 0;
+    uint32_t output_b_rows = kOutputMinB;
     std::vector<weight_set> weights;
 
     ~model_fixture() { std::free(data); }
@@ -329,7 +332,9 @@ uint64_t q4_weight_bytes(uint32_t in_dim, uint32_t out_dim) {
            sizeof(block_q4_K_host);
 }
 
-bool make_model(model_fixture *model, uint32_t sets) {
+bool make_model(model_fixture *model, uint32_t sets,
+                uint32_t output_b_rows) {
+    if (output_b_rows < kOutputMinB) return false;
     constexpr uint64_t page = 4096u;
     const uint64_t dense_bytes = q4_weight_bytes(kDenseK, kDenseM);
     const uint64_t kv_bytes = q4_weight_bytes(kDenseK, kKvM);
@@ -337,8 +342,9 @@ bool make_model(model_fixture *model, uint32_t sets) {
     const uint64_t output_a_bytes =
         q4_weight_bytes(kDenseK, kOutputLowDim);
     const uint64_t output_b_bytes =
-        q4_weight_bytes(kOutputLowDim, kOutputMinB);
+        q4_weight_bytes(kOutputLowDim, output_b_rows);
 
+    model->output_b_rows = output_b_rows;
     model->weights.resize(sets);
     uint64_t cursor = 0;
     auto append = [&](uint64_t bytes) {
@@ -738,12 +744,13 @@ const char *path_name(cuda_path path) {
 const char *case_scope(const config &cfg) {
     switch (cfg.selected) {
         case bench_case::all:
-            return cfg.kernel_16warp ? "dense,pair,q_b"
+            return cfg.kernel_16warp ? "dense,pair,q_b,output_b"
                                      : "dense,pair,q_b,outa";
         case bench_case::dense: return "dense";
         case bench_case::pair: return "pair";
         case bench_case::qb: return "q_b";
         case bench_case::outa: return "outa";
+        case bench_case::outb: return "output_b";
     }
     return "unknown";
 }
@@ -1697,7 +1704,7 @@ void usage(FILE *stream, const char *argv0) {
         "usage: %s [options]\n\n"
         "Resident CUDA Q4_K prefill kernel benchmark (CUDA event timing).\n\n"
         "  --path mmq|legacy         process-wide path (default: mmq)\n"
-        "  --case all|dense|pair|qb|outa\n"
+        "  --case all|dense|pair|qb|outa|outb\n"
         "                             case to run (default: all)\n"
         "  --tokens N[,N...]         token counts, each 9..8192\n"
         "  --full                    use 9,16,17,31,32,33,127,128,129,256,"
@@ -1719,7 +1726,8 @@ void usage(FILE *stream, const char *argv0) {
         "DS4_CUDA_MMQ_X_MAX\nmay explicitly select an 8..128 multiple-of-8 "
         "sweep point; the setup line\nattests it, or prints auto when the "
         "variable is unset. --kernel-16warp requires\n--path mmq and "
-        "--case dense/pair/qb; with --case all it runs dense, pair, and q_b. Its "
+        "--case dense/pair/qb/outb; with --case all it also runs the real "
+        "K=8192,M=4096 output-B. Its "
         "pair arm\nshares one prequantized activation across M=1024+512. Token "
         "counts must be\n>=512 and select canonical m128n128 on the active "
         "device; without --tokens/--full it uses "
@@ -1805,6 +1813,8 @@ config parse_options(int argc, char **argv) {
                 cfg.selected = bench_case::qb;
             } else if (!std::strcmp(value, "outa")) {
                 cfg.selected = bench_case::outa;
+            } else if (!std::strcmp(value, "outb")) {
+                cfg.selected = bench_case::outb;
             } else {
                 std::fprintf(stderr, "invalid --case: %s\n", value);
                 std::exit(2);
@@ -1862,7 +1872,12 @@ config parse_options(int argc, char **argv) {
     if (cfg.kernel_16warp && cfg.selected == bench_case::outa) {
         std::fprintf(stderr,
                      "--kernel-16warp supports only --case dense, pair, qb, "
-                     "or all (all runs dense+pair+qb)\n");
+                     "outb, or all\n");
+        std::exit(2);
+    }
+    if (!cfg.kernel_16warp && cfg.selected == bench_case::outb) {
+        std::fprintf(stderr,
+                     "--case outb requires --kernel-16warp\n");
         std::exit(2);
     }
     if (cfg.path == cuda_path::legacy &&
@@ -1932,7 +1947,7 @@ bool verify_resident_weight_ranges(const model_fixture &model) {
     const uint64_t output_a_bytes =
         q4_weight_bytes(kDenseK, kOutputLowDim);
     const uint64_t output_b_bytes =
-        q4_weight_bytes(kOutputLowDim, kOutputMinB);
+        q4_weight_bytes(kOutputLowDim, model.output_b_rows);
     for (uint32_t set = 0; set < model.weights.size(); set++) {
         struct range_desc {
             const char *name;
@@ -1944,7 +1959,9 @@ bool verify_resident_weight_ranges(const model_fixture &model) {
             {"kv", model.weights[set].kv_offset, kv_bytes},
             {"q_b", model.weights[set].qb_offset, qb_bytes},
             {"output_a", model.weights[set].output_a_offset, output_a_bytes},
-            {"output_b_min", model.weights[set].output_b_offset,
+            {model.output_b_rows == kOutputMinB
+                 ? "output_b_min" : "output_b",
+             model.weights[set].output_b_offset,
              output_b_bytes},
         };
         for (const range_desc &range : ranges) {
@@ -2095,7 +2112,10 @@ int main(int argc, char **argv) {
 
     bool ok = true;
     model_fixture model;
-    if (!make_model(&model, cfg.sets)) {
+    const uint32_t output_b_rows =
+        cfg.kernel_16warp && includes(cfg.selected, bench_case::outb)
+            ? kOutputM : kOutputMinB;
+    if (!make_model(&model, cfg.sets, output_b_rows)) {
         std::fprintf(stderr,
                      "cuda-q4-prefill-bench: model fixture allocation failed\n");
         ok = false;
@@ -2175,6 +2195,12 @@ int main(int argc, char **argv) {
                                 model, cfg, n_tokens, kQbK, kQbM,
                                 &weight_set::qb_offset, "q_b")
                           : run_qb(model, cfg, n_tokens)) && ok;
+            }
+            if (ok && cfg.kernel_16warp &&
+                includes(cfg.selected, bench_case::outb)) {
+                ok = run_q4_16warp_kernel(
+                         model, cfg, n_tokens, kOutputLowDim, kOutputM,
+                         &weight_set::output_b_offset, "output_b") && ok;
             }
             if (ok && !cfg.kernel_16warp && grouped_prefill_supported &&
                 includes(cfg.selected, bench_case::outa)) {

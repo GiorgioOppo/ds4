@@ -3269,6 +3269,14 @@ int main(int argc, char ** argv) {
                     prop.major, prop.minor);
             return 77;
         }
+        if (!ds4_mmq_q4_K_dense_16warp_supported(
+                cc, /*M=*/4096, /*N=*/768, /*K=*/8192) ||
+            ds4_mmq_q4_K_dense_16warp_supported(
+                cc, /*M=*/4096, /*N=*/768, /*K=*/8448)) {
+            fprintf(stderr,
+                    "Q4 16-warp K=8192 admission envelope is invalid\n");
+            return 1;
+        }
         const int prepare_rc = ds4_mmq_q4_K_dense_16warp_prepare();
         if (prepare_rc != 0) {
             fprintf(stderr,
@@ -3288,9 +3296,11 @@ int main(int argc, char ** argv) {
         };
         const int dense_4096_eff = grid_efficiency(1024, 4096);
         const int kv_4096_eff = grid_efficiency(512, 4096);
+        const int output_b_8192_eff = grid_efficiency(4096, 768);
         const bool public_dense_4096 = dense_4096_eff >= 80;
         const bool public_pair_4096 =
             public_dense_4096 && kv_4096_eff >= 80;
+        const bool public_output_b_8192 = output_b_8192_eff >= 80;
 
         // N=512 and mmq_x=128 give four N tiles. Choose the smallest M-tile
         // count >=16 for which 4*tiles_m is divisible by nSM. Stream-K then
@@ -3344,6 +3354,21 @@ int main(int argc, char ** argv) {
                     "Q4 16-warp public dense N=4096 SKIP: grid efficiency "
                     "%d%% < 80%% (nsm=%d)\n",
                     dense_4096_eff, prop.multiProcessorCount);
+        }
+        // Production output-B has M=4096,K=8192. N=768 is a smaller,
+        // independent set of complete N128 tiles that selects the same
+        // scratch-free direct kernel as N=2048 on GB10, while the dedicated
+        // speed benchmark covers the real N=2048 timing geometry.
+        all_ok &= run_q4_K_dense_16warp_parity(
+            /*M=*/4096, /*N=*/768, /*K=*/8192,
+            prop.multiProcessorCount, 0xC4160006u,
+            /*check_public_dense=*/public_output_b_8192,
+            /*check_rejection=*/false);
+        if (!public_output_b_8192) {
+            fprintf(stderr,
+                    "Q4 16-warp public output-B K=8192 SKIP: grid "
+                    "efficiency %d%% < 80%% (nsm=%d)\n",
+                    output_b_8192_eff, prop.multiProcessorCount);
         }
         if (public_pair_4096) {
             all_ok &= run_q4_K_dense_pair_16warp_parity(

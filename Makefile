@@ -445,7 +445,7 @@ help:
 	@echo "  make rocm-iq2-moe-prefill-bench  Build the resident ROCm IQ2/Q2 WMMA A/B harness"
 	@echo "  make rocm-q4-prefill-bench  Build the resident ROCm Q4 projection/WMMA A/B harness"
 	@echo "  make cuda-iq2-moe-prefill-bench CUDA_ARCH=sm_N  Build the resident CUDA IQ2/Q2 profiling harness"
-	@echo "  make cuda-q4-prefill-bench CUDA_ARCH=sm_N  Build the resident CUDA Q4 dense/pair/q_b/output-A harness"
+	@echo "  make cuda-q4-prefill-bench CUDA_ARCH=sm_N  Build the resident CUDA Q4 dense/pair/q_b/output-A/output-B harness"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
