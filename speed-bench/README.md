@@ -213,6 +213,24 @@ its own configuration. Eligible resident runtime calls use direct-Q4 WMMA by
 default; set `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` to opt out. The
 production-API comparison still uses the strict REQUIRE gate so a rejected
 dispatch fails instead of timing a fallback.
+
+Eligible direct-Q4 WMMA launches use K64/P80 staging by default. It stages two
+adjacent 32-value Q4_K groups and a 64-value activation slice in one padded
+P80 LDS tile, halving workgroup barriers while retaining the K32 activation
+traffic and accumulation order. Leave
+`DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64` unset or set it to a true value for this
+default; set it to `0`, `false`, `no`, or `off` to restore K32 staging.
+`DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` rolls the whole direct-WMMA path back to
+Q8_K plus TILE8/TILE4.
+
+Use the production 2048-token sweep to isolate default K64/P80 from the K32
+rollback without SSD-streaming or policy-selection noise:
+
+```
+./speed-bench/rocm_q4_prefill_bench \
+  --case all --tokens 2048 --sets 4 --warmup 4 --samples 12
+```
+
 The benchmark always keeps SSD streaming disabled. Runtime SSD experiments
 need the separate `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD=1` gate and only accept
 projection ranges already backed by physical device memory, so model I/O is

@@ -36,6 +36,9 @@ extern "C" int ds4_rocm_test_q4_prefill_k1024_tile4_policy(
     int disabled, int required);
 extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void);
+extern "C" int ds4_rocm_test_q4_prefill_wmma_k64_control_policy(
+    int control);
 extern "C" int ds4_rocm_test_q4_prefill_wmma_requested_policy(
     int ssd_streaming, int enabled, int ssd_enabled, int disabled,
     int required);
@@ -111,6 +114,8 @@ constexpr const char *kPrefillWmmaRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA";
 constexpr const char *kPrefillWmmaRowTile =
     "DS4_ROCM_Q4_PREFILL_WMMA_ROW_TILE";
+constexpr const char *kPrefillWmmaK64 =
+    "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64";
 constexpr const char *kPrefillQ8Wave32Enable =
     "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32";
 constexpr const char *kPrefillQ8Wave32Disable =
@@ -1295,11 +1300,25 @@ bool run_prefill_wmma_requested_policy_oracle() {
                      strict_wmma_yield);
         ok = false;
     }
+    const int k64_unset =
+        ds4_rocm_test_q4_prefill_wmma_k64_control_policy(-1);
+    const int k64_false =
+        ds4_rocm_test_q4_prefill_wmma_k64_control_policy(0);
+    const int k64_true =
+        ds4_rocm_test_q4_prefill_wmma_k64_control_policy(1);
+    if (k64_unset != 1 || k64_false != 0 || k64_true != 1) {
+        std::fprintf(stderr,
+                     "Q4 WMMA K64 default policy: unset=%d false=%d "
+                     "true=%d FAIL\n",
+                     k64_unset, k64_false, k64_true);
+        ok = false;
+    }
     std::fprintf(stderr,
                  "ROCm Q4 WMMA request policy oracle: cases=%zu "
-                 "q8_yield=%d/%d/%d %s\n",
+                 "q8_yield=%d/%d/%d k64=%d/%d/%d %s\n",
                  sizeof(cases) / sizeof(cases[0]), optional_q8_yield,
                  absent_q8_yield, strict_wmma_yield,
+                 k64_unset, k64_false, k64_true,
                  ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -1458,6 +1477,7 @@ bool run_pair_pre_enqueue_policy_oracle() {
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
     env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
+    env_snapshot wmma_k64(kPrefillWmmaK64);
     env_snapshot q8_enable(kPrefillQ8Wave32Enable);
     env_snapshot q8_disable(kPrefillQ8Wave32Disable);
     env_snapshot q8_require(kPrefillQ8Wave32Require);
@@ -1469,6 +1489,7 @@ bool run_pair_pre_enqueue_policy_oracle() {
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
     (void)unsetenv(kPrefillWmmaRowTile);
+    (void)setenv(kPrefillWmmaK64, "0", 1);
     (void)unsetenv(kPrefillQ8Wave32Enable);
     (void)unsetenv(kPrefillQ8Wave32Disable);
     (void)unsetenv(kPrefillQ8Wave32Require);
@@ -2754,10 +2775,12 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
 
     constexpr uint32_t n_tokens = 257u;
     const size_t logical_count = (size_t)n_tokens * kM0;
-    /* A broken N-tail store could write the remaining 63 rows of the final
-     * 64-token tile.  Cover that full footprint, not just the normal API
-     * canary. */
-    constexpr size_t wmma_guard_floats = (64u - 1u) * kM0;
+    /* A broken N-tail store could write the remaining 63 tokens of the final
+     * tile, while a simultaneous M-tail failure could address the remaining
+     * 63 rows of this 64-row launch.  Cover both predicates failing together,
+     * not just the normal API canary. */
+    constexpr size_t wmma_guard_floats =
+        (64u - 1u) * kM0 + (64u - 1u);
     const size_t allocation_count = logical_count + wmma_guard_floats;
     const std::vector<float> sentinel = sentinel_values(allocation_count);
     std::vector<float> x;
@@ -2765,9 +2788,11 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     tensor_owner x_gpu(x.size() * sizeof(float));
     tensor_owner tile8_gpu(allocation_count * sizeof(float));
     tensor_owner wmma_gpu(allocation_count * sizeof(float));
-    if (!x_gpu.ptr || !tile8_gpu.ptr || !wmma_gpu.ptr ||
+    tensor_owner k64_gpu(allocation_count * sizeof(float));
+    if (!x_gpu.ptr || !tile8_gpu.ptr || !wmma_gpu.ptr || !k64_gpu.ptr ||
         !write_tensor(x_gpu.ptr, x) || !write_tensor(tile8_gpu.ptr, sentinel) ||
-        !write_tensor(wmma_gpu.ptr, sentinel)) {
+        !write_tensor(wmma_gpu.ptr, sentinel) ||
+        !write_tensor(k64_gpu.ptr, sentinel)) {
         std::fprintf(stderr, "ROCm Q4 direct-WMMA prefill: setup FAIL\n");
         return false;
     }
@@ -2781,6 +2806,7 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
     env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
+    env_snapshot wmma_k64(kPrefillWmmaK64);
     env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
     env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
     env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
@@ -2794,6 +2820,7 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     (void)setenv(kPrefillWmmaDisable, "1", 1);
     (void)unsetenv(kPrefillWmmaRequire);
     (void)unsetenv(kPrefillWmmaRowTile);
+    (void)setenv(kPrefillWmmaK64, "0", 1);
     (void)unsetenv(kPrefillQ8Wave32Enable);
     (void)unsetenv(kPrefillQ8Wave32Disable);
     (void)unsetenv(kPrefillQ8Wave32Require);
@@ -2803,39 +2830,70 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
         kK, kM0, x_gpu.ptr, n_tokens);
     const uint64_t tile8_wmma_calls =
         ds4_rocm_test_q4_prefill_wmma_get_calls();
+    const uint64_t tile8_k64_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
 
     (void)unsetenv(kPrefillRequire);
     (void)unsetenv(kPrefillWmmaEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)setenv(kPrefillWmmaK64, "0", 1);
     ds4_rocm_test_q4_prefill_wmma_reset();
     const int wmma_rc = ds4_gpu_matmul_quant_tensor(
         wmma_gpu.ptr, model.data, model.size, model.weight0_offset, kQ4Type,
         kK, kM0, x_gpu.ptr, n_tokens);
     const uint64_t wmma_calls =
         ds4_rocm_test_q4_prefill_wmma_get_calls();
+    const uint64_t wmma_k64_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
+
+    /* The production default must select K64 when no override is present. */
+    (void)unsetenv(kPrefillWmmaK64);
+    ds4_rocm_test_q4_prefill_wmma_reset();
+    const int k64_default_rc = ds4_gpu_matmul_quant_tensor(
+        k64_gpu.ptr, model.data, model.size, model.weight0_offset, kQ4Type,
+        kK, kM0, x_gpu.ptr, n_tokens);
+    const uint64_t k64_default_wmma_calls =
+        ds4_rocm_test_q4_prefill_wmma_get_calls();
+    const uint64_t k64_default_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
 
     std::vector<float> tile8(allocation_count);
     std::vector<float> wmma(allocation_count);
-    bool ok = tile8_rc != 0 && wmma_rc != 0 && tile8_wmma_calls == 0u &&
-        wmma_calls == 1u &&
+    std::vector<float> k64_default(allocation_count);
+    bool ok = tile8_rc != 0 && wmma_rc != 0 && k64_default_rc != 0 &&
+        tile8_wmma_calls == 0u && tile8_k64_calls == 0u &&
+        wmma_calls == 1u && wmma_k64_calls == 0u &&
+        k64_default_wmma_calls == 1u && k64_default_calls == 1u &&
         read_tensor(tile8_gpu.ptr, &tile8) &&
-        read_tensor(wmma_gpu.ptr, &wmma);
+        read_tensor(wmma_gpu.ptr, &wmma) &&
+        read_tensor(k64_gpu.ptr, &k64_default);
     if (ok) {
         ok = output_body_overwritten(tile8, sentinel, logical_count,
                                      "direct-WMMA TILE8 output body") && ok;
         ok = output_body_overwritten(wmma, sentinel, logical_count,
                                      "direct-WMMA candidate output body") && ok;
+        ok = output_body_overwritten(
+                 k64_default, sentinel, logical_count,
+                 "direct-WMMA default K64 output body") && ok;
         ok = output_guard_unchanged(tile8, sentinel, logical_count,
                                     "direct-WMMA TILE8 output canary") && ok;
         ok = output_guard_unchanged(wmma, sentinel, logical_count,
                                     "direct-WMMA candidate output canary") && ok;
+        ok = output_guard_unchanged(
+                 k64_default, sentinel, logical_count,
+                 "direct-WMMA default K64 output canary") && ok;
         tile8.resize(logical_count);
         wmma.resize(logical_count);
+        k64_default.resize(logical_count);
         ok = close_with_tolerance(wmma, tile8, 2.0f, 3.0e-2f,
                                   "direct-WMMA vs TILE8 N/M tail") && ok;
+        ok = bitwise_equal(k64_default, wmma,
+                           "direct-WMMA default K64 vs K32 N/M tail") && ok;
     }
 
+    /* Return to the neutral K32 setting for the remaining policy cases. */
+    (void)setenv(kPrefillWmmaK64, "0", 1);
     (void)setenv(kPrefillWmmaDisable, "1", 1);
     (void)unsetenv(kPrefillWmmaRequire);
     if (!write_tensor(wmma_gpu.ptr, sentinel)) return false;
@@ -2845,8 +2903,11 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
         kK, kM0, x_gpu.ptr, n_tokens);
     const uint64_t opt_out_wmma_calls =
         ds4_rocm_test_q4_prefill_wmma_get_calls();
+    const uint64_t opt_out_k64_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
     std::vector<float> opt_out(allocation_count);
     const bool opt_out_read = opt_out_rc != 0 && opt_out_wmma_calls == 0u &&
+        opt_out_k64_calls == 0u &&
         read_tensor(wmma_gpu.ptr, &opt_out);
     ok = opt_out_read && ok;
     if (opt_out_read) {
@@ -2866,17 +2927,28 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
         kK, kM0, x_gpu.ptr, n_tokens);
     const uint64_t rejected_wmma_calls =
         ds4_rocm_test_q4_prefill_wmma_get_calls();
+    const uint64_t rejected_k64_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
     ok = rejected_rc == 0 && rejected_wmma_calls == 0u &&
+         rejected_k64_calls == 0u &&
          unchanged_after_rejected_call(
              wmma_gpu.ptr, sentinel,
              "direct-WMMA DISABLE+REQUIRE preserves output") && ok;
     std::fprintf(stderr,
-                 "ROCm Q4 direct-WMMA prefill: tile8=%d/%llu "
-                 "default=%d/%llu opt_out=%d/%llu rejected=%d/%llu %s\n",
+                 "ROCm Q4 direct-WMMA prefill: tile8=%d/%llu/%llu "
+                 "K32=%d/%llu/%llu K64-default=%d/%llu/%llu "
+                 "opt_out=%d/%llu/%llu rejected=%d/%llu/%llu %s\n",
                  tile8_rc, (unsigned long long)tile8_wmma_calls,
+                 (unsigned long long)tile8_k64_calls,
                  wmma_rc, (unsigned long long)wmma_calls,
+                 (unsigned long long)wmma_k64_calls,
+                 k64_default_rc,
+                 (unsigned long long)k64_default_wmma_calls,
+                 (unsigned long long)k64_default_calls,
                  opt_out_rc, (unsigned long long)opt_out_wmma_calls,
+                 (unsigned long long)opt_out_k64_calls,
                  rejected_rc, (unsigned long long)rejected_wmma_calls,
+                 (unsigned long long)rejected_k64_calls,
                  ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -2938,6 +3010,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
     env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
+    env_snapshot wmma_k64(kPrefillWmmaK64);
 
     ds4_gpu_set_ssd_streaming(false);
     (void)unsetenv(kPrefillEnable);
@@ -2949,6 +3022,7 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
     (void)setenv(kPrefillWmmaDisable, "1", 1);
     (void)unsetenv(kPrefillWmmaRequire);
     (void)unsetenv(kPrefillWmmaRowTile);
+    (void)setenv(kPrefillWmmaK64, "0", 1);
     ds4_rocm_test_q4_prefill_wmma_reset();
     const int tile8_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
         tile8_out.ptr, tile8_low.ptr, nullptr, nullptr,
@@ -2958,11 +3032,14 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
         heads_gpu.ptr, n_tokens);
     const uint64_t tile8_wmma_calls =
         ds4_rocm_test_q4_prefill_wmma_get_calls();
+    const uint64_t tile8_k64_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
 
     (void)unsetenv(kPrefillRequire);
     (void)unsetenv(kPrefillWmmaEnable);
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
+    (void)setenv(kPrefillWmmaK64, "0", 1);
     ds4_rocm_test_q4_prefill_wmma_reset();
     const int wmma_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
         wmma_out.ptr, wmma_low.ptr, nullptr, nullptr,
@@ -2972,13 +3049,17 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
         heads_gpu.ptr, n_tokens);
     const uint64_t wmma_calls =
         ds4_rocm_test_q4_prefill_wmma_get_calls();
+    const uint64_t wmma_k64_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
 
     std::vector<float> tile8_low_host(low_sentinel.size());
     std::vector<float> tile8_out_host(out_sentinel.size());
     std::vector<float> wmma_low_host(low_sentinel.size());
     std::vector<float> wmma_out_host(out_sentinel.size());
     bool ok = tile8_rc == 1 && wmma_rc == 1 &&
-        tile8_wmma_calls == 0u && wmma_calls == 1u &&
+        tile8_wmma_calls == 0u && tile8_k64_calls == 0u &&
+        wmma_calls == 1u &&
+        wmma_k64_calls == 0u &&
         read_tensor(tile8_low.ptr, &tile8_low_host) &&
         read_tensor(tile8_out.ptr, &tile8_out_host) &&
         read_tensor(wmma_low.ptr, &wmma_low_host) &&
@@ -3019,11 +3100,68 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
                  wmma_out_host, tile8_out_host, 16.0f, 8.0e-2f,
                  "production output A-WMMA/B-TILE8 vs all-TILE8") && ok;
     }
+
+    int k64_default_rc = 0;
+    uint64_t k64_default_wmma_calls = 0u;
+    uint64_t k64_default_calls = 0u;
+    std::vector<float> k64_default_low_host(low_sentinel.size());
+    std::vector<float> k64_default_out_host(out_sentinel.size());
+    if (ok) {
+        ok = write_tensor(wmma_low.ptr, low_sentinel) &&
+             write_tensor(wmma_out.ptr, out_sentinel);
+    }
+    if (ok) {
+        /* Attest the production K64 default, not its explicit opt-in alias. */
+        (void)unsetenv(kPrefillWmmaK64);
+        ds4_rocm_test_q4_prefill_wmma_reset();
+        k64_default_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
+            wmma_out.ptr, wmma_low.ptr, nullptr, nullptr,
+            model.data, model.size, model.decode_attn_a_offset,
+            model.decode_attn_b_offset, kQ4Type, kDecodeAttnGroupDim,
+            kDecodeAttnRank, kDecodeAttnGroups, kDecodeAttnOutDim,
+            heads_gpu.ptr, n_tokens);
+        k64_default_wmma_calls =
+            ds4_rocm_test_q4_prefill_wmma_get_calls();
+        k64_default_calls = ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
+        ok = k64_default_rc == 1 && k64_default_wmma_calls == 1u &&
+             k64_default_calls == 1u &&
+             read_tensor(wmma_low.ptr, &k64_default_low_host) &&
+             read_tensor(wmma_out.ptr, &k64_default_out_host);
+    }
+    if (ok) {
+        ok = output_body_overwritten(
+                 k64_default_low_host, low_sentinel, low_count,
+                 "production output-A default K64 direct-WMMA body") && ok;
+        ok = output_body_overwritten(
+                 k64_default_out_host, out_sentinel, out_count,
+                 "production output-B A-default-K64/B-TILE8 body") && ok;
+        ok = output_guard_unchanged(
+                 k64_default_low_host, low_sentinel, low_count,
+                 "production output-A default K64 direct-WMMA N-tail") && ok;
+        ok = output_guard_unchanged(
+                 k64_default_out_host, out_sentinel, out_count,
+                 "production output-B A-default-K64/B-TILE8 N-tail") && ok;
+        k64_default_low_host.resize(low_count);
+        k64_default_out_host.resize(out_count);
+        ok = bitwise_equal(
+                 k64_default_low_host, wmma_low_host,
+                 "production output-A default K64 vs K32") && ok;
+        ok = bitwise_equal(
+                 k64_default_out_host, wmma_out_host,
+                 "production output A-default-K64/B-TILE8 vs "
+                 "A-K32/B-TILE8") && ok;
+    }
     std::fprintf(stderr,
                  "ROCm Q4 production output WMMA safety default: "
-                 "tile8=%d/%llu A-WMMA/B-TILE8=%d/%llu %s\n",
+                 "tile8=%d/%llu/%llu A-K32/B-TILE8=%d/%llu/%llu "
+                 "A-K64-default/B-TILE8=%d/%llu/%llu %s\n",
                  tile8_rc, (unsigned long long)tile8_wmma_calls,
+                 (unsigned long long)tile8_k64_calls,
                  wmma_rc, (unsigned long long)wmma_calls,
+                 (unsigned long long)wmma_k64_calls,
+                 k64_default_rc,
+                 (unsigned long long)k64_default_wmma_calls,
+                 (unsigned long long)k64_default_calls,
                  ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -3106,6 +3244,7 @@ int main(int argc, char **argv) {
     env_snapshot wmma_disable(kPrefillWmmaDisable);
     env_snapshot wmma_require(kPrefillWmmaRequire);
     env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
+    env_snapshot wmma_k64_global(kPrefillWmmaK64);
     env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
     env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
     env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
@@ -3124,6 +3263,8 @@ int main(int argc, char **argv) {
     (void)unsetenv(kPrefillWmmaDisable);
     (void)unsetenv(kPrefillWmmaRequire);
     (void)unsetenv(kPrefillWmmaRowTile);
+    /* Neutralize the new K64 default for every non-K64-specific oracle. */
+    (void)setenv(kPrefillWmmaK64, "0", 1);
     (void)unsetenv(kPrefillQ8Wave32Enable);
     (void)unsetenv(kPrefillQ8Wave32Disable);
     (void)unsetenv(kPrefillQ8Wave32Require);

@@ -99,6 +99,7 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_ROCM_DISABLE_Q4_PREFILL_Q8_K_WAVE32=1` | Dominant rollback to the canonical one-workgroup-per-Q8_K-block quantizer. |
 | `DS4_ROCM_REQUIRE_Q4_PREFILL_Q8_K_WAVE32=1` | Require the wave32 quantizer for strict prefill A/B runs; unsupported scope/device, rollback, or an incompatible required F16/WMMA path fails closed. |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA=0/1` | Compatibility control for the resident gfx1151 wave32 direct-Q4 WMMA prefill kernel at 256–4096 tokens. Unset keeps the automatic standalone/attention-output-A path, while the numerically compounded all-Q4 attention-output B stays on Q8_K+TILE8; an enabled value also opts B into direct WMMA for experiments, and an explicit false value opts out of resident WMMA entirely. The kernel uses transient F16 register dequantization and F32 accumulation, with 64 rows below output dimension 1024, 128 rows below 8192, and 256 rows otherwise. |
+| `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64=0/1` | K64/P80 is the default staging mode for an otherwise eligible direct-Q4 WMMA launch. It stages two adjacent 32-value Q4_K groups in one padded LDS tile, halving workgroup barriers while preserving activation traffic and K32 accumulation order. Unset or true keeps K64/P80; `0`/`false`/`no`/`off` rolls back selectively to K32, while `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` rolls back direct WMMA entirely. |
 | `DS4_ROCM_Q4_PREFILL_WMMA_ROW_TILE=64|128|256` | Override the direct-Q4 WMMA output-row tile. The default uses 64 rows below output dimension 1024, 128 below 8192, and 256 otherwise; `64` also retains the prior kernel geometry as an A/B control. |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD=1` | Explicitly allow direct-Q4 WMMA during SSD streaming, including attention-output B, only when each complete projection weight range is already backed by physical device storage. It never treats mapped/registered host memory as resident. |
 | `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` | Dominant value-aware opt-out for the automatic direct-Q4 WMMA path, including explicit resident or SSD requests. |
@@ -152,7 +153,7 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1079 `DS4_*` runtime variables** and
+Inventory totals: **1080 `DS4_*` runtime variables** and
 **6 external runtime variables**.
 The auxiliary inventories contain **118 test/test-fixture entries**
 and **19 tool/wrapper entries**.
@@ -958,7 +959,7 @@ and **19 tool/wrapper entries**.
 </details>
 
 <details>
-<summary><strong>ROCm (145)</strong></summary>
+<summary><strong>ROCm (146)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -1011,6 +1012,7 @@ and **19 tool/wrapper entries**.
 | `DS4_ROCM_ENABLE_Q4_DENSE_PAIR` | presence opt-in; unset=off; DISABLE takes precedence | Enable rocm enable q4 dense pair. | [rocm/ds4_rocm_q4.cuh:434](rocm/ds4_rocm_q4.cuh#L434) |
 | `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A` | presence opt-in outside the default scope; the exact caller-marked resident decode shape groups=8, N=1, K=4096, M=1024 is automatic, while row-at-a-time batch fallbacks are not; DISABLE wins | Enable grouped Q4 attention-A for eligible slices, non-production shapes, or explicit experiments in addition to the resident decode default. | [rocm/ds4_rocm_q4.cuh:872](rocm/ds4_rocm_q4.cuh#L872) |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA` | value-aware compatibility control; unset keeps automatic resident direct-Q4 WMMA for standalone dense and attention-output A while all-Q4 attention-output B remains on Q8_K+TILE8; empty or any value other than 0/false/no/off also opts B into experimental direct WMMA; explicit 0/false/no/off opts out of resident WMMA; N=256..4096, K a positive multiple of 256, resident non-quality gfx1151 wave32 only; SSD has a separate gate and DISABLE wins | Use compressed Q4_K-to-F16 register dequantization plus shape-selected 64-token by 64/128/256-row WMMA tiles and two-wide activation staging on the wider tiles, without Q8_K activation scratch or an F16 weight sidecar. | [rocm/ds4_rocm_q4.cuh:1089](rocm/ds4_rocm_q4.cuh#L1089) |
+| `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64` | value-aware compatibility control for the default K64/P80 stage; unset, empty, or any value other than 0/false/no/off selects K64/P80 after the normal direct-Q4 WMMA device, shape, residency, and quality gates pass; 0/false/no/off rolls back only to the established K32 stage; DS4_ROCM_DISABLE_Q4_PREFILL_WMMA wins | Stage two adjacent 32-value Q4_K groups and a 64-value activation slice in one padded P80 LDS tile, halving workgroup barriers while preserving activation traffic and the K32 accumulation order. | [rocm/ds4_rocm_q4.cuh:1537](rocm/ds4_rocm_q4.cuh#L1537) |
 | `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD` | value-aware SSD-only opt-in, default off; unset/0/false/no/off retains TILE8/TILE4, while empty or any other value requests direct-Q4 WMMA including attention-output B; eligibility additionally requires each complete projection weight range in physical device storage rather than mapped/registered host memory; DISABLE wins | Allow the compressed direct-Q4 WMMA kernel to consume an already device-resident/cache-backed Q4_K projection during SSD streaming without changing model I/O. | [rocm/ds4_rocm_q4.cuh:1091](rocm/ds4_rocm_q4.cuh#L1091) |
 | `DS4_ROCM_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming full expert addr table. | [ds4.c:18255](ds4.c#L18255) |
 | `DS4_ROCM_ENABLE_STREAMING_MADVISE_WILLNEED` | presence opt-in flag; unset=off unless paired policy is automatic | Enable rocm enable streaming madvise willneed. | [ds4.c:18224](ds4.c#L18224) |

@@ -33,6 +33,12 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_enqueue(
     uint64_t row_bytes, uint64_t x_token_stride,
     uint64_t x_group_stride, uint64_t out_token_stride,
     uint32_t row_tile, int load2);
+extern "C" int ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+    void *out, const void *w, const void *x, uint32_t n_tok,
+    uint32_t n_groups, uint32_t in_dim, uint32_t out_dim,
+    uint64_t row_bytes, uint64_t x_token_stride,
+    uint64_t x_group_stride, uint64_t out_token_stride,
+    uint32_t row_tile, uint32_t k_tile, int load2);
 
 namespace {
 
@@ -78,6 +84,8 @@ constexpr const char *kWmmaRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA";
 constexpr const char *kWmmaRowTile =
     "DS4_ROCM_Q4_PREFILL_WMMA_ROW_TILE";
+constexpr const char *kWmmaK64 =
+    "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64";
 constexpr const char *kQ8Wave32Enable =
     "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32";
 constexpr const char *kQ8Wave32Disable =
@@ -526,6 +534,7 @@ void select_legacy() {
     (void)setenv(kWmmaDisable, "1", 1);
     (void)unsetenv(kWmmaRequire);
     (void)unsetenv(kWmmaRowTile);
+    (void)unsetenv(kWmmaK64);
     (void)unsetenv(kQ8Wave32Enable);
     (void)unsetenv(kQ8Wave32Disable);
     (void)unsetenv(kQ8Wave32Require);
@@ -542,6 +551,7 @@ void select_tile8(bool disable_k1024_tile4) {
     (void)setenv(kWmmaDisable, "1", 1);
     (void)unsetenv(kWmmaRequire);
     (void)unsetenv(kWmmaRowTile);
+    (void)unsetenv(kWmmaK64);
     (void)unsetenv(kQ8Wave32Enable);
     (void)unsetenv(kQ8Wave32Disable);
     (void)unsetenv(kQ8Wave32Require);
@@ -568,6 +578,7 @@ void select_wmma_shape() {
     (void)setenv(kWmmaRequire, "1", 1);
     (void)unsetenv(kK1024Tile4Require);
     (void)unsetenv(kWmmaRowTile);
+    (void)unsetenv(kWmmaK64);
 }
 
 double percentile(std::vector<double> sorted, double fraction) {
@@ -956,7 +967,7 @@ bool run_dense(const model_fixture &model, const config &cfg,
                        kDenseK, 0u, kDenseM,
                        shape_wmma_row_tile(kDenseM), 0) != 0;
         }};
-    return benchmark_arms(
+    if (!benchmark_arms(
         "dense_wmma_rows", n_tokens, kDenseK, kDenseM, cfg,
         geometry_baseline, geometry_candidate,
         [&]() {
@@ -970,6 +981,39 @@ bool run_dense(const model_fixture &model, const config &cfg,
                                "dense WMMA rows64 oracle") &&
                    check_guard(tiled.ptr, logical_bytes,
                                "dense WMMA shape oracle");
+        })) return false;
+
+    const uint32_t fixed_row_tile = shape_wmma_row_tile(kDenseM);
+    const arm k32_baseline = {
+        "wmma_k32_rows128_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       rows64_device, dense_weights[set], x_device,
+                       n_tokens, 1u, kDenseK, kDenseM, row_bytes,
+                       kDenseK, 0u, kDenseM, fixed_row_tile, 32u, 1) != 0;
+        }};
+    const arm k64_candidate = {
+        "wmma_k64p80_rows128_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       shape_device, dense_weights[set], x_device,
+                       n_tokens, 1u, kDenseK, kDenseM, row_bytes,
+                       kDenseK, 0u, kDenseM, fixed_row_tile, 64u, 1) != 0;
+        }};
+    return benchmark_arms(
+        "dense_wmma_k32_k64", n_tokens, kDenseK, kDenseM, cfg,
+        k32_baseline, k64_candidate,
+        [&]() {
+            return poison_output(legacy.ptr, logical_bytes, 0x7fc10001u) &&
+                   poison_output(tiled.ptr, logical_bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return bitwise_equal(legacy.ptr, tiled.ptr, logical_bytes,
+                                 "dense WMMA K32 vs K64/P80") &&
+                   check_guard(legacy.ptr, logical_bytes,
+                               "dense WMMA K32 oracle") &&
+                   check_guard(tiled.ptr, logical_bytes,
+                               "dense WMMA K64/P80 oracle");
         });
 }
 
@@ -1261,7 +1305,7 @@ bool run_qb(const model_fixture &model, const config &cfg,
                        n_tokens, 1u, kQbK, kQbM, row_bytes,
                        kQbK, 0u, kQbM, 256u, 1) != 0;
         }};
-    return benchmark_arms(
+    if (!benchmark_arms(
         "q_b_wmma_load2_256", n_tokens, kQbK, kQbM, cfg,
         rows256_scalar, rows256_load2,
         [&]() {
@@ -1275,6 +1319,38 @@ bool run_qb(const model_fixture &model, const config &cfg,
                                "q_b WMMA rows256 scalar oracle") &&
                    check_guard(tile4.ptr, logical_bytes,
                                "q_b WMMA rows256 load2 oracle");
+        })) return false;
+
+    const arm k32_baseline = {
+        "wmma_k32_rows256_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       rows64_device, qb_weights[set], x_device,
+                       n_tokens, 1u, kQbK, kQbM, row_bytes,
+                       kQbK, 0u, kQbM, 256u, 32u, 1) != 0;
+        }};
+    const arm k64_candidate = {
+        "wmma_k64p80_rows256_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       shape_device, qb_weights[set], x_device,
+                       n_tokens, 1u, kQbK, kQbM, row_bytes,
+                       kQbK, 0u, kQbM, 256u, 64u, 1) != 0;
+        }};
+    return benchmark_arms(
+        "q_b_wmma_k32_k64", n_tokens, kQbK, kQbM, cfg,
+        k32_baseline, k64_candidate,
+        [&]() {
+            return poison_output(tile8.ptr, logical_bytes, 0x7fc10001u) &&
+                   poison_output(tile4.ptr, logical_bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return bitwise_equal(tile8.ptr, tile4.ptr, logical_bytes,
+                                 "q_b WMMA K32 vs K64/P80") &&
+                   check_guard(tile8.ptr, logical_bytes,
+                               "q_b WMMA K32 oracle") &&
+                   check_guard(tile4.ptr, logical_bytes,
+                               "q_b WMMA K64/P80 oracle");
         });
 }
 
@@ -1359,7 +1435,7 @@ bool run_output_b(const model_fixture &model, const config &cfg,
                        kOutputLowDim, 0u, kOutputM,
                        shape_wmma_row_tile(kOutputM), 0) != 0;
         }};
-    return benchmark_arms(
+    if (!benchmark_arms(
         "output_b_wmma_rows", n_tokens, kOutputLowDim, kOutputM, cfg,
         geometry_baseline, geometry_candidate,
         [&]() {
@@ -1373,6 +1449,41 @@ bool run_output_b(const model_fixture &model, const config &cfg,
                                "output_b WMMA rows64 oracle") &&
                    check_guard(wmma.ptr, logical_bytes,
                                "output_b WMMA shape oracle");
+        })) return false;
+
+    const uint32_t fixed_row_tile = shape_wmma_row_tile(kOutputM);
+    const arm k32_baseline = {
+        "wmma_k32_rows128_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       rows64_device, output_b_weights[set], x_device,
+                       n_tokens, 1u, kOutputLowDim, kOutputM, row_bytes,
+                       kOutputLowDim, 0u, kOutputM, fixed_row_tile,
+                       32u, 1) != 0;
+        }};
+    const arm k64_candidate = {
+        "wmma_k64p80_rows128_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       shape_device, output_b_weights[set], x_device,
+                       n_tokens, 1u, kOutputLowDim, kOutputM, row_bytes,
+                       kOutputLowDim, 0u, kOutputM, fixed_row_tile,
+                       64u, 1) != 0;
+        }};
+    return benchmark_arms(
+        "output_b_wmma_k32_k64", n_tokens, kOutputLowDim, kOutputM, cfg,
+        k32_baseline, k64_candidate,
+        [&]() {
+            return poison_output(tile8.ptr, logical_bytes, 0x7fc10001u) &&
+                   poison_output(wmma.ptr, logical_bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return bitwise_equal(tile8.ptr, wmma.ptr, logical_bytes,
+                                 "output_b WMMA K32 vs K64/P80") &&
+                   check_guard(tile8.ptr, logical_bytes,
+                               "output_b WMMA K32 oracle") &&
+                   check_guard(wmma.ptr, logical_bytes,
+                               "output_b WMMA K64/P80 oracle");
         });
 }
 
@@ -1508,7 +1619,7 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
                        kOutputM, row_b_bytes, kOutputLowDim, 0u, kOutputM,
                        shape_wmma_row_tile(kOutputM), 0) != 0;
         }};
-    return benchmark_arms(
+    if (!benchmark_arms(
         "attention_output_ab_wmma_rows", n_tokens, kOutputLowDim,
         kDenseK + kOutputM, cfg, geometry_baseline, geometry_candidate,
         poison_all,
@@ -1525,6 +1636,54 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
                                "output_b WMMA rows64 oracle") &&
                    check_guard(wmma_out.ptr, out_bytes,
                                "output_b WMMA shape oracle");
+        })) return false;
+
+    const uint32_t fixed_row_a_tile = shape_wmma_row_tile(kOutputRank);
+    const uint32_t fixed_row_b_tile = shape_wmma_row_tile(kOutputM);
+    const arm k32_baseline = {
+        "wmma_k32_ab_rows128_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       rows64_low_device, output_a_weights[set], heads_device,
+                       n_tokens, kOutputGroups, kDenseK, kOutputRank,
+                       row_a_bytes, kOutputGroups * kDenseK, kDenseK,
+                       kOutputLowDim, fixed_row_a_tile, 32u, 1) != 0 &&
+                   ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       rows64_out_device, output_b_weights[set],
+                       rows64_low_device, n_tokens, 1u, kOutputLowDim,
+                       kOutputM, row_b_bytes, kOutputLowDim, 0u, kOutputM,
+                       fixed_row_b_tile, 32u, 1) != 0;
+        }};
+    const arm k64_candidate = {
+        "wmma_k64p80_ab_rows128_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       shape_low_device, output_a_weights[set], heads_device,
+                       n_tokens, kOutputGroups, kDenseK, kOutputRank,
+                       row_a_bytes, kOutputGroups * kDenseK, kDenseK,
+                       kOutputLowDim, fixed_row_a_tile, 64u, 1) != 0 &&
+                   ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       shape_out_device, output_b_weights[set],
+                       shape_low_device, n_tokens, 1u, kOutputLowDim,
+                       kOutputM, row_b_bytes, kOutputLowDim, 0u, kOutputM,
+                       fixed_row_b_tile, 64u, 1) != 0;
+        }};
+    return benchmark_arms(
+        "attention_output_ab_wmma_k32_k64", n_tokens, kOutputLowDim,
+        kDenseK + kOutputM, cfg, k32_baseline, k64_candidate, poison_all,
+        [&]() {
+            return bitwise_equal(tile8_low.ptr, wmma_low.ptr, low_bytes,
+                                 "output_a WMMA K32 vs K64/P80") &&
+                   bitwise_equal(tile8_out.ptr, wmma_out.ptr, out_bytes,
+                                 "output_a+b WMMA K32 vs K64/P80") &&
+                   check_guard(tile8_low.ptr, low_bytes,
+                               "output_a WMMA K32 oracle") &&
+                   check_guard(wmma_low.ptr, low_bytes,
+                               "output_a WMMA K64/P80 oracle") &&
+                   check_guard(tile8_out.ptr, out_bytes,
+                               "output_b WMMA K32 oracle") &&
+                   check_guard(wmma_out.ptr, out_bytes,
+                               "output_b WMMA K64/P80 oracle");
         });
 }
 
@@ -1549,7 +1708,9 @@ void usage(FILE *stream, const char *argv0) {
         "K=1024,M=32768 shape. outb isolates K=8192,M=4096; output measures\n"
         "the production grouped output_a plus output_b API. WMMA comparisons\n"
         "use a finite/toleranced oracle because their F16 boundary is not\n"
-        "bit-identical to the Q8_K activation path.\n",
+        "bit-identical to the Q8_K activation path. At N>=256 the direct\n"
+        "arms also compare rollback K32 with default K64/P80 at fixed\n"
+        "production geometry and load2, requiring bitwise-identical output.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);
 }
 
@@ -1664,6 +1825,7 @@ int main(int argc, char **argv) {
     env_snapshot wmma_disable_guard(kWmmaDisable);
     env_snapshot wmma_require_guard(kWmmaRequire);
     env_snapshot wmma_row_tile_guard(kWmmaRowTile);
+    env_snapshot wmma_k64_guard(kWmmaK64);
     env_snapshot q8_wave32_enable_guard(kQ8Wave32Enable);
     env_snapshot q8_wave32_disable_guard(kQ8Wave32Disable);
     env_snapshot q8_wave32_require_guard(kQ8Wave32Require);
@@ -1732,11 +1894,14 @@ int main(int argc, char **argv) {
         std::printf(
             "DS4_ROCM_Q4_PREFILL_SETUP device=%s arch=%s warp=%d sets=%u "
             "resident_mib=%.2f timing=hip_events ssd_streaming=off "
-            "wmma_rowtiles=%s wmma_loaders=%s q8_wave32=%s\n",
+            "wmma_rowtiles=%s wmma_loaders=%s wmma_k_stages=%s "
+            "wmma_k_default=%s q8_wave32=%s\n",
             properties.name, properties.gcnArchName, properties.warpSize,
             cfg.sets, static_cast<double>(model.resident_bytes) / 1048576.0,
             cfg.wmma_supported ? "64,128,256" : "skipped",
             cfg.wmma_supported ? "scalar,load2" : "skipped",
+            cfg.wmma_supported ? "32,64p80" : "skipped",
+            cfg.wmma_supported ? "64p80" : "skipped",
             cfg.wmma_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
