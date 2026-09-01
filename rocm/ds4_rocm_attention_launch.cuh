@@ -84,12 +84,14 @@ static int rocm_attention_env_bool_value(
 /* Cache a successful device-property query per host thread and active device.
  * This is intentionally not a process-global, unkeyed architecture flag:
  * HIP's active device is thread-local and callers may switch devices. */
-static int rocm_attention_runtime_is_gfx1151_wave32(void) {
+static int rocm_attention_runtime_is_gfx1151_wave32(
+        int report_unavailable) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     int device = -1;
     const cudaError_t device_err = cudaGetDevice(&device);
     if (device_err != cudaSuccess || device < 0) {
-        if (rocm_attention_wmma_notice_once(1u << 3)) {
+        if (report_unavailable &&
+            rocm_attention_wmma_notice_once(1u << 3)) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "cannot query active device for "
                     "gfx1151 WMMA attention; using fallback: %s\n",
@@ -102,13 +104,20 @@ static int rocm_attention_runtime_is_gfx1151_wave32(void) {
     static thread_local int cached_device = -1;
     static thread_local int cached_eligible = -1;
     if (cached_device == device && cached_eligible >= 0) {
+        if (!cached_eligible && report_unavailable &&
+            rocm_attention_wmma_notice_once(1u << 5)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "gfx1151 WMMA attention requested on "
+                    "a cached unsupported device; using fallback\n");
+        }
         return cached_eligible;
     }
 
     cudaDeviceProp prop = {};
     const cudaError_t prop_err = cudaGetDeviceProperties(&prop, device);
     if (prop_err != cudaSuccess) {
-        if (rocm_attention_wmma_notice_once(1u << 4)) {
+        if (report_unavailable &&
+            rocm_attention_wmma_notice_once(1u << 4)) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "cannot query device properties for "
                     "gfx1151 WMMA attention; using fallback: %s\n",
@@ -125,7 +134,8 @@ static int rocm_attention_runtime_is_gfx1151_wave32(void) {
          prop.gcnArchName[sizeof(kGfx1151) - 1u] == ':');
     cached_device = device;
     cached_eligible = arch_matches && prop.warpSize == 32 ? 1 : 0;
-    if (!cached_eligible && rocm_attention_wmma_notice_once(1u << 5)) {
+    if (!cached_eligible && report_unavailable &&
+        rocm_attention_wmma_notice_once(1u << 5)) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "gfx1151 WMMA attention requested on "
                 "unsupported device arch=%s warpSize=%d; using fallback\n",
@@ -134,6 +144,7 @@ static int rocm_attention_runtime_is_gfx1151_wave32(void) {
     }
     return cached_eligible;
 #else
+    (void)report_unavailable;
     return 0;
 #endif
 }
@@ -166,7 +177,7 @@ static int rocm_attention_gfx1151_wmma_enabled(
         }
         return 0;
     }
-    if (!rocm_attention_runtime_is_gfx1151_wave32()) return 0;
+    if (!rocm_attention_runtime_is_gfx1151_wave32(1)) return 0;
     if (rocm_attention_wmma_notice_once(enabled_notice_bit)) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "gfx1151 wave32 WMMA attention enabled "
@@ -214,20 +225,28 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
         uint32_t              raw_start,
         uint32_t              n_head,
         uint32_t              head_dim) {
+    uint64_t sink_bytes = 0;
+    uint64_t head_elems = 0;
+    uint64_t head_bytes = 0;
+    uint64_t raw_bytes = 0;
+    const bool sizes_ok =
+        cuda_u64_mul_checked(n_head, sizeof(float), &sink_bytes) &&
+        cuda_u64_mul3_checked(n_tokens, n_head, head_dim, &head_elems) &&
+        cuda_u64_mul_checked(head_elems, sizeof(float), &head_bytes) &&
+        cuda_u64_mul3_checked(raw_cap, head_dim, sizeof(float), &raw_bytes);
     if (!heads || !q || !raw_kv || !model_map ||
+        !sizes_ok ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || n_head == 0 || head_dim == 0 ||
-        sinks_offset > model_size ||
-        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+        sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        heads->bytes < head_bytes || q->bytes < head_bytes ||
+        raw_kv->bytes < raw_bytes) {
         return 0;
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map,
             sinks_offset,
-            (uint64_t)n_head * sizeof(float),
+            sink_bytes,
             "dspark_attn_sinks");
     if (!sinks) return 0;
 
@@ -257,8 +276,8 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
     if (verify_left > 0) {
         verify_left--;
         (void)cudaDeviceSynchronize();
-        const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
-        const uint64_t kn = (uint64_t)raw_cap * head_dim;
+        const uint64_t qn = head_elems;
+        const uint64_t kn = raw_bytes / sizeof(float);
         std::vector<float> hq(qn), hkv(kn), hout(qn), hsink(n_head);
         (void)cudaMemcpy(hq.data(), q->ptr, qn * sizeof(float),
                          cudaMemcpyDeviceToHost);
@@ -266,7 +285,7 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
                          cudaMemcpyDeviceToHost);
         (void)cudaMemcpy(hout.data(), heads->ptr, qn * sizeof(float),
                          cudaMemcpyDeviceToHost);
-        (void)cudaMemcpy(hsink.data(), sinks, (uint64_t)n_head * sizeof(float),
+        (void)cudaMemcpy(hsink.data(), sinks, sink_bytes,
                          cudaMemcpyDeviceToHost);
         double max_abs = 0.0;
         double max_rel = 0.0;
@@ -649,58 +668,6 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       q, raw_kv, NULL, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim);
-}
-
-extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        uint32_t              n_tokens,
-        uint32_t              n_raw,
-        uint32_t              raw_cap,
-        uint32_t              raw_start,
-        uint32_t              n_head,
-        uint32_t              head_dim) {
-    uint64_t sink_bytes = 0;
-    uint64_t head_elems = 0;
-    uint64_t head_bytes = 0;
-    uint64_t raw_bytes = 0;
-    const bool sizes_ok =
-        cuda_u64_mul_checked(n_head, sizeof(float), &sink_bytes) &&
-        cuda_u64_mul3_checked(n_tokens, n_head, head_dim, &head_elems) &&
-        cuda_u64_mul_checked(head_elems, sizeof(float), &head_bytes) &&
-        cuda_u64_mul3_checked(raw_cap, head_dim, sizeof(float), &raw_bytes);
-    if (!heads || !q || !raw_kv || !model_map ||
-        !sizes_ok ||
-        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw ||
-        raw_start >= raw_cap || n_head == 0 || head_dim == 0 ||
-        sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
-        heads->bytes < head_bytes || q->bytes < head_bytes ||
-        raw_kv->bytes < raw_bytes) {
-        return 0;
-    }
-    const float *sinks = (const float *)cuda_model_range_ptr(
-            model_map, sinks_offset, sink_bytes, "dspark_attn_sinks");
-    if (!sinks) return 0;
-    const size_t shmem = (size_t)n_raw * sizeof(float);
-    if (shmem > 32768u) return 0;
-    dim3 grid(n_tokens, n_head, 1);
-    attention_noncausal_raw_batch_heads_kernel<<<grid, 256, shmem>>>(
-            (float *)heads->ptr,
-            sinks,
-            (const float *)q->ptr,
-            (const float *)raw_kv->ptr,
-            n_tokens,
-            n_raw,
-            raw_cap,
-            raw_start,
-            n_head,
-            head_dim);
-    return cuda_ok(cudaGetLastError(),
-                   "attention noncausal raw batch heads launch");
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
