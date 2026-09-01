@@ -39,6 +39,9 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_variant_enqueue(
     uint64_t row_bytes, uint64_t x_token_stride,
     uint64_t x_group_stride, uint64_t out_token_stride,
     uint32_t row_tile, uint32_t k_tile, int load2);
+extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void);
 
 namespace {
 
@@ -475,13 +478,15 @@ bool numerically_close(const ds4_gpu_tensor *got,
                        uint64_t bytes,
                        const char *label,
                        float abs_tolerance = 2.0f,
-                       float rel_tolerance = 3.0e-2f) {
+                       float rel_tolerance = 3.0e-2f,
+                       bool gate = true) {
     if ((bytes % sizeof(float)) != 0u) return false;
     const uint64_t chunk_bytes =
         std::min(kCompareChunk, bytes) & ~(uint64_t)(sizeof(float) - 1u);
     std::vector<float> lhs(static_cast<size_t>(chunk_bytes / sizeof(float)));
     std::vector<float> rhs(static_cast<size_t>(chunk_bytes / sizeof(float)));
     uint64_t failures = 0u;
+    uint64_t nonfinite = 0u;
     uint64_t compared = 0u;
     float max_abs = 0.0f;
     float max_rel = 0.0f;
@@ -495,6 +500,12 @@ bool numerically_close(const ds4_gpu_tensor *got,
         }
         const uint64_t values = count / sizeof(float);
         for (uint64_t i = 0u; i < values; i++) {
+            if (!std::isfinite(lhs[(size_t)i]) ||
+                !std::isfinite(rhs[(size_t)i])) {
+                failures++;
+                nonfinite++;
+                continue;
+            }
             const float diff = std::fabs(lhs[(size_t)i] - rhs[(size_t)i]);
             const float rel = diff /
                 std::max(1.0f, std::fabs(rhs[(size_t)i]));
@@ -503,9 +514,7 @@ bool numerically_close(const ds4_gpu_tensor *got,
                 worst = compared + i;
             }
             max_rel = std::max(max_rel, rel);
-            if (!std::isfinite(lhs[(size_t)i]) ||
-                !std::isfinite(rhs[(size_t)i]) ||
-                diff > abs_tolerance +
+            if (diff > abs_tolerance +
                        rel_tolerance * std::fabs(rhs[(size_t)i])) {
                 failures++;
             }
@@ -513,13 +522,15 @@ bool numerically_close(const ds4_gpu_tensor *got,
         compared += values;
     }
     std::fprintf(stderr,
-                 "%s: failures=%llu/%llu max_abs=%g max_rel=%g worst=%llu "
-                 "tolerance(abs=%g rel=%g) %s\n",
+                 "%s: failures=%llu/%llu nonfinite=%llu max_abs=%g "
+                 "max_rel=%g worst=%llu tolerance(abs=%g rel=%g) %s\n",
                  label, (unsigned long long)failures,
-                 (unsigned long long)compared, max_abs, max_rel,
+                 (unsigned long long)compared,
+                 (unsigned long long)nonfinite, max_abs, max_rel,
                  (unsigned long long)worst, abs_tolerance, rel_tolerance,
-                 failures == 0u ? "PASS" : "FAIL");
-    return failures == 0u;
+                 failures == 0u ? "PASS" :
+                 (gate || nonfinite != 0u ? "FAIL" : "DIAGNOSTIC"));
+    return nonfinite == 0u && (failures == 0u || !gate);
 }
 
 void select_legacy() {
@@ -579,6 +590,22 @@ void select_wmma_shape() {
     (void)unsetenv(kK1024Tile4Require);
     (void)unsetenv(kWmmaRowTile);
     (void)unsetenv(kWmmaK64);
+}
+
+void select_wmma_attention_a_tile8_b() {
+    select_tile8(false);
+    /* ENABLE is the production A-only request.  Do not use REQUIRE here:
+     * REQUIRE deliberately promotes the numerically compounded output-B
+     * direct-WMMA path for diagnostics. */
+    (void)unsetenv(kPrefillRequire);
+    (void)setenv(kWmmaEnable, "1", 1);
+    (void)unsetenv(kWmmaSsdEnable);
+    (void)unsetenv(kWmmaDisable);
+    (void)unsetenv(kWmmaRequire);
+    (void)unsetenv(kK1024Tile4Require);
+    (void)unsetenv(kWmmaRowTile);
+    (void)unsetenv(kWmmaK64);
+    ds4_rocm_test_q4_prefill_wmma_reset();
 }
 
 double percentile(std::vector<double> sorted, double fraction) {
@@ -1508,10 +1535,11 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
     tensor_owner tile8_out(out_bytes + guard_bytes);
     tensor_owner wmma_low(low_bytes + guard_bytes);
     tensor_owner wmma_out(out_bytes + guard_bytes);
+    tensor_owner replay_out(out_bytes + guard_bytes);
     std::vector<float> activation;
     fill_activation(&activation, n_tokens, kOutputGroups * kDenseK);
     if (!heads.ptr || !tile8_low.ptr || !tile8_out.ptr || !wmma_low.ptr ||
-        !wmma_out.ptr ||
+        !wmma_out.ptr || !replay_out.ptr ||
         !ds4_gpu_tensor_write(heads.ptr, 0, activation.data(),
                               activation.size() * sizeof(float))) {
         std::fprintf(stderr,
@@ -1519,13 +1547,19 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
         return false;
     }
 
-    auto poison_all = [&]() {
+    auto poison_outputs = [&]() {
         return poison_output(tile8_low.ptr, low_bytes, 0x7fc10001u) &&
                poison_output(tile8_out.ptr, out_bytes, 0x7fc20002u) &&
                poison_output(wmma_low.ptr, low_bytes, 0x7fc30003u) &&
                poison_output(wmma_out.ptr, out_bytes, 0x7fc40004u);
     };
-    if (!poison_all()) return false;
+    auto poison_production = [&]() {
+        return poison_outputs() &&
+               poison_output(replay_out.ptr, out_bytes, 0x7fc50005u);
+    };
+    if (!poison_production()) return false;
+
+    uint32_t production_candidate_set = 0u;
 
     const arm baseline = {
         "tile8_ab", []() { select_tile8(false); },
@@ -1539,8 +1573,9 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
                        heads.ptr, n_tokens) > 0;
         }};
     const arm candidate = {
-        "wmma_shape_ab", select_wmma_shape,
+        "wmma_a_k64p80_b_tile8", select_wmma_attention_a_tile8_b,
         [&](uint32_t set) {
+            production_candidate_set = set;
             return ds4_gpu_attention_output_q4_K_batch_tensor(
                        wmma_out.ptr, wmma_low.ptr, nullptr, nullptr,
                        model.data, model.size,
@@ -1550,22 +1585,84 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
                        heads.ptr, n_tokens) > 0;
         }};
     if (!benchmark_arms(
-        "attention_output_ab_wmma", n_tokens, kOutputLowDim,
-        kDenseK + kOutputM, cfg, baseline, candidate, poison_all,
+        "attention_output_a_wmma_b_tile8", n_tokens, kOutputLowDim,
+        kDenseK + kOutputM, cfg, baseline, candidate, poison_production,
         [&]() {
-            return numerically_close(wmma_low.ptr, tile8_low.ptr, low_bytes,
-                                     "output_a grouped WMMA shape vs TILE8") &&
-                   numerically_close(wmma_out.ptr, tile8_out.ptr, out_bytes,
-                                     "output_a+b WMMA shape vs TILE8",
-                                     16.0f, 8.0e-2f) &&
-                   check_guard(tile8_low.ptr, low_bytes,
-                               "output_a TILE8 oracle") &&
-                   check_guard(wmma_low.ptr, low_bytes,
-                               "output_a WMMA shape oracle") &&
-                   check_guard(tile8_out.ptr, out_bytes,
-                               "output_b TILE8 oracle") &&
-                   check_guard(wmma_out.ptr, out_bytes,
-                               "output_b WMMA shape oracle");
+            const uint64_t wmma_calls =
+                ds4_rocm_test_q4_prefill_wmma_get_calls();
+            const uint64_t k64_calls =
+                ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
+            bool oracle_ok = wmma_calls == 1u && k64_calls == 1u;
+            std::fprintf(stderr,
+                         "output production dispatch: WMMA=%llu/1 "
+                         "K64=%llu/1 %s\n",
+                         (unsigned long long)wmma_calls,
+                         (unsigned long long)k64_calls,
+                         oracle_ok ? "PASS" : "FAIL");
+            oracle_ok = numerically_close(
+                wmma_low.ptr, tile8_low.ptr, low_bytes,
+                "output_a grouped WMMA shape vs TILE8") && oracle_ok;
+
+            /* A changes the values presented to B, so comparing the composed
+             * candidate against an all-TILE8 run conflates A's deliberate F16
+             * boundary with B correctness.  Keep the delta visible, but do
+             * not make it the production-path gate. */
+            oracle_ok = numerically_close(
+                wmma_out.ptr, tile8_out.ptr, out_bytes,
+                "output A-WMMA/B-TILE8 vs all-TILE8 (diagnostic only)",
+                16.0f, 8.0e-2f, false) && oracle_ok;
+
+            /* Hard B oracle: replay exact TILE8 with the very same WMMA-low
+             * intermediate consumed by the production candidate. */
+            select_tile8(false);
+            const bool replay_ok =
+                ds4_gpu_matmul_quant_tensor(
+                    replay_out.ptr, model.data, model.size,
+                    model.weights[production_candidate_set].output_b_offset,
+                    kQ4Type, kOutputLowDim, kOutputM, wmma_low.ptr,
+                    n_tokens) != 0 &&
+                ds4_gpu_synchronize();
+            if (!replay_ok) {
+                std::fprintf(stderr,
+                             "output_b same-low TILE8 replay dispatch FAIL\n");
+                oracle_ok = false;
+            } else {
+                const uint64_t replay_wmma_calls =
+                    ds4_rocm_test_q4_prefill_wmma_get_calls();
+                const uint64_t replay_k64_calls =
+                    ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
+                if (replay_wmma_calls != wmma_calls ||
+                    replay_k64_calls != k64_calls) {
+                    std::fprintf(stderr,
+                                 "output_b same-low TILE8 replay used WMMA: "
+                                 "WMMA=%llu/%llu K64=%llu/%llu FAIL\n",
+                                 (unsigned long long)replay_wmma_calls,
+                                 (unsigned long long)wmma_calls,
+                                 (unsigned long long)replay_k64_calls,
+                                 (unsigned long long)k64_calls);
+                    oracle_ok = false;
+                }
+                oracle_ok = bitwise_equal(
+                    wmma_out.ptr, replay_out.ptr, out_bytes,
+                    "output_b production TILE8 vs same-low TILE8 replay") &&
+                    oracle_ok;
+            }
+            oracle_ok = check_guard(
+                tile8_low.ptr, low_bytes, "output_a TILE8 oracle") &&
+                oracle_ok;
+            oracle_ok = check_guard(
+                wmma_low.ptr, low_bytes, "output_a WMMA shape oracle") &&
+                oracle_ok;
+            oracle_ok = check_guard(
+                tile8_out.ptr, out_bytes, "output_b all-TILE8 oracle") &&
+                oracle_ok;
+            oracle_ok = check_guard(
+                wmma_out.ptr, out_bytes,
+                "output_b production A-WMMA/B-TILE8 oracle") && oracle_ok;
+            oracle_ok = check_guard(
+                replay_out.ptr, out_bytes,
+                "output_b same-low TILE8 replay oracle") && oracle_ok;
+            return oracle_ok;
         })) return false;
 
     void *const heads_device = ds4_gpu_tensor_contents(heads.ptr);
@@ -1622,7 +1719,7 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
     if (!benchmark_arms(
         "attention_output_ab_wmma_rows", n_tokens, kOutputLowDim,
         kDenseK + kOutputM, cfg, geometry_baseline, geometry_candidate,
-        poison_all,
+        poison_outputs,
         [&]() {
             return bitwise_equal(tile8_low.ptr, wmma_low.ptr, low_bytes,
                                  "output_a WMMA rows64 vs shape") &&
@@ -1670,7 +1767,7 @@ bool run_attention_output(const model_fixture &model, const config &cfg,
         }};
     return benchmark_arms(
         "attention_output_ab_wmma_k32_k64", n_tokens, kOutputLowDim,
-        kDenseK + kOutputM, cfg, k32_baseline, k64_candidate, poison_all,
+        kDenseK + kOutputM, cfg, k32_baseline, k64_candidate, poison_outputs,
         [&]() {
             return bitwise_equal(tile8_low.ptr, wmma_low.ptr, low_bytes,
                                  "output_a WMMA K32 vs K64/P80") &&
@@ -1706,9 +1803,11 @@ void usage(FILE *stream, const char *argv0) {
         "two TILE8 projections with\n"
         "the fused K=4096,M=(1024+512) path. qb adds TILE4/direct WMMA at the\n"
         "K=1024,M=32768 shape. outb isolates K=8192,M=4096; output measures\n"
-        "the production grouped output_a plus output_b API. WMMA comparisons\n"
+        "the production grouped output_a plus output_b API as all-TILE8 vs\n"
+        "A-WMMA/B-TILE8. Its hard B oracle replays TILE8 on the same low; the\n"
+        "composed all-TILE8 delta is diagnostic only. Other WMMA comparisons\n"
         "use a finite/toleranced oracle because their F16 boundary is not\n"
-        "bit-identical to the Q8_K activation path. At N>=256 the direct\n"
+        "bit-identical to the Q8_K activation path. At N>=256 the raw direct\n"
         "arms also compare rollback K32 with default K64/P80 at fixed\n"
         "production geometry and load2, requiring bitwise-identical output.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);

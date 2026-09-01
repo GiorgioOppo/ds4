@@ -42,7 +42,12 @@ extern "C" int ds4_rocm_test_q4_prefill_wmma_k64_control_policy(
 extern "C" int ds4_rocm_test_q4_prefill_wmma_requested_policy(
     int ssd_streaming, int enabled, int ssd_enabled, int disabled,
     int required);
-extern "C" int ds4_rocm_test_q4_prefill_wmma_b_requested_policy(
+extern "C" int
+ds4_rocm_test_q4_prefill_wmma_attention_a_requested_policy(
+    int ssd_streaming, int enabled, int ssd_enabled, int disabled,
+    int required);
+extern "C" int
+ds4_rocm_test_q4_prefill_wmma_attention_b_requested_policy(
     int ssd_streaming, int enabled, int ssd_enabled, int disabled,
     int required);
 extern "C" int ds4_rocm_test_q4_prefill_wmma_yields_to_q8_wave32(
@@ -632,13 +637,20 @@ bool close_with_tolerance(const std::vector<float> &got,
                           const std::vector<float> &expected,
                           float abs_tolerance,
                           float rel_tolerance,
-                          const char *label) {
+                          const char *label,
+                          bool gate = true) {
     if (got.size() != expected.size()) return false;
     uint64_t failures = 0;
+    uint64_t nonfinite = 0;
     float max_abs = 0.0f;
     float max_rel = 0.0f;
     size_t worst = 0;
     for (size_t i = 0; i < got.size(); i++) {
+        if (!std::isfinite(got[i]) || !std::isfinite(expected[i])) {
+            failures++;
+            nonfinite++;
+            continue;
+        }
         const float diff = std::fabs(got[i] - expected[i]);
         const float rel = diff / std::max(1.0f, std::fabs(expected[i]));
         if (diff > max_abs) {
@@ -646,18 +658,19 @@ bool close_with_tolerance(const std::vector<float> &got,
             worst = i;
         }
         max_rel = std::max(max_rel, rel);
-        if (!std::isfinite(got[i]) || !std::isfinite(expected[i]) ||
-            diff > abs_tolerance + rel_tolerance * std::fabs(expected[i])) {
+        if (diff > abs_tolerance + rel_tolerance * std::fabs(expected[i])) {
             failures++;
         }
     }
     std::fprintf(stderr,
-                 "%s: failures=%llu/%zu max_abs=%g max_rel=%g worst=%zu "
-                 "tolerance(abs=%g rel=%g) %s\n",
-                 label, (unsigned long long)failures, got.size(), max_abs,
-                 max_rel, worst, abs_tolerance, rel_tolerance,
-                 failures == 0u ? "PASS" : "FAIL");
-    return failures == 0u;
+                 "%s: failures=%llu/%zu nonfinite=%llu max_abs=%g "
+                 "max_rel=%g worst=%zu tolerance(abs=%g rel=%g) %s\n",
+                 label, (unsigned long long)failures, got.size(),
+                 (unsigned long long)nonfinite, max_abs, max_rel, worst,
+                 abs_tolerance, rel_tolerance,
+                 failures == 0u ? "PASS" :
+                 (gate || nonfinite != 0u ? "FAIL" : "DIAGNOSTIC"));
+    return nonfinite == 0u && (failures == 0u || !gate);
 }
 
 bool bitwise_equal(const std::vector<float> &got,
@@ -871,6 +884,30 @@ bool output_body_overwritten(const std::vector<float> &values,
         std::fprintf(stderr, "  first unwritten output at float %zu\n", first);
     }
     return unchanged == 0;
+}
+
+bool output_body_finite(const std::vector<float> &values,
+                        size_t logical_count,
+                        const char *label) {
+    if (logical_count > values.size()) {
+        std::fprintf(stderr, "%s: invalid body geometry FAIL\n", label);
+        return false;
+    }
+    uint64_t nonfinite = 0u;
+    size_t first = logical_count;
+    for (size_t i = 0; i < logical_count; i++) {
+        if (!std::isfinite(values[i])) {
+            if (nonfinite == 0u) first = i;
+            nonfinite++;
+        }
+    }
+    std::fprintf(stderr, "%s: nonfinite=%llu/%zu %s\n",
+                 label, (unsigned long long)nonfinite, logical_count,
+                 nonfinite == 0u ? "PASS" : "FAIL");
+    if (nonfinite != 0u) {
+        std::fprintf(stderr, "  first non-finite output at float %zu\n", first);
+    }
+    return nonfinite == 0u;
 }
 
 bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
@@ -1244,21 +1281,28 @@ bool run_prefill_wmma_requested_policy_oracle() {
         int ssd_enabled;
         int disabled;
         int required;
-        int expected;
-        int b_expected;
+        int standalone_expected;
+        int attention_a_expected;
+        int attention_b_expected;
     };
     const policy_case cases[] = {
-        {"resident unset is automatic", 0, -1, 0, 0, 0, 1, 0},
-        {"resident ENABLE=0 compatibility opt-out", 0, 0, 0, 0, 0, 0, 0},
-        {"resident ENABLE=1 remains accepted", 0, 1, 0, 0, 0, 1, 1},
-        {"resident DISABLE opts out", 0, -1, 0, 1, 0, 0, 0},
-        {"resident REQUIRE requests after ENABLE=0", 0, 0, 0, 0, 1, 1, 1},
-        {"DISABLE+REQUIRE reaches strict rejection", 0, -1, 0, 1, 1, 1, 1},
-        {"SSD default stays conservative", 1, -1, 0, 0, 0, 0, 0},
-        {"generic ENABLE does not bypass SSD gate", 1, 1, 0, 0, 0, 0, 0},
-        {"SSD gate requests the candidate", 1, -1, 1, 0, 0, 1, 1},
-        {"SSD DISABLE opts out", 1, -1, 1, 1, 0, 0, 0},
-        {"SSD REQUIRE requests strict validation", 1, -1, 0, 0, 1, 1, 1},
+        {"resident unset keeps A automatic", 0, -1, 0, 0, 0, 1, 1, 0},
+        {"resident ENABLE=0 compatibility opt-out", 0, 0, 0, 0, 0,
+         0, 0, 0},
+        {"resident ENABLE=1 opts attention A only", 0, 1, 0, 0, 0,
+         1, 1, 0},
+        {"resident DISABLE opts out", 0, -1, 0, 1, 0, 0, 0, 0},
+        {"resident REQUIRE requests both attention stages", 0, 0, 0, 0, 1,
+         1, 1, 1},
+        {"DISABLE+REQUIRE reaches strict rejection", 0, -1, 0, 1, 1,
+         1, 1, 1},
+        {"SSD default stays conservative", 1, -1, 0, 0, 0, 0, 0, 0},
+        {"generic ENABLE does not bypass SSD gate", 1, 1, 0, 0, 0,
+         0, 0, 0},
+        {"SSD gate opts attention A only", 1, -1, 1, 0, 0, 1, 1, 0},
+        {"SSD DISABLE opts out", 1, -1, 1, 1, 0, 0, 0, 0},
+        {"SSD REQUIRE requests both attention stages", 1, -1, 0, 0, 1,
+         1, 1, 1},
     };
 
     bool ok = true;
@@ -1266,22 +1310,33 @@ bool run_prefill_wmma_requested_policy_oracle() {
         const int got = ds4_rocm_test_q4_prefill_wmma_requested_policy(
             test.ssd_streaming, test.enabled, test.ssd_enabled,
             test.disabled, test.required);
-        if (got != test.expected) {
+        if (got != test.standalone_expected) {
             std::fprintf(stderr,
-                         "Q4 WMMA request policy %s: expected=%d got=%d "
-                         "FAIL\n",
-                         test.label, test.expected, got);
+                         "Q4 standalone WMMA request policy %s: "
+                         "expected=%d got=%d FAIL\n",
+                         test.label, test.standalone_expected, got);
+            ok = false;
+        }
+        const int a_got =
+            ds4_rocm_test_q4_prefill_wmma_attention_a_requested_policy(
+                test.ssd_streaming, test.enabled, test.ssd_enabled,
+                test.disabled, test.required);
+        if (a_got != test.attention_a_expected) {
+            std::fprintf(stderr,
+                         "Q4 attention-output A WMMA policy %s: "
+                         "expected=%d got=%d FAIL\n",
+                         test.label, test.attention_a_expected, a_got);
             ok = false;
         }
         const int b_got =
-            ds4_rocm_test_q4_prefill_wmma_b_requested_policy(
+            ds4_rocm_test_q4_prefill_wmma_attention_b_requested_policy(
                 test.ssd_streaming, test.enabled, test.ssd_enabled,
                 test.disabled, test.required);
-        if (b_got != test.b_expected) {
+        if (b_got != test.attention_b_expected) {
             std::fprintf(stderr,
                          "Q4 attention-output B WMMA policy %s: "
                          "expected=%d got=%d FAIL\n",
-                         test.label, test.b_expected, b_got);
+                         test.label, test.attention_b_expected, b_got);
             ok = false;
         }
     }
@@ -2987,15 +3042,14 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
     tensor_owner heads_gpu(heads_count * sizeof(float));
     tensor_owner tile8_low(low_sentinel.size() * sizeof(float));
     tensor_owner tile8_out(out_sentinel.size() * sizeof(float));
-    tensor_owner wmma_low(low_sentinel.size() * sizeof(float));
-    tensor_owner wmma_out(out_sentinel.size() * sizeof(float));
+    tensor_owner candidate_low(low_sentinel.size() * sizeof(float));
+    tensor_owner candidate_out(out_sentinel.size() * sizeof(float));
+    tensor_owner replay_out(out_sentinel.size() * sizeof(float));
     if (!heads_gpu.ptr || !tile8_low.ptr || !tile8_out.ptr ||
-        !wmma_low.ptr || !wmma_out.ptr ||
+        !candidate_low.ptr || !candidate_out.ptr || !replay_out.ptr ||
         !write_tensor(heads_gpu.ptr, heads_host) ||
         !write_tensor(tile8_low.ptr, low_sentinel) ||
-        !write_tensor(tile8_out.ptr, out_sentinel) ||
-        !write_tensor(wmma_low.ptr, low_sentinel) ||
-        !write_tensor(wmma_out.ptr, out_sentinel)) {
+        !write_tensor(tile8_out.ptr, out_sentinel)) {
         std::fprintf(stderr,
                      "ROCm Q4 production output direct-WMMA: setup FAIL\n");
         return false;
@@ -3011,157 +3065,384 @@ bool run_attention_output_wmma_smoke(const aligned_model &model) {
     env_snapshot wmma_require(kPrefillWmmaRequire);
     env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
     env_snapshot wmma_k64(kPrefillWmmaK64);
+    env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
+    env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
+    env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
+
+    struct batch_result {
+        int rc = 0;
+        uint64_t wmma_calls = 0u;
+        uint64_t k64_calls = 0u;
+        bool write_ok = false;
+        bool low_read = false;
+        bool out_read = false;
+    };
+
+    struct replay_result {
+        int rc = 0;
+        uint64_t wmma_calls = 0u;
+        uint64_t k64_calls = 0u;
+        bool write_ok = false;
+        bool out_read = false;
+    };
+
+    auto clear_controls = [&]() {
+        (void)unsetenv(kPrefillEnable);
+        (void)unsetenv(kPrefillDisable);
+        (void)unsetenv(kPrefillRequire);
+        (void)unsetenv(kPrefillK1024Tile4Require);
+        (void)unsetenv(kPrefillWmmaEnable);
+        (void)unsetenv(kPrefillWmmaSsdEnable);
+        (void)unsetenv(kPrefillWmmaDisable);
+        (void)unsetenv(kPrefillWmmaRequire);
+        (void)unsetenv(kPrefillWmmaRowTile);
+        (void)unsetenv(kPrefillWmmaK64);
+        (void)unsetenv(kPrefillQ8Wave32Enable);
+        (void)unsetenv(kPrefillQ8Wave32Disable);
+        (void)unsetenv(kPrefillQ8Wave32Require);
+    };
+
+    auto run_batch = [&](ds4_gpu_tensor *low, ds4_gpu_tensor *out,
+                         std::vector<float> *low_host,
+                         std::vector<float> *out_host) {
+        batch_result result;
+        ds4_rocm_test_q4_prefill_wmma_reset();
+        result.write_ok = write_tensor(low, low_sentinel) &&
+                          write_tensor(out, out_sentinel);
+        if (result.write_ok) {
+            result.rc = ds4_gpu_attention_output_q4_K_batch_tensor(
+                out, low, nullptr, nullptr,
+                model.data, model.size, model.decode_attn_a_offset,
+                model.decode_attn_b_offset, kQ4Type, kDecodeAttnGroupDim,
+                kDecodeAttnRank, kDecodeAttnGroups, kDecodeAttnOutDim,
+                heads_gpu.ptr, n_tokens);
+        }
+        result.wmma_calls = ds4_rocm_test_q4_prefill_wmma_get_calls();
+        result.k64_calls = ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
+        if (result.write_ok) {
+            result.low_read = read_tensor(low, low_host);
+            result.out_read = read_tensor(out, out_host);
+        }
+        return result;
+    };
+
+    auto batch_ready = [&](const batch_result &result,
+                           uint64_t expected_wmma,
+                           uint64_t expected_k64,
+                           const char *label) {
+        const bool ready = result.write_ok && result.rc == 1 &&
+            result.wmma_calls == expected_wmma &&
+            result.k64_calls == expected_k64 &&
+            result.low_read && result.out_read;
+        std::fprintf(stderr,
+                     "%s: rc=%d WMMA=%llu/%llu K64=%llu/%llu "
+                     "write=%d read=%d/%d %s\n",
+                     label, result.rc,
+                     (unsigned long long)result.wmma_calls,
+                     (unsigned long long)expected_wmma,
+                     (unsigned long long)result.k64_calls,
+                     (unsigned long long)expected_k64,
+                     result.write_ok ? 1 : 0,
+                     result.low_read ? 1 : 0,
+                     result.out_read ? 1 : 0,
+                     ready ? "PASS" : "FAIL");
+        return ready;
+    };
+
+    auto batch_memory_ok = [&](const batch_result &result,
+                               const std::vector<float> &low_host,
+                               const std::vector<float> &out_host,
+                               const char *label) {
+        if (!result.low_read || !result.out_read) return false;
+        const std::string low_body = std::string(label) + " low body";
+        const std::string out_body = std::string(label) + " out body";
+        const std::string low_finite = std::string(label) + " low finite";
+        const std::string out_finite = std::string(label) + " out finite";
+        const std::string low_guard = std::string(label) + " low N-tail";
+        const std::string out_guard = std::string(label) + " out N-tail";
+        bool memory_ok = output_body_overwritten(
+            low_host, low_sentinel, low_count, low_body.c_str());
+        memory_ok = output_body_overwritten(
+            out_host, out_sentinel, out_count, out_body.c_str()) && memory_ok;
+        memory_ok = output_body_finite(
+            low_host, low_count, low_finite.c_str()) && memory_ok;
+        memory_ok = output_body_finite(
+            out_host, out_count, out_finite.c_str()) && memory_ok;
+        memory_ok = output_guard_unchanged(
+            low_host, low_sentinel, low_count, low_guard.c_str()) && memory_ok;
+        memory_ok = output_guard_unchanged(
+            out_host, out_sentinel, out_count, out_guard.c_str()) && memory_ok;
+        return memory_ok;
+    };
+
+    auto run_tile8_replay = [&](const ds4_gpu_tensor *low,
+                                std::vector<float> *out_host) {
+        replay_result result;
+        clear_controls();
+        (void)setenv(kPrefillRequire, "1", 1);
+        (void)setenv(kPrefillWmmaDisable, "1", 1);
+        ds4_rocm_test_q4_prefill_wmma_reset();
+        result.write_ok = write_tensor(replay_out.ptr, out_sentinel);
+        if (result.write_ok) {
+            result.rc = ds4_gpu_matmul_quant_tensor(
+                replay_out.ptr, model.data, model.size,
+                model.decode_attn_b_offset, kQ4Type,
+                kDecodeAttnLowDim, kDecodeAttnOutDim, low, n_tokens);
+        }
+        result.wmma_calls = ds4_rocm_test_q4_prefill_wmma_get_calls();
+        result.k64_calls = ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
+        if (result.write_ok) {
+            result.out_read = read_tensor(replay_out.ptr, out_host);
+        }
+        return result;
+    };
+
+    auto replay_ready = [&](const replay_result &result,
+                            const std::vector<float> &out_host,
+                            const char *label) {
+        bool ready = result.write_ok && result.rc != 0 &&
+            result.wmma_calls == 0u && result.k64_calls == 0u &&
+            result.out_read;
+        std::fprintf(stderr,
+                     "%s: rc=%d WMMA=%llu K64=%llu write=%d read=%d %s\n",
+                     label, result.rc,
+                     (unsigned long long)result.wmma_calls,
+                     (unsigned long long)result.k64_calls,
+                     result.write_ok ? 1 : 0,
+                     result.out_read ? 1 : 0,
+                     ready ? "PASS" : "FAIL");
+        if (result.out_read) {
+            const std::string body = std::string(label) + " body";
+            const std::string finite = std::string(label) + " finite";
+            const std::string guard = std::string(label) + " N-tail";
+            ready = output_body_overwritten(
+                out_host, out_sentinel, out_count, body.c_str()) && ready;
+            ready = output_body_finite(
+                out_host, out_count, finite.c_str()) && ready;
+            ready = output_guard_unchanged(
+                out_host, out_sentinel, out_count, guard.c_str()) && ready;
+        }
+        return ready;
+    };
 
     ds4_gpu_set_ssd_streaming(false);
-    (void)unsetenv(kPrefillEnable);
-    (void)unsetenv(kPrefillDisable);
+
+    /* Forced TILE8 is the exact baseline. */
+    clear_controls();
     (void)setenv(kPrefillRequire, "1", 1);
-    (void)unsetenv(kPrefillK1024Tile4Require);
-    (void)unsetenv(kPrefillWmmaEnable);
-    (void)unsetenv(kPrefillWmmaSsdEnable);
     (void)setenv(kPrefillWmmaDisable, "1", 1);
-    (void)unsetenv(kPrefillWmmaRequire);
-    (void)unsetenv(kPrefillWmmaRowTile);
-    (void)setenv(kPrefillWmmaK64, "0", 1);
-    ds4_rocm_test_q4_prefill_wmma_reset();
-    const int tile8_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
-        tile8_out.ptr, tile8_low.ptr, nullptr, nullptr,
-        model.data, model.size, model.decode_attn_a_offset,
-        model.decode_attn_b_offset, kQ4Type, kDecodeAttnGroupDim,
-        kDecodeAttnRank, kDecodeAttnGroups, kDecodeAttnOutDim,
-        heads_gpu.ptr, n_tokens);
-    const uint64_t tile8_wmma_calls =
-        ds4_rocm_test_q4_prefill_wmma_get_calls();
-    const uint64_t tile8_k64_calls =
-        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
-
-    (void)unsetenv(kPrefillRequire);
-    (void)unsetenv(kPrefillWmmaEnable);
-    (void)unsetenv(kPrefillWmmaDisable);
-    (void)unsetenv(kPrefillWmmaRequire);
-    (void)setenv(kPrefillWmmaK64, "0", 1);
-    ds4_rocm_test_q4_prefill_wmma_reset();
-    const int wmma_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
-        wmma_out.ptr, wmma_low.ptr, nullptr, nullptr,
-        model.data, model.size, model.decode_attn_a_offset,
-        model.decode_attn_b_offset, kQ4Type, kDecodeAttnGroupDim,
-        kDecodeAttnRank, kDecodeAttnGroups, kDecodeAttnOutDim,
-        heads_gpu.ptr, n_tokens);
-    const uint64_t wmma_calls =
-        ds4_rocm_test_q4_prefill_wmma_get_calls();
-    const uint64_t wmma_k64_calls =
-        ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
-
     std::vector<float> tile8_low_host(low_sentinel.size());
     std::vector<float> tile8_out_host(out_sentinel.size());
-    std::vector<float> wmma_low_host(low_sentinel.size());
-    std::vector<float> wmma_out_host(out_sentinel.size());
-    bool ok = tile8_rc == 1 && wmma_rc == 1 &&
-        tile8_wmma_calls == 0u && tile8_k64_calls == 0u &&
-        wmma_calls == 1u &&
-        wmma_k64_calls == 0u &&
-        read_tensor(tile8_low.ptr, &tile8_low_host) &&
-        read_tensor(tile8_out.ptr, &tile8_out_host) &&
-        read_tensor(wmma_low.ptr, &wmma_low_host) &&
-        read_tensor(wmma_out.ptr, &wmma_out_host);
-    if (ok) {
-        ok = output_body_overwritten(
-                 tile8_low_host, low_sentinel, low_count,
-                 "production output-A TILE8 body") && ok;
-        ok = output_body_overwritten(
-                 tile8_out_host, out_sentinel, out_count,
-                 "production output-B TILE8 body") && ok;
-        ok = output_body_overwritten(
-                 wmma_low_host, low_sentinel, low_count,
-                 "production output-A direct-WMMA body") && ok;
-        ok = output_body_overwritten(
-                 wmma_out_host, out_sentinel, out_count,
-                 "production output-B A-WMMA/B-TILE8 body") && ok;
-        ok = output_guard_unchanged(
-                 tile8_low_host, low_sentinel, low_count,
-                 "production output-A TILE8 N-tail") && ok;
-        ok = output_guard_unchanged(
-                 tile8_out_host, out_sentinel, out_count,
-                 "production output-B TILE8 N-tail") && ok;
-        ok = output_guard_unchanged(
-                 wmma_low_host, low_sentinel, low_count,
-                 "production output-A direct-WMMA N-tail") && ok;
-        ok = output_guard_unchanged(
-                 wmma_out_host, out_sentinel, out_count,
-                 "production output-B A-WMMA/B-TILE8 N-tail") && ok;
-        tile8_low_host.resize(low_count);
-        tile8_out_host.resize(out_count);
-        wmma_low_host.resize(low_count);
-        wmma_out_host.resize(out_count);
-        ok = close_with_tolerance(
-                 wmma_low_host, tile8_low_host, 2.0f, 3.0e-2f,
-                 "production output-A direct-WMMA vs TILE8") && ok;
-        ok = close_with_tolerance(
-                 wmma_out_host, tile8_out_host, 16.0f, 8.0e-2f,
-                 "production output A-WMMA/B-TILE8 vs all-TILE8") && ok;
+    const batch_result tile8_result = run_batch(
+        tile8_low.ptr, tile8_out.ptr, &tile8_low_host, &tile8_out_host);
+
+    /* The production default keeps validated WMMA on A and exact TILE8 on B. */
+    clear_controls();
+    std::vector<float> default_low_host(low_sentinel.size());
+    std::vector<float> default_out_host(out_sentinel.size());
+    const batch_result default_result = run_batch(
+        candidate_low.ptr, candidate_out.ptr,
+        &default_low_host, &default_out_host);
+
+    /* ENABLE opts only A into direct WMMA.  Pin K32 as the rollback arm. */
+    clear_controls();
+    (void)setenv(kPrefillWmmaEnable, "1", 1);
+    (void)setenv(kPrefillWmmaK64, "0", 1);
+    std::vector<float> k32_low_host(low_sentinel.size());
+    std::vector<float> k32_out_host(out_sentinel.size());
+    const batch_result k32_result = run_batch(
+        candidate_low.ptr, candidate_out.ptr, &k32_low_host, &k32_out_host);
+
+    std::vector<float> k32_replay_host(out_sentinel.size());
+    replay_result k32_replay_result;
+    if (k32_result.rc == 1 && k32_result.low_read) {
+        k32_replay_result = run_tile8_replay(
+            candidate_low.ptr, &k32_replay_host);
     }
 
-    int k64_default_rc = 0;
-    uint64_t k64_default_wmma_calls = 0u;
-    uint64_t k64_default_calls = 0u;
-    std::vector<float> k64_default_low_host(low_sentinel.size());
-    std::vector<float> k64_default_out_host(out_sentinel.size());
-    if (ok) {
-        ok = write_tensor(wmma_low.ptr, low_sentinel) &&
-             write_tensor(wmma_out.ptr, out_sentinel);
+    /* Run K64 regardless of every earlier comparison result. */
+    clear_controls();
+    (void)setenv(kPrefillWmmaEnable, "1", 1);
+    std::vector<float> k64_low_host(low_sentinel.size());
+    std::vector<float> k64_out_host(out_sentinel.size());
+    const batch_result k64_result = run_batch(
+        candidate_low.ptr, candidate_out.ptr, &k64_low_host, &k64_out_host);
+
+    /* REQUIRE is the only policy that opts both A and B into direct WMMA. */
+    clear_controls();
+    (void)setenv(kPrefillWmmaRequire, "1", 1);
+    (void)setenv(kPrefillWmmaK64, "0", 1);
+    std::vector<float> strict_k32_low_host(low_sentinel.size());
+    std::vector<float> strict_k32_out_host(out_sentinel.size());
+    const batch_result strict_k32_result = run_batch(
+        candidate_low.ptr, candidate_out.ptr,
+        &strict_k32_low_host, &strict_k32_out_host);
+
+    clear_controls();
+    (void)setenv(kPrefillWmmaRequire, "1", 1);
+    std::vector<float> strict_k64_low_host(low_sentinel.size());
+    std::vector<float> strict_k64_out_host(out_sentinel.size());
+    const batch_result strict_k64_result = run_batch(
+        candidate_low.ptr, candidate_out.ptr,
+        &strict_k64_low_host, &strict_k64_out_host);
+
+    const bool tile8_ready = batch_ready(
+        tile8_result, 0u, 0u, "production forced TILE8");
+    const bool default_ready = batch_ready(
+        default_result, 1u, 1u,
+        "production clean-default A-K64/B-TILE8");
+    const bool k32_ready = batch_ready(
+        k32_result, 1u, 0u, "production ENABLE A-K32/B-TILE8");
+    const bool k64_ready = batch_ready(
+        k64_result, 1u, 1u, "production ENABLE A-K64/B-TILE8");
+    const bool strict_k32_ready = batch_ready(
+        strict_k32_result, 2u, 0u, "production REQUIRE A+B K32");
+    const bool strict_k64_ready = batch_ready(
+        strict_k64_result, 2u, 2u, "production REQUIRE A+B K64");
+
+    const bool tile8_memory = batch_memory_ok(
+        tile8_result, tile8_low_host, tile8_out_host,
+        "production forced TILE8");
+    const bool default_memory = batch_memory_ok(
+        default_result, default_low_host, default_out_host,
+        "production clean-default A-K64/B-TILE8");
+    const bool k32_memory = batch_memory_ok(
+        k32_result, k32_low_host, k32_out_host,
+        "production ENABLE A-K32/B-TILE8");
+    const bool k64_memory = batch_memory_ok(
+        k64_result, k64_low_host, k64_out_host,
+        "production ENABLE A-K64/B-TILE8");
+    const bool strict_k32_memory = batch_memory_ok(
+        strict_k32_result, strict_k32_low_host, strict_k32_out_host,
+        "production REQUIRE A+B K32");
+    const bool strict_k64_memory = batch_memory_ok(
+        strict_k64_result, strict_k64_low_host, strict_k64_out_host,
+        "production REQUIRE A+B K64");
+    const bool k32_replay_ready = replay_ready(
+        k32_replay_result, k32_replay_host,
+        "production K32-low standalone B-TILE8 replay");
+
+    tile8_low_host.resize(low_count);
+    tile8_out_host.resize(out_count);
+    default_low_host.resize(low_count);
+    default_out_host.resize(out_count);
+    k32_low_host.resize(low_count);
+    k32_out_host.resize(out_count);
+    k32_replay_host.resize(out_count);
+    k64_low_host.resize(low_count);
+    k64_out_host.resize(out_count);
+    strict_k32_low_host.resize(low_count);
+    strict_k32_out_host.resize(out_count);
+    strict_k64_low_host.resize(low_count);
+    strict_k64_out_host.resize(out_count);
+
+    bool comparisons_ok = true;
+    if (tile8_result.low_read && default_result.low_read) {
+        comparisons_ok = close_with_tolerance(
+            default_low_host, tile8_low_host,
+            2.0f, 3.0e-2f,
+            "production clean-default A-WMMA vs forced TILE8") &&
+            comparisons_ok;
+    } else {
+        comparisons_ok = false;
     }
-    if (ok) {
-        /* Attest the production K64 default, not its explicit opt-in alias. */
-        (void)unsetenv(kPrefillWmmaK64);
-        ds4_rocm_test_q4_prefill_wmma_reset();
-        k64_default_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
-            wmma_out.ptr, wmma_low.ptr, nullptr, nullptr,
-            model.data, model.size, model.decode_attn_a_offset,
-            model.decode_attn_b_offset, kQ4Type, kDecodeAttnGroupDim,
-            kDecodeAttnRank, kDecodeAttnGroups, kDecodeAttnOutDim,
-            heads_gpu.ptr, n_tokens);
-        k64_default_wmma_calls =
-            ds4_rocm_test_q4_prefill_wmma_get_calls();
-        k64_default_calls = ds4_rocm_test_q4_prefill_wmma_k64_get_calls();
-        ok = k64_default_rc == 1 && k64_default_wmma_calls == 1u &&
-             k64_default_calls == 1u &&
-             read_tensor(wmma_low.ptr, &k64_default_low_host) &&
-             read_tensor(wmma_out.ptr, &k64_default_out_host);
+    if (tile8_result.out_read && default_result.out_read) {
+        comparisons_ok = close_with_tolerance(
+            default_out_host, tile8_out_host,
+            16.0f, 8.0e-2f,
+            "production clean-default A-WMMA/B-TILE8 vs all-TILE8",
+            false) && comparisons_ok;
+    } else {
+        comparisons_ok = false;
     }
-    if (ok) {
-        ok = output_body_overwritten(
-                 k64_default_low_host, low_sentinel, low_count,
-                 "production output-A default K64 direct-WMMA body") && ok;
-        ok = output_body_overwritten(
-                 k64_default_out_host, out_sentinel, out_count,
-                 "production output-B A-default-K64/B-TILE8 body") && ok;
-        ok = output_guard_unchanged(
-                 k64_default_low_host, low_sentinel, low_count,
-                 "production output-A default K64 direct-WMMA N-tail") && ok;
-        ok = output_guard_unchanged(
-                 k64_default_out_host, out_sentinel, out_count,
-                 "production output-B A-default-K64/B-TILE8 N-tail") && ok;
-        k64_default_low_host.resize(low_count);
-        k64_default_out_host.resize(out_count);
-        ok = bitwise_equal(
-                 k64_default_low_host, wmma_low_host,
-                 "production output-A default K64 vs K32") && ok;
-        ok = bitwise_equal(
-                 k64_default_out_host, wmma_out_host,
-                 "production output A-default-K64/B-TILE8 vs "
-                 "A-K32/B-TILE8") && ok;
+    if (tile8_result.low_read && k32_result.low_read) {
+        comparisons_ok = close_with_tolerance(
+            k32_low_host, tile8_low_host, 2.0f, 3.0e-2f,
+            "production ENABLE output-A K32 vs TILE8") && comparisons_ok;
+    } else {
+        comparisons_ok = false;
     }
+    if (k32_result.out_read && k32_replay_result.out_read) {
+        comparisons_ok = bitwise_equal(
+            k32_out_host, k32_replay_host,
+            "production ENABLE K32 B vs standalone TILE8 replay") &&
+            comparisons_ok;
+    } else {
+        comparisons_ok = false;
+    }
+    if (k32_result.low_read && k64_result.low_read) {
+        comparisons_ok = bitwise_equal(
+            k64_low_host, k32_low_host,
+            "production ENABLE output-A K64 vs K32") && comparisons_ok;
+    } else {
+        comparisons_ok = false;
+    }
+    if (k32_result.out_read && k64_result.out_read) {
+        comparisons_ok = bitwise_equal(
+            k64_out_host, k32_out_host,
+            "production ENABLE A-K64/B-TILE8 vs A-K32/B-TILE8") &&
+            comparisons_ok;
+    } else {
+        comparisons_ok = false;
+    }
+    if (default_result.low_read && k64_result.low_read) {
+        comparisons_ok = bitwise_equal(
+            default_low_host, k64_low_host,
+            "production clean-default A vs explicit ENABLE A-K64") &&
+            comparisons_ok;
+    } else {
+        comparisons_ok = false;
+    }
+    if (default_result.out_read && k64_result.out_read) {
+        comparisons_ok = bitwise_equal(
+            default_out_host, k64_out_host,
+            "production clean-default B vs explicit ENABLE B-TILE8") &&
+            comparisons_ok;
+    } else {
+        comparisons_ok = false;
+    }
+    if (strict_k32_result.low_read && strict_k64_result.low_read) {
+        comparisons_ok = bitwise_equal(
+            strict_k64_low_host, strict_k32_low_host,
+            "production REQUIRE output-A K64 vs K32") && comparisons_ok;
+    } else {
+        comparisons_ok = false;
+    }
+    if (strict_k32_result.out_read && strict_k64_result.out_read) {
+        comparisons_ok = bitwise_equal(
+            strict_k64_out_host, strict_k32_out_host,
+            "production REQUIRE output A+B K64 vs K32") && comparisons_ok;
+    } else {
+        comparisons_ok = false;
+    }
+
+    const bool ok = tile8_ready && default_ready && k32_ready && k64_ready &&
+        strict_k32_ready && strict_k64_ready && tile8_memory &&
+        default_memory && k32_memory && k64_memory && strict_k32_memory &&
+        strict_k64_memory && k32_replay_ready && comparisons_ok;
     std::fprintf(stderr,
-                 "ROCm Q4 production output WMMA safety default: "
-                 "tile8=%d/%llu/%llu A-K32/B-TILE8=%d/%llu/%llu "
-                 "A-K64-default/B-TILE8=%d/%llu/%llu %s\n",
-                 tile8_rc, (unsigned long long)tile8_wmma_calls,
-                 (unsigned long long)tile8_k64_calls,
-                 wmma_rc, (unsigned long long)wmma_calls,
-                 (unsigned long long)wmma_k64_calls,
-                 k64_default_rc,
-                 (unsigned long long)k64_default_wmma_calls,
-                 (unsigned long long)k64_default_calls,
+                 "ROCm Q4 production output WMMA policy: "
+                 "tile8=%d/%llu/%llu default=%d/%llu/%llu "
+                 "enable-k32=%d/%llu/%llu enable-k64=%d/%llu/%llu "
+                 "require-k32=%d/%llu/%llu require-k64=%d/%llu/%llu %s\n",
+                 tile8_result.rc,
+                 (unsigned long long)tile8_result.wmma_calls,
+                 (unsigned long long)tile8_result.k64_calls,
+                 default_result.rc,
+                 (unsigned long long)default_result.wmma_calls,
+                 (unsigned long long)default_result.k64_calls,
+                 k32_result.rc,
+                 (unsigned long long)k32_result.wmma_calls,
+                 (unsigned long long)k32_result.k64_calls,
+                 k64_result.rc,
+                 (unsigned long long)k64_result.wmma_calls,
+                 (unsigned long long)k64_result.k64_calls,
+                 strict_k32_result.rc,
+                 (unsigned long long)strict_k32_result.wmma_calls,
+                 (unsigned long long)strict_k32_result.k64_calls,
+                 strict_k64_result.rc,
+                 (unsigned long long)strict_k64_result.wmma_calls,
+                 (unsigned long long)strict_k64_result.k64_calls,
                  ok ? "PASS" : "FAIL");
     return ok;
 }

@@ -191,7 +191,8 @@ comparisons are:
 - `outb`: TILE8 versus the compressed direct-Q4 WMMA kernel at the
   production `output_b` `K=8192,M=4096` shape;
 - `output`: the complete grouped `output_a` plus `output_b` production API,
-  comparing two TILE8 projections with two direct WMMA projections.
+  comparing an all-TILE8 rollback with the production A-WMMA/B-TILE8
+  pipeline.
 
 On gfx1151 wave32, `dense` and `qb` also emit a direct-Q4 WMMA comparison for
 `N>=256`. The candidate keeps Q4_K weights compressed, rounds each transient
@@ -209,10 +210,16 @@ including its changed workgroup and occupancy contract, separately from the
 candidate's arithmetic change versus TILE8. `q_b` additionally compares scalar
 versus two-wide activation staging at fixed 128- and 256-row geometry.
 The direct hook receives both tile and loader explicitly, so every arm attests
-its own configuration. Eligible resident runtime calls use direct-Q4 WMMA by
-default; set `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` to opt out. The
-production-API comparison still uses the strict REQUIRE gate so a rejected
-dispatch fails instead of timing a fallback.
+its own configuration. Eligible standalone resident calls and attention-output
+A use direct-Q4 WMMA by default; set `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` to
+opt out. Attention-output B remains on Q8_K+TILE8. The production comparison
+sets `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA=1` without REQUIRE, which explicitly
+retains that same A-WMMA/B-TILE8 policy. The hard B oracle replays TILE8 over
+the same WMMA-low intermediate and requires bitwise-identical output. The composed
+A-WMMA/B-TILE8 versus all-TILE8 delta remains visible as a non-gating
+diagnostic because it includes A's deliberate F16 boundary rather than
+isolating B correctness. Raw two-stage direct-WMMA row-geometry and K32/K64
+comparisons remain diagnostic-only kernel measurements.
 
 Eligible direct-Q4 WMMA launches use K64/P80 staging by default. It stages two
 adjacent 32-value Q4_K groups and a 64-value activation slice in one padded
@@ -233,8 +240,10 @@ rollback without SSD-streaming or policy-selection noise:
 
 The benchmark always keeps SSD streaming disabled. Runtime SSD experiments
 need the separate `DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_SSD=1` gate and only accept
-projection ranges already backed by physical device memory, so model I/O is
-never folded into the kernel result.
+projection ranges already backed by physical device memory. That gate opts
+attention-output A into WMMA but retains TILE8 for B; only the strict,
+diagnostic `DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA=1` selects direct WMMA for B.
+Model I/O is therefore never folded into the kernel result.
 
 The default token set is `9,17,33,128,256,257,512`, covering the first row
 after the small TILE8 boundaries plus both the exact 256-token occupancy case
@@ -249,11 +258,13 @@ and the first token after a 64-token WMMA boundary. Use `--full` for
 
 Every case rotates identical resident weight sets between arms, alternates
 ABBA/BAAB, and verifies allocation guards both before and after timing.
-Comparisons among the integer Q4
-paths remain bit-exact. Direct-Q4 WMMA has a deliberate F16 arithmetic
-boundary, so those comparisons require finite results within an explicit
-absolute/relative smoke tolerance; release validation must also include the
-model-logit or prompt oracle that guards the automatic policy.
+Comparisons among the integer Q4 paths remain bit-exact. Direct-Q4 WMMA has a
+deliberate F16 arithmetic boundary, so single-stage comparisons require finite
+results within an explicit absolute/relative smoke tolerance. For the chained
+production output, the B-stage same-input replay is bit-exact while the
+end-to-end delta is informational; release validation must also include the
+model-logit or prompt oracle that guards the automatic standalone and
+attention-output-A policy.
 Fixture creation, the host-to-device residency copy, warmup, oracle readback,
 and environment-gate changes are outside the reported HIP-event intervals.
 `candidate_delta_pct` is negative when the candidate is faster; the companion
