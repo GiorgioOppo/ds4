@@ -1712,6 +1712,13 @@ int ds4_mmq_q4_K_dense_pair_impl(
     return 0;
 }
 
+#if !defined(GGML_USE_HIP)
+static bool ds4_q4_grouped_q81_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
+}
+#endif
+
 /* Token-batched grouped Q4_K projection for attention output-A.  The source
  * is token-major [N][G][K], while MMQ stores directly into token-major
  * [N][G][M].  Quantizing the strided source as G channels removes the old
@@ -1750,6 +1757,28 @@ int ds4_mmq_q4_K_grouped_dense_impl(
 
     const int dev = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[dev].cc;
+#if !defined(GGML_USE_HIP)
+    const bool q81_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr;
+    const bool q81_require = ds4_q4_grouped_q81_env_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81");
+    const bool q81_eligible =
+        gb10_optimizations_enabled() &&
+        cc == GGML_CUDA_CC_DGX_SPARK && M == 1024 && N > 8 &&
+        N <= INT32_MAX / (8*4096) && K == 4096 && n_groups == 8 &&
+        (((uintptr_t)X & 15u) == 0u);
+    if (q81_require && (q81_disable || !q81_eligible)) {
+        fprintf(stderr,
+                "%s: required grouped K4096/G8 Q8_1 quantizer is not "
+                "eligible\n",
+                tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const bool use_specialized_q81 = q81_eligible && !q81_disable;
+#endif
     ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
     if (!ctx) {
         fprintf(stderr, "%s: failed to get cuda context for device %d\n",
@@ -1800,14 +1829,22 @@ int ds4_mmq_q4_K_grouped_dense_impl(
     ggml_cuda_pool_alloc<char> y_q8_1(
         ctx->pool(), payload_bytes + slack_bytes);
     ybuf_memset(y_q8_1.get(), payload_bytes + slack_bytes, stream);
-    quantize_mmq_q8_1_cuda(
-        X, /*ids=*/nullptr, (void *)y_q8_1.get(), GGML_TYPE_Q4_K,
-        /*ne00=*/K,
-        /*s01=*/(int64_t)n_groups * K,
-        /*s02=*/(int64_t)K,
-        /*s03=*/(int64_t)n_groups * N * K,
-        /*ne0=*/ne10_padded, /*ne1=*/N,
-        /*ne2=*/n_groups, /*ne3=*/1, stream);
+#if !defined(GGML_USE_HIP)
+    if (use_specialized_q81) {
+        quantize_mmq_q8_1_q4_grouped_k4096_g8x2_cuda(
+            X, (void *)y_q8_1.get(), N, stream);
+    } else
+#endif
+    {
+        quantize_mmq_q8_1_cuda(
+            X, /*ids=*/nullptr, (void *)y_q8_1.get(), GGML_TYPE_Q4_K,
+            /*ne00=*/K,
+            /*s01=*/(int64_t)n_groups * K,
+            /*s02=*/(int64_t)K,
+            /*s03=*/(int64_t)n_groups * N * K,
+            /*ne0=*/ne10_padded, /*ne1=*/N,
+            /*ne2=*/n_groups, /*ne3=*/1, stream);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: quantize failed: %s\n",
@@ -2146,6 +2183,40 @@ extern "C" int ds4_mmq_q4_K_grouped_dense_single_grid(
     return ds4_mmq_q4_K_grouped_dense_impl(
         W, X, out, M, N, K, n_groups, true, stream);
 }
+
+#if !defined(GGML_USE_HIP)
+extern "C" size_t ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(int N) {
+    if (N <= 0 || N > INT32_MAX / (8*4096)) return 0u;
+    constexpr size_t blocks_per_token = 8u * 4096u / (4u * QK8_1);
+    if ((size_t)N > SIZE_MAX / blocks_per_token /
+                        sizeof(block_q8_1_mmq)) {
+        return 0u;
+    }
+    return (size_t)N * blocks_per_token * sizeof(block_q8_1_mmq);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+        const float *X, void *q8, size_t q8_bytes, int N,
+        int use_specialized, cudaStream_t stream) {
+    const size_t required =
+        ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(N);
+    if (!X || !q8 || required == 0u || q8_bytes < required ||
+        (((uintptr_t)X & 15u) != 0u)) {
+        return -1;
+    }
+    if (use_specialized) {
+        quantize_mmq_q8_1_q4_grouped_k4096_g8x2_cuda(
+            X, q8, N, stream);
+    } else {
+        quantize_mmq_q8_1_cuda(
+            X, /*ids=*/nullptr, q8, GGML_TYPE_Q4_K,
+            /*ne00=*/4096, /*s01=*/8*4096, /*s02=*/4096,
+            /*s03=*/(int64_t)N*8*4096,
+            /*ne0=*/4096, /*ne1=*/N, /*ne2=*/8, /*ne3=*/1, stream);
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+#endif
 
 extern "C" int ds4_mmq_mxfp4_dense(
         const void * W, const float * X, float * out,

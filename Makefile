@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-ssd environment-docs test-quantizer-indexer-q4 test-rocm test-glm53-kda-rocm test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-q4-prefill-pair test-metal-indexer-q4 test-metal-q4-attn-exactn test-metal-q4-attn-out-a-direct test-metal-q4-qb-f16-cache test-metal-q4-qb-f16-cache-timing test-metal-exactn-oracle test-metal-dspark-capture test-metal-argmax-top1 bench-metal-argmax-top1 test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-metal test-mxfp4-cuda test-mxfp4-rocm test-mmq-parity-cuda test-mmq-q4-16warp-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cuda-iq2-moe-prefill-bench cuda-q4-prefill-bench rocm-iq2-moe-prefill-bench rocm-q4-prefill-bench
+.PHONY: all help clean test test-ssd environment-docs test-quantizer-indexer-q4 test-rocm test-glm53-kda-rocm test-metal-session-batch test-metal-session-batch-ssd test-metal-q4-streams test-metal-q4-prefill-pair test-metal-indexer-q4 test-metal-q4-attn-exactn test-metal-q4-attn-out-a-direct test-metal-q4-qb-f16-cache test-metal-q4-qb-f16-cache-timing test-metal-exactn-oracle test-metal-dspark-capture test-metal-argmax-top1 bench-metal-argmax-top1 test-metal-iq2-midonly test-metal-iq2-ssd-grouped-mm test-metal-iq2-live-index test-mxfp4-metal test-mxfp4-cuda test-mxfp4-rocm test-mmq-parity-cuda test-mmq-q4-grouped-q81-cuda test-mmq-q4-16warp-cuda test-rocm-q4-parity test-rocm-q4-dense test-rocm-q4-pair test-rocm-q4-prefill test-strix-rocm-q4-parity test-strix-rocm-q4-prefill test-strix-rocm-q4-prefill-long test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth rocm-dspark-acceptance rocm-dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cuda-iq2-moe-prefill-bench cuda-q4-prefill-bench rocm-iq2-moe-prefill-bench rocm-q4-prefill-bench
 
 gguf-tools/deepseek4-quantize: gguf-tools/deepseek4-quantize.c gguf-tools/quants.c gguf-tools/quants.h
 	$(MAKE) -C gguf-tools deepseek4-quantize
@@ -433,6 +433,7 @@ help:
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make test-mmq-parity-cuda CUDA_ARCH=sm_N  Run quantized CUDA kernel parity tests"
+	@echo "  make test-mmq-q4-grouped-q81-cuda CUDA_ARCH=sm_N  Run focused grouped Q8_1 byte-parity tests"
 	@echo "  make test-mmq-q4-16warp-cuda CUDA_ARCH=sm_N  Run focused Q4 16-warp bitwise/canary oracle"
 	@echo "  make test-rocm-q4-parity        Run ROCm Q4_K dense/pair/prefill oracle"
 	@echo "  make test-strix-rocm-q4-prefill Require gfx1151 and run tiled-prefill oracle"
@@ -575,6 +576,9 @@ cuda/mmq/test/test_mmq_parity: cuda/mmq/test/test_mmq_parity.cu cuda/mmq/ds4_mmq
 
 test-mmq-parity-cuda: cuda/mmq/test/test_mmq_parity
 	./cuda/mmq/test/test_mmq_parity
+
+test-mmq-q4-grouped-q81-cuda: cuda/mmq/test/test_mmq_parity
+	./cuda/mmq/test/test_mmq_parity --q4-grouped-q81
 
 test-mmq-q4-16warp-cuda: cuda/mmq/test/test_mmq_parity
 	./cuda/mmq/test/test_mmq_parity --q4-16warp

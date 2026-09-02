@@ -71,6 +71,8 @@ The detailed Metal A/B contracts and expected oracle counters live in
 | `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL=0` | Compatibility opt-out for the default GB10 Q4 attention-A grouped prefill path above eight tokens; any other nonempty value explicitly requests it. |
 | `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` | Dominant rollback from the default grouped Q4 attention-A prefill path to eight pack/MMQ/unpack projections. Any defined value disables the path. |
 | `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL=1` | Request the grouped Q4 attention-A prefill candidate and fail before enqueue when its GB10, shape, residency, or buffer contract is unavailable. |
+| `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81=1` | Narrow rollback from the default fixed-layout `K=4096`, `groups=8` Q8_1 producer to the canonical strided producer while retaining grouped prefill. Any defined value disables the specialized kernel. |
+| `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81=1` | Request the fixed-layout eight-warp Q8_1 producer and fail before enqueue on rollback or ineligibility. |
 | `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID=1` | On eligible GB10 prefills, submit the eight grouped attention-A MMQs as one grid.z launch while retaining a separate stream-K coordinate and fixup slice per group. |
 | `DS4_CUDA_DISABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID=1` | Dominant rollback from the single-grid experiment to the established one-MMQ-grid-per-group path. |
 | `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_SINGLE_GRID=1` | Require the single-grid grouped attention-A submission and fail closed on rollback, ineligibility, or dispatch failure. |
@@ -154,7 +156,7 @@ above, it is an unstable internal diagnostic or tuning interface. The linked sou
 remains normative for exact eligibility
 gates, bounds, and architecture-specific defaults.
 
-Inventory totals: **1081 `DS4_*` runtime variables** and
+Inventory totals: **1083 `DS4_*` runtime variables** and
 **6 external runtime variables**.
 The auxiliary inventories contain **118 test/test-fixture entries**
 and **19 tool/wrapper entries**.
@@ -615,7 +617,7 @@ and **19 tool/wrapper entries**.
 </details>
 
 <details>
-<summary><strong>CUDA (334)</strong></summary>
+<summary><strong>CUDA (336)</strong></summary>
 
 | Variable | Accepted value and default | Effect | Source |
 | --- | --- | --- | --- |
@@ -814,6 +816,7 @@ and **19 tool/wrapper entries**.
 | `DS4_CUDA_NO_Q4_GROUPED_ATTN_A` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q4 grouped attn a CUDA Q4 optimization. | [cuda/mmq/ds4_mmq.cu:4295](cuda/mmq/ds4_mmq.cu#L4295) |
 | `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q4 grouped attn a batch CUDA Q4 optimization. | [cuda/mmq/ds4_mmq.cu:4305](cuda/mmq/ds4_mmq.cu#L4305) |
 | `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL` | presence kill switch for the default-on GB10 path; default unset; any defined value including empty or 0 disables and dominates ENABLE/REQUIRE | Restore the eight pack/MMQ/unpack Q4 attention-A prefill projections. | [ds4_cuda.cu:41930](ds4_cuda.cu#L41930) |
+| `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81` | presence rollback for the default-on fixed-shape quantizer; default unset; any defined value including empty or 0 disables; REQUIRE then fails closed | Restore the canonical strided Q8_1 producer while retaining grouped Q4 attention-A prefill and its eight MMQ grids. | [cuda/mmq/ds4_mmq.cu:1762](cuda/mmq/ds4_mmq.cu#L1762); [ds4_cuda.cu:44143](ds4_cuda.cu#L44143) |
 | `DS4_CUDA_NO_Q4_K1024_PERSISTENT` | presence kill switch, default off; any defined value including 0 disables | Disable the Q4 K1024 persistent CUDA Q4 optimization. | [cuda/mmq/ds4_mmq.cu:3907](cuda/mmq/ds4_mmq.cu#L3907) |
 | `DS4_CUDA_NO_Q4_MMQ_16WARP` | value-aware rollback, default off; unset/empty/exact 0 permits the experiment, every other nonempty value disables it and overrides REQUEST/REQUIRE | Disable the experimental Stream-K-compatible CUDA Q4_K m128n128 16-warp prefill kernel. | [cuda/mmq/ds4_mmq.cu:1133](cuda/mmq/ds4_mmq.cu#L1133) |
 | `DS4_CUDA_NO_Q8_ALIGNED_DENSE_SCRATCH` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q8 aligned dense scratch CUDA Q8 optimization. | [cuda/mmq/ds4_mmq.cu:5578](cuda/mmq/ds4_mmq.cu#L5578) |
@@ -883,6 +886,7 @@ and **19 tool/wrapper entries**.
 | `DS4_CUDA_REQUIRE_IQ2_XXS_SSD_PREFILL_MMQ` | false-like-aware flag, default off; 0/false/no/off (case-insensitive) is off, any other nonempty value is on; disable flags dominate | Require the CUDA IQ2 XXS SSD prefill MMQ path; fail closed when unavailable. | [ds4_cuda.cu:4631](ds4_cuda.cu#L4631) |
 | `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH` | value-aware flag, default off; unset/empty/exact 0 is off, any other nonempty value is on | Fail if grouped batched attention-A cannot be used. | [ds4_cuda.cu:40198](ds4_cuda.cu#L40198) |
 | `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL` | value-aware fail-closed assertion, default off; unset/empty/exact 0 is off, any other nonempty value requests the candidate and rejects ineligibility before enqueue | Require the GB10 grouped Q4_K attention-A prefill path instead of silently using pack/MMQ/unpack. | [ds4_cuda.cu:41889](ds4_cuda.cu#L41889) |
+| `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81` | value-aware fail-closed assertion, default off; unset/empty/exact 0 is off, any other nonempty value requests grouped prefill and the fixed K=4096, groups=8, rank=1024 Q8_1 producer; NO wins | Require the eight-warp K4096/G8x2 Q8_1 producer instead of silently using the generic strided quantizer. | [cuda/mmq/ds4_mmq.cu:1767](cuda/mmq/ds4_mmq.cu#L1767); [ds4_cuda.cu:44089](ds4_cuda.cu#L44089) |
 | `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT` | presence flag, default off; any defined value including 0 makes ineligible candidate fail closed | Fail when the exact Q4 K1024 persistent candidate is unavailable instead of using MMVQ. | [cuda/mmq/ds4_mmq.cu:3929](cuda/mmq/ds4_mmq.cu#L3929) |
 | `DS4_CUDA_REQUIRE_Q4_MMQ_16WARP` | value-aware fail-closed prefill opt-in cached on the first Q4_K dense or dense-pair MMQ call; unset/empty/exact 0 is off, every other nonempty value requests and requires the candidate for N>8; a dense-pair is rejected before allocation unless both legs are eligible; rollback, disabled MMQ, ineligibility, or preflight failure prevents fallback; decode/speculative N<=8 remains on MMVQ | Require the experimental CUDA Q4_K 16-warp prefill kernel so benchmark runs cannot silently measure another path. | [cuda/mmq/ds4_mmq.cu:1130](cuda/mmq/ds4_mmq.cu#L1130); [ds4_cuda.cu:38208](ds4_cuda.cu#L38208); [ds4_cuda.cu:38358](ds4_cuda.cu#L38358) |
 | `DS4_CUDA_REQUIRE_STREAMING_EXPERT_PERSISTENT_CACHE` | false-like-aware flag, default off; 0/false/no/off (case-insensitive) is off, any other nonempty value is on; disable flags dominate | Require streaming expert persistent cache in CUDA SSD streaming; fail closed when unavailable. | [ds4_cuda.cu:4117](ds4_cuda.cu#L4117) |

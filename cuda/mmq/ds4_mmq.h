@@ -236,6 +236,20 @@ int ds4_mmq_q4_K_dense_preq_16warp_for_test(
     int           N,
     int           K,
     cudaStream_t  stream);
+
+// Byte-parity boundary for the fixed [N][8][4096] grouped attention-A Q8_1
+// producer.  use_specialized=0 launches the canonical strided quantizer;
+// nonzero launches the K4096/G8x2 candidate.  Both write the same canonical
+// group-major block_q8_1_mmq DS4 payload and never synchronize the stream.
+size_t ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(int N);
+
+int ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+    const float * X_f32,
+    void        * q8_ds4,
+    size_t        q8_bytes,
+    int           N,
+    int           use_specialized,
+    cudaStream_t  stream);
 #endif
 
 // Two dense Q4_K MMQ projections that share one token-tiled Q8_1

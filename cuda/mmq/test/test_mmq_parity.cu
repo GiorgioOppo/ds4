@@ -1612,6 +1612,149 @@ bool run_q4_K_grouped_dense_parity(
     return ok;
 }
 
+#if !defined(GGML_USE_HIP)
+// The production selector is deliberately GB10-only, but the specialized
+// quantizer uses baseline CUDA operations.  Exercise it directly on every
+// CUDA test device and require the complete block_q8_1_mmq payload to match
+// the canonical strided producer byte-for-byte.
+bool run_q4_K_grouped_q8_1_kernel_parity(int N, uint32_t seed) {
+    fprintf(stderr,
+            "=== Q4_K/GROUPED_Q8_1_K4096_G8X2 N=%d seed=%u ===\n",
+            N, seed);
+
+    constexpr int K = 4096;
+    constexpr int groups = 8;
+    constexpr size_t guard_bytes = 256u;
+    constexpr uint8_t guard_byte = 0xa5u;
+    const size_t q8_bytes =
+        ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(N);
+    const size_t x_count = (size_t)N * groups * K;
+    if (q8_bytes == 0u ||
+        q8_bytes > SIZE_MAX - 2u * guard_bytes) {
+        fprintf(stderr, "invalid grouped Q8_1 parity shape\n\n");
+        return false;
+    }
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> X(x_count);
+    for (float &value : X) value = nd(rng);
+
+    cudaStream_t stream = nullptr;
+    float *dX = nullptr;
+    void *dReferenceStorage = nullptr;
+    void *dCandidateStorage = nullptr;
+    const bool allocated = cudaStreamCreate(&stream) == cudaSuccess &&
+        cudaMalloc(&dX, X.size() * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&dReferenceStorage, q8_bytes + 2u * guard_bytes) ==
+            cudaSuccess &&
+        cudaMalloc(&dCandidateStorage, q8_bytes + 2u * guard_bytes) ==
+            cudaSuccess;
+    const auto cleanup = [&]() {
+        if (dCandidateStorage) cudaFree(dCandidateStorage);
+        if (dReferenceStorage) cudaFree(dReferenceStorage);
+        if (dX) cudaFree(dX);
+        if (stream) cudaStreamDestroy(stream);
+    };
+    if (!allocated) {
+        fprintf(stderr,
+                "grouped Q8_1 parity allocation failed: %s\n\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cleanup();
+        return false;
+    }
+
+    auto *dReference =
+        static_cast<uint8_t *>(dReferenceStorage) + guard_bytes;
+    auto *dCandidate =
+        static_cast<uint8_t *>(dCandidateStorage) + guard_bytes;
+    cudaError_t enqueue_err = cudaMemcpyAsync(
+        dX, X.data(), X.size() * sizeof(float),
+        cudaMemcpyHostToDevice, stream);
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dReferenceStorage, guard_byte,
+            q8_bytes + 2u * guard_bytes, stream);
+    }
+    if (enqueue_err == cudaSuccess) {
+        enqueue_err = cudaMemsetAsync(
+            dCandidateStorage, guard_byte,
+            q8_bytes + 2u * guard_bytes, stream);
+    }
+
+    const int rc_reference = enqueue_err == cudaSuccess
+        ? ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+              dX, dReference, q8_bytes, N, /*use_specialized=*/0, stream)
+        : -100;
+    const int rc_candidate = rc_reference == 0
+        ? ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+              dX, dCandidate, q8_bytes, N, /*use_specialized=*/1, stream)
+        : -100;
+
+    std::vector<uint8_t> reference(q8_bytes + 2u * guard_bytes);
+    std::vector<uint8_t> candidate(q8_bytes + 2u * guard_bytes);
+    if (rc_candidate == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            reference.data(), dReferenceStorage, reference.size(),
+            cudaMemcpyDeviceToHost, stream);
+    }
+    if (enqueue_err == cudaSuccess && rc_candidate == 0) {
+        enqueue_err = cudaMemcpyAsync(
+            candidate.data(), dCandidateStorage, candidate.size(),
+            cudaMemcpyDeviceToHost, stream);
+    }
+    const cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+    size_t mismatches = 0;
+    size_t first_mismatch = SIZE_MAX;
+    for (size_t i = 0; i < q8_bytes; ++i) {
+        const size_t offset = guard_bytes + i;
+        if (reference[offset] != candidate[offset]) {
+            if (first_mismatch == SIZE_MAX) first_mismatch = i;
+            mismatches++;
+        }
+    }
+    size_t canary_mismatches = 0;
+    for (size_t i = 0; i < guard_bytes; ++i) {
+        if (reference[i] != guard_byte || candidate[i] != guard_byte) {
+            canary_mismatches++;
+        }
+        const size_t suffix = guard_bytes + q8_bytes + i;
+        if (reference[suffix] != guard_byte ||
+            candidate[suffix] != guard_byte) {
+            canary_mismatches++;
+        }
+    }
+
+    const bool ok = rc_reference == 0 && rc_candidate == 0 &&
+        enqueue_err == cudaSuccess && sync_err == cudaSuccess &&
+        mismatches == 0 && canary_mismatches == 0;
+    const std::string first = first_mismatch == SIZE_MAX
+        ? "none" : std::to_string(first_mismatch);
+    fprintf(stderr,
+            "rc=%d/%d enqueue=%s sync=%s bytes=%zu mismatches=%zu "
+            "first=%s canary=%zu: %s\n\n",
+            rc_reference, rc_candidate, cudaGetErrorString(enqueue_err),
+            cudaGetErrorString(sync_err), q8_bytes, mismatches,
+            first.c_str(), canary_mismatches, ok ? "PASS" : "FAIL");
+    cleanup();
+    return ok;
+}
+
+bool run_q4_K_grouped_q8_1_kernel_suite() {
+    bool ok = true;
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/9, 0xC4810009u);
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/127, 0xC481007Fu);
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/128, 0xC4810080u);
+    ok &= run_q4_K_grouped_q8_1_kernel_parity(
+        /*N=*/129, 0xC4810081u);
+    return ok;
+}
+#endif
+
 // IQ2_XXS internally accumulates in int8 via SIMD intrinsics
 // (__vsub4 / __vcmpne4 in vec_dot_iq2_xxs_q8_1) and applies the scale
 // post-accumulation, while the CPU reference does per-element float
@@ -3252,6 +3395,10 @@ bool run_q4_K_grouped_vec_parity(
 int main(int argc, char ** argv) {
     const bool q4_16warp_oracle =
         argc == 2 && std::strcmp(argv[1], "--q4-16warp") == 0;
+#if !defined(GGML_USE_HIP)
+    const bool q4_grouped_q81_oracle =
+        argc == 2 && std::strcmp(argv[1], "--q4-grouped-q81") == 0;
+#endif
     scoped_env_override require_16warp(
         "DS4_CUDA_REQUIRE_Q4_MMQ_16WARP");
     scoped_env_override disable_16warp(
@@ -3269,6 +3416,16 @@ int main(int argc, char ** argv) {
     if (rc != 0) { fprintf(stderr, "ds4_mmq_init failed: %d\n", rc); return 1; }
 
     bool all_ok = true;
+
+#if !defined(GGML_USE_HIP)
+    if (q4_grouped_q81_oracle) {
+        all_ok &= run_q4_K_grouped_q8_1_kernel_suite();
+        fprintf(stderr, "===================\n");
+        fprintf(stderr, "Q4 GROUPED Q8_1 %s\n",
+                all_ok ? "PASS" : "FAILED");
+        return all_ok ? 0 : 1;
+    }
+#endif
 
     if (q4_16warp_oracle) {
         // The canonical production baseline must select mmq_x=128. Mirror
@@ -3478,6 +3635,11 @@ int main(int argc, char ** argv) {
     all_ok &= run_q4_K_grouped_dense_parity(
         /*M=*/31, /*N=*/129, /*K=*/512, /*groups=*/3, 0xC4D081,
         /*inject_nonfinite=*/true);
+#if !defined(GGML_USE_HIP)
+    // Fixed production Q8_1 front-end: cover the first eligible width and
+    // both sides of the canonical 128-token tile boundary.
+    all_ok &= run_q4_K_grouped_q8_1_kernel_suite();
+#endif
 
     // MoE (_id) path.  Small expert counts + small shapes for fast verification.
     // Per-token-distinct routing with top_k=2 or 6.

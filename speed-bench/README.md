@@ -410,6 +410,10 @@ On GB10, isolate the production Flash attention-output A geometry
 ./speed-bench/cuda_q4_prefill_bench \
   --path mmq --case outa --tokens 127,128,129,257,512,2048 \
   --samples 16 --warmup 4
+./speed-bench/cuda_q4_prefill_bench \
+  --path mmq --case outa --grouped-q81-kernel \
+  --tokens 512,1024,2048,4096,6144,8192 \
+  --sets 4 --samples 16 --warmup 4
 ```
 
 This is an in-process ABBA/BAAB comparison between the current eight-group
@@ -418,6 +422,13 @@ grouped-prefill dispatch with one canonical MMQ grid per group. Add
 `--grouped-single-grid` to instead compare the grouped eight-grid path with the
 experimental grid.z submission; do not mix that experiment into the default
 promotion measurement.
+`--grouped-q81-kernel` holds those same eight MMQ grids constant and compares
+the canonical strided Q8_1 producer with the default `K=4096`, `groups=8`
+eight-warp kernel. The candidate is required and the reference is forced with
+its narrow rollback, so neither arm can silently time the other quantizer. The
+complete output remains bitwise checked; run
+`make test-mmq-q4-grouped-q81-cuda CUDA_ARCH=sm_121` first for direct
+byte-level Q8_1 parity and canary coverage.
 The public API must also execute output-B, so the fixture uses a valid Q4_K
 `K=8192,M=256` output-B common to both arms. It is 6.25% of output-A's MACs;
 the result prints `focus_macs_per_token` and `common_macs_per_token` separately

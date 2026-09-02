@@ -52,6 +52,10 @@ constexpr const char *kGroupedSingleGridDisable =
     "DS4_CUDA_DISABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID";
 constexpr const char *kGroupedSingleGridRequire =
     "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_SINGLE_GRID";
+constexpr const char *kGroupedQ81Disable =
+    "DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81";
+constexpr const char *kGroupedQ81Require =
+    "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81";
 constexpr const char *kGroupedGlobalDisable =
     "DS4_CUDA_NO_Q4_GROUPED_ATTN_A";
 constexpr const char *kGb10GlobalDisable = "DS4_CUDA_NO_Q4_GB10_FAST";
@@ -90,6 +94,7 @@ struct config {
     uint32_t warmup = kDefaultWarmup;
     bool kernel_16warp = false;
     bool grouped_single_grid = false;
+    bool grouped_q81_kernel = false;
 };
 
 struct weight_set {
@@ -706,7 +711,9 @@ bool select_grouped_prefill_legacy() {
            unsetenv(kGroupedPrefillRequire) == 0 &&
            unsetenv(kGroupedSingleGridEnable) == 0 &&
            setenv(kGroupedSingleGridDisable, "1", 1) == 0 &&
-           unsetenv(kGroupedSingleGridRequire) == 0;
+           unsetenv(kGroupedSingleGridRequire) == 0 &&
+           unsetenv(kGroupedQ81Disable) == 0 &&
+           unsetenv(kGroupedQ81Require) == 0;
 }
 
 bool select_grouped_prefill_grid8() {
@@ -715,7 +722,9 @@ bool select_grouped_prefill_grid8() {
            setenv(kGroupedPrefillRequire, "1", 1) == 0 &&
            unsetenv(kGroupedSingleGridEnable) == 0 &&
            setenv(kGroupedSingleGridDisable, "1", 1) == 0 &&
-           unsetenv(kGroupedSingleGridRequire) == 0;
+           unsetenv(kGroupedSingleGridRequire) == 0 &&
+           unsetenv(kGroupedQ81Disable) == 0 &&
+           unsetenv(kGroupedQ81Require) == 0;
 }
 
 bool select_grouped_prefill_single_grid() {
@@ -724,7 +733,21 @@ bool select_grouped_prefill_single_grid() {
            setenv(kGroupedPrefillRequire, "1", 1) == 0 &&
            setenv(kGroupedSingleGridEnable, "1", 1) == 0 &&
            unsetenv(kGroupedSingleGridDisable) == 0 &&
-           setenv(kGroupedSingleGridRequire, "1", 1) == 0;
+           setenv(kGroupedSingleGridRequire, "1", 1) == 0 &&
+           unsetenv(kGroupedQ81Disable) == 0 &&
+           unsetenv(kGroupedQ81Require) == 0;
+}
+
+bool select_grouped_q81_reference() {
+    return select_grouped_prefill_grid8() &&
+           setenv(kGroupedQ81Disable, "1", 1) == 0 &&
+           unsetenv(kGroupedQ81Require) == 0;
+}
+
+bool select_grouped_q81_candidate() {
+    return select_grouped_prefill_grid8() &&
+           unsetenv(kGroupedQ81Disable) == 0 &&
+           setenv(kGroupedQ81Require, "1", 1) == 0;
 }
 
 double percentile(std::vector<double> sorted, double fraction) {
@@ -1618,8 +1641,12 @@ bool run_output_a(const model_fixture &model, const config &cfg,
     }
 
     const bool compare_single_grid = cfg.grouped_single_grid;
+    const bool compare_q81_kernel = cfg.grouped_q81_kernel;
     const arm baseline = {
-        compare_single_grid ? "grouped_8_grids" : "pack8_mmq_unpack",
+        compare_q81_kernel
+            ? "grouped_generic_q81"
+            : (compare_single_grid
+                   ? "grouped_8_grids" : "pack8_mmq_unpack"),
         [&](uint32_t set) {
             return ds4_gpu_attention_output_q4_K_batch_tensor(
                        baseline_out.ptr, baseline_low.ptr, group_tmp.ptr,
@@ -1630,11 +1657,17 @@ bool run_output_a(const model_fixture &model, const config &cfg,
                        heads.ptr, n_tokens) > 0;
         },
         [=]() {
-            return compare_single_grid ? select_grouped_prefill_grid8()
-                                       : select_grouped_prefill_legacy();
+            return compare_q81_kernel
+                ? select_grouped_q81_reference()
+                : (compare_single_grid
+                       ? select_grouped_prefill_grid8()
+                       : select_grouped_prefill_legacy());
         }};
     const arm candidate = {
-        compare_single_grid ? "grouped_single_grid" : "grouped_8_grids",
+        compare_q81_kernel
+            ? "grouped_k4096_g8x2_q81"
+            : (compare_single_grid
+                   ? "grouped_single_grid" : "grouped_8_grids"),
         [&](uint32_t set) {
             return ds4_gpu_attention_output_q4_K_batch_tensor(
                        candidate_out.ptr, candidate_low.ptr, group_tmp.ptr,
@@ -1645,9 +1678,11 @@ bool run_output_a(const model_fixture &model, const config &cfg,
                        heads.ptr, n_tokens) > 0;
         },
         [=]() {
-            return compare_single_grid
-                ? select_grouped_prefill_single_grid()
-                : select_grouped_prefill_grid8();
+            return compare_q81_kernel
+                ? select_grouped_q81_candidate()
+                : (compare_single_grid
+                       ? select_grouped_prefill_single_grid()
+                       : select_grouped_prefill_grid8());
         }};
     const uint64_t output_a_macs_per_token =
         static_cast<uint64_t>(kOutputGroups) * kDenseK * kOutputRank;
@@ -1672,9 +1707,11 @@ bool run_output_a(const model_fixture &model, const config &cfg,
         [&](uint32_t set) {
             return bitwise_equal(baseline_low.ptr, candidate_low.ptr,
                                  low_bytes,
-                                 compare_single_grid
-                                     ? "output_a single-grid vs eight-grid"
-                                     : "output_a grouped vs pack/unpack") &&
+                                 compare_q81_kernel
+                                     ? "output_a specialized vs generic Q8_1"
+                                     : (compare_single_grid
+                                            ? "output_a single-grid vs eight-grid"
+                                            : "output_a grouped vs pack/unpack")) &&
                    bitwise_equal(baseline_out.ptr, candidate_out.ptr,
                                  out_bytes,
                                  "output_a minimal-B final output") &&
@@ -1733,6 +1770,7 @@ void usage(FILE *stream, const char *argv0) {
         "  --samples N               samples/arm, multiple of 4 (default: %u)\n"
         "  --warmup N                untimed dispatches/arm (default: %u)\n"
         "  --grouped-single-grid     compare grouped 8-grid vs grid.z outa\n"
+        "  --grouped-q81-kernel      compare generic vs K4096/G8x2 Q8_1 outa\n"
         "  --kernel-16warp           prequantized canonical-vs-16-warp A/B\n"
         "  -h, --help                show this help\n\n"
         "Dense and q_b measure one immutable process path. Run separate "
@@ -1743,7 +1781,10 @@ void usage(FILE *stream, const char *argv0) {
         "pack/MMQ/unpack sequence against the default\ndirect-strided grouped "
         "path with one canonical MMQ grid per group. Add\n"
         "--grouped-single-grid to compare that default with the experimental "
-        "grid.z\nsubmission instead. It includes a common minimal "
+        "grid.z\nsubmission instead. Add\n"
+        "--grouped-q81-kernel to isolate the default fixed-shape Q8_1 "
+        "front-end against\nthe canonical strided quantizer while retaining "
+        "the same eight MMQ grids. Both outa comparisons include a common minimal "
         "Q4 output-B (M=256) whose MACs are reported separately. "
         "DS4_CUDA_MMQ_X_MAX\nmay explicitly select an 8..128 multiple-of-8 "
         "sweep point; the setup line\nattests it, or prints auto when the "
@@ -1862,6 +1903,8 @@ config parse_options(int argc, char **argv) {
             cfg.kernel_16warp = true;
         } else if (!std::strcmp(argv[i], "--grouped-single-grid")) {
             cfg.grouped_single_grid = true;
+        } else if (!std::strcmp(argv[i], "--grouped-q81-kernel")) {
+            cfg.grouped_q81_kernel = true;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(stderr, argv[0]);
@@ -1875,6 +1918,9 @@ config parse_options(int argc, char **argv) {
     }
     if (cfg.kernel_16warp && !tokens_explicit) {
         cfg.tokens = {512u, 1024u, 2048u, 2049u, 4096u, 6144u, 8192u};
+    }
+    if (cfg.grouped_q81_kernel && !tokens_explicit) {
+        cfg.tokens = {512u, 1024u, 2048u, 4096u, 6144u, 8192u};
     }
     if (cfg.kernel_16warp) {
         const auto below_minimum = std::find_if(
@@ -1898,16 +1944,34 @@ config parse_options(int argc, char **argv) {
                      "--grouped-single-grid requires --path mmq\n");
         std::exit(2);
     }
+    if (cfg.grouped_q81_kernel && cfg.path != cuda_path::mmq) {
+        std::fprintf(stderr,
+                     "--grouped-q81-kernel requires --path mmq\n");
+        std::exit(2);
+    }
     if (cfg.grouped_single_grid && cfg.kernel_16warp) {
         std::fprintf(stderr,
                      "--grouped-single-grid cannot be combined with "
                      "--kernel-16warp\n");
         std::exit(2);
     }
+    if (cfg.grouped_q81_kernel &&
+        (cfg.grouped_single_grid || cfg.kernel_16warp)) {
+        std::fprintf(stderr,
+                     "--grouped-q81-kernel cannot be combined with "
+                     "--grouped-single-grid or --kernel-16warp\n");
+        std::exit(2);
+    }
     if (cfg.grouped_single_grid && cfg.selected != bench_case::all &&
         cfg.selected != bench_case::outa) {
         std::fprintf(stderr,
                      "--grouped-single-grid requires --case outa or all\n");
+        std::exit(2);
+    }
+    if (cfg.grouped_q81_kernel && cfg.selected != bench_case::all &&
+        cfg.selected != bench_case::outa) {
+        std::fprintf(stderr,
+                     "--grouped-q81-kernel requires --case outa or all\n");
         std::exit(2);
     }
     if (cfg.kernel_16warp && cfg.selected == bench_case::outa) {
@@ -2069,6 +2133,8 @@ int main(int argc, char **argv) {
     env_snapshot grouped_single_grid_enable_guard(kGroupedSingleGridEnable);
     env_snapshot grouped_single_grid_disable_guard(kGroupedSingleGridDisable);
     env_snapshot grouped_single_grid_require_guard(kGroupedSingleGridRequire);
+    env_snapshot grouped_q81_disable_guard(kGroupedQ81Disable);
+    env_snapshot grouped_q81_require_guard(kGroupedQ81Require);
     env_snapshot grouped_global_disable_guard(kGroupedGlobalDisable);
     env_snapshot gb10_global_disable_guard(kGb10GlobalDisable);
     if (setenv("DS4_CUDA_MMQ",
@@ -2082,6 +2148,8 @@ int main(int argc, char **argv) {
         unsetenv(kGroupedSingleGridEnable) != 0 ||
         unsetenv(kGroupedSingleGridDisable) != 0 ||
         unsetenv(kGroupedSingleGridRequire) != 0 ||
+        unsetenv(kGroupedQ81Disable) != 0 ||
+        unsetenv(kGroupedQ81Require) != 0 ||
         unsetenv(kGroupedGlobalDisable) != 0 ||
         unsetenv(kGb10GlobalDisable) != 0) {
         std::fprintf(stderr,
@@ -2200,6 +2268,7 @@ int main(int argc, char **argv) {
             "mmq_x_max=%s sets=%u resident_payload_mib=%.2f "
             "device_free_delta_mib=%.2f "
             "device_free_delta_valid=%d timing=%s kernel_16warp=%d "
+            "grouped_q81_kernel=%d "
             "cases=%s "
             "ssd_streaming=off model_storage=cudaMalloc "
             "residency=backend_provenance strict_mmq=%d "
@@ -2213,11 +2282,14 @@ int main(int argc, char **argv) {
             resident_delta_valid ? 1 : 0,
             cfg.kernel_16warp ? "kernel_only_prequant" : "cuda_events",
             cfg.kernel_16warp ? 1 : 0,
+            cfg.grouped_q81_kernel ? 1 : 0,
             case_scope(cfg),
             cfg.path == cuda_path::mmq ? 1 : 0,
             grouped_prefill_supported ? "available" : "skipped",
-            cfg.grouped_single_grid ? "grid8_vs_single_grid"
-                                    : "pack8_vs_grid8");
+            cfg.grouped_q81_kernel
+                ? "q81_generic_vs_k4096_g8x2"
+                : (cfg.grouped_single_grid
+                       ? "grid8_vs_single_grid" : "pack8_vs_grid8"));
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
             if (includes(cfg.selected, bench_case::dense)) {

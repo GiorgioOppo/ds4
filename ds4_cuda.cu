@@ -44085,8 +44085,11 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL", 0);
     const int grouped_single_grid_require = cuda_env_flag_enabled(
         "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_SINGLE_GRID", 0);
+    const int grouped_q81_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81", 0);
     const int any_grouped_require = grouped_batch_require ||
-        grouped_prefill_require || grouped_single_grid_require;
+        grouped_prefill_require || grouped_single_grid_require ||
+        grouped_q81_require;
     if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
         n_tokens < 2u || group_dim > INT_MAX || rank > INT_MAX ||
@@ -44136,11 +44139,14 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID", 0);
     const int grouped_single_grid_disable = cuda_env_flag_enabled(
         "DS4_CUDA_DISABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID", 0);
+    const int grouped_q81_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81") != NULL;
     const int grouped_single_grid_selected =
         (grouped_single_grid_enable || grouped_single_grid_require) &&
         !grouped_single_grid_disable;
     const int grouped_prefill_selected = grouped_prefill_enable ||
-        grouped_prefill_require || grouped_single_grid_selected;
+        grouped_prefill_require || grouped_single_grid_selected ||
+        grouped_q81_require;
     if (grouped_oracle) cuda_q4_grouped_attn_a_oracle_register_report();
 
     const int grouped_gb10 =
@@ -44174,6 +44180,15 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         fprintf(stderr,
                 "ds4: required CUDA Q4 grouped attention-A single-grid "
                 "path is not eligible\n");
+        return -1;
+    }
+    if (grouped_q81_require &&
+        (grouped_q81_disable || !grouped_prefill_gb10 ||
+         rank != 1024u || group_dim != 4096u || n_groups != 8u ||
+         n_tokens > (uint32_t)(INT32_MAX / (8*4096)))) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A K4096/G8 "
+                "Q8_1 quantizer is not eligible\n");
         return -1;
     }
     if (grouped_prefill_selected && grouped_prefill_gb10) {

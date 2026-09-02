@@ -1007,10 +1007,18 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   `./speed-bench/cuda_q4_prefill_bench --path mmq --case outa --tokens
   127,128,129,257,512,2048,4096 --samples 16 --warmup 4`; require bitwise
   equality between `pack8_mmq_unpack` and `grouped_8_grids`, finite/canary/CPU
-  oracle success, and record the paired median. Then compare full-model
+  oracle success, and record the paired median. Run
+  `make test-mmq-q4-grouped-q81-cuda CUDA_ARCH=sm_121`, then isolate the new
+  Q8_1 front-end with
+  `--grouped-q81-kernel --tokens 512,1024,2048,4096,6144,8192`; require
+  byte-identical direct parity, bitwise final output, and a repeatable paired
+  median win between `grouped_generic_q81` and
+  `grouped_k4096_g8x2_q81`. Then compare full-model
   prefills with the default environment against the dominant
-  `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` rollback. Keep the single-grid and
-  16-warp experiments unset in this promotion comparison. Benchmark the K1024
+  `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` rollback, and separately against
+  the narrow `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81=1` rollback. Keep the
+  single-grid and 16-warp experiments unset in this promotion comparison.
+  Benchmark the K1024
   persistent kernel as a
   separate fail-closed arm with both
   `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1` and

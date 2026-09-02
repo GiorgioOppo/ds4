@@ -791,11 +791,20 @@ arithmetic:
 - for prefill widths above eight, the default eligible GB10 path quantizes the
   strided `[token][group][K]` input in one launch and writes each group directly
   into `[token][group][rank]`. It removes the eight F32 pack/unpack copies while
-  keeping one established stream-K MMQ reduction per group. Set
+  keeping one established stream-K MMQ reduction per group. On the production
+  `groups=8`, `K=4096`, `rank=1024` shape, a fixed-layout eight-warp Q8_1
+  producer is also the default: each warp emits two canonical 128-value DS4
+  records, reducing quantizer CTA count by four while preserving every output
+  byte. `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81=1` restores only the generic
+  strided Q8_1 producer, and
+  `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81=1` fails closed if the specialized
+  producer is not selected. Set
   `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` for the dominant local rollback;
   exact `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL=0` is also a compatibility
   opt-out. Add `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL=1` for fail-closed
-  tests. The separate single-grid/grid.z submission remains opt-in;
+  tests. The separate single-grid/grid.z submission remains opt-in. The
+  unrelated 16-warp MMQ experiment also remains opt-in and is not used by
+  this producer;
 - attention-output B keeps its canonical MMVQ result and the ordinary HC
   epilogue inside the graph-compatible fused call.  The row-packed epilogue
   remains oracle-only until a GB10 device run proves it bit-exact;
