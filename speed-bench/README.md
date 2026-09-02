@@ -221,17 +221,35 @@ diagnostic because it includes A's deliberate F16 boundary rather than
 isolating B correctness. Raw two-stage direct-WMMA row-geometry and K32/K64
 comparisons remain diagnostic-only kernel measurements.
 
-Eligible direct-Q4 WMMA launches use K64/P80 staging by default. It stages two
-adjacent 32-value Q4_K groups and a 64-value activation slice in one padded
-P80 LDS tile, halving workgroup barriers while retaining the K32 activation
-traffic and accumulation order. Leave
-`DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64` unset or set it to a true value for this
-default; set it to `0`, `false`, `no`, or `off` to restore K32 staging.
-`DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` rolls the whole direct-WMMA path back to
-Q8_K plus TILE8/TILE4.
+Eligible aligned 256-row direct-Q4 WMMA launches use the q_b-focused K128/P144
+stage by default. It groups four adjacent Q4_K qgroups behind one barrier pair
+and uses float4 activation loads, targeting a 2x reduction in synchronization
+and activation-load instructions over K64 while retaining the same F16
+conversions and accumulation order. Set
+`DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K128=1` to roll the same launch back to
+K64/P80; unset or explicitly false keeps K128. Incompatible alignment or
+64/128-row geometry automatically uses K64.
 
-Use the production 2048-token sweep to isolate default K64/P80 from the K32
-rollback without SSD-streaming or policy-selection noise:
+K64/P80 stages two adjacent 32-value Q4_K groups and a 64-value activation
+slice in one padded P80 LDS tile. Leave
+`DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64` unset or true to permit both K64 and the
+eligible K128 default; set it to `0`, `false`, `no`, or `off` to restore K32
+staging. `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA=1` rolls the whole direct-WMMA path
+back to Q8_K plus TILE8/TILE4. A persistent or automatic transient F16 q_b
+projection bypasses the direct-Q4 candidates.
+
+The q_b microbenchmark contains a strict, same-process
+`q_b_wmma_k64_k128` A/B with bitwise output and canary checks:
+
+```
+./speed-bench/rocm_q4_prefill_bench \
+  --case qb --tokens 256,512,1024,2048,2049,4096 \
+  --sets 4 --warmup 4 --samples 12
+```
+
+Use the production 2048-token sweep to exercise default K128/P144 without
+SSD-streaming or policy-selection noise. The same process also reports the
+strict K64/P80 versus K128/P144 A/B above:
 
 ```
 ./speed-bench/rocm_q4_prefill_bench \

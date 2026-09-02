@@ -39,6 +39,11 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_variant_enqueue(
     uint64_t row_bytes, uint64_t x_token_stride,
     uint64_t x_group_stride, uint64_t out_token_stride,
     uint32_t row_tile, uint32_t k_tile, int load2);
+extern "C" int ds4_rocm_bench_q4_K_wmma_k128_enqueue(
+    void *out, const void *w, const void *x, uint32_t n_tok,
+    uint32_t n_groups, uint32_t in_dim, uint32_t out_dim,
+    uint64_t row_bytes, uint64_t x_token_stride,
+    uint64_t x_group_stride, uint64_t out_token_stride);
 extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void);
@@ -89,6 +94,8 @@ constexpr const char *kWmmaRowTile =
     "DS4_ROCM_Q4_PREFILL_WMMA_ROW_TILE";
 constexpr const char *kWmmaK64 =
     "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64";
+constexpr const char *kWmmaK128Disable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K128";
 constexpr const char *kQ8Wave32Enable =
     "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32";
 constexpr const char *kQ8Wave32Disable =
@@ -546,6 +553,7 @@ void select_legacy() {
     (void)unsetenv(kWmmaRequire);
     (void)unsetenv(kWmmaRowTile);
     (void)unsetenv(kWmmaK64);
+    (void)unsetenv(kWmmaK128Disable);
     (void)unsetenv(kQ8Wave32Enable);
     (void)unsetenv(kQ8Wave32Disable);
     (void)unsetenv(kQ8Wave32Require);
@@ -563,6 +571,7 @@ void select_tile8(bool disable_k1024_tile4) {
     (void)unsetenv(kWmmaRequire);
     (void)unsetenv(kWmmaRowTile);
     (void)unsetenv(kWmmaK64);
+    (void)unsetenv(kWmmaK128Disable);
     (void)unsetenv(kQ8Wave32Enable);
     (void)unsetenv(kQ8Wave32Disable);
     (void)unsetenv(kQ8Wave32Require);
@@ -590,6 +599,7 @@ void select_wmma_shape() {
     (void)unsetenv(kK1024Tile4Require);
     (void)unsetenv(kWmmaRowTile);
     (void)unsetenv(kWmmaK64);
+    (void)unsetenv(kWmmaK128Disable);
 }
 
 void select_wmma_attention_a_tile8_b() {
@@ -605,6 +615,7 @@ void select_wmma_attention_a_tile8_b() {
     (void)unsetenv(kK1024Tile4Require);
     (void)unsetenv(kWmmaRowTile);
     (void)unsetenv(kWmmaK64);
+    (void)unsetenv(kWmmaK128Disable);
     ds4_rocm_test_q4_prefill_wmma_reset();
 }
 
@@ -1364,7 +1375,7 @@ bool run_qb(const model_fixture &model, const config &cfg,
                        n_tokens, 1u, kQbK, kQbM, row_bytes,
                        kQbK, 0u, kQbM, 256u, 64u, 1) != 0;
         }};
-    return benchmark_arms(
+    if (!benchmark_arms(
         "q_b_wmma_k32_k64", n_tokens, kQbK, kQbM, cfg,
         k32_baseline, k64_candidate,
         [&]() {
@@ -1378,6 +1389,38 @@ bool run_qb(const model_fixture &model, const config &cfg,
                                "q_b WMMA K32 oracle") &&
                    check_guard(tile4.ptr, logical_bytes,
                                "q_b WMMA K64/P80 oracle");
+        })) return false;
+
+    const arm k64_baseline = {
+        "wmma_k64p80_rows256_load2", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+                       rows64_device, qb_weights[set], x_device,
+                       n_tokens, 1u, kQbK, kQbM, row_bytes,
+                       kQbK, 0u, kQbM, 256u, 64u, 1) != 0;
+        }};
+    const arm k128_candidate = {
+        "wmma_k128p144_rows256_load4", []() {},
+        [&](uint32_t set) {
+            return ds4_rocm_bench_q4_K_wmma_k128_enqueue(
+                       shape_device, qb_weights[set], x_device,
+                       n_tokens, 1u, kQbK, kQbM, row_bytes,
+                       kQbK, 0u, kQbM) != 0;
+        }};
+    return benchmark_arms(
+        "q_b_wmma_k64_k128", n_tokens, kQbK, kQbM, cfg,
+        k64_baseline, k128_candidate,
+        [&]() {
+            return poison_output(tile8.ptr, logical_bytes, 0x7fc10001u) &&
+                   poison_output(tile4.ptr, logical_bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return bitwise_equal(tile8.ptr, tile4.ptr, logical_bytes,
+                                 "q_b WMMA K64/P80 vs K128/P144") &&
+                   check_guard(tile8.ptr, logical_bytes,
+                               "q_b WMMA K64/P80 oracle") &&
+                   check_guard(tile4.ptr, logical_bytes,
+                               "q_b WMMA K128/P144 oracle");
         });
 }
 
@@ -1808,8 +1851,9 @@ void usage(FILE *stream, const char *argv0) {
         "composed all-TILE8 delta is diagnostic only. Other WMMA comparisons\n"
         "use a finite/toleranced oracle because their F16 boundary is not\n"
         "bit-identical to the Q8_K activation path. At N>=256 the raw direct\n"
-        "arms also compare rollback K32 with default K64/P80 at fixed\n"
-        "production geometry and load2, requiring bitwise-identical output.\n",
+        "arms also compare K32 with K64/P80 at fixed production geometry and\n"
+        "load2; q_b additionally compares K64/P80 with the default K128/P144\n"
+        "load4 stage. Both staged-kernel checks require bitwise output.\n",
         argv0, kDefaultSets, kDefaultSamples, kDefaultWarmup);
 }
 
@@ -1925,12 +1969,14 @@ int main(int argc, char **argv) {
     env_snapshot wmma_require_guard(kWmmaRequire);
     env_snapshot wmma_row_tile_guard(kWmmaRowTile);
     env_snapshot wmma_k64_guard(kWmmaK64);
+    env_snapshot wmma_k128_disable_guard(kWmmaK128Disable);
     env_snapshot q8_wave32_enable_guard(kQ8Wave32Enable);
     env_snapshot q8_wave32_disable_guard(kQ8Wave32Disable);
     env_snapshot q8_wave32_require_guard(kQ8Wave32Require);
     (void)unsetenv(kQ8Wave32Enable);
     (void)unsetenv(kQ8Wave32Disable);
     (void)unsetenv(kQ8Wave32Require);
+    (void)unsetenv(kWmmaK128Disable);
 
     int device_count = 0;
     hipError_t hip_rc = hipGetDeviceCount(&device_count);
@@ -1998,9 +2044,10 @@ int main(int argc, char **argv) {
             properties.name, properties.gcnArchName, properties.warpSize,
             cfg.sets, static_cast<double>(model.resident_bytes) / 1048576.0,
             cfg.wmma_supported ? "64,128,256" : "skipped",
-            cfg.wmma_supported ? "scalar,load2" : "skipped",
-            cfg.wmma_supported ? "32,64p80" : "skipped",
-            cfg.wmma_supported ? "64p80" : "skipped",
+            cfg.wmma_supported ? "scalar,load2,load4" : "skipped",
+            cfg.wmma_supported ? "32,64p80,128p144" : "skipped",
+            cfg.wmma_supported ? "128p144@rows256,64p80@rows64/128"
+                               : "skipped",
             cfg.wmma_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
