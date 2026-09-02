@@ -413,7 +413,11 @@ On GB10, isolate the production Flash attention-output A geometry
 ```
 
 This is an in-process ABBA/BAAB comparison between the current eight-group
-pack/MMQ/unpack sequence and the strictly required grouped-prefill dispatch.
+pack/MMQ/unpack rollback and the default, strictly required direct-strided
+grouped-prefill dispatch with one canonical MMQ grid per group. Add
+`--grouped-single-grid` to instead compare the grouped eight-grid path with the
+experimental grid.z submission; do not mix that experiment into the default
+promotion measurement.
 The public API must also execute output-B, so the fixture uses a valid Q4_K
 `K=8192,M=256` output-B common to both arms. It is 6.25% of output-A's MACs;
 the result prints `focus_macs_per_token` and `common_macs_per_token` separately

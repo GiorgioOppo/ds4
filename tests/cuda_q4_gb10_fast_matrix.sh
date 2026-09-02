@@ -135,6 +135,12 @@ clean_env() {
         -u DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH \
         -u DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH \
         -u DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH \
+        -u DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL \
+        -u DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL \
+        -u DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL \
+        -u DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID \
+        -u DS4_CUDA_DISABLE_Q4_GROUPED_ATTN_A_SINGLE_GRID \
+        -u DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_SINGLE_GRID \
         -u DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE \
         -u DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE \
         -u DS4_CUDA_ENABLE_Q4_ATTN_OUT_HC_FUSE \
@@ -143,6 +149,9 @@ clean_env() {
         -u DS4_CUDA_NO_Q4_K1024_PERSISTENT \
         -u DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT \
         -u DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT \
+        -u DS4_CUDA_Q4_MMQ_16WARP \
+        -u DS4_CUDA_NO_Q4_MMQ_16WARP \
+        -u DS4_CUDA_REQUIRE_Q4_MMQ_16WARP \
         -u DS4_CUDA_DECODE_GRAPHS \
         -u DS4_CUDA_DECODE_GRAPH_LOG \
         "$@"
@@ -313,6 +322,7 @@ check_hc_oracle() {
 LOCAL_ROLLBACK="DS4_CUDA_NO_Q4_DENSE_SCRATCH=1
 DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1
 DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1
+DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1
 DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1
 DS4_CUDA_NO_Q4_K1024_PERSISTENT=1"
 
@@ -335,6 +345,7 @@ run_smoke local_control "$@"
 run_smoke scratch_only \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1 \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1 \
+    DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1 \
     DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1 \
     DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
 run_smoke grouped_only \
@@ -346,8 +357,12 @@ run_smoke hc_only \
     DS4_CUDA_NO_Q4_DENSE_SCRATCH=1 \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1 \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1 \
+    DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1 \
     DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
 run_smoke default_fast DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
+run_smoke grouped_prefill_rollback \
+    DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1 \
+    DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
 
 status=0
 oracle_mismatch_arms=
@@ -385,7 +400,7 @@ compare_smoke() {
 }
 
 for arm in local_control scratch_only grouped_only hc_only default_fast \
-           grouped_oracle hc_oracle; do
+           grouped_prefill_rollback grouped_oracle hc_oracle; do
     compare_smoke "$arm"
 done
 
@@ -396,6 +411,7 @@ run_score local_control "$@"
 run_score scratch_only \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1 \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1 \
+    DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1 \
     DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1 \
     DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
 run_score grouped_only \
@@ -407,10 +423,15 @@ run_score hc_only \
     DS4_CUDA_NO_Q4_DENSE_SCRATCH=1 \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1 \
     DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1 \
+    DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1 \
     DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
 run_score default_fast DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
+run_score grouped_prefill_rollback \
+    DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1 \
+    DS4_CUDA_NO_Q4_K1024_PERSISTENT=1
 
-for arm in local_control scratch_only grouped_only hc_only default_fast; do
+for arm in local_control scratch_only grouped_only hc_only default_fast \
+           grouped_prefill_rollback; do
     if cmp -s "$OUT_DIR/umbrella_control.tsv" "$OUT_DIR/$arm.tsv"; then
         echo "q4-gb10-matrix: quality $arm: EXACT"
     else

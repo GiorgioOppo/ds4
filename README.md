@@ -788,13 +788,14 @@ arithmetic:
   dispatch while keeping `ncols_dst=1`;
   `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1` restores the per-token grouped loop
   and `DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1` restores the per-group loop;
-- for prefill widths above eight, the experimental
-  `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL=1` path quantizes the strided
-  `[token][group][K]` input in one launch and writes each group directly into
-  `[token][group][rank]`. It removes the eight F32 pack/unpack copies while
-  keeping one established stream-K MMQ reduction per group. Add
-  `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL=1` for fail-closed tests;
-  `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` is the dominant local rollback;
+- for prefill widths above eight, the default eligible GB10 path quantizes the
+  strided `[token][group][K]` input in one launch and writes each group directly
+  into `[token][group][rank]`. It removes the eight F32 pack/unpack copies while
+  keeping one established stream-K MMQ reduction per group. Set
+  `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` for the dominant local rollback;
+  exact `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL=0` is also a compatibility
+  opt-out. Add `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL=1` for fail-closed
+  tests. The separate single-grid/grid.z submission remains opt-in;
 - attention-output B keeps its canonical MMVQ result and the ordinary HC
   epilogue inside the graph-compatible fused call.  The row-packed epilogue
   remains oracle-only until a GB10 device run proves it bit-exact;

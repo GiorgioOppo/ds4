@@ -44124,8 +44124,12 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         "DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE", 0);
     const int grouped_batch_enable = cuda_env_flag_enabled(
         "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH", 0);
+    /* The direct-strided eight-grid path preserves the canonical MMQ
+     * reduction tree and is the GB10 prefill default. Exact ENABLE=0 is a
+     * compatibility opt-out; the presence-based NO switch remains the
+     * authoritative rollback. The separate grid.z candidate stays opt-in. */
     const int grouped_prefill_enable = cuda_env_flag_enabled(
-        "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL", 0);
+        "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL", 1);
     const int grouped_prefill_disable =
         getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL") != NULL;
     const int grouped_single_grid_enable = cuda_env_flag_enabled(
@@ -44183,9 +44187,9 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
                   (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
                   cuda_decode_stream());
         /* NOT_APPLICABLE is returned before allocation or enqueue, so the
-         * opt-in candidate can safely fall back to the established grouped
-         * implementation.  Every other failure may follow an enqueue and
-         * remains fail-closed. */
+         * opt-in single-grid candidate can safely fall back to the default
+         * eight-grid grouped implementation. Every other failure may follow
+         * an enqueue and remains fail-closed. */
         if (rc == DS4_MMQ_NOT_APPLICABLE && grouped_single_grid_selected) {
             if (grouped_single_grid_require) {
                 fprintf(stderr,
