@@ -1134,24 +1134,41 @@ per-layer chunk dispatch path.
 ## Capability Evaluation
 
 `ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
-runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
-security benchmark score: the questions are an embedded 92-item subset chosen
-to make local regression testing useful and visually inspectable. The program
-loads the real GGUF, renders DeepSeek chat prompts, streams sampled tokens in a split-screen TUI, grades
-the final answer, and prints a per-question report with prompt tokens,
-generated tokens, pass/fail state, the model answer, and the correct answer.
+runner and its results are not official benchmark scores. The default `core`
+suite is the original 92-item set. A separate 50-item `hard` suite adds harder
+science, math, logic, and defensive code-review problems. The program loads the
+real GGUF, renders chat prompts, streams sampled tokens in a split-screen TUI,
+grades the final answer, and prints a per-question report.
 
 ```sh
 ./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
 ```
 
-The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
-`</think>` budget cutoff so the model has room to produce a visible answer.
+Run the short hard-suite gate before a full hard pass:
+
+```sh
+./ds4-eval -m ds4flash.gguf --suite hard-smoke
+./ds4-eval -m ds4flash.gguf --suite hard --retry-incomplete
+```
+
+Use `--suite all` for both sets. `--source`, `--domain`, and `--case-id` narrow
+the selection; `--list-cases` shows the resulting order without loading a
+model. `--validate-cases` checks IDs, keys, answer formats, and suite metadata.
+
+The core suite uses a 16,000-token generation budget. Hard cases carry smaller
+per-case budgets where appropriate; `--tokens` overrides all of them. Thinking
+mode and the soft/hard `</think>` cutoff remain enabled so the model has room to
+produce a visible answer.
 `ds4-eval` sizes the context internally from the largest selected prompt plus
 the generation budget, and refuses runs that would need more than 1M context
 tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
 `--plain` disables the TUI.
+
+Live runs are graded only when their last non-empty line contains `Answer:`.
+Otherwise the result is `INCOMPLETE`, not a wrong answer.
+`--retry-incomplete` repeats that case once with twice its normal budget. Old
+trace files retain their original loose regrading behavior.
 
 Use `--regrade-trace /path/to/trace.txt` to replay the current answer
 extractor and scorer against a prior `--trace` file without loading the model
@@ -1181,7 +1198,7 @@ The generated-token counts must stay aligned with the baseline:
 | 3 | `PASSED` | 666 | `70` / `70` |
 | 4 | `FAILED` | 2048 | `A` / `C` |
 
-The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
+The first 75 core questions are interleaved as 25 GPQA Diamond, 25 audited
 SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
 subset of reduced single-function C/C++ vulnerability-localization questions.
 The model is asked for the single best source line, or the smallest exact line
@@ -1196,6 +1213,12 @@ rows.
 
 The set should be treated as a hard capability regression suite rather than
 a pass/fail unit test.
+
+The separate hard suite contains 30 MMLU-Pro, 10 OlympiadBench, 5 LiveBench,
+and 5 NIST Juliet-derived cases. It covers multiple choice, exact integers,
+reduced fractions, short exact answers, ordered sequences, and security line
+sets. Source revisions, licenses, selected IDs, and transformations are recorded
+in [EVAL_DATA.md](EVAL_DATA.md).
 
 - **GPQA Diamond** contributes graduate-level science questions with
   multiple-choice answers. DeepSeek's model card reports strong results
