@@ -44674,3 +44674,39 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
+
+/* The TP flag-fold and deferred kv-norm paths are Metal-only optimizations;
+ * non-Apple backends always take the plain fallback (add without the checked
+ * flag, kv norm always standalone). */
+extern "C" int ds4_gpu_add_tensor_tp_flag(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n,
+        uint32_t              layer,
+        uint32_t              gate) {
+    (void)layer; (void)gate;
+    return ds4_gpu_add_tensor(out, a, b, n);
+}
+
+extern "C" void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;
+}
+
+extern "C" void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void) {
+}
+
+extern "C" int ds4_gpu_kv_norm_task_pending(void) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_kv_norm_task_flush(void) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_kv_norm_task_begin_concurrent(void) {
+    return 0;
+}
+
+extern "C" void ds4_gpu_kv_norm_task_end_concurrent(void) {
+}
