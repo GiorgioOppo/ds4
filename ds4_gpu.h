@@ -148,6 +148,7 @@ int ds4_gpu_parallel_ffn_start_split(
         uint32_t              n_expert,
         uint32_t              n_expert_used,
         uint32_t              shift_q16);
+#endif
 
 /* out = a + b into this rank's TP slab slot for (layer, gate), publishing the
  * gate's checked flag from the same kernel; falls back to ds4_gpu_add_tensor
@@ -173,7 +174,6 @@ int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
-#endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
