@@ -190,6 +190,8 @@ static void test_session_snapshot_roundtrip(void) {
                             "Give one concise reason to test session restore.");
     ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
     TEST_ASSERT(prompt.len > 0);
+    fprintf(stderr, "ds4-test: snapshot prompt=%d ctx=%u glm_mtp=%d\n",
+            prompt.len, ctx, test_glm_mtp);
     TEST_ASSERT(ds4_session_sync(reference, &prompt, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_session_top_logprobs(reference, before, 8) == 8);
     TEST_ASSERT(ds4_session_save_snapshot(reference, &snapshot,
