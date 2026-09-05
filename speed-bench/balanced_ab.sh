@@ -24,18 +24,25 @@
 #
 # CAVEAT WORTH KNOWING BEFORE YOU COMPARE ANYTHING
 #
-# Above ctx 8192 ds4-bench stops prefilling the whole context and prefills
-# half of it:
+# ds4-bench prefills only the STEP INCREMENT at each point of a sweep, reusing
+# the KV cache built by the previous point. prefill_tokens equals ctx_tokens
+# only at the first point:
 #
-#     ctx_tokens   prefill_tokens
-#     8192         8192
-#     16384        8192
-#     32768        16384
-#     65536        32768
+#     --ctx-start 2048 --ctx-max 8192 --step-incr 2048
+#         ctx 2048 -> prefill 2048     ctx 4096 -> prefill 2048
+#         ctx 6144 -> prefill 2048     ctx 8192 -> prefill 2048
 #
-# So prefill_tps at ctx 65536 and prefill_tps at ctx 8192 do not describe the
-# same amount of work. Compare within one context point, or compare
-# prefill_tokens/second explicitly.
+#     --ctx-start 8192 --ctx-max 65536 --step-mul 2
+#         ctx 8192 -> prefill 8192     ctx 16384 -> prefill 8192
+#         ctx 32768 -> prefill 16384   ctx 65536 -> prefill 32768
+#
+# So "prefill_tps at ctx 8192" is not one quantity. It is a cold 8192-token
+# prefill in the first sweep, and a 2048-token increment onto a warm cache in
+# the second. We measured the difference: Q4 leads Q8 by about 0.4% on the cold
+# full prefill and by about 2.3% on the warm increment, at the same ctx.
+#
+# Only compare runs with the same --ctx-start and the same step. The summary
+# CSV records prefill_tokens next to prefill_tps so this stays checkable.
 #
 # USAGE
 #
