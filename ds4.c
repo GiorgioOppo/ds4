@@ -69824,6 +69824,21 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
             ok = metal_graph_dspark_capture_prefill_layer(pg, il, start, rows);
         }
     }
+    const int prefill_src_tier = pg->active_tier;
+    ds4_gpu_tensor *saved_prefill_cur = NULL;
+    ds4_gpu_tensor *last_prefill_hc = NULL;
+    if (ok) {
+        saved_prefill_cur = pg->cur_hc_by_tier[prefill_src_tier];
+        last_prefill_hc = metal_graph_tensor_row_view(
+                metal_graph_batch_cur_hc(pg), rows - 1u, hc_dim);
+        ok = last_prefill_hc != NULL;
+    }
+    if (ok) {
+        pg->cur_hc_by_tier[prefill_src_tier] = last_prefill_hc;
+        ok = metal_graph_encode_output_head(
+                pg, &e->model, &e->weights, e->weights.output->dim[1]);
+        pg->cur_hc_by_tier[prefill_src_tier] = saved_prefill_cur;
+    }
     /* Decode graphs retain their established session-major ordering. Some
      * decode kernels use the engine-shared prefill scratch as transient
      * reduction space, so alternating prefill and decode at layer granularity
@@ -69847,27 +69862,11 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
                 ok = metal_graph_dspark_capture_decode_layer(g, il);
             }
         }
-    }
-
-    const int prefill_src_tier = pg->active_tier;
-    ds4_gpu_tensor *saved_prefill_cur = NULL;
-    ds4_gpu_tensor *last_prefill_hc = NULL;
-    if (ok) {
-        saved_prefill_cur = pg->cur_hc_by_tier[prefill_src_tier];
-        last_prefill_hc = metal_graph_tensor_row_view(
-                metal_graph_batch_cur_hc(pg), rows - 1u, hc_dim);
-        ok = last_prefill_hc != NULL;
-    }
-    if (ok) {
-        pg->cur_hc_by_tier[prefill_src_tier] = last_prefill_hc;
-        ok = metal_graph_encode_output_head(
-                pg, &e->model, &e->weights, e->weights.output->dim[1]);
-        pg->cur_hc_by_tier[prefill_src_tier] = saved_prefill_cur;
-    }
-    for (int i = 0; ok && i < count; i++) {
-        ok = metal_graph_encode_output_head(
-                &items[i].session->graph, &e->model, &e->weights,
-                e->weights.output->dim[1]);
+        /* TP may defer the final residual expansion. Consume its exchange
+         * buffers before another session reuses them, as ordinary decode does. */
+        if (ok) ok = metal_graph_flush_hc_expand(g);
+        if (ok) ok = metal_graph_encode_output_head(
+                g, &e->model, &e->weights, e->weights.output->dim[1]);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();

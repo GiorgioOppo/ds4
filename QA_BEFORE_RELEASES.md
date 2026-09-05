@@ -1139,6 +1139,15 @@ Both ranks exited cleanly; instrumented and ordinary retries, plus four- and
 six-session runs, passed. The cause was not established. Keep transport failures
 in the record even when reruns pass; do not hide them by increasing timeouts.
 
+Repeat the physical TP session oracle with two, four and six sessions. Do not
+set `DS4_TEST_SKIP_MIXED`: ordinary decode and the mixed continued-prefill step
+must both match full serial logits exactly. A regression once left the final
+TP residual update deferred in mixed mode, producing a maximum logit difference
+of 23.7409 despite choosing the same next token. Testing only argmax misses it.
+After flushing that update before the output head, September 5 MXFP4 TP tests
+passed exactly at all three session counts; mixed Q2/Q4 passed at six sessions
+both in TP and on a single host.
+
 Do not discard slow runs as noise: separate-process tests sometimes varied
 by about 20%, including ordinary decoding. Vision Exp prose showed slower
 outliers; matched GPU-monitored reruns measured about 41.1 versus 38.4 t/s,
