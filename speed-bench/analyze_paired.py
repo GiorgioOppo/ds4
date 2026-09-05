@@ -37,6 +37,10 @@ def read_rows(path, metric):
                 continue
             if value <= 0.0:
                 continue
+            try:
+                ptok = int(row["prefill_tokens"])
+            except (TypeError, ValueError, KeyError):
+                ptok = None
             rows.append(
                 {
                     "block": row["block"],
@@ -44,10 +48,35 @@ def read_rows(path, metric):
                     "position": int(row["position"]),
                     "arm": row["arm"],
                     "ctx": int(row["ctx"]),
+                    "prefill_tokens": ptok,
                     "value": value,
                 }
             )
     return rows
+
+
+def check_prefill_tokens(rows):
+    """ds4-bench prefills only the step increment at each sweep point, so
+    prefill_tokens equals ctx_tokens at the first point and nowhere else. Two
+    runs can share a ctx and still be measuring different operations - a cold
+    full prefill in one, a small increment onto a warm cache in the other.
+    Averaging across that mismatch produces a number that describes neither."""
+    seen = defaultdict(set)
+    for r in rows:
+        if r["prefill_tokens"] is not None:
+            seen[r["ctx"]].add(r["prefill_tokens"])
+    bad = {ctx: vals for ctx, vals in seen.items() if len(vals) > 1}
+    if bad:
+        lines = ["prefill_tokens is not consistent within a context point:"]
+        for ctx in sorted(bad):
+            lines.append(f"  ctx {ctx}: prefill_tokens "
+                         f"{sorted(bad[ctx])}")
+        lines.append("")
+        lines.append("These rows measure different operations and must not be "
+                     "pooled. Re-run with one --ctx-start and one step, or "
+                     "split the CSV by sweep shape first.")
+        sys.exit("\n".join(lines))
+    return {ctx: next(iter(vals)) for ctx, vals in seen.items()}
 
 
 def ci95(values):
@@ -97,6 +126,8 @@ def main():
     if not rows:
         sys.exit(f"no usable rows for metric {args.metric} in {args.csv_path}")
 
+    ptok_by_ctx = check_prefill_tokens(rows)
+
     arms = sorted({r["arm"] for r in rows})
     if len(arms) != 2:
         sys.exit(f"expected exactly 2 arms, found: {arms}")
@@ -120,8 +151,9 @@ def main():
     print(f"paired samples: {sum(len(v) for v in per_ctx.values())}"
           f"   incomplete cells dropped: {unpaired}")
     print()
-    print(f"{'ctx':>8}  {'n':>3}  {'paired A/B':>12}  {'95% CI':>18}  {'naive A/B':>10}")
-    print("-" * 62)
+    print(f"{'ctx':>8}  {'pref':>6}  {'n':>3}  {'paired A/B':>12}  "
+          f"{'95% CI':>18}  {'naive A/B':>10}")
+    print("-" * 70)
 
     all_ratios = []
     for ctx in sorted(per_ctx):
@@ -132,15 +164,19 @@ def main():
         b_vals = [r["value"] for r in rows if r["ctx"] == ctx and r["arm"] == b_label]
         naive = statistics.median(a_vals) / statistics.median(b_vals)
         lo, hi = (mean - half) * 100 - 100, (mean + half) * 100 - 100
-        print(f"{ctx:>8}  {len(ratios):>3}  {mean * 100 - 100:>+11.2f}%  "
+        ptok = ptok_by_ctx.get(ctx)
+        ptok_s = str(ptok) if ptok is not None else "?"
+        print(f"{ctx:>8}  {ptok_s:>6}  {len(ratios):>3}  "
+              f"{mean * 100 - 100:>+11.2f}%  "
               f"[{lo:>+6.2f}%, {hi:>+6.2f}%]  {naive * 100 - 100:>+9.2f}%")
 
     mean, half = ci95(all_ratios)
     a_all = [r["value"] for r in rows if r["arm"] == a_label]
     b_all = [r["value"] for r in rows if r["arm"] == b_label]
     naive_all = statistics.median(a_all) / statistics.median(b_all)
-    print("-" * 62)
-    print(f"{'all':>8}  {len(all_ratios):>3}  {mean * 100 - 100:>+11.2f}%  "
+    print("-" * 70)
+    print(f"{'all':>8}  {'':>6}  {len(all_ratios):>3}  "
+          f"{mean * 100 - 100:>+11.2f}%  "
           f"[{(mean - half) * 100 - 100:>+6.2f}%, {(mean + half) * 100 - 100:>+6.2f}%]  "
           f"{naive_all * 100 - 100:>+9.2f}%")
 

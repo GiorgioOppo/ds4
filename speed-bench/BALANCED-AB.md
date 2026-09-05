@@ -90,19 +90,39 @@ ratios and is a summary, not a measurement.
 
 ## Two traps worth knowing before you compare anything
 
-**Above ctx 8192, `prefill_tokens` is half of `ctx_tokens`.**
+**`prefill_tokens` is the step increment, not the context.** At each point of a
+sweep `ds4-bench` prefills only the tokens added since the previous point,
+reusing the KV cache already built. It equals `ctx_tokens` at the first point
+and nowhere else:
 
 ```
-ctx_tokens   prefill_tokens
-8192         8192
-16384        8192
-32768        16384
-65536        32768
+--ctx-start 2048 --ctx-max 8192 --step-incr 2048
+    ctx 2048  -> prefill 2048        ctx 4096  -> prefill 2048
+    ctx 6144  -> prefill 2048        ctx 8192  -> prefill 2048
+
+--ctx-start 8192 --ctx-max 65536 --step-mul 2
+    ctx 8192  -> prefill 8192        ctx 16384 -> prefill 8192
+    ctx 32768 -> prefill 16384       ctx 65536 -> prefill 32768
 ```
 
-A `prefill_tps` at ctx 65536 and one at ctx 8192 are not measuring the same
-quantity of work, so a sweep that spans the boundary cannot be read as one
-curve. Compare within a context point.
+This is the trap: **"prefill_tps at ctx 8192" is not one quantity.** In the
+first sweep it is a 2048-token increment onto a warm cache; in the second it is
+a cold 8192-token prefill. Two people can report that number for the same
+context, the same model and the same machine, and be measuring different
+operations.
+
+It is not a small effect. Measuring the same models at ctx 8192 both ways:
+
+| what is actually measured | Q4 vs Q8 |
+|---|---|
+| cold 8192-token prefill | **+0.4%** |
+| 2048-token increment onto a warm cache | **+2.3%** |
+
+Both numbers are correct. They answer different questions.
+
+So: only compare runs with the same `--ctx-start` and the same step, and quote
+`prefill_tokens` whenever you quote `prefill_tps`. The summary CSV records them
+side by side, and `analyze_paired.py` refuses to average across a mismatch.
 
 **Check that two prompt files really are two prompts.** We spent a window
 chasing a difference we had attributed to prompt length, before checking:
