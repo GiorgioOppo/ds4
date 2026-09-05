@@ -44,6 +44,11 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_k128_enqueue(
     uint32_t n_groups, uint32_t in_dim, uint32_t out_dim,
     uint64_t row_bytes, uint64_t x_token_stride,
     uint64_t x_group_stride, uint64_t out_token_stride);
+extern "C" int ds4_rocm_bench_q4_K_wmma_k64_load4_enqueue(
+    void *out, const void *w, const void *x, uint32_t n_tok,
+    uint32_t n_groups, uint32_t in_dim, uint32_t out_dim,
+    uint64_t row_bytes, uint64_t x_token_stride,
+    uint64_t x_group_stride, uint64_t out_token_stride, uint32_t row_tile);
 extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void);
@@ -134,6 +139,7 @@ enum class bench_case {
     all,
     lds,
     lds_vector,
+    wmma_load4,
     dense,
     pair,
     qb,
@@ -654,7 +660,8 @@ bool benchmark_arms(const char *case_name, uint32_t n_tokens, uint32_t in_dim,
                     const arm &candidate,
                     const std::function<bool()> &oracle_prepare,
                     const std::function<bool()> &oracle,
-                    benchmark_rate rate = benchmark_rate::macs) {
+                    benchmark_rate rate = benchmark_rate::macs,
+                    bool balance_weight_order = false) {
     // Validate every rotating weight set and prime reusable Q8_K scratch
     // before any timed event.  This catches data-dependent path errors without
     // admitting readback or comparison work into the HIP-event interval.
@@ -714,7 +721,12 @@ bool benchmark_arms(const char *case_name, uint32_t n_tokens, uint32_t in_dim,
     for (uint32_t cycle = 0; a_samples.size() < cfg.samples; cycle++) {
         const uint32_t set0 = (cycle * 2u) % cfg.sets;
         const uint32_t set1 = (cycle * 2u + 1u) % cfg.sets;
-        if ((cycle & 1u) == 0u) {
+        // LOAD4: reverse each rotating set's order on the next traversal.
+        // Simple cycle parity pins even/odd sets to AB/BA for four sets.
+        const uint32_t period = cfg.sets % 2u ? cfg.sets : cfg.sets / 2u;
+        const uint32_t order = balance_weight_order
+            ? (cycle % period + cycle / period) : cycle;
+        if ((order & 1u) == 0u) {
             if (!take(baseline, set0, &a_samples) ||
                 !take(candidate, set0, &b_samples) ||
                 !take(candidate, set1, &b_samples) ||
@@ -961,6 +973,47 @@ bool run_lds(const model_fixture &model, const config &cfg,
                    check_guard(reference.ptr, bytes, "Q4 LDS reference") &&
                    check_guard(candidate.ptr, bytes, "Q4 LDS candidate");
         });
+}
+
+// Enqueue-only A/B: the old hook is explicitly LOAD2, the new strict hook
+// explicitly LOAD4. No mutable environment or production selector in timing.
+bool run_wmma_load4(const model_fixture &model, const config &cfg,
+                    uint32_t n, uint32_t k, uint32_t m, uint32_t groups,
+                    uint64_t weight_set::*offset, const char *label) {
+    if (!cfg.wmma_supported || n < 256u) return true;
+    const uint64_t elements = (uint64_t)n * groups * m;
+    const uint64_t bytes = elements * sizeof(float);
+    tensor_owner x((uint64_t)n * groups * k * sizeof(float));
+    tensor_owner a(bytes + kGuardWords * sizeof(uint32_t));
+    tensor_owner b(bytes + kGuardWords * sizeof(uint32_t));
+    if (!allocate_io(n, groups * k, elements, &x, &a, &b)) return false;
+    const void *xp = ds4_gpu_tensor_contents(x.ptr);
+    void *ap = ds4_gpu_tensor_contents(a.ptr);
+    void *bp = ds4_gpu_tensor_contents(b.ptr);
+    std::vector<const void *> weights;
+    if (!xp || !ap || !bp || !resolve_resident_weights(
+            model, offset, q4_weight_bytes(k, groups * m), &weights)) return false;
+    const uint32_t rows = shape_wmma_row_tile(m);
+    const uint64_t row_bytes = q4_weight_bytes(k, 1u);
+    const arm baseline = {"wmma_k64p80_load2", []() {}, [&](uint32_t set) {
+        return ds4_rocm_bench_q4_K_wmma_variant_enqueue(
+            ap, weights[set], xp, n, groups, k, m, row_bytes,
+            (uint64_t)groups * k, k, (uint64_t)groups * m, rows, 64u, 1) != 0;
+    }};
+    const arm candidate = {"wmma_k64p80_load4", []() {}, [&](uint32_t set) {
+        return ds4_rocm_bench_q4_K_wmma_k64_load4_enqueue(
+            bp, weights[set], xp, n, groups, k, m, row_bytes,
+            (uint64_t)groups * k, k, (uint64_t)groups * m, rows) != 0;
+    }};
+    return benchmark_arms(label, n, k, groups * m, cfg, baseline, candidate,
+        [&]() {
+            return poison_output(a.ptr, bytes, 0x7fc10001u) &&
+                   poison_output(b.ptr, bytes, 0x7fc20002u);
+        }, [&]() {
+            return bitwise_equal(a.ptr, b.ptr, bytes, label) &&
+                   check_guard(a.ptr, bytes, "K64 LOAD2 guard") &&
+                   check_guard(b.ptr, bytes, "K64 LOAD4 guard");
+        }, benchmark_rate::macs, true);
 }
 
 bool run_dense(const model_fixture &model, const config &cfg,
@@ -1907,7 +1960,7 @@ void usage(FILE *stream, const char *argv0) {
         stream,
         "usage: %s [options]\n\n"
         "Resident ROCm Q4_K prefill kernel A/B (HIP event timing only).\n\n"
-        "  --case all|lds|lds_vector|dense|pair|qb|outb|output\n"
+        "  --case all|lds|lds_vector|wmma_load4|dense|pair|qb|outb|output\n"
         "                              comparison to run (default: all)\n"
         "  --tokens N[,N...]          token counts, each 9..4096\n"
         "  --full                     use 9,16,17,31,32,33,128,256,257,512,4096\n"
@@ -1919,6 +1972,9 @@ void usage(FILE *stream, const char *argv0) {
         "Q-b K1024, with bitwise checks, launch evidence and identical tiling.\n"
         "lds_vector isolates four-word vs scalar LDS copies with the same\n"
         "streaming fence schedule; lds keeps the previous scalar-only A/B.\n"
+        "wmma_load4 isolates K64 float2/float4 loads at identical geometry\n"
+        "for dense, grouped output-A, output-B and q_b (N>=256, gfx1151).\n"
+        "The q_b comparison forces K64 on both arms, not production K128.\n"
         "dense compares legacy/TILE8, times the raw canonical/wave32 Q8_K\n"
         "quantizer kernels on gfx1151, and TILE8/direct WMMA there for N>=256\n"
         "at K=4096,M=1024. pair compares\n"
@@ -1993,6 +2049,7 @@ config parse_options(int argc, char **argv) {
             if (!std::strcmp(value, "all")) cfg.selected = bench_case::all;
             else if (!std::strcmp(value, "lds")) cfg.selected = bench_case::lds;
             else if (!std::strcmp(value, "lds_vector")) cfg.selected = bench_case::lds_vector;
+            else if (!std::strcmp(value, "wmma_load4")) cfg.selected = bench_case::wmma_load4;
             else if (!std::strcmp(value, "dense")) cfg.selected = bench_case::dense;
             else if (!std::strcmp(value, "pair")) cfg.selected = bench_case::pair;
             else if (!std::strcmp(value, "qb")) cfg.selected = bench_case::qb;
@@ -2077,7 +2134,8 @@ int main(int argc, char **argv) {
     cfg.wmma_supported = properties.warpSize == 32 &&
         std::strncmp(properties.gcnArchName, "gfx1151", 7u) == 0;
     const bool wmma_only_case =
-        cfg.selected == bench_case::outb || cfg.selected == bench_case::output;
+        cfg.selected == bench_case::outb || cfg.selected == bench_case::output ||
+        cfg.selected == bench_case::wmma_load4;
     const bool has_wmma_tokens = std::any_of(
         cfg.tokens.begin(), cfg.tokens.end(),
         [](uint32_t n_tokens) { return n_tokens >= 256u; });
@@ -2085,7 +2143,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr,
                      "rocm-q4-prefill-bench: SKIP (%s requires gfx1151 "
                      "wave32 and at least one N>=256 sample)\n",
-                     cfg.selected == bench_case::outb ? "outb" : "output");
+                     cfg.selected == bench_case::outb ? "outb" :
+                     (cfg.selected == bench_case::output ? "output" : "wmma_load4"));
         return 77;
     }
     if (!ds4_gpu_init()) {
@@ -2132,6 +2191,18 @@ int main(int argc, char **argv) {
             cfg.wmma_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
+            if (includes(cfg.selected, bench_case::wmma_load4)) {
+                ok = run_wmma_load4(model, cfg, n_tokens, kDenseK, kDenseM, 1u,
+                                   &weight_set::dense_offset, "dense_k64_load4") &&
+                     run_wmma_load4(model, cfg, n_tokens, kDenseK, kOutputRank,
+                                   kOutputGroups, &weight_set::output_a_offset,
+                                   "output_a_k64_load4") &&
+                     run_wmma_load4(model, cfg, n_tokens, kOutputLowDim, kOutputM,
+                                   1u, &weight_set::output_b_offset, "output_b_k64_load4") &&
+                     run_wmma_load4(model, cfg, n_tokens, kQbK, kQbM, 1u,
+                                   &weight_set::qb_offset, "q_b_k64_load4") && ok;
+                if (!ok) break;
+            }
             if (includes(cfg.selected, bench_case::lds)) {
                 ok = run_lds(model, cfg, n_tokens, false) &&
                      run_lds(model, cfg, n_tokens, true) && ok;

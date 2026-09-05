@@ -134,6 +134,7 @@ help:
 	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
 	@echo "  make test-rocm-q4-lds-host Check Q4 prefill LDS addressing and fence schedule without HIP"
+	@echo "  make test-rocm-q4-wmma-load-host Check Q4 K64 float4 loader policy/addressing without HIP"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make metal-q4-dense-pair-bench  Build the resident Q4 decode pair kernel benchmark"
@@ -396,7 +397,7 @@ test-metal-exactn-oracle: tests/test_metal_exactn_oracle
 speed-bench/metal_q4_dense_pair_bench: speed-bench/metal_q4_dense_pair_bench.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 
-.PHONY: test-metal-ssd-decode-kernels bench-metal-q8-mv bench-metal-q4-token-pair
+.PHONY: test-metal-ssd-decode-kernels bench-metal-q8-mv bench-metal-q4-token-pair bench-metal-q4-single-vec
 .PHONY: test-metal-q4-qb-token-pair
 tests/test_metal_q4_qb_token_pair: tests/test_metal_q4_qb_token_pair.m ds4_gpu.h ds4_image.o ds4_metal.o
 	$(CC) $(OBJCFLAGS) -I. -o $@ $< ds4_image.o ds4_metal.o $(METAL_LDLIBS)
@@ -415,6 +416,9 @@ bench-metal-q8-mv: tests/test_metal_ssd_decode_kernels
 
 bench-metal-q4-token-pair: tests/test_metal_ssd_decode_kernels
 	./tests/test_metal_ssd_decode_kernels --bench-q4-token-pair
+
+bench-metal-q4-single-vec: tests/test_metal_ssd_decode_kernels
+	./tests/test_metal_ssd_decode_kernels --bench-q4-single-vec
 
 metal-q4-dense-pair-bench: speed-bench/metal_q4_dense_pair_bench
 
@@ -898,6 +902,48 @@ tests/test_rocm_q4_lds_host: tests/test_rocm_q4_lds_host.cpp rocm/ds4_rocm_q4_ld
 test-rocm-q4-lds-host: tests/test_rocm_q4_lds_host
 	./tests/test_rocm_q4_lds_host
 
+.PHONY: test-rocm-q4-wmma-load-host
+tests/test_rocm_q4_wmma_load_host: tests/test_rocm_q4_wmma_load_host.cpp rocm/ds4_rocm_q4_wmma_load.cuh
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -I. -o $@ $<
+
+test-rocm-q4-wmma-load-host: tests/test_rocm_q4_wmma_load_host
+	./tests/test_rocm_q4_wmma_load_host
+
+.PHONY: test-rocm-q4-decode-host
+tests/test_rocm_q4_decode_host: tests/test_rocm_q4_decode_host.cpp rocm/ds4_rocm_q4_decode.cuh
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -fno-fast-math -I. -o $@ $<
+
+test-rocm-q4-decode-host: tests/test_rocm_q4_decode_host
+	./tests/test_rocm_q4_decode_host
+
+.PHONY: test-rocm-q4-decode-lane4 bench-rocm-q4-decode-lane4
+tests/test_rocm_q4_decode_lane4.o: tests/test_rocm_q4_decode_lane4.cpp ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -std=c++17 -fno-fast-math -I. -c -o $@ $<
+
+tests/test_rocm_q4_decode_lane4: tests/test_rocm_q4_decode_lane4.o ds4_image.o ds4_rocm.o $(ROCM_MMQ_OBJS) ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+ROCM_Q4_DECODE_TEST_ARGS ?=
+test-rocm-q4-decode-lane4:
+	@lane4_hipcc="$(strip $(HIPCC))"; \
+	if [ -z "$$lane4_hipcc" ]; then lane4_hipcc="$$(command -v hipcc 2>/dev/null || true)"; fi; \
+	lane4_probe="$${lane4_hipcc%% *}"; \
+	if [ -z "$$lane4_probe" ] || ! command -v "$$lane4_probe" >/dev/null 2>&1; then \
+		if [ -n "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" ] && [ "$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" != "0" ]; then \
+			echo "ROCm Q4 lane4: FAIL (hipcc not found, device required)"; exit 1; \
+		fi; \
+		echo "ROCm Q4 lane4: SKIP (hipcc not found)"; exit 0; \
+	fi; \
+	$(MAKE) --no-print-directory tests/test_rocm_q4_decode_lane4 HIPCC="$$lane4_hipcc" || exit $$?; \
+	DS4_TEST_REQUIRE_ROCM_DEVICE="$(strip $(DS4_TEST_REQUIRE_ROCM_DEVICE))" \
+		./tests/test_rocm_q4_decode_lane4 $(ROCM_Q4_DECODE_TEST_ARGS); \
+	rc=$$?; \
+	if [ $$rc -eq 77 ]; then echo "ROCm Q4 lane4: SKIP (no HIP device)"; exit 0; fi; \
+	exit $$rc
+
+bench-rocm-q4-decode-lane4:
+	$(MAKE) test-rocm-q4-decode-lane4 ROCM_Q4_DECODE_TEST_ARGS="--bench $(ROCM_Q4_DECODE_TEST_ARGS)"
+
 tests/test_rocm_q4_dense_pair.o: tests/test_rocm_q4_dense_pair.cpp ds4_gpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -std=c++17 -fno-fast-math -I. -c -o $@ $<
 
@@ -944,6 +990,10 @@ test-rocm-q4-pair:
 
 test-rocm-q4-prefill:
 	$(MAKE) --no-print-directory test-rocm-q4-parity ROCM_Q4_TEST_ARGS=--prefill
+
+.PHONY: test-rocm-q4-prefill-load4
+test-rocm-q4-prefill-load4:
+	$(MAKE) --no-print-directory test-rocm-q4-parity ROCM_Q4_TEST_ARGS=--prefill-wmma-load4
 
 test-strix-rocm-q4-parity:
 	$(MAKE) --no-print-directory -B test-rocm-q4-parity ROCM_ARCH=gfx1151 DS4_TEST_REQUIRE_ROCM_DEVICE=1
@@ -1122,7 +1172,10 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
+	rm -f tests/test_rocm_q4_decode_host
+	rm -f tests/test_rocm_q4_decode_lane4
 	rm -f tests/test_rocm_q4_lds_host
+	rm -f tests/test_rocm_q4_wmma_load_host
 	rm -f tests/test_metal_q4_qb_token_pair
 	rm -f tests/test_q4_epilogue_host tests/test_cuda_q4_epilogue
 	rm -f tests/test_q8_quantize_host tests/test_cuda_q8_quantize

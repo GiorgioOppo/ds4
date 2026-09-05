@@ -7,6 +7,8 @@
 // single reusable scratch arena whose lifetime is protected by that ordering.
 
 #include "ds4_rocm_q4_lds.cuh"
+#include "ds4_rocm_q4_decode.cuh"
+#include "ds4_rocm_q4_wmma_load.cuh"
 
 static_assert(sizeof(cuda_block_q4_K) == 144u,
               "ROCm Q4_K block layout must match GGUF");
@@ -36,6 +38,96 @@ __global__ static void rocm_matmul_q4_K_dense_kernel(
     }
     acc = quarter_warp_sum_f32(acc, lane);
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+/* Experimental standalone Q-b decode only. Keep the generic loop, block
+ * dot and Q8_K inputs; dispatch guarantees exactly four K blocks. Removing
+ * the four empty workers doubles rows/workgroup, not arithmetic throughput
+ * by assertion. GPU parity and timing are required before any promotion. */
+__global__ static void rocm_matmul_q4_K_dense_decode_lane4_kernel(
+        float *out, const char *w_base, const cuda_block_q8_K *xq,
+        uint64_t row_bytes, uint32_t xq_blocks, uint32_t out_dim,
+        uint32_t n_tok) {
+    const uint32_t lane = ds4_rocm_q4_decode::lane(threadIdx.x);
+    const uint32_t row = ds4_rocm_q4_decode::row(blockIdx.x, threadIdx.x);
+    const uint32_t tok = blockIdx.y;
+    if (tok >= n_tok || row >= out_dim) return;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr = reinterpret_cast<const cuda_block_q4_K *>(
+        w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+    }
+    acc = ds4_rocm_q4_decode::canonical_offset4(acc);
+    const MASK_T mask = static_cast<MASK_T>(
+        ds4_rocm_q4_decode::mask(threadIdx.x, warpSize));
+    acc += __shfl_down_sync(mask, acc, 2, 4);
+    acc += __shfl_down_sync(mask, acc, 1, 4);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+// Same-host-thread launch oracle, not a device-completion/performance counter.
+// No atomics or counter updates on the default/rollback path.
+static thread_local uint64_t g_rocm_q4_decode_lane4_launches;
+extern "C" void ds4_rocm_test_q4_decode_lane4_reset(void) {
+    g_rocm_q4_decode_lane4_launches = 0u;
+}
+extern "C" uint64_t ds4_rocm_test_q4_decode_lane4_get_calls(void) {
+    return g_rocm_q4_decode_lane4_launches;
+}
+
+static uint32_t rocm_q4_decode_lane4_runtime_wave_size(void) {
+#if defined(__HIP_PLATFORM_AMD__)
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0) return 0u;
+    static thread_local int cached_device = -1;
+    static thread_local uint32_t cached_wave = 0u;
+    if (cached_device == device) return cached_wave;
+    cudaDeviceProp prop = {};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return 0u;
+    cached_device = device;
+    cached_wave = (uint32_t)prop.warpSize;
+    return cached_wave;
+#else
+    return 0u;
+#endif
+}
+
+static int rocm_q4_decode_lane4_select(
+        uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    // Presence semantics, like dense-pair: even DISABLE=0 means rollback.
+    const bool required = getenv("DS4_ROCM_REQUIRE_Q4_DECODE_LANE4") != NULL;
+    // Only REQUIRE needs checking outside the exact scope. Do not cache the
+    // environment: native same-process A/B deliberately changes these flags.
+    if (!ds4_rocm_q4_decode::shape(in_dim, out_dim, n_tok)) {
+        if (!required) return ds4_rocm_q4_decode::fallback;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "required Q4 decode lane4 outside K1024/M32768/N1..8 "
+                "(K=%llu M=%llu N=%llu)\n",
+                (unsigned long long)in_dim, (unsigned long long)out_dim,
+                (unsigned long long)n_tok);
+        return ds4_rocm_q4_decode::required_failure;
+    }
+    const bool enabled = required ||
+        getenv("DS4_ROCM_ENABLE_Q4_DECODE_LANE4") != NULL;
+    if (!enabled) return ds4_rocm_q4_decode::fallback;
+    const bool disabled = getenv("DS4_ROCM_DISABLE_Q4_DECODE_LANE4") != NULL;
+    // Intended arithmetic is exact, but GPU parity/codegen are not validated.
+    // Keep quality-mode on the canonical path until that evidence exists.
+    const uint32_t wave = !disabled && !g_quality_mode
+        ? rocm_q4_decode_lane4_runtime_wave_size() : 0u;
+    const int decision = ds4_rocm_q4_decode::select(
+        in_dim, out_dim, n_tok, wave, g_quality_mode, enabled, disabled, required);
+    if (decision == ds4_rocm_q4_decode::required_failure) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "required Q4 decode lane4 unavailable "
+                "(K=%llu M=%llu N=%llu wave=%u disabled=%d quality=%d)\n",
+                (unsigned long long)in_dim, (unsigned long long)out_dim,
+                (unsigned long long)n_tok, wave, (int)disabled,
+                g_quality_mode ? 1 : 0);
+    }
+    return decision;
 }
 
 /* Latency-oriented pair variant of the canonical dense kernel.  Concatenating
@@ -388,9 +480,12 @@ __global__ static void rocm_matmul_q4_K_prefill_wmma_rowtile_strided_kernel(
  *
  * A padded 80-half LDS pitch keeps every 16-half WMMA load 32-byte aligned
  * while rotating successive token rows across LDS banks.  Natural pitch 64
- * would map every 128-byte row to the same bank pattern on RDNA wave32. */
+ * would map every 128-byte row to the same bank pattern on RDNA wave32.
+ * LOAD4 changes only the aligned activation loader. The default template
+ * argument keeps all existing enqueue-only benchmark hooks on their original
+ * LOAD2/scalar instantiations, independent of the production opt-out. */
 template <uint32_t ROW_TILE, uint32_t WAVES, uint32_t MIN_BLOCKS,
-          bool LOAD2>
+          bool LOAD2, bool LOAD4 = false>
 __launch_bounds__(WAVES * 32u, MIN_BLOCKS)
 __global__ static void
 rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel(
@@ -434,6 +529,12 @@ rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel(
     ds4_q4_float8_t acc3 = acc0;
     __shared__ __align__(32) _Float16
         lds_x[ROCM_Q4_WMMA_TOKEN_TILE * ROCM_Q4_WMMA_K64_LDS_PITCH];
+    static_assert(ROCM_Q4_WMMA_K64_LDS_PITCH ==
+                      ds4_rocm_q4_wmma_load::pitch &&
+                  ROCM_Q4_WMMA_K64_TILE == ds4_rocm_q4_wmma_load::columns &&
+                  ROCM_Q4_WMMA_TOKEN_TILE == ds4_rocm_q4_wmma_load::tokens,
+                  "K64 float4 loader must match the WMMA LDS layout");
+    static_assert(!LOAD4 || LOAD2, "float4 extends the aligned float2 loader");
 
     for (uint32_t block_index = 0u; block_index < q4_blocks;
          block_index++) {
@@ -452,7 +553,31 @@ rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel(
                 sizeof(packed1));
 
             const uint32_t group32_base = block_index * 8u + qpair * 2u;
-            if constexpr (LOAD2) {
+            if constexpr (LOAD4) {
+                // Four adjacent F32 values, with the same two pairwise RN
+                // conversions/stores as LOAD2. No wider LDS footprint, new
+                // precision boundary, or change to WMMA accumulation order.
+                for (uint32_t j = tid * 4u;
+                     j < ROCM_Q4_WMMA_TOKEN_TILE * ROCM_Q4_WMMA_K64_TILE;
+                     j += blockDim.x * 4u) {
+                    half2 value01 = __floats2half2_rn(0.0f, 0.0f);
+                    half2 value23 = value01;
+                    if (tok0 + ds4_rocm_q4_wmma_load::token(j) < n_tok) {
+                        const float4 values =
+                            *reinterpret_cast<const float4 *>(
+                                x + ds4_rocm_q4_wmma_load::source(
+                                    j, tok0, group,
+                                    group32_base * ROCM_Q4_WMMA_K_TILE,
+                                    x_token_stride, x_group_stride));
+                        value01 = __floats2half2_rn(values.x, values.y);
+                        value23 = __floats2half2_rn(values.z, values.w);
+                    }
+                    _Float16 *const dst =
+                        lds_x + ds4_rocm_q4_wmma_load::destination(j);
+                    *reinterpret_cast<half2 *>(dst) = value01;
+                    *reinterpret_cast<half2 *>(dst + 2u) = value23;
+                }
+            } else if constexpr (LOAD2) {
                 for (uint32_t j = tid * 2u;
                      j < ROCM_Q4_WMMA_TOKEN_TILE * ROCM_Q4_WMMA_K64_TILE;
                      j += blockDim.x * 2u) {
@@ -1557,6 +1682,7 @@ enum {
  * not merely produce output through a canonical fallback. */
 static uint64_t g_rocm_q4_prefill_wmma_launches;
 static uint64_t g_rocm_q4_prefill_wmma_k64_launches;
+static uint64_t g_rocm_q4_prefill_wmma_k64_load4_launches;
 static uint64_t g_rocm_q4_prefill_wmma_k128_launches;
 static int g_rocm_q4_prefill_tile8_report_registered;
 
@@ -1575,6 +1701,8 @@ extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void) {
                      __ATOMIC_RELAXED);
     __atomic_store_n(&g_rocm_q4_prefill_wmma_k64_launches, 0u,
                      __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rocm_q4_prefill_wmma_k64_load4_launches, 0u,
+                     __ATOMIC_RELAXED);
     __atomic_store_n(&g_rocm_q4_prefill_wmma_k128_launches, 0u,
                      __ATOMIC_RELAXED);
 }
@@ -1591,6 +1719,11 @@ extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void) {
 
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k128_get_calls(void) {
     return __atomic_load_n(&g_rocm_q4_prefill_wmma_k128_launches,
+                           __ATOMIC_RELAXED);
+}
+
+extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_load4_get_calls(void) {
+    return __atomic_load_n(&g_rocm_q4_prefill_wmma_k64_load4_launches,
                            __ATOMIC_RELAXED);
 }
 
@@ -1860,14 +1993,20 @@ static void rocm_q4_K_prefill_wmma_k64_enqueue(
         uint64_t x_group_stride,
         uint64_t out_token_stride,
         uint32_t row_tile,
-        int load2) {
+        int load2,
+        int load4 = 0) {
     const dim3 grid(
         (unsigned)(((uint64_t)out_dim + row_tile - 1u) / row_tile),
         (unsigned)(((uint64_t)n_tok + ROCM_Q4_WMMA_TOKEN_TILE - 1u) /
                    ROCM_Q4_WMMA_TOKEN_TILE),
         n_groups);
     if (row_tile == 256u) {
-        if (load2) {
+        if (load4) {
+            rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel<
+                256u, 16u, 1u, true, true><<<grid, 512u>>>(
+                    out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
+                    x_token_stride, x_group_stride, out_token_stride);
+        } else if (load2) {
             rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel<
                 256u, 16u, 1u, true><<<grid, 512u>>>(
                     out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
@@ -1879,7 +2018,12 @@ static void rocm_q4_K_prefill_wmma_k64_enqueue(
                     x_token_stride, x_group_stride, out_token_stride);
         }
     } else if (row_tile == 128u) {
-        if (load2) {
+        if (load4) {
+            rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel<
+                128u, 8u, 1u, true, true><<<grid, 256u>>>(
+                    out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
+                    x_token_stride, x_group_stride, out_token_stride);
+        } else if (load2) {
             rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel<
                 128u, 8u, 1u, true><<<grid, 256u>>>(
                     out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
@@ -1987,6 +2131,9 @@ static int rocm_q4_K_prefill_wmma_launch(
         x, x_token_stride, x_group_stride);
     const int use_k128 = rocm_q4_K_prefill_wmma_k128_policy(
         k128_disabled, use_k64, row_tile, load4);
+    const int use_k64_load4 = ds4_rocm_q4_wmma_load::select(
+        getenv("DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K64_LOAD4") != NULL,
+        use_k64, use_k128, row_tile, x, x_token_stride, x_group_stride);
     if (use_k128) {
         rocm_q4_K_prefill_wmma_k128_enqueue(
             out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
@@ -1994,7 +2141,8 @@ static int rocm_q4_K_prefill_wmma_launch(
     } else if (use_k64) {
         rocm_q4_K_prefill_wmma_k64_enqueue(
             out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
-            x_token_stride, x_group_stride, out_token_stride, row_tile, load2);
+            x_token_stride, x_group_stride, out_token_stride, row_tile, load2,
+            use_k64_load4);
     } else {
         rocm_q4_K_prefill_wmma_enqueue(
             out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
@@ -2016,6 +2164,10 @@ static int rocm_q4_K_prefill_wmma_launch(
         } else if (use_k64) {
             __atomic_fetch_add(&g_rocm_q4_prefill_wmma_k64_launches, 1u,
                                __ATOMIC_RELAXED);
+            if (use_k64_load4) {
+                __atomic_fetch_add(&g_rocm_q4_prefill_wmma_k64_load4_launches,
+                                   1u, __ATOMIC_RELAXED);
+            }
         }
     }
     return ok;
@@ -2129,6 +2281,31 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_variant_enqueue(
             n_tok, n_groups, in_dim, out_dim, row_bytes,
             x_token_stride, x_group_stride, out_token_stride, row_tile, load2);
     }
+    return 1;
+}
+
+/* Strict LOAD4 hook: existing K64 hooks deliberately remain LOAD2. Caller
+ * owns architecture/residency checks, just as for the other raw WMMA hooks.
+ * Incompatible geometry/alignment fails instead of benchmarking a fallback. */
+extern "C" int ds4_rocm_bench_q4_K_wmma_k64_load4_enqueue(
+        void *out, const void *w, const void *x, uint32_t n_tok,
+        uint32_t n_groups, uint32_t in_dim, uint32_t out_dim,
+        uint64_t row_bytes, uint64_t x_token_stride,
+        uint64_t x_group_stride, uint64_t out_token_stride,
+        uint32_t row_tile) {
+    if (!out || !w || n_tok == 0u || n_groups == 0u ||
+        in_dim == 0u || out_dim == 0u ||
+        (in_dim % CUDA_QK_K) != 0u ||
+        !ds4_rocm_q4_wmma_load::select(
+            false, true, false, row_tile, x, x_token_stride, x_group_stride) ||
+        row_bytes < ((uint64_t)in_dim / CUDA_QK_K) * sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    rocm_q4_K_prefill_wmma_k64_enqueue(
+        reinterpret_cast<float *>(out), reinterpret_cast<const char *>(w),
+        reinterpret_cast<const float *>(x), n_tok, n_groups, in_dim, out_dim,
+        row_bytes, x_token_stride, x_group_stride, out_token_stride,
+        row_tile, 1, 1);
     return 1;
 }
 
@@ -2325,7 +2502,9 @@ static void rocm_q4_K_prefill_tile8_report(void) {
                         __ATOMIC_RELAXED);
     const uint64_t wmma_k128_calls =
         __atomic_load_n(&g_rocm_q4_prefill_wmma_k128_launches,
-                        __ATOMIC_RELAXED);
+                           __ATOMIC_RELAXED);
+    const uint64_t wmma_k64_load4_calls =
+        ds4_rocm_test_q4_prefill_wmma_k64_load4_get_calls();
     const uint64_t staged_calls = wmma_k64_calls + wmma_k128_calls;
     const uint64_t wmma_k32_calls =
         wmma_calls >= staged_calls ? wmma_calls - staged_calls : 0u;
@@ -2345,7 +2524,7 @@ static void rocm_q4_K_prefill_tile8_report(void) {
             "dense_calls=%llu pair_calls=%llu attention_batch_calls=%llu "
             "k1024_tile4_calls=%llu k1024_tile4_ssd_calls=%llu "
             "wmma_calls=%llu wmma_k32_calls=%llu wmma_k64_calls=%llu "
-            "wmma_k128_calls=%llu tokens=%llu\n",
+            "wmma_k128_calls=%llu wmma_k64_load4_calls=%llu tokens=%llu\n",
             (unsigned long long)dense_calls,
             (unsigned long long)pair_calls,
             (unsigned long long)attention_batch_calls,
@@ -2355,6 +2534,7 @@ static void rocm_q4_K_prefill_tile8_report(void) {
             (unsigned long long)wmma_k32_calls,
             (unsigned long long)wmma_k64_calls,
             (unsigned long long)wmma_k128_calls,
+            (unsigned long long)wmma_k64_load4_calls,
             (unsigned long long)tokens);
 }
 
@@ -2387,6 +2567,10 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
+    // REQUIRE is a standalone-API assertion, including shape exclusions.
+    // Resolve before range lookup, allocation or any quantizer enqueue.
+    const int decode_lane4 = rocm_q4_decode_lane4_select(in_dim, out_dim, n_tok);
+    if (decode_lane4 == ds4_rocm_q4_decode::required_failure) return 0;
     uint64_t blocks = 0;
     uint64_t row_bytes = 0;
     uint64_t weight_bytes = 0;
@@ -2539,6 +2723,17 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
         const int ok = cuda_ok(cudaGetLastError(),
                                "q4_K dense prefill tile8 launch");
         if (ok) rocm_q4_K_prefill_tile8_note(1u, 0u, 0u, 0u, n_tok);
+        return ok;
+    }
+
+    if (decode_lane4 == ds4_rocm_q4_decode::use) {
+        const dim3 grid(ds4_rocm_q4_decode::m / ds4_rocm_q4_decode::rows,
+                        (unsigned)n_tok, 1u);
+        rocm_matmul_q4_K_dense_decode_lane4_kernel<<<grid, 256>>>(
+            reinterpret_cast<float *>(out->ptr), wptr, xq, row_bytes,
+            (uint32_t)blocks, (uint32_t)out_dim, (uint32_t)n_tok);
+        const int ok = cuda_ok(cudaGetLastError(), "q4_K decode lane4 launch");
+        if (ok) ++g_rocm_q4_decode_lane4_launches;
         return ok;
     }
 

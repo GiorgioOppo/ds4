@@ -9,6 +9,11 @@
 #include <string.h>
 #include <time.h>
 
+/* Optional Q-b candidate coverage. Counts are sampled outside timed steps;
+ * setting --candidate-env alone must not silently measure a fallback. */
+extern void ds4_gpu_test_q4_qb_single_vec_reset(void);
+extern uint64_t ds4_gpu_test_q4_qb_single_vec_get_calls(void);
+
 #define FIRST_SPLIT_ENV "DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS"
 #define SECOND_SPLIT_ENV "DS4_METAL_GRAPH_TOKEN_SECOND_SPLIT_LAYERS"
 
@@ -36,6 +41,7 @@ typedef struct {
     uint32_t ssd_cache_experts;
     uint32_t ssd_preload_experts;
     bool include_selection;
+    bool print_step_times;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     decode_schedule control;
@@ -63,7 +69,8 @@ static void usage(FILE *fp, const char *argv0) {
             "                        dynamic expert-cache entry count\n"
             "  --ssd-streaming-preload-experts N\n"
             "                        popularity preload count\n"
-            "  --include-selection    include one non-EOS argmax in each timed step\n",
+            "  --include-selection    include one non-EOS argmax in each timed step\n"
+            "  --print-step-times     print paired decode durations outside timed regions\n",
             argv0);
 }
 
@@ -104,6 +111,7 @@ static bench_config parse_options(int argc, char **argv) {
         .ssd_cache_experts = 0,
         .ssd_preload_experts = 0,
         .include_selection = false,
+        .print_step_times = false,
         .ssd_streaming = false,
         .ssd_streaming_cold = false,
         .control = {.first = 2, .second = 32},
@@ -125,6 +133,8 @@ static bench_config parse_options(int argc, char **argv) {
             cfg.candidate_env = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--include-selection")) {
             cfg.include_selection = true;
+        } else if (!strcmp(arg, "--print-step-times")) {
+            cfg.print_step_times = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             cfg.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -421,6 +431,11 @@ int main(int argc, char **argv) {
     size_t exact_rows = 0;
     size_t exact_floats = 0;
     size_t exact_selected_ids = 0;
+    const bool reverse_qb_single = cfg.candidate_env &&
+        !strcmp(cfg.candidate_env, "DS4_METAL_DISABLE_Q4_QB_SINGLE_VEC");
+    const bool check_qb_single = reverse_qb_single || (cfg.candidate_env &&
+        !strcmp(cfg.candidate_env, "DS4_METAL_ENABLE_Q4_QB_SINGLE_VEC"));
+    uint64_t qb_calls[VARIANT_COUNT] = {0};
     int rc = 1;
 
     if (ds4_engine_open(&engine, &opt) != 0) goto done;
@@ -499,6 +514,7 @@ int main(int argc, char **argv) {
     for (int step = 0; step < total_steps; step++) {
         int token = -1;
         int selected[VARIANT_COUNT] = {-1, -1};
+        double step_seconds[VARIANT_COUNT] = {0};
         if (compare_frontier(sessions[0],
                              sessions[1],
                              logits[0],
@@ -521,6 +537,7 @@ int main(int argc, char **argv) {
             const int session_i = order;
             const int variant_i = (order + step) & 1;
             if (select_variant(&cfg, variant_i) != 0) goto done;
+            if (check_qb_single) ds4_gpu_test_q4_qb_single_vec_reset();
 
             const double t0 = now_sec();
             if (ds4_session_eval(sessions[session_i],
@@ -556,11 +573,26 @@ int main(int argc, char **argv) {
                 }
             }
             const double t1 = now_sec();
+            step_seconds[variant_i] = t1 - t0;
+            if (check_qb_single) {
+                const uint64_t calls = ds4_gpu_test_q4_qb_single_vec_get_calls();
+                const bool want_candidate = (variant_i == 1) != reverse_qb_single;
+                if ((want_candidate && calls == 0u) ||
+                    (!want_candidate && calls != 0u)) {
+                    fprintf(stderr, "metal-decode-schedule-bench: wrong Q-b single-vector coverage step=%d variant=%d calls=%llu\n",
+                            step, variant_i, (unsigned long long)calls);
+                    goto done;
+                }
+                qb_calls[variant_i] += calls;
+            }
             if (step >= cfg.warmup) {
                 elapsed[variant_i] += t1 - t0;
                 measured_tokens[variant_i]++;
             }
         }
+        if (cfg.print_step_times && step >= cfg.warmup)
+            printf("step=%d control_seconds=%.9f candidate_seconds=%.9f\n",
+                   step - cfg.warmup, step_seconds[0], step_seconds[1]);
         if (cfg.include_selection) {
             if (selected[0] != selected[1]) {
                 fprintf(stderr,
@@ -610,6 +642,9 @@ int main(int argc, char **argv) {
            exact_floats,
            exact_selected_ids,
            vocab);
+    if (check_qb_single)
+        printf("qb_single_vec_calls_control=%llu qb_single_vec_calls_candidate=%llu\n",
+               (unsigned long long)qb_calls[0], (unsigned long long)qb_calls[1]);
     rc = 0;
 
 done:

@@ -10,6 +10,8 @@
 #include <unistd.h>
 
 bool ds4_log_is_tty(FILE *fp) { (void)fp; return false; }
+extern void ds4_gpu_test_q4_qb_single_vec_reset(void);
+extern uint64_t ds4_gpu_test_q4_qb_single_vec_get_calls(void);
 enum { K = 1024, M = 32768, MAX_TOKENS = 9, GUARD = 64 };
 typedef struct { uint16_t d, dmin; uint8_t scales[12], qs[128]; } q4_block;
 _Static_assert(sizeof(q4_block) == 144, "Q4_K ABI");
@@ -18,6 +20,11 @@ static void require(bool ok, const char *msg) {
     if (!ok) { fprintf(stderr, "Q4 Q-b runtime FAIL: %s\n", msg); exit(1); }
 }
 static uint32_t random_u32(uint32_t *seed) { return *seed = *seed * 1664525u + 1013904223u; }
+static int unexpected_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
+    (void)ud; (void)layer; (void)gate; (void)seq;
+    require(false, "standalone Q-b test must never request a TP exchange");
+    return 0;
+}
 
 int main(void) {
     @autoreleasepool {
@@ -58,40 +65,58 @@ int main(void) {
         require(x && base && out, "device buffer allocation");
         const char *values[] = {"1", NULL, "0", ""};
         unsigned cases = 0;
-        for (int ssd = 0; ssd < 2; ++ssd) for (int quality = 0; quality < 2; ++quality) {
-            ds4_gpu_set_ssd_streaming(ssd);
-            ds4_gpu_set_quality(quality);
-            for (int tokens = 1; tokens <= MAX_TOKENS; ++tokens) {
-                ds4_gpu_set_stream(tokens % 2);
-                for (size_t i = 0; i < x_count; ++i)
-                    input[i] = i % 13 ? ((int)(random_u32(&seed) % 1025u) - 512) / 1024.f : -0.f;
-                require(ds4_gpu_tensor_write(x, 0, input, x_count*sizeof(float)), "activation write");
-                for (unsigned arm = 0; arm < 4; ++arm) {
-                    require((values[arm] ? setenv("DS4_METAL_DISABLE_Q4_QB_TOKEN_PAIR", values[arm], 1) :
-                                          unsetenv("DS4_METAL_DISABLE_Q4_QB_TOKEN_PAIR")) == 0, "rollback setup");
-                    for (size_t i = 0; i < total; ++i) got[i] = poison;
-                    require(ds4_gpu_tensor_write(base, 0, got, total*sizeof(uint32_t)), "output poison");
-                    require(ds4_gpu_begin_commands(), "begin commands");
-                    const int ok = ds4_gpu_matmul_quant_tensor(out, model, model_bytes, page, 12, K, M, x, tokens);
-                    const int ended = ds4_gpu_end_commands();
-                    require(ok && ended, "matmul dispatch");
-                    require(ds4_gpu_tensor_read(base, 0, got, total*sizeof(uint32_t)), "output read");
-                    for (size_t i = 0; i < total; ++i) {
-                        if (i < GUARD || i >= GUARD + (size_t)tokens*M)
-                            require(got[i] == poison, "output guard/inactive token overwritten");
-                        else require((got[i] & 0x7f800000u) != 0x7f800000u, "nonfinite/unwritten output");
+        // Original pairing, isolated vector candidate, both enabled, then TP
+        // active and TP with sharding suspended (the local MTP draft case).
+        for (int feature = 0; feature < 5; ++feature) {
+            const char *flag = feature ? "DS4_METAL_DISABLE_Q4_QB_SINGLE_VEC" : "DS4_METAL_DISABLE_Q4_QB_TOKEN_PAIR";
+            require((feature == 2 ? unsetenv("DS4_METAL_DISABLE_Q4_QB_TOKEN_PAIR") :
+                     setenv("DS4_METAL_DISABLE_Q4_QB_TOKEN_PAIR", "1", 1)) == 0, "token-pair baseline setup");
+            require((feature ? setenv("DS4_METAL_ENABLE_Q4_QB_SINGLE_VEC", "1", 1) :
+                               unsetenv("DS4_METAL_ENABLE_Q4_QB_SINGLE_VEC")) == 0, "single-vector setup");
+            if (feature >= 3) {
+                require(setenv("DS4_TP_NO_KEEPALIVE", "1", 1) == 0, "no TP keepalive in oracle");
+                require(ds4_gpu_tp_init(0, NULL, 0, 0, 0, unexpected_exchange, NULL), "local TP fixture init");
+                ds4_gpu_tp_suspend_expert_sharding(feature == 4);
+            }
+            for (int ssd = 0; ssd < 2; ++ssd) for (int quality = 0; quality < 2; ++quality) {
+                ds4_gpu_set_ssd_streaming(ssd);
+                ds4_gpu_set_quality(quality);
+                for (int tokens = 1; tokens <= MAX_TOKENS; ++tokens) {
+                    ds4_gpu_set_stream(tokens % 2);
+                    for (size_t i = 0; i < x_count; ++i)
+                        input[i] = i % 13 ? ((int)(random_u32(&seed) % 1025u) - 512) / 1024.f : -0.f;
+                    require(ds4_gpu_tensor_write(x, 0, input, x_count*sizeof(float)), "activation write");
+                    for (unsigned arm = 0; arm < 4; ++arm) {
+                        require((values[arm] ? setenv(flag, values[arm], 1) :
+                                              unsetenv(flag)) == 0, "rollback setup");
+                        ds4_gpu_test_q4_qb_single_vec_reset();
+                        for (size_t i = 0; i < total; ++i) got[i] = poison;
+                        require(ds4_gpu_tensor_write(base, 0, got, total*sizeof(uint32_t)), "output poison");
+                        require(ds4_gpu_begin_commands(), "begin commands");
+                        const int ok = ds4_gpu_matmul_quant_tensor(out, model, model_bytes, page, 12, K, M, x, tokens);
+                        const int ended = ds4_gpu_end_commands();
+                        require(ok && ended, "matmul dispatch");
+                        const uint64_t wanted = feature > 0 && feature < 3 && !quality && tokens == 1 && arm == 1;
+                        require(ds4_gpu_test_q4_qb_single_vec_get_calls() == wanted, "wrong single-vector dispatch coverage");
+                        require(ds4_gpu_tensor_read(base, 0, got, total*sizeof(uint32_t)), "output read");
+                        for (size_t i = 0; i < total; ++i) {
+                            if (i < GUARD || i >= GUARD + (size_t)tokens*M)
+                                require(got[i] == poison, "output guard/inactive token overwritten");
+                            else require((got[i] & 0x7f800000u) != 0x7f800000u, "nonfinite/unwritten output");
+                        }
+                        if (arm == 0) memcpy(expected, got, total*sizeof(uint32_t));
+                        else require(memcmp(expected, got, total*sizeof(uint32_t)) == 0, "output not bitwise equal");
+                        ++cases;
                     }
-                    if (arm == 0) memcpy(expected, got, total*sizeof(uint32_t));
-                    else require(memcmp(expected, got, total*sizeof(uint32_t)) == 0, "output not bitwise equal");
-                    ++cases;
                 }
             }
+            if (feature >= 3) ds4_gpu_tp_shutdown();
         }
         ds4_gpu_set_stream(0);
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(base); ds4_gpu_tensor_free(x);
         ds4_gpu_cleanup();
         free(model); free(input); free(expected); free(got);
-        printf("PASS: %u Q4 Q-b runtime cases (default/1/0/empty, 1..9 tokens, quality, SSD spans, streams, guards).\n", cases);
+        printf("PASS: %u Q4 Q-b runtime cases (token-pair/single-vector/coexistence, default/1/0/empty, 1..9 tokens, quality, SSD spans, streams, TP/suspended TP, guards, coverage).\n", cases);
     }
     return 0;
 }

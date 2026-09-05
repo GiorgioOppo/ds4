@@ -39,6 +39,7 @@ extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k128_get_calls(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_load4_get_calls(void);
 extern "C" int ds4_rocm_test_q4_prefill_wmma_k64_control_policy(
     int control);
 extern "C" int ds4_rocm_test_q4_prefill_wmma_k128_policy(
@@ -136,6 +137,8 @@ constexpr const char *kPrefillWmmaK64 =
     "DS4_ROCM_ENABLE_Q4_PREFILL_WMMA_K64";
 constexpr const char *kPrefillWmmaK128Disable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K128";
+constexpr const char *kPrefillWmmaK64Load4Disable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K64_LOAD4";
 constexpr const char *kPrefillQ8Wave32Enable =
     "DS4_ROCM_ENABLE_Q4_PREFILL_Q8_K_WAVE32";
 constexpr const char *kPrefillQ8Wave32Disable =
@@ -3198,6 +3201,95 @@ bool run_prefill_wmma_smoke(const aligned_model &model) {
     return ok;
 }
 
+bool run_prefill_wmma_load4_oracle(const aligned_model &model, bool required = false) {
+#if DS4_TEST_HAS_HIP_RUNTIME
+    hipDeviceProp_t properties{};
+    if (hipGetDeviceProperties(&properties, 0) != hipSuccess ||
+        properties.warpSize != 32 ||
+        std::strncmp(properties.gcnArchName, "gfx1151", 7u) != 0) {
+        std::fprintf(stderr, "Q4 K64 LOAD4: %s (requires gfx1151 wave32)\n",
+                     required ? "FAIL" : "SKIP");
+        return !required;
+    }
+#else
+    (void)model;
+    return !required;
+#endif
+    env_snapshot enabled(kPrefillWmmaEnable), disabled(kPrefillWmmaDisable);
+    env_snapshot wmma_required(kPrefillWmmaRequire), tile_required(kPrefillRequire);
+    env_snapshot row_tile(kPrefillWmmaRowTile), k64(kPrefillWmmaK64);
+    env_snapshot k128(kPrefillWmmaK128Disable), load4(kPrefillWmmaK64Load4Disable);
+    (void)setenv(kPrefillWmmaEnable, "1", 1);
+    (void)unsetenv(kPrefillWmmaDisable);
+    (void)unsetenv(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillRequire);
+    // This suite, like the surrounding oracle, starts/ends outside quality.
+    struct quality_reset { ~quality_reset() { ds4_gpu_set_quality(false); } } reset;
+    unsigned cases = 0;
+    for (uint32_t n : {9u, 255u, 256u, 257u, 319u})
+    for (uint32_t offset : {0u, 1u, 2u, 3u, 4u})
+    for (unsigned mode = 0; mode < 6; ++mode) {
+        // modes: K64 rows128/256, scalar rows64, K32, K128, quality fallback.
+        const uint32_t rows = mode == 1 || mode == 4 ? 256 : (mode == 2 ? 64 : 128);
+        (void)setenv(kPrefillWmmaRowTile, std::to_string(rows).c_str(), 1);
+        (void)setenv(kPrefillWmmaK64, mode == 3 ? "0" : "1", 1);
+        (void)setenv(kPrefillWmmaK128Disable, mode == 4 ? "0" : "1", 1);
+        ds4_gpu_set_quality(mode == 5);
+        std::vector<float> activation;
+        fill_activation(&activation, n, kK);
+        // Exercise pair conversion at signed-zero/subnormal/halfway limits.
+        const float limits[] = {0.0f, -0.0f, 0x1p-25f, -0x1p-24f,
+                                1.00048828125f, 1.00146484375f, 65504.0f};
+        for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); ++i)
+            activation[i] = limits[i];
+        std::vector<float> input(offset + activation.size() + 4, -123.0f);
+        std::copy(activation.begin(), activation.end(), input.begin() + offset);
+        tensor_owner backing(input.size() * sizeof(float));
+        if (!backing.ptr || !write_tensor(backing.ptr, input)) return false;
+        tensor_owner x(ds4_gpu_tensor_view(backing.ptr, offset * sizeof(float),
+                                           activation.size() * sizeof(float)));
+        const size_t logical = (size_t)n * kM0;
+        const std::vector<float> sentinel =
+            sentinel_values(logical + 63u * kM0 + 255u);
+        tensor_owner out(sentinel.size() * sizeof(float));
+        if (!x.ptr || !out.ptr) return false;
+        std::vector<float> reference(sentinel.size()), actual(sentinel.size());
+        auto run = [&](const char *flag, std::vector<float> *result) {
+            if (flag) (void)setenv(kPrefillWmmaK64Load4Disable, flag, 1);
+            else (void)unsetenv(kPrefillWmmaK64Load4Disable);
+            if (!write_tensor(out.ptr, sentinel)) return false;
+            ds4_rocm_test_q4_prefill_wmma_reset();
+            const bool rc = ds4_gpu_matmul_quant_tensor(
+                out.ptr, model.data, model.size, model.weight0_offset,
+                kQ4Type, kK, kM0, x.ptr, n) != 0;
+            const uint64_t count = ds4_rocm_test_q4_prefill_wmma_k64_load4_get_calls();
+            const uint64_t expected =
+                !flag && n >= 256u && offset % 4 == 0 && mode < 2 ? 1 : 0;
+            if (!rc || count != expected || !read_tensor(out.ptr, result) ||
+                !output_body_overwritten(*result, sentinel, logical, "K64 LOAD4 body") ||
+                !output_guard_unchanged(*result, sentinel, logical, "K64 LOAD4 guard")) {
+                std::fprintf(stderr,
+                    "Q4 K64 LOAD4 N=%u offset=%u mode=%u flag=%s calls=%llu/%llu FAIL\n",
+                    n, offset, mode, flag ? flag : "unset",
+                    (unsigned long long)count, (unsigned long long)expected);
+                return false;
+            }
+            return true;
+        };
+        if (!run("1", &reference)) return false;
+        for (const char *flag : {static_cast<const char *>(nullptr), "1", "0", ""}) {
+            if (!run(flag, &actual) ||
+                !bitwise_equal(actual, reference, "K64 LOAD4 rollback/output guards")) return false;
+            ++cases;
+        }
+        std::vector<float> unchanged(input.size());
+        if (!read_tensor(backing.ptr, &unchanged) ||
+            !bitwise_equal(unchanged, input, "K64 LOAD4 input unchanged")) return false;
+    }
+    std::fprintf(stderr, "Q4 K64 LOAD4 runtime: PASS %u cases\n", cases);
+    return true;
+}
+
 bool run_attention_output_wmma_smoke(const aligned_model &model) {
 #if DS4_TEST_HAS_HIP_RUNTIME
     hipDeviceProp_t properties{};
@@ -3666,6 +3758,7 @@ int main(int argc, char **argv) {
     bool run_grouped_decode = true;
     bool run_prefill_long = false;
     bool run_policy_only = false;
+    bool run_load4_only = false;
     if (argc == 2 && std::strcmp(argv[1], "--dense") == 0) {
         run_pair = false;
         run_prefill = false;
@@ -3674,6 +3767,9 @@ int main(int argc, char **argv) {
         run_dense = false;
         run_prefill = false;
         run_grouped_decode = false;
+    } else if (argc == 2 && std::strcmp(argv[1], "--prefill-wmma-load4") == 0) {
+        run_dense = run_pair = run_prefill = run_grouped_decode = false;
+        run_load4_only = true;
     } else if (argc == 2 && std::strcmp(argv[1], "--prefill") == 0) {
         run_dense = false;
         run_pair = false;
@@ -3699,7 +3795,7 @@ int main(int argc, char **argv) {
                !(argc == 2 && std::strcmp(argv[1], "--all") == 0)) {
         std::fprintf(stderr,
                      "usage: %s [--all|--dense|--pair|--grouped-decode|"
-                     "--prefill|--prefill-long|--policy]\n",
+                     "--prefill|--prefill-wmma-load4|--prefill-long|--policy]\n",
                      argv[0]);
         return 2;
     }
@@ -3717,6 +3813,8 @@ int main(int argc, char **argv) {
     env_snapshot wmma_row_tile(kPrefillWmmaRowTile);
     env_snapshot wmma_k64_global(kPrefillWmmaK64);
     env_snapshot wmma_k128_disable_global(kPrefillWmmaK128Disable);
+    env_snapshot wmma_k64_load4_disable_global(kPrefillWmmaK64Load4Disable);
+    (void)unsetenv(kPrefillWmmaK64Load4Disable);
     env_snapshot q8_wave32_enable(kPrefillQ8Wave32Enable);
     env_snapshot q8_wave32_disable(kPrefillQ8Wave32Disable);
     env_snapshot q8_wave32_require(kPrefillQ8Wave32Require);
@@ -3779,6 +3877,9 @@ int main(int argc, char **argv) {
     }
 
     const bool model_ready = ok;
+    if (model_ready && run_load4_only) {
+        ok = run_prefill_wmma_load4_oracle(model, true) && ok;
+    }
     if (model_ready && run_dense) {
         std::fprintf(stderr, "ROCm Q4 dense oracle (raw GGUF Q4_K x Q8_K):\n");
         ok = run_dense_case(model, 1u, model.weight0_offset, kM0,
@@ -3872,6 +3973,7 @@ int main(int argc, char **argv) {
             "n_tok=30 (token-tail nt=6)",
             kQ8Type);
         const bool prefill_wmma_ok = run_prefill_wmma_smoke(model);
+        const bool prefill_load4_ok = run_prefill_wmma_load4_oracle(model);
         const bool output_wmma_ok =
             run_attention_output_wmma_smoke(model);
         const bool gate_ok = run_prefill_gate_guards(model);
@@ -3882,7 +3984,7 @@ int main(int argc, char **argv) {
              prefill_single128_ok && prefill_pair9_ok &&
              prefill_pair30_reverse_ok && prefill_pair128_ok && attention9_ok &&
              attention30_ok && attention128_ok && attention_q8_9_ok &&
-             attention_q8_30_ok && prefill_wmma_ok && output_wmma_ok &&
+             attention_q8_30_ok && prefill_wmma_ok && prefill_load4_ok && output_wmma_ok &&
              gate_ok && ok;
         if (run_prefill_long) {
             // A 64 MiB activation and a roughly 0.5 Gi-op projection stress

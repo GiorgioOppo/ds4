@@ -55,6 +55,24 @@ while the engine opens, including the Metal streaming `F_NOCACHE` controls,
 also require separate processes: `--candidate-env` changes them too late to
 create a different model descriptor inside this harness.
 
+The experimental single-token Q4 Q-b vector loader has a native kernel test:
+
+```sh
+make bench-metal-q4-single-vec
+make test-metal-q4-qb-token-pair
+```
+
+The kernel benchmark rotates eight pairs of production-size weights (288 MiB),
+checks bitwise outputs, and compares adjacent AB/BA samples. Runtime selection
+requires `DS4_METAL_ENABLE_Q4_QB_SINGLE_VEC=1`; any defined
+`DS4_METAL_DISABLE_Q4_QB_SINGLE_VEC` rolls it back. The same-engine benchmark
+checks dispatch counts for either flag used with `--candidate-env` and can
+print per-step durations with `--print-step-times`. When using the DISABLE
+flag, keep ENABLE set and remember that the labels are reversed: `control`
+is the new kernel, `candidate` the rollback. See
+[the measurements and limitations](metal_q4_qb_single_vec.md) before treating
+kernel latency as an SSD tokens/s gain.
+
 To compare the default pre-M5 ratio-4 compressor pack/transpose fusion with the
 legacy decode path, including token selection, use:
 
@@ -234,6 +252,14 @@ conversions and accumulation order. Set
 `DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K128=1` to roll the same launch back to
 K64/P80; unset or explicitly false keeps K128. Incompatible alignment or
 64/128-row geometry automatically uses K64.
+
+Aligned 128/256-row K64 launches now have a float4 activation loader with
+`DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K64_LOAD4=1` as the presence-based rollback
+(even `0` or empty disables). This changes neither the staging geometry nor
+WMMA arithmetic. The separate `--case wmma_load4` benchmark isolates LOAD2 vs
+LOAD4, including grouped output-A, at fixed K64 geometry. Existing direct
+K32/K64 benchmark hooks retain the original loaders. GPU validation and
+timing are pending; see [scope and native tester commands](rocm_q4_prefill_wmma_load4.md).
 
 K64/P80 stages two adjacent 32-value Q4_K groups and a 64-value activation
 slice in one padded P80 LDS tile. Leave

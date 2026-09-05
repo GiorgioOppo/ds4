@@ -21538,6 +21538,15 @@ static bool ds4_gpu_q4_table_model_residency_enabled(void) {
     return getenv("DS4_METAL_Q4_TABLE_MODEL_RESIDENCY_SET") != NULL;
 }
 
+// Candidate-only dispatch coverage for the single-token Q-b oracle.
+static uint64_t g_q4_qb_single_vec_calls;
+void ds4_gpu_test_q4_qb_single_vec_reset(void) {
+    __atomic_store_n(&g_q4_qb_single_vec_calls, 0u, __ATOMIC_RELAXED);
+}
+uint64_t ds4_gpu_test_q4_qb_single_vec_get_calls(void) {
+    return __atomic_load_n(&g_q4_qb_single_vec_calls, __ATOMIC_RELAXED);
+}
+
 static bool ds4_gpu_pro_q4_expert_indirect_shape_supported(
         uint32_t n_total_expert,
         uint32_t n_expert,
@@ -23618,6 +23627,19 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             const int16_t nsg = 2;
             id<MTLComputePipelineState> pipeline = nil;
             bool token_pair = false;
+            bool single_vec = false;
+            // Keep the new N=1 candidate opt-in until model-backed timing is
+            // repeatable. The existing N=2..8 token-pair policy is unchanged.
+            if (ds4_gpu_device_is_m1_apple_silicon() &&
+                !g_quality_mode && !g_tp_thread_running && g_tp_split_world <= 1 &&
+                in_dim == 1024u && out_dim == 32768u && n_tok == 1u &&
+                (inner_offset & 7u) == 0 &&
+                getenv("DS4_METAL_ENABLE_Q4_QB_SINGLE_VEC") != NULL &&
+                getenv("DS4_METAL_DISABLE_Q4_QB_SINGLE_VEC") == NULL) {
+                pipeline = ds4_gpu_get_mul_mv_ext_pipeline(
+                    "kernel_mul_mv_q4_K_dense_single_vec_f32", nsg, 8);
+                single_vec = pipeline != nil;
+            }
             // M1 Max measurements consistently improve the Q-b shape, while
             // K4096 Q-A/KV results are mixed. Keep that pair, one-token decode,
             // other devices, quality and TP on their established dispatch.
@@ -23670,6 +23692,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 ds4_gpu_end_compute_encoder(cb, enc);
 
                 if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4_K classic mul_mv")) return 0;
+                if (single_vec)
+                    __atomic_fetch_add(&g_q4_qb_single_vec_calls, 1u, __ATOMIC_RELAXED);
                 return 1;
             }
         }

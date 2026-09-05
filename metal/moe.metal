@@ -2941,18 +2941,18 @@ struct ds4_q4_K_lane_weights {
     half2 dm;
 };
 
-template<int nr0>
+template<int nr0, int tokens_per_group = 2>
 void kernel_mul_mv_q4_K_token_pair_impl(
         constant ds4_metal_args_mul_mv &args,
         device const char *src0, device const char *src1, device char *dst,
         uint3 tgpig, ushort tiisg, ushort sgitg) {
     const int first_row = (tgpig.x * FC_mul_mv_nsg + sgitg) * nr0;
-    const int first_token = 2 * tgpig.y;
+    const int first_token = tokens_per_group * tgpig.y;
     const short ix = tiisg / 8;
     const short iq = (tiisg % 8) / 4;
     const short ir = tiisg % 4;
     const int nb = args.ne00 / QK_K;
-    float sumf[2][nr0] = {};
+    float sumf[tokens_per_group][nr0] = {};
 
     for (int ib = ix; ib < nb; ib += 4) {
         ds4_q4_K_lane_weights w[nr0];
@@ -2972,7 +2972,7 @@ void kernel_mul_mv_q4_K_token_pair_impl(
                 w[row].dm = *(device const half2 *)&b->d;
             }
         }
-        for (short token = 0; token < 2; ++token) {
+        for (short token = 0; token < tokens_per_group; ++token) {
             if (first_token + token >= args.ne11) break;
             device const float *y4 = (device const float *)(
                 src1 + (uint64_t)(first_token + token) * args.nb11) +
@@ -3011,13 +3011,27 @@ void kernel_mul_mv_q4_K_token_pair_impl(
             }
         }
     }
-    for (short token = 0; token < 2 && first_token + token < args.ne11; ++token) {
+    for (short token = 0; token < tokens_per_group && first_token + token < args.ne11; ++token) {
         device float *out = (device float *)dst + (uint64_t)(first_token + token) * args.ne0;
         for (short row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
             const float value = simd_sum(sumf[token][row]);
             if (tiisg == 0) out[first_row + row] = value;
         }
     }
+}
+
+// Experimental single-token specialization: keep the vector weight loads
+// without the second token's accumulators. Do not infer a single-token gain
+// from the established two-token weight-reuse measurements.
+kernel void kernel_mul_mv_q4_K_dense_single_vec_f32(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0, device const char *src1, device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K, 1>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+    (void)shmem;
 }
 
 kernel void kernel_mul_mv_q4_K_dense_token_pair_f32(
