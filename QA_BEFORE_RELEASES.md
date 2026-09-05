@@ -867,7 +867,8 @@ a substitute for CUDA or Metal release testing.
   Also test initial and continued prefill across 2051 and 4096 tokens, including
   non-multiple-of-four frontiers, and compare with the scalar attention
   control. Do not claim a long-context quality improvement from unchanged
-  short-prompt scores.
+  short-prompt scores. Use the long Z.AI FP8 fixture and its rendered-prefix
+  procedure in section 3 for this comparison.
 - After MXFP4 or ROCm routed-MoE changes, run `make test-mxfp4-rocm`. Require
   zero `failures` for both `mid` and `out` at 1, 3, 32, 128, and 512 tokens,
   followed by `MXFP4 ROCm routed MoE: PASS`.
@@ -1091,8 +1092,25 @@ first-token matches `90/100`, mean greedy prefix `7.320`. CUDA scored
 corrected boundary. Independent attention tests pass on Metal, CUDA and ROCm;
 whole-model warm/cold continued prefill passes on CUDA and ROCm. CUDA also
 passes snapshot/MTP restore and reuse with a 2,771-token prompt. Fresh
-long-context official scoring remains required; its
-September 5 collection was blocked by an expired provider credential.
+long-context scoring now uses eight September 5 Z.AI FP8 references, covering
+roughly 3K-7.3K prompt tokens and 740 answer tokens. Use the official low-effort
+template and returned reasoning as the prefix; the provider requires reasoning.
+Do not compare these answers against the no-thinking template.
+
+| GLM Q2 long-reference path | NLL | First-token matches | Mean greedy prefix |
+| --- | ---: | ---: | ---: |
+| ROCm corrected default | 0.661721610 | 6/8 | 2.500 |
+| ROCm old dense-cutoff control | 0.661579639 | 6/8 | 2.500 |
+| ROCm corrected scalar control | 0.674282960 | 6/8 | 2.500 |
+| CUDA corrected default | 0.680093110 | 6/8 | 2.500 |
+
+The old-cutoff control retains the other correctness fixes. Its 0.021% NLL
+difference is neutral (four case wins each). The corrected fast path is 1.86%
+better than scalar on this set (six case wins versus two). This is focused
+regression evidence, not a broad quality claim or API-logit parity: the API
+returned no logprobs and may normalize reasoning whitespace. All runs completed
+with at least 11.3 GiB usable RAM. CUDA's complete long-fixture TSV is identical
+before and after the Q8 scratch change below.
 
 The matched Flash 0731 Q2 ROCm fixture also has unchanged scores in all 100
 cases: NLL `0.398181736`, first-token matches `56/100`, mean prefix `5.170`.
@@ -1124,7 +1142,27 @@ request. A separate same-engine test of three fresh sessions measured
 168.63/207.41/206.90 t/s with byte-identical full logits, after 18.35 seconds
 of engine startup. Record this cold-request cost; warm results alone do not
 establish unchanged startup-to-first-response latency. These focused runs do
-not replace the three-run release medians or fresh long-context API scoring.
+not replace the three-run release medians.
+
+September 5 DGX Spark, fully resident Flash 0731 Q2, no speculative decoding:
+three interleaved medians per build after warmup, 128 teacher-forced decode
+tokens, Promessi Sposi, 9,216 allocated context. Reusing aligned Q8 scratch
+removes per-call pool allocations without changing the computation.
+
+| Context | Previous decode | Q8 scratch reuse | Gain | Prefill before / after |
+| --- | ---: | ---: | ---: | ---: |
+| 2,048 | 17.90 t/s | 19.25 t/s | 7.5% | 823.06 / 823.49 t/s |
+| 4,096 | 15.23 t/s | 16.22 t/s | 6.5% | 898.69 / 899.89 t/s |
+| 8,192 | 15.01 t/s | 15.97 t/s | 6.4% | 931.53 / 931.17 t/s |
+
+Full prefill and post-decode logits matched exactly at all three frontiers.
+All 100 Flash-0731 continuation scores were also identical: NLL `0.404714573`,
+first-token matches `55/100`, mean prefix `4.890`. The Q8 scratch test covers
+24 shapes, missing/undersized scratch, and graph replay with changing inputs;
+Compute Sanitizer memcheck reported zero errors. This is a single-GPU result,
+not a claim about multi-GPU speed or speculative acceptance.
+The final CUDA and ROCm builds were warning-free; ROCm attention, KDA and memory
+admission tests passed after removing the unused Q8 matvec kernels.
 
 For M5 dense-kernel changes, run `MTL_DEBUG_LAYER=1 make test-metal-dense-mpp`.
 It checks Q8 decode and Q4_0/Q4_K prefill against exactly representable CPU
