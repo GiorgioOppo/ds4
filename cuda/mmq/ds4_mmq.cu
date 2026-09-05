@@ -6619,7 +6619,9 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec_pair(
     ggml_cuda_pool_alloc<char> q8_pool;
     char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, padded, stream);
     if (!x8) {
-        if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
+        if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, qbytes)) {
+            x8 = (char *)scratch;
+        } else if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
             g_q81_scratch_bytes >= qbytes) {
             x8 = (char *)g_q81_scratch_ptr;
         } else {

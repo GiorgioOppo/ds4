@@ -633,6 +633,16 @@ gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_of
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.o $(CORE_OBJS) rax.o ds4_gpu_args.o
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/test_cuda_q8_scratch.o: tests/test_cuda_q8_scratch.cu cuda/mmq/ds4_mmq.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Icuda/mmq -c -o $@ $<
+
+tests/test_cuda_q8_scratch: tests/test_cuda_q8_scratch.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-q8-scratch
+test-cuda-q8-scratch: tests/test_cuda_q8_scratch
+	./tests/test_cuda_q8_scratch
+
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -1266,6 +1276,12 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
 	./tests/test_mxfp4_dot
 
+.PHONY: test-quality-api
+# Only the scorer's JSON parser is needed; discard the unused engine entry point.
+test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_official.c
+	$(CC) $(QUALITY_CFLAGS) -I. -ffunction-sections -fdata-sections -o tests/test_quality_api tests/test_quality_api.c -Wl,$(if $(filter Darwin,$(UNAME_S)),-dead_strip,--gc-sections) -lm
+	./tests/test_quality_api
+
 clean:
 	rm -f tests/test_rocm_q4_decode_host
 	rm -f tests/test_rocm_q4_decode_lane4
@@ -1277,6 +1293,8 @@ clean:
 	rm -f tests/test_metal_ssd_decode_kernels
 	rm -f speed-bench/metal_iq2_moe_top8_pair_bench
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_q4_dense_pair_bench speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench speed-bench/metal_iq2_moe_tail_cull_bench speed-bench/gpu_iq2_moe_prefill_bench_rocm speed-bench/gpu_iq2_moe_prefill_bench_cuda speed-bench/rocm_q4_prefill_bench speed-bench/cuda_q4_prefill_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_quantizer_indexer_q4 tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/bench_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_q4_dense_pair tests/test_metal_session_batch tests/test_metal_q4_streams tests/test_metal_q4_prefill_pair tests/test_metal_indexer_q4 tests/test_metal_q4_attn_exactn tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_qb_f16_cache tests/test_metal_exactn_oracle tests/test_metal_dspark_capture tests/test_metal_argmax_top1 tests/test_metal_iq2_midonly tests/test_metal_iq2_ssd_grouped_mm tests/test_metal_iq2_live_index tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o cuda/mmq/*.o cuda/mmq/test/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f tests/test_cuda_q8_scratch
+	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
