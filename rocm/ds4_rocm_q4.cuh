@@ -6,6 +6,8 @@
 // Launches intentionally stay on ROCm's default stream: cuda_tmp_alloc() is a
 // single reusable scratch arena whose lifetime is protected by that ordering.
 
+#include "ds4_rocm_q4_lds.cuh"
+
 static_assert(sizeof(cuda_block_q4_K) == 144u,
               "ROCm Q4_K block layout must match GGUF");
 static_assert(sizeof(cuda_block_q8_K) == 292u,
@@ -111,7 +113,8 @@ __global__ static void rocm_matmul_q4_K_dense_grouped_decode_kernel(
  *
  * LDS footprint: 8 tokens * 8 K blocks * 292 bytes = 18,688 bytes.
  * The final, partial token and K tiles are handled without an early return;
- * every thread must reach both barriers.
+ * every thread reaches the load barrier and the reuse barrier before each
+ * subsequent tile. No reuse barrier is needed after the final tile.
  */
 enum {
     ROCM_Q4_PREFILL_TOKEN_TILE = 8u,
@@ -122,6 +125,8 @@ enum {
 };
 static_assert((sizeof(cuda_block_q8_K) % sizeof(uint32_t)) == 0u,
               "ROCm Q8_K LDS copies require a whole number of words");
+static_assert(ROCM_Q4_Q8K_WORDS == ds4_rocm_q4_lds::block_words,
+              "Q4 prefill LDS helper must match the Q8_K ABI");
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 /* Direct-Q4 WMMA for resident gfx1151 prefill.
@@ -902,6 +907,7 @@ rocm_q4_K_lane4_sum_f32(float v) {
     return v;
 }
 
+template<bool STREAM_LDS>
 __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
         float *out,
         const char *w_base,
@@ -930,19 +936,26 @@ __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
 
     /* The complete K dimension fits one LDS tile.  Flatten the copy so
      * neighboring threads read consecutive words across token/block rows. */
-    const uint32_t tile_words = nt * ROCM_Q4_PREFILL_K1024_KBLOCK_TILE *
-                                ROCM_Q4_Q8K_WORDS;
-    uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
-    for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
-        const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
-        const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
-        const uint32_t p = block_slot >> 2u;
-        const uint32_t bb = block_slot & 3u;
-        const uint32_t *const src_words =
-            reinterpret_cast<const uint32_t *>(
-                xq + (uint64_t)(tok0 + p) *
-                          ROCM_Q4_PREFILL_K1024_KBLOCK_TILE + bb);
-        sxq_words[i] = src_words[word];
+    if (STREAM_LDS) {
+        ds4_rocm_q4_lds::copy_thread<ROCM_Q4_PREFILL_K1024_KBLOCK_TILE>(
+            reinterpret_cast<uint32_t *>(sxq),
+            reinterpret_cast<const uint32_t *>(xq + (uint64_t)tok0 * 4u),
+            tid, blockDim.x, nt, 4u, 4u * ROCM_Q4_Q8K_WORDS);
+    } else {
+        const uint32_t tile_words = nt * ROCM_Q4_PREFILL_K1024_KBLOCK_TILE *
+                                    ROCM_Q4_Q8K_WORDS;
+        uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
+        for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
+            const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
+            const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
+            const uint32_t p = block_slot >> 2u;
+            const uint32_t bb = block_slot & 3u;
+            const uint32_t *const src_words =
+                reinterpret_cast<const uint32_t *>(
+                    xq + (uint64_t)(tok0 + p) *
+                              ROCM_Q4_PREFILL_K1024_KBLOCK_TILE + bb);
+            sxq_words[i] = src_words[word];
+        }
     }
     __syncthreads();
 
@@ -967,6 +980,7 @@ __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
     }
 }
 
+template<bool STREAM_LDS>
 __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
         float *out,
         const char *w_base,
@@ -1007,21 +1021,31 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
          * struct per lane makes adjacent lanes issue 292-B-strided global
          * loads; flattening the packed blocks gives the memory coalescer long
          * contiguous runs while preserving the fixed eight-block LDS layout. */
-        const uint32_t tile_words = nt * ROCM_Q4_PREFILL_KBLOCK_TILE *
-                                    ROCM_Q4_Q8K_WORDS;
-        uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
-        for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
-            const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
-            const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
-            const uint32_t p = block_slot >> 3u;
-            const uint32_t bb = block_slot & 7u;
-            if (bb < nb) {
-                const uint64_t src_block =
-                    (uint64_t)(tok0 + p) * xq_token_stride +
-                    (uint64_t)group * xq_blocks + b0 + bb;
-                const uint32_t *const src_words =
-                    reinterpret_cast<const uint32_t *>(xq + src_block);
-                sxq_words[i] = src_words[word];
+        if (STREAM_LDS) {
+            const uint64_t src_block = (uint64_t)tok0 * xq_token_stride +
+                (uint64_t)group * xq_blocks + b0;
+            ds4_rocm_q4_lds::copy_thread<ROCM_Q4_PREFILL_KBLOCK_TILE>(
+                reinterpret_cast<uint32_t *>(sxq),
+                reinterpret_cast<const uint32_t *>(xq + src_block),
+                tid, blockDim.x, nt, nb,
+                (uint64_t)xq_token_stride * ROCM_Q4_Q8K_WORDS);
+        } else {
+            const uint32_t tile_words = nt * ROCM_Q4_PREFILL_KBLOCK_TILE *
+                                        ROCM_Q4_Q8K_WORDS;
+            uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
+            for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
+                const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
+                const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
+                const uint32_t p = block_slot >> 3u;
+                const uint32_t bb = block_slot & 7u;
+                if (bb < nb) {
+                    const uint64_t src_block =
+                        (uint64_t)(tok0 + p) * xq_token_stride +
+                        (uint64_t)group * xq_blocks + b0 + bb;
+                    const uint32_t *const src_words =
+                        reinterpret_cast<const uint32_t *>(xq + src_block);
+                    sxq_words[i] = src_words[word];
+                }
             }
         }
         __syncthreads();
@@ -1035,7 +1059,8 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
                 sxq[6] + lane, sxq[7] + lane,
                 nt, acc);
         }
-        __syncthreads();
+        if (!STREAM_LDS || ds4_rocm_q4_lds::needs_reuse_barrier(b0, xq_blocks))
+            __syncthreads();
     }
 
     if (row_valid) {
@@ -1058,6 +1083,7 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
  * projection up to the larger one's row count.  Each workgroup still handles
  * only one weight matrix: this preserves the standalone TILE8 block walk and
  * its accumulation order while removing the second host launch. */
+template<bool STREAM_LDS>
 __global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
         float *out0,
         float *out1,
@@ -1099,20 +1125,30 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
         const uint32_t nb = xq_blocks - b0 < ROCM_Q4_PREFILL_KBLOCK_TILE
                           ? xq_blocks - b0
                           : ROCM_Q4_PREFILL_KBLOCK_TILE;
-        const uint32_t tile_words = nt * ROCM_Q4_PREFILL_KBLOCK_TILE *
-                                    ROCM_Q4_Q8K_WORDS;
-        uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
-        for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
-            const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
-            const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
-            const uint32_t p = block_slot >> 3u;
-            const uint32_t bb = block_slot & 7u;
-            if (bb < nb) {
-                const uint64_t src_block =
-                    (uint64_t)(tok0 + p) * xq_blocks + b0 + bb;
-                const uint32_t *const src_words =
-                    reinterpret_cast<const uint32_t *>(xq + src_block);
-                sxq_words[i] = src_words[word];
+        if (STREAM_LDS) {
+            const uint64_t src_block = (uint64_t)tok0 * xq_blocks +
+                b0;
+            ds4_rocm_q4_lds::copy_thread<ROCM_Q4_PREFILL_KBLOCK_TILE>(
+                reinterpret_cast<uint32_t *>(sxq),
+                reinterpret_cast<const uint32_t *>(xq + src_block),
+                tid, blockDim.x, nt, nb,
+                (uint64_t)xq_blocks * ROCM_Q4_Q8K_WORDS);
+        } else {
+            const uint32_t tile_words = nt * ROCM_Q4_PREFILL_KBLOCK_TILE *
+                                        ROCM_Q4_Q8K_WORDS;
+            uint32_t *const sxq_words = reinterpret_cast<uint32_t *>(sxq);
+            for (uint32_t i = tid; i < tile_words; i += blockDim.x) {
+                const uint32_t block_slot = i / ROCM_Q4_Q8K_WORDS;
+                const uint32_t word = i - block_slot * ROCM_Q4_Q8K_WORDS;
+                const uint32_t p = block_slot >> 3u;
+                const uint32_t bb = block_slot & 7u;
+                if (bb < nb) {
+                    const uint64_t src_block =
+                        (uint64_t)(tok0 + p) * xq_blocks + b0 + bb;
+                    const uint32_t *const src_words =
+                        reinterpret_cast<const uint32_t *>(xq + src_block);
+                    sxq_words[i] = src_words[word];
+                }
             }
         }
         __syncthreads();
@@ -1126,7 +1162,8 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
                 sxq[6] + lane, sxq[7] + lane,
                 nt, acc);
         }
-        __syncthreads();
+        if (!STREAM_LDS || ds4_rocm_q4_lds::needs_reuse_barrier(b0, xq_blocks))
+            __syncthreads();
     }
 
     if (row_valid) {
@@ -1139,6 +1176,49 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
                 }
             }
         }
+    }
+}
+
+// Thread-local launch evidence for the model-free public-runtime oracle.
+static thread_local uint64_t g_rocm_q4_prefill_lds_stream_launches;
+extern "C" void ds4_rocm_test_q4_prefill_lds_stream_reset(void) {
+    g_rocm_q4_prefill_lds_stream_launches = 0;
+}
+extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_stream_get_calls(void) {
+    return g_rocm_q4_prefill_lds_stream_launches;
+}
+static int rocm_q4_K_prefill_lds_stream_enabled(void) {
+    return getenv("DS4_ROCM_DISABLE_Q4_PREFILL_LDS_STREAM") == NULL;
+}
+
+// Compile both schedules so rollback retains the original loader/barriers.
+template<typename... Args>
+static void rocm_q4_K_prefill_k1024_tile4_launch(dim3 grid, Args... args) {
+    if (rocm_q4_K_prefill_lds_stream_enabled()) {
+        rocm_matmul_q4_K_prefill_k1024_tile4_kernel<true><<<grid, 256>>>(args...);
+        ++g_rocm_q4_prefill_lds_stream_launches;
+    } else {
+        rocm_matmul_q4_K_prefill_k1024_tile4_kernel<false><<<grid, 256>>>(args...);
+    }
+}
+
+template<typename... Args>
+static void rocm_q4_K_prefill_tile8_strided_launch(dim3 grid, Args... args) {
+    if (rocm_q4_K_prefill_lds_stream_enabled()) {
+        rocm_matmul_q4_K_prefill_tile8_strided_kernel<true><<<grid, 256>>>(args...);
+        ++g_rocm_q4_prefill_lds_stream_launches;
+    } else {
+        rocm_matmul_q4_K_prefill_tile8_strided_kernel<false><<<grid, 256>>>(args...);
+    }
+}
+
+template<typename... Args>
+static void rocm_q4_K_prefill_tile8_pair_launch(dim3 grid, Args... args) {
+    if (rocm_q4_K_prefill_lds_stream_enabled()) {
+        rocm_matmul_q4_K_prefill_tile8_pair_kernel<true><<<grid, 256>>>(args...);
+        ++g_rocm_q4_prefill_lds_stream_launches;
+    } else {
+        rocm_matmul_q4_K_prefill_tile8_pair_kernel<false><<<grid, 256>>>(args...);
     }
 }
 
@@ -2406,7 +2486,7 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
                 (unsigned)((n_tok - 1u) /
                            ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
                 1u);
-            rocm_matmul_q4_K_prefill_k1024_tile4_kernel<<<tiled_grid, 256>>>(
+            rocm_q4_K_prefill_k1024_tile4_launch(tiled_grid,
                     reinterpret_cast<float *>(out->ptr), wptr, xq,
                     row_bytes, (uint32_t)out_dim, (uint32_t)n_tok);
             const int ok = cuda_ok(
@@ -2421,7 +2501,7 @@ extern "C" int ds4_rocm_matmul_q4_K_tensor(
                               (unsigned)((n_tok - 1u) /
                                          ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
                               1u);
-        rocm_matmul_q4_K_prefill_tile8_strided_kernel<<<tiled_grid, 256>>>(
+        rocm_q4_K_prefill_tile8_strided_launch(tiled_grid,
                 reinterpret_cast<float *>(out->ptr), wptr, xq, row_bytes,
                 (uint32_t)blocks, (uint32_t)out_dim, (uint32_t)n_tok,
                 blocks, out_dim);
@@ -2593,7 +2673,7 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
                         (unsigned)((n_tok - 1u) /
                                    ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
                         1u);
-        rocm_matmul_q4_K_prefill_tile8_pair_kernel<<<grid, 256>>>(
+        rocm_q4_K_prefill_tile8_pair_launch(grid,
                 reinterpret_cast<float *>(out0->ptr),
                 reinterpret_cast<float *>(out1->ptr), w0, w1, xq,
                 row_bytes0, (uint32_t)blocks0, (uint32_t)out0_dim,
@@ -2755,7 +2835,7 @@ static int rocm_q4_K_prefill_tile8_quant_launch(
                     (unsigned)((n_tok - 1u) /
                                ROCM_Q4_PREFILL_TOKEN_TILE + 1u),
                     n_groups);
-    rocm_matmul_q4_K_prefill_tile8_strided_kernel<<<grid, 256>>>(
+    rocm_q4_K_prefill_tile8_strided_launch(grid,
             out, w, xq, row_bytes, (uint32_t)blocks, out_dim, n_tok,
             xq_token_stride, out_token_stride);
     if (!cuda_ok(cudaGetLastError(),

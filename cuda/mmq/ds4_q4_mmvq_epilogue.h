@@ -14,6 +14,20 @@ static inline bool ds4_q4_mmvq_epilogue_shape_ok(int M, int N, int K) {
            (uint64_t)M * (uint64_t)(K / 256) <= INT_MAX;
 }
 
+// Grouped decode flattens (token, group) into grid.y. In addition to full
+// row cohorts, bound the signed weight-block index and unsigned channel
+// offsets used by canonical MMVQ. Strides are in Q8_1 blocks, not bytes.
+static inline bool ds4_q4_mmvq_grouped_shape_ok(
+        int M, int K, int n_tokens, int n_groups, int64_t stride_col_y) {
+    if (!ds4_q4_mmvq_epilogue_shape_ok(M, 1, K) ||
+        n_tokens <= 0 || n_tokens > 8 || n_groups <= 0 || n_groups > 16 ||
+        stride_col_y < K / 32 || stride_col_y > INT_MAX) return false;
+    const uint64_t channels = (uint64_t)n_tokens * (uint64_t)n_groups;
+    return (uint64_t)n_groups * (uint64_t)M * (uint64_t)(K / 256) <= INT_MAX &&
+           channels * (uint64_t)M <= UINT32_MAX &&
+           (uint64_t)stride_col_y <= UINT32_MAX / channels;
+}
+
 #if defined(__CUDACC__) || defined(__HIPCC__)
 __host__ __device__
 #endif

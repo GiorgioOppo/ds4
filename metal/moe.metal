@@ -2931,6 +2931,125 @@ void kernel_mul_mv_q4_K_f32_impl(
     (void)shmem;
 }
 
+// Two-token classic matvec. Preload each lane's quant bytes and scale/min
+// metadata once, then run the original scalar arithmetic for each token.
+// Each output keeps the classic ix/ib partition and simd_sum tree; the two
+// tokens never share an accumulator. Only dense token-major callers use this.
+struct ds4_q4_K_lane_weights {
+    ushort4 q1, q2;
+    ushort sc16[4];
+    half2 dm;
+};
+
+template<int nr0>
+void kernel_mul_mv_q4_K_token_pair_impl(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0, device const char *src1, device char *dst,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int first_row = (tgpig.x * FC_mul_mv_nsg + sgitg) * nr0;
+    const int first_token = 2 * tgpig.y;
+    const short ix = tiisg / 8;
+    const short iq = (tiisg % 8) / 4;
+    const short ir = tiisg % 4;
+    const int nb = args.ne00 / QK_K;
+    float sumf[2][nr0] = {};
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        ds4_q4_K_lane_weights w[nr0];
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {
+            // Guard tails before loading, including fully inactive SIMDgroups.
+            if (first_row + row < args.ne0) {
+                device const block_q4_K *b = (device const block_q4_K *)(
+                    src0 + (uint64_t)(first_row + row) * args.nb01) + ib;
+                device const ushort *sc = (device const ushort *)b->scales + iq;
+                device const ushort *q1 = (device const ushort *)b->qs + 16 * iq + 4 * ir;
+                w[row].q1 = *(device const ushort4 *)q1;
+                w[row].q2 = *(device const ushort4 *)(q1 + 32);
+                w[row].sc16[0] = sc[0] & 0x3f3f;
+                w[row].sc16[1] = sc[2] & 0x3f3f;
+                w[row].sc16[2] = (sc[4] & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
+                w[row].sc16[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+                w[row].dm = *(device const half2 *)&b->d;
+            }
+        }
+        for (short token = 0; token < 2; ++token) {
+            if (first_token + token >= args.ne11) break;
+            device const float *y4 = (device const float *)(
+                src1 + (uint64_t)(first_token + token) * args.nb11) +
+                ib * QK_K + 64 * iq + 8 * ir;
+            float yl[16], yh[16];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                if (first_row + row < args.ne0) {
+                    const ushort4 q1 = w[row].q1, q2 = w[row].q2;
+                    const half2 dh = w[row].dm;
+                    thread const uchar *sc8 = (thread const uchar *)w[row].sc16;
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    FOR_UNROLL (short i = 0; i < 4; ++i) {
+                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                    }
+                    sumf[token][row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                                               (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                                               (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                                               (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                                      dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+                }
+            }
+        }
+    }
+    for (short token = 0; token < 2 && first_token + token < args.ne11; ++token) {
+        device float *out = (device float *)dst + (uint64_t)(first_token + token) * args.ne0;
+        for (short row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+            const float value = simd_sum(sumf[token][row]);
+            if (tiisg == 0) out[first_row + row] = value;
+        }
+    }
+}
+
+kernel void kernel_mul_mv_q4_K_dense_token_pair_f32(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0, device const char *src1, device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+    (void)shmem;
+}
+
+// Oracle/benchmark only. Production Q-A/KV pairs retain the legacy kernel:
+// K4096 paired timings were mixed, unlike the standalone Q-b admission.
+kernel void kernel_mul_mv_q4_K_dense_pair_token_pair_f32(
+        constant ds4_metal_args_mul_mv &args0,
+        constant ds4_metal_args_mul_mv &args1,
+        device const char *src0_a, device const char *src0_b,
+        device const char *src1, device char *dst_a, device char *dst_b,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int first_row = (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+    if (first_row < args0.ne0)
+        kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K>(args0, src0_a, src1, dst_a, tgpig, tiisg, sgitg);
+    if (first_row < args1.ne0)
+        kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K>(args1, src0_b, src1, dst_b, tgpig, tiisg, sgitg);
+    (void)shmem;
+}
+
 // This is the classic Q4_K matvec inner loop with only the weight address
 // space changed from device to threadgroup.  Its lane-to-K mapping, scalar
 // operation order and simd_sum reduction are deliberately kept identical to

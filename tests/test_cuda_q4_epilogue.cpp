@@ -56,6 +56,36 @@ static void host_tests() {
     require(ds4_q4_mmvq_epilogue_shape_ok(INT_MAX-3, 1, 256), "valid index bound rejected");
     std::printf("PASS: %zu sanitizer patterns, %zu shape/coverage cases, index bounds.\n",
         random_patterns + sizeof(special) / sizeof(special[0]), shapes);
+
+    size_t grouped_shapes = 0;
+    for (int m = 0; m <= 65; ++m) for (int k : ks)
+    for (int tokens = 0; tokens <= 9; ++tokens) for (int groups = 0; groups <= 17; ++groups) {
+        const int64_t stride = ((int64_t(k) + 511) / 512) * 16;
+        const bool expected = m > 0 && m % 4 == 0 && k > 0 && k % 256 == 0 &&
+                              tokens >= 1 && tokens <= 8 && groups >= 1 && groups <= 16;
+        require(ds4_q4_mmvq_grouped_shape_ok(m, k, tokens, groups, stride) == expected,
+                "grouped shape admission mismatch");
+        if (expected) {
+            for (int t = 0; t < tokens; ++t) for (int g = 0; g < groups; ++g) {
+                const int channel = t * groups + g;
+                require(channel % groups == g, "cyclic weight group mismatch");
+                require(channel % (tokens * groups) == channel, "activation channel mismatch");
+            }
+        }
+        ++grouped_shapes;
+    }
+    require(!ds4_q4_mmvq_grouped_shape_ok(4, 256, -1, 8, 16), "negative tokens admitted");
+    require(!ds4_q4_mmvq_grouped_shape_ok(4, 256, 1, -1, 16), "negative groups admitted");
+    require(!ds4_q4_mmvq_grouped_shape_ok(INT_MAX-3, 256, 1, 2, 16), "grouped weight index overflow admitted");
+    require(!ds4_q4_mmvq_grouped_shape_ok(1<<29, 256, 8, 1, 16), "grouped output offset overflow admitted");
+    require(ds4_q4_mmvq_grouped_shape_ok((1<<29)-4, 256, 8, 1, 16), "valid output offset bound rejected");
+    require(!ds4_q4_mmvq_grouped_shape_ok(4, 256, 8, 16, int64_t(UINT32_MAX)/128+1),
+            "grouped Q8 offset overflow admitted");
+    require(ds4_q4_mmvq_grouped_shape_ok(4, 256, 8, 16, int64_t(UINT32_MAX)/128),
+            "valid Q8 offset bound rejected");
+    require(!ds4_q4_mmvq_grouped_shape_ok(4, 256, 1, 1, 7), "short Q8 stride admitted");
+    require(!ds4_q4_mmvq_grouped_shape_ok(4, 256, 1, 1, INT64_MAX), "Q8 stride overflow admitted");
+    std::printf("PASS: %zu grouped shape/channel cases and offset bounds.\n", grouped_shapes);
 }
 
 #ifdef __CUDACC__
@@ -98,6 +128,8 @@ struct Buffer {
 struct Q4Block { uint16_t d, dmin; uint8_t scales[12], qs[128]; };
 static_assert(sizeof(Q4Block) == 144, "Q4_K ABI");
 struct GraphCounts { size_t kernels = 0, memsets = 0; };
+struct EpilogueArm { const char *rollback_value; bool candidate; };
+static const EpilogueArm epilogue_arms[] = {{"1", false}, {nullptr, true}, {"0", false}, {"", false}};
 static GraphCounts graph_counts(cudaGraph_t graph) {
     size_t count = 0;
     check(cudaGraphGetNodes(graph, nullptr, &count));
@@ -156,8 +188,6 @@ static void gpu_case(int m0, int m1, int n, int k, bool nonfinite, bool pair) {
     };
     // Start with the legacy reference. Every defined value must disable the
     // candidate, including "0" and an empty string (presence-based opt-out).
-    struct Arm { const char *rollback_value; bool candidate; };
-    const Arm arms[] = {{"1", false}, {nullptr, true}, {"0", false}, {"", false}};
     const size_t eligible_legs = size_t(ds4_q4_mmvq_epilogue_shape_ok(m0, n, k)) +
                                  size_t(ds4_q4_mmvq_epilogue_shape_ok(m1, n, k));
     for (int repeat = 0; repeat < 3; ++repeat) {
@@ -170,7 +200,7 @@ static void gpu_case(int m0, int m1, int n, int k, bool nonfinite, bool pair) {
         std::array<std::vector<unsigned char>, 2> reference;
         GraphCounts reference_counts;
         bool first_arm = true;
-        for (const Arm &arm : arms) {
+        for (const EpilogueArm &arm : epilogue_arms) {
             rollback.set(arm.rollback_value);
             poison(); launch(); check(cudaStreamSynchronize(stream));
             const std::array<std::vector<unsigned char>, 2> output = {y0.read(), y1.read()};
@@ -216,6 +246,141 @@ static void gpu_case(int m0, int m1, int n, int k, bool nonfinite, bool pair) {
     std::printf("PASS: %s M=%d+%d N=%d K=%d %s (direct/graph/rollback/canaries).\n",
         pair ? "pair" : "single", m0, m1, n, k, nonfinite ? "NaN/Inf" : "finite");
 }
+static void gpu_grouped_case(int m, int k, int tokens, int groups, bool nonfinite) {
+    uint32_t seed = 9137u + m + k + tokens + groups;
+    const size_t row_blocks = size_t(k) / 256;
+    // Extra physical rows only protect the legacy small-K tail loader. Each
+    // logical group still has exactly M rows; there is no inter-group padding.
+    std::vector<Q4Block> weights((size_t(groups)*m + 3)*row_blocks);
+    for (size_t i = 0; i < weights.size(); ++i) {
+        auto &b = weights[i];
+        b.d = 0x2000u + (random_u32(seed) & 0x7ffu);
+        b.dmin = i % 5 ? 0x1800u + (random_u32(seed) & 0x3ffu) : 0u;
+        if (nonfinite) {
+            const uint16_t values[] = {0x7c00, 0xfc00, 0x7e00, 0x7c01};
+            b.d = values[(i / row_blocks) % 4];
+        }
+        for (auto &v : b.scales) v = random_u32(seed) >> 24;
+        for (auto &v : b.qs) v = random_u32(seed) >> 24;
+    }
+    const size_t channels = size_t(tokens)*groups;
+    const size_t padded_k = (size_t(k) + 511) / 512 * 512;
+    const size_t q8_bytes = channels * (padded_k / 32) * 36; // block_q8_1 ABI
+    const size_t ids_offset = (q8_bytes + 15) / 16 * 16;
+    const size_t scratch_bytes = ids_offset + channels*sizeof(int32_t);
+    Buffer w(weights.size()*sizeof(Q4Block)), x(channels*k*sizeof(float)),
+        ref(channels*m*sizeof(float)), out(ref.bytes), scratch(scratch_bytes);
+    check(cudaMemcpy(w.ptr<void>(), weights.data(), w.bytes, cudaMemcpyHostToDevice));
+    cudaStream_t stream;
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    ds4_mmq_set_aligned_q81_scratch(scratch.ptr<void>(), scratch.bytes);
+    ScopedEnv rollback("DS4_CUDA_DISABLE_Q4_GROUPED_MMVQ_FUSION");
+    auto enqueue = [&] {
+        return tokens == 1
+            ? ds4_mmq_q4_K_grouped_vec(w.ptr<void>(), x.ptr<float>(), out.ptr<float>(), m, k, groups, stream)
+            : ds4_mmq_q4_K_grouped_batch_vec(w.ptr<void>(), x.ptr<float>(), out.ptr<float>(), m, k, tokens, groups, stream);
+    };
+    auto launch = [&] { require(enqueue() == 0, "grouped enqueue failed"); check(cudaGetLastError()); };
+    auto poison = [&] {
+        check(cudaMemsetAsync(out.ptr<void>(), 0xff, out.bytes, stream));
+        check(cudaMemsetAsync(scratch.ptr<void>(), 0xa5, scratch.bytes, stream));
+    };
+    const bool eligible = ds4_q4_mmvq_grouped_shape_ok(m, k, tokens, groups, padded_k / 32);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        std::vector<float> input(channels*k);
+        for (size_t i = 0; i < input.size(); ++i)
+            input[i] = repeat == 0 ? (i & 1 ? -0.f : 0.f) :
+                (int(random_u32(seed) % 8193u) - 4096) / 1024.f;
+        check(cudaMemcpyAsync(x.ptr<void>(), input.data(), x.bytes, cudaMemcpyHostToDevice, stream));
+        // Independent per-(token, group) reference, with dense epilogue fusion
+        // disabled by the suite. Different rows/groups/tokens carry distinct data.
+        for (int t = 0; t < tokens; ++t) for (int g = 0; g < groups; ++g) {
+            const size_t channel = size_t(t)*groups + g;
+            require(ds4_mmq_q4_K_dense_vec(
+                w.ptr<Q4Block>() + size_t(g)*m*row_blocks, x.ptr<float>() + channel*k,
+                ref.ptr<float>() + channel*m, m, 1, k, stream) == 0, "grouped dense reference failed");
+        }
+        check(cudaStreamSynchronize(stream));
+        const auto reference = ref.read();
+        std::vector<unsigned char> reference_q8;
+        GraphCounts reference_counts;
+        bool first_arm = true;
+        for (const EpilogueArm &arm : epilogue_arms) {
+            rollback.set(arm.rollback_value);
+            // Both arms keep the original scratch-capacity/pre-enqueue contract.
+            ds4_mmq_set_aligned_q81_scratch(scratch.ptr<void>(), scratch.bytes - 1);
+            require(enqueue() == DS4_MMQ_NOT_APPLICABLE, "short grouped scratch accepted");
+            ds4_mmq_set_aligned_q81_scratch(scratch.ptr<void>(), scratch.bytes);
+            poison(); launch(); check(cudaStreamSynchronize(stream));
+            const auto result = out.read();
+            require(result == reference, "grouped direct output not bitwise equal");
+            for (size_t i = 0; i < result.size(); i += sizeof(uint32_t)) {
+                uint32_t bits; std::memcpy(&bits, result.data()+i, sizeof(bits));
+                require((bits & 0x7f800000u) != 0x7f800000u, "grouped nonfinite/unwritten output");
+                if (nonfinite) require(bits == 0u, "grouped nonfinite result not sanitized to +0");
+            }
+            const auto arena = scratch.read();
+            const std::vector<unsigned char> q8(arena.begin(), arena.begin() + q8_bytes);
+            if (first_arm) reference_q8 = q8;
+            else require(q8 == reference_q8, "grouped Q8_1 bytes changed");
+            if (arm.candidate && eligible)
+                for (size_t i = ids_offset; i < arena.size(); ++i)
+                    require(arena[i] == 0xa5, "fused grouped path wrote the unused ids table");
+
+            cudaGraph_t graph;
+            cudaGraphExec_t executable;
+            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+            launch();
+            check(cudaStreamEndCapture(stream, &graph));
+            const GraphCounts counts = graph_counts(graph);
+            if (first_arm) reference_counts = counts;
+            const size_t removed = arm.candidate && eligible ? 1 : 0;
+            require(reference_counts.kernels == counts.kernels + 2*removed &&
+                    reference_counts.memsets == counts.memsets + removed,
+                    "grouped graph did not remove/restore ids, sanitizer and output clear");
+            check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            // A changed environment must not change an already captured graph.
+            rollback.set(arm.candidate ? "1" : nullptr);
+            for (int replay = 0; replay < 3; ++replay) {
+                poison(); check(cudaGraphLaunch(executable, stream));
+                check(cudaStreamSynchronize(stream));
+                require(out.read() == reference, "grouped graph output not bitwise equal");
+            }
+            check(cudaGraphExecDestroy(executable));
+            check(cudaGraphDestroy(graph));
+            first_arm = false;
+        }
+        const auto after_x = x.read();
+        require(!std::memcmp(after_x.data(), input.data(), x.bytes), "grouped input mutated");
+    }
+    const auto after_w = w.read();
+    require(!std::memcmp(after_w.data(), weights.data(), w.bytes), "grouped weights mutated");
+    (void)scratch.read();
+    ds4_mmq_set_aligned_q81_scratch(nullptr, 0);
+    check(cudaStreamDestroy(stream));
+    std::printf("PASS: grouped M=%d K=%d tokens=%d groups=%d %s (bits/Q8/graph/rollback/guards).\n",
+        m, k, tokens, groups, nonfinite ? "NaN/Inf" : "finite");
+}
+
+static void gpu_grouped_tests() {
+    ScopedEnv global_off("DS4_CUDA_NO_Q4_GB10_FAST"); global_off.set(nullptr);
+    ScopedEnv grouped_off("DS4_CUDA_NO_Q4_GROUPED_ATTN_A"); grouped_off.set(nullptr);
+    ScopedEnv batch_off("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH"); batch_off.set(nullptr);
+    ScopedEnv batch_on("DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH"); batch_on.set("1");
+    ScopedEnv dense_epilogue("DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE"); dense_epilogue.set("1");
+    ds4_mmq_set_gb10_optimizations(1);
+    const int shapes[][4] = {{4,256,1,1}, {12,512,2,3}, {32,1024,3,8},
+        {12,1792,8,16}, {36,2048,2,5}, {1024,4096,1,8}, {1024,4096,8,8},
+        {64,8192,3,16}, {33,512,3,3}, {33,4096,1,8}};
+    unsigned cases = 0;
+    for (const auto &s : shapes) for (bool nonfinite : {false, true}) {
+        gpu_grouped_case(s[0], s[1], s[2], s[3], nonfinite);
+        ++cases;
+    }
+    ds4_mmq_set_gb10_optimizations(0);
+    std::printf("PASS: %u CUDA grouped Q4 cases. No throughput claim.\n", cases);
+}
+
 static void gpu_tests() {
     cudaDeviceProp props{};
     check(cudaGetDeviceProperties(&props, 0));
@@ -233,6 +398,7 @@ static void gpu_tests() {
         ++cases;
     }
     std::printf("PASS: %u CUDA production Q4 epilogue cases. No throughput claim.\n", cases);
+    gpu_grouped_tests();
 }
 #endif
 

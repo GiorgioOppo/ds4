@@ -127,10 +127,13 @@ help:
 	@echo "  make test-metal-iq2-midonly  Check M1 IQ2 addr mid-only output and sentinels"
 	@echo "  make test-metal-ssd-decode-kernels  Bitwise Q4/Q8 SSD decode kernel oracle (no model)"
 	@echo "  make bench-metal-q8-mv  Bitwise checks and kernel-only Q8 decode reduction A/B"
+	@echo "  make bench-metal-q4-token-pair  Bitwise checks and kernel-only Q4 Q-b token-pair A/B"
+	@echo "  make test-metal-q4-qb-token-pair  Check the M1 Q-b token-pair runtime and opt-out"
 	@echo "  make test-q4-epilogue-host  Check CUDA Q4 epilogue bits and admission without a GPU"
 	@echo "  make test-metal-iq2-live-index  Check IQ2 SSD live-cache index policy and fallback"
 	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
+	@echo "  make test-rocm-q4-lds-host Check Q4 prefill LDS addressing and fence schedule without HIP"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make metal-q4-dense-pair-bench  Build the resident Q4 decode pair kernel benchmark"
@@ -393,7 +396,14 @@ test-metal-exactn-oracle: tests/test_metal_exactn_oracle
 speed-bench/metal_q4_dense_pair_bench: speed-bench/metal_q4_dense_pair_bench.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 
-.PHONY: test-metal-ssd-decode-kernels bench-metal-q8-mv
+.PHONY: test-metal-ssd-decode-kernels bench-metal-q8-mv bench-metal-q4-token-pair
+.PHONY: test-metal-q4-qb-token-pair
+tests/test_metal_q4_qb_token_pair: tests/test_metal_q4_qb_token_pair.m ds4_gpu.h ds4_image.o ds4_metal.o
+	$(CC) $(OBJCFLAGS) -I. -o $@ $< ds4_image.o ds4_metal.o $(METAL_LDLIBS)
+
+test-metal-q4-qb-token-pair: tests/test_metal_q4_qb_token_pair
+	./tests/test_metal_q4_qb_token_pair
+
 tests/test_metal_ssd_decode_kernels: tests/test_metal_ssd_decode_kernels.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 
@@ -402,6 +412,9 @@ test-metal-ssd-decode-kernels: tests/test_metal_ssd_decode_kernels
 
 bench-metal-q8-mv: tests/test_metal_ssd_decode_kernels
 	./tests/test_metal_ssd_decode_kernels --bench-q8-mv
+
+bench-metal-q4-token-pair: tests/test_metal_ssd_decode_kernels
+	./tests/test_metal_ssd_decode_kernels --bench-q4-token-pair
 
 metal-q4-dense-pair-bench: speed-bench/metal_q4_dense_pair_bench
 
@@ -878,6 +891,13 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
+.PHONY: test-rocm-q4-lds-host
+tests/test_rocm_q4_lds_host: tests/test_rocm_q4_lds_host.cpp rocm/ds4_rocm_q4_lds.cuh
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -I. -o $@ $<
+
+test-rocm-q4-lds-host: tests/test_rocm_q4_lds_host
+	./tests/test_rocm_q4_lds_host
+
 tests/test_rocm_q4_dense_pair.o: tests/test_rocm_q4_dense_pair.cpp ds4_gpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -std=c++17 -fno-fast-math -I. -c -o $@ $<
 
@@ -1102,6 +1122,8 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
+	rm -f tests/test_rocm_q4_lds_host
+	rm -f tests/test_metal_q4_qb_token_pair
 	rm -f tests/test_q4_epilogue_host tests/test_cuda_q4_epilogue
 	rm -f tests/test_q8_quantize_host tests/test_cuda_q8_quantize
 	rm -f tests/test_metal_ssd_decode_kernels

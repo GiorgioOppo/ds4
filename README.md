@@ -215,6 +215,14 @@ make cpu              # CPU-only diagnostics build
 
 For ROCm packages, GTT configuration and the reproducible ROCm 10.0 container build, see [DS4 on Strix Halo](STRIXHALO.md).
 
+The exact ROCm Q4 tiled-prefill kernels now use simpler Q8_K activation
+staging and omit the final shared-memory reuse barrier. The change is default
+on within the existing TILE8/K1024 TILE4 paths; set
+`DS4_ROCM_DISABLE_Q4_PREFILL_LDS_STREAM=1` to restore their previous
+loaders/barriers. Decode, WMMA, quantization and tile geometry are unchanged.
+Host checks pass, but HIP compilation, GPU parity and performance measurement
+remain pending. See [the Q4 LDS tester notes](speed-bench/rocm_q4_prefill_lds.md).
+
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
@@ -630,6 +638,17 @@ this verifier:
   the enable gate for N=2..5 and turns an ineligible shape, the kill switch, or
   a dispatch failure into a hard error instead of a silent row-wise fallback.
 
+For standalone Q4_K Q-b micro-batches (`1024 -> 32768`, 2–8 tokens), Apple
+M1-family GPUs now reuse each lane's packed weights and scale/min metadata
+across two tokens. The default retains the classic per-token arithmetic and
+reduction tree. Set `DS4_METAL_DISABLE_Q4_QB_TOKEN_PAIR=1` to restore the
+one-token-per-threadgroup path; any defined value, including `0` or empty,
+disables it. One-token decode, Q-A/KV pairs, larger prefills, quality mode,
+tensor parallelism and other GPU families keep their existing dispatches.
+Local M1 Max kernel A/B measurements reduced Q-b time by roughly 20–28%; this
+is not an end-to-end model or SSD throughput result. See
+[the measurements and tester commands](speed-bench/metal_q4_qb_token_pair.md).
+
 The AProjQ8 Q-A/KV plus compressor compound remains the M1-M5 default for
 eligible resident `FULL` decode. For an SSD-streaming A/B, including the
 exact-union `TO_ROUTER` collection prefix, set
@@ -793,6 +812,14 @@ arithmetic:
   dispatch while keeping `ncols_dst=1`;
   `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1` restores the per-token grouped loop
   and `DS4_CUDA_NO_Q4_GROUPED_ATTN_A=1` restores the per-group loop;
+  within eligible grouped MMVQ calls, a default specialization now derives the
+  weight group from the grid index and sanitizes at store, removing the ids
+  producer, output clear and separate sanitizer. Set
+  `DS4_CUDA_DISABLE_Q4_GROUPED_MMVQ_FUSION=1` to restore those three operations
+  while keeping grouped dispatch. Any defined value, including `0` or empty,
+  disables this specialization. It does not enable multi-token batching or
+  affect grouped prefill above eight tokens. GPU validation and throughput
+  measurements are pending; see [the grouped MMVQ test notes](speed-bench/cuda_q4_grouped_mmvq_fusion.md);
 - for prefill widths above eight, the default eligible GB10 path quantizes the
   strided `[token][group][K]` input in one launch and writes each group directly
   into `[token][group][rank]`. It removes the eight F32 pack/unpack copies while

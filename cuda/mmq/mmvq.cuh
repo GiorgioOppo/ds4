@@ -27,6 +27,12 @@ void mul_mat_vec_q_switch_type(
 void ds4_mmvq_q4_K_dense_sanitized(
         const void *weights, const void *q8_1, float *out,
         int M, int K, int stride_col_y, cudaStream_t stream);
+
+// Token-major grouped Q4 attention-A. Uses grid.y % n_groups instead of ids;
+// caller checks full row cohorts and representable weight/Q8/output offsets.
+void ds4_mmvq_q4_K_grouped_sanitized(
+        const void *weights, const void *q8_1, float *out,
+        int M, int K, int n_tokens, int n_groups, int stride_col_y, cudaStream_t stream);
 #endif
 
 #ifdef DS4_MMVQ_INCLUDE_GGML_ENTRIES

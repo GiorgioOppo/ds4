@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <sys/mman.h>
@@ -71,6 +72,8 @@ extern "C" int ds4_rocm_test_q4_attn_q_b_yield_to_q8_wave32_policy(
     int f16_cache_required);
 extern "C" int ds4_rocm_test_q4_pair_pre_enqueue_failure_policy(
     int prefill_scope, int tile8_required, int q8_wave32_required);
+extern "C" void ds4_rocm_test_q4_prefill_lds_stream_reset(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_stream_get_calls(void);
 
 namespace {
 
@@ -107,6 +110,8 @@ constexpr const char *kPrefillDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_TILE8";
 constexpr const char *kPrefillRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8";
+constexpr const char *kPrefillLdsDisable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_LDS_STREAM";
 constexpr const char *kPrefillK1024Tile4Disable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4";
 constexpr const char *kPrefillK1024Tile4SsdEnable =
@@ -715,6 +720,39 @@ bool read_tensor(const ds4_gpu_tensor *tensor, std::vector<float> *values) {
         tensor, 0, values->data(), values->size() * sizeof(float)) != 0;
 }
 
+struct lds_output_check {
+    ds4_gpu_tensor *tensor;
+    const std::vector<float> *expected;
+    const std::vector<float> *sentinel;
+};
+
+template<typename Enqueue>
+bool run_prefill_lds_rollback_oracle(
+        Enqueue enqueue, std::initializer_list<lds_output_check> outputs) {
+    env_snapshot disable(kPrefillLdsDisable);
+    for (const char *value : {static_cast<const char *>(nullptr), "1", "0", ""}) {
+        if ((value ? setenv(kPrefillLdsDisable, value, 1) :
+                     unsetenv(kPrefillLdsDisable)) != 0) return false;
+        for (const auto &out : outputs)
+            if (!write_tensor(out.tensor, *out.sentinel)) return false;
+        ds4_rocm_test_q4_prefill_lds_stream_reset();
+        if (enqueue() <= 0) return false;
+        const uint64_t calls = ds4_rocm_test_q4_prefill_lds_stream_get_calls();
+        if ((value == nullptr && calls == 0u) || (value != nullptr && calls != 0u)) {
+            std::fprintf(stderr, "Q4 LDS opt-out '%s': unexpected launches=%llu FAIL\n",
+                         value ? value : "unset", (unsigned long long)calls);
+            return false;
+        }
+        for (const auto &out : outputs) {
+            std::vector<float> got(out.expected->size());
+            if (!read_tensor(out.tensor, &got) ||
+                !bitwise_equal(got, *out.expected, "Q4 LDS default/rollback and guards"))
+                return false;
+        }
+    }
+    return true;
+}
+
 std::vector<float> sentinel_values(size_t count) {
     std::vector<float> result(count);
     for (size_t i = 0; i < count; i++) {
@@ -990,6 +1028,11 @@ bool run_prefill_parity_case(const aligned_model &model, uint32_t n_tokens,
 
     bool ok = output_guard_unchanged(
         legacy_all, sentinel, logical_count, "prefill legacy output canary");
+    ok = run_prefill_lds_rollback_oracle([&]() {
+        return ds4_gpu_matmul_quant_tensor(
+            candidate_gpu.ptr, model.data, model.size, offset, kQ4Type,
+            in_dim, out_dim, x_gpu.ptr, n_tokens);
+    }, {{candidate_gpu.ptr, &candidate_all, &sentinel}}) && ok;
     ok = output_guard_unchanged(
              candidate_all, sentinel, logical_count,
              "prefill candidate output canary") && ok;
@@ -2062,6 +2105,13 @@ bool run_prefill_pair_case(const aligned_model &model, uint32_t n_tokens,
 
     bool ok = output_guard_unchanged(
         pair0_host, sentinel0, count0, "prefill pair0 output canary");
+    ok = run_prefill_lds_rollback_oracle([&]() {
+        return ds4_gpu_matmul_q4_K_pair_tensor(
+            pair0.ptr, pair1.ptr, model.data, model.size,
+            weight0_offset, weight1_offset,
+            in_dim, out0_dim, out1_dim, x_gpu.ptr, n_tokens);
+    }, {{pair0.ptr, &pair0_host, &sentinel0},
+        {pair1.ptr, &pair1_host, &sentinel1}}) && ok;
     ok = output_guard_unchanged(
              pair1_host, sentinel1, count1,
              "prefill pair1 output canary") && ok;
@@ -2249,6 +2299,14 @@ bool run_attention_prefill_case(const aligned_model &model,
     bool ok = output_guard_unchanged(
         candidate_low_host, low_sentinel, low_count,
         "attention candidate low canary");
+    ok = run_prefill_lds_rollback_oracle([&]() {
+        return ds4_gpu_attention_output_q4_K_batch_tensor(
+            candidate_out.ptr, candidate_low.ptr, group_tmp.ptr, low_tmp.ptr,
+            model.data, model.size, model.attn_a_offset, out_b_offset,
+            out_b_type, kAttnGroupDim, kAttnRank, kAttnGroups, kAttnOutDim,
+            heads_gpu.ptr, n_tokens);
+    }, {{candidate_low.ptr, &candidate_low_host, &low_sentinel},
+        {candidate_out.ptr, &candidate_out_host, &out_sentinel}}) && ok;
     ok = output_guard_unchanged(
              candidate_out_host, out_sentinel, out_count,
              "attention candidate out canary") && ok;

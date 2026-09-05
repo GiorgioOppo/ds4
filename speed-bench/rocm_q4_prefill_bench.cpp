@@ -47,6 +47,8 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_k128_enqueue(
 extern "C" void ds4_rocm_test_q4_prefill_wmma_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void);
+extern "C" void ds4_rocm_test_q4_prefill_lds_stream_reset(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_stream_get_calls(void);
 
 namespace {
 
@@ -76,6 +78,8 @@ constexpr const char *kPrefillDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_TILE8";
 constexpr const char *kPrefillRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8";
+constexpr const char *kLdsDisable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_LDS_STREAM";
 constexpr const char *kK1024Tile4Disable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4";
 constexpr const char *kK1024Tile4SsdEnable =
@@ -124,6 +128,7 @@ static_assert(sizeof(block_q8_K_host) == 292u,
 
 enum class bench_case {
     all,
+    lds,
     dense,
     pair,
     qb,
@@ -886,6 +891,60 @@ bool run_q8_quantizer(const config &cfg, ds4_gpu_tensor *x,
                                "raw wave32 Q8_K", kRawQ8GuardWords);
         },
         benchmark_rate::quantized_values);
+}
+
+// Isolate this change: same quantizer, tile shape, grid and launch count.
+// Public-API HIP-event timing includes Q8_K quantization in both arms.
+bool run_lds(const model_fixture &model, const config &cfg,
+             uint32_t n_tokens, bool qb) {
+    env_snapshot lds_guard(kLdsDisable);
+    const uint32_t k = qb ? kQbK : kDenseK;
+    const uint32_t m = qb ? kQbM : kDenseM;
+    const uint64_t elements = (uint64_t)n_tokens * m;
+    const uint64_t bytes = elements * sizeof(float);
+    const uint64_t allocation = bytes + kGuardWords * sizeof(uint32_t);
+    tensor_owner x((uint64_t)n_tokens * k * sizeof(float));
+    tensor_owner reference(allocation), candidate(allocation);
+    if (!allocate_io(n_tokens, k, elements, &x, &reference, &candidate)) return false;
+    auto enqueue = [&](uint32_t set, ds4_gpu_tensor *out, bool optimized) {
+        const uint64_t offset = qb ? model.weights[set].qb_offset :
+                                     model.weights[set].dense_offset;
+        ds4_rocm_test_q4_prefill_lds_stream_reset();
+        const int rc = ds4_gpu_matmul_quant_tensor(
+            out, model.data, model.size, offset, kQ4Type, k, m, x.ptr, n_tokens);
+        const uint64_t calls = ds4_rocm_test_q4_prefill_lds_stream_get_calls();
+        if (rc == 0 || calls != (optimized ? 1u : 0u)) {
+            std::fprintf(stderr, "Q4 LDS benchmark wrong path: optimized=%d rc=%d calls=%llu\n",
+                         optimized, rc, (unsigned long long)calls);
+            return false;
+        }
+        return true;
+    };
+    const arm baseline = {
+        "lds_legacy",
+        [&]() {
+            if (qb) select_k1024_tile4(); else select_tile8(false);
+            (void)setenv(kLdsDisable, "1", 1);
+        },
+        [&](uint32_t set) { return enqueue(set, reference.ptr, false); }};
+    const arm optimized = {
+        "lds_stream",
+        [&]() {
+            if (qb) select_k1024_tile4(); else select_tile8(false);
+            (void)unsetenv(kLdsDisable);
+        },
+        [&](uint32_t set) { return enqueue(set, candidate.ptr, true); }};
+    return benchmark_arms(
+        qb ? "q_b_lds" : "dense_lds", n_tokens, k, m, cfg, baseline, optimized,
+        [&]() {
+            return poison_output(reference.ptr, bytes, 0x7fc10001u) &&
+                   poison_output(candidate.ptr, bytes, 0x7fc20002u);
+        },
+        [&]() {
+            return bitwise_equal(reference.ptr, candidate.ptr, bytes, "Q4 LDS rollback vs default") &&
+                   check_guard(reference.ptr, bytes, "Q4 LDS reference") &&
+                   check_guard(candidate.ptr, bytes, "Q4 LDS candidate");
+        });
 }
 
 bool run_dense(const model_fixture &model, const config &cfg,
@@ -1832,7 +1891,7 @@ void usage(FILE *stream, const char *argv0) {
         stream,
         "usage: %s [options]\n\n"
         "Resident ROCm Q4_K prefill kernel A/B (HIP event timing only).\n\n"
-        "  --case all|dense|pair|qb|outb|output\n"
+        "  --case all|lds|dense|pair|qb|outb|output\n"
         "                              comparison to run (default: all)\n"
         "  --tokens N[,N...]          token counts, each 9..4096\n"
         "  --full                     use 9,16,17,31,32,33,128,256,257,512,4096\n"
@@ -1840,6 +1899,8 @@ void usage(FILE *stream, const char *argv0) {
         "  --samples N                samples/arm, multiple of 4 (default: %u)\n"
         "  --warmup N                 untimed dispatches/arm (default: %u)\n"
         "  -h, --help                 show this help\n\n"
+        "lds isolates the Q4 LDS loader/final-fence rollback at K4096 and\n"
+        "Q-b K1024, with bitwise checks, launch evidence and identical tiling.\n"
         "dense compares legacy/TILE8, times the raw canonical/wave32 Q8_K\n"
         "quantizer kernels on gfx1151, and TILE8/direct WMMA there for N>=256\n"
         "at K=4096,M=1024. pair compares\n"
@@ -1912,6 +1973,7 @@ config parse_options(int argc, char **argv) {
         } else if (!std::strcmp(argv[i], "--case")) {
             const char *value = need_value(&i, argc, argv);
             if (!std::strcmp(value, "all")) cfg.selected = bench_case::all;
+            else if (!std::strcmp(value, "lds")) cfg.selected = bench_case::lds;
             else if (!std::strcmp(value, "dense")) cfg.selected = bench_case::dense;
             else if (!std::strcmp(value, "pair")) cfg.selected = bench_case::pair;
             else if (!std::strcmp(value, "qb")) cfg.selected = bench_case::qb;
@@ -2051,6 +2113,11 @@ int main(int argc, char **argv) {
             cfg.wmma_supported ? "available" : "skipped");
         std::fflush(stdout);
         for (uint32_t n_tokens : cfg.tokens) {
+            if (includes(cfg.selected, bench_case::lds)) {
+                ok = run_lds(model, cfg, n_tokens, false) &&
+                     run_lds(model, cfg, n_tokens, true) && ok;
+                if (!ok) break;
+            }
             if (includes(cfg.selected, bench_case::dense)) {
                 ok = run_dense(model, cfg, n_tokens) && ok;
             }

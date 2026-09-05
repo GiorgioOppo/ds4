@@ -19,7 +19,9 @@ Admission requires `N=1`, positive `M%4=0`, positive `K%256=0`, and
 `M*(K/256) <= INT_MAX`. Four-row alignment covers both the canonical small-K
 four-row kernel and the ordinary one-row kernel. The persistent K1024 candidate
 and its oracle retain their old epilogue. HIP/ROCm, Metal, other quant types,
-grouped/MoE entry points and multi-token MMVQ/MMQ are unchanged. Model storage
+grouped/MoE entry points and multi-token MMVQ/MMQ are not controlled by this
+dense flag. The separate [grouped MMVQ specialization](cuda_q4_grouped_mmvq_fusion.md)
+has its own rollback and additional tests. Model storage
 policy is unchanged; resident/SSD runs can benefit only when they actually
 reach the affected dense MMVQ entries.
 
@@ -46,7 +48,8 @@ NaNs and infinities. It checks 112,860 shape/admission cases, models row
 coverage, and rejects overflowing block indices. It does not compile CUDA
 device code or establish numerical parity of the GPU matvec.
 
-The GPU oracle invokes the production single and shared-pair APIs for 40 cases:
+The GPU oracle invokes the production single and shared-pair APIs for 40 cases
+(and now runs 20 additional grouped cases under the independent flag):
 small-K and ordinary dispatch, production widths (including 32768x1024),
 unequal/reversed pair widths, nonfinite weights, zero/changing activations,
 mixed eligible/ineligible legs, multi-token fallback and output/input guards.
@@ -68,7 +71,7 @@ sanitization and launch order remain with the callers. `git diff --check`
 passes and the Linux CUDA test build recipe was checked with `make -n`.
 
 CUDA/nvcc and HIP are not installed in the local Mac
-environment, so GPU compilation, the 40-case GPU oracle, compute-sanitizer,
+environment, so GPU compilation, the 60-case GPU oracle, compute-sanitizer,
 and performance measurements are **pending**. No remote machine was contacted.
 No percentage speedup, GPU parity result, or end-to-end decode gain is claimed.
 

@@ -5105,9 +5105,9 @@ __global__ static void ds4_mmq_group_ids_i32_kernel(
  * MMVQ channel dimension (never the column dimension): ncols_dst stays one,
  * so every pair uses exactly the same one-row Q4_K MMVQ specialization, K
  * partition, peer-warp fold, and reduction tree as the canonical nested
- * token/group loop.  The repeated ids select W[group], while channel_y and
- * channel_dst retain the token-major flat index.  Only activation
- * quantization and launch setup are shared. */
+ * token/group loop. The legacy repeated ids select W[group]; the fused Q4
+ * specialization derives the same group from grid.y and sanitizes at store.
+ * Both retain the token-major activation/output indices. */
 static int ds4_mmq_q4_K_grouped_batch_vec_impl(
         const void  *W,
         const float *X,
@@ -5165,18 +5165,32 @@ static int ds4_mmq_q4_K_grouped_batch_vec_impl(
     }
 
     const int dev = ggml_cuda_get_device();
+    const int64_t y_channel_stride = ne10_padded / QK8_1;
+    // Preserve the scratch-capacity contract in both arms so rollback never
+    // needs a larger arena, even though the fused arm does not populate ids.
     char *x8 = (char *)ds4_mmq_aligned_q81_scratch(
         dev, ids_offset + ids_bytes);
     if (!x8) return DS4_MMQ_NOT_APPLICABLE;
+    bool fused_grouped = false;
+#if !defined(GGML_USE_HIP)
+    if (ds4_q4_mmvq_grouped_shape_ok(M, K, n_tokens, n_groups, y_channel_stride)) {
+        const int cc = ggml_cuda_info().devices[dev].cc;
+        fused_grouped = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING &&
+            getenv("DS4_CUDA_DISABLE_Q4_GROUPED_MMVQ_FUSION") == nullptr;
+    }
+#endif
     int32_t *ids = (int32_t *)(x8 + ids_offset);
-    ds4_mmq_group_ids_i32_kernel<<<
-        (unsigned)(flat_channels + 31) / 32u, 32, 0, stream>>>(
-            ids, flat_channels, n_groups);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: group-id launch failed: %s\n",
-                tag, cudaGetErrorString(err));
-        return -2;
+    cudaError_t err = cudaSuccess;
+    if (!fused_grouped) {
+        ds4_mmq_group_ids_i32_kernel<<<
+            (unsigned)(flat_channels + 31) / 32u, 32, 0, stream>>>(
+                ids, flat_channels, n_groups);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: group-id launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -2;
+        }
     }
 
     quantize_row_q8_1_cuda(
@@ -5194,43 +5208,52 @@ static int ds4_mmq_q4_K_grouped_batch_vec_impl(
         return -3;
     }
 
-    const int64_t y_channel_stride = ne10_padded / QK8_1;
-    ggml_cuda_mm_fusion_args_device fusion = {};
-    err = cudaMemsetAsync(
-        out, 0, (size_t)flat_channels * (size_t)M * sizeof(float), stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: output clear failed: %s\n",
-                tag, cudaGetErrorString(err));
-        return -4;
+#if !defined(GGML_USE_HIP)
+    if (fused_grouped) {
+        ds4_mmvq_q4_K_grouped_sanitized(
+            W, x8, out, M, K, n_tokens, n_groups, (int)y_channel_stride, stream);
+    } else
+#endif
+    {
+        ggml_cuda_mm_fusion_args_device fusion = {};
+        err = cudaMemsetAsync(
+            out, 0, (size_t)flat_channels * (size_t)M * sizeof(float), stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: output clear failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -4;
+        }
+        mul_mat_vec_q_switch_type(
+            /*vx=*/W, /*type_x=*/GGML_TYPE_Q4_K,
+            /*vy=*/(const void *)x8,
+            /*ids=*/ids, /*fusion=*/fusion,
+            /*dst=*/out,
+            /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/1,
+            /*stride_row_x=*/(int)row_blocks,
+            /*stride_col_y=*/(int)y_channel_stride,
+            /*stride_col_dst=*/M,
+            /*nchannels_x=*/n_groups,
+            /*nchannels_y=*/flat_channels,
+            /*nchannels_dst=*/flat_channels,
+            /*stride_channel_x=*/(int)weight_channel_stride,
+            /*stride_channel_y=*/(int)y_channel_stride,
+            /*stride_channel_dst=*/M,
+            /*nsamples_x=*/1, /*nsamples_dst=*/1,
+            /*stride_sample_x=*/0, /*stride_sample_y=*/0,
+            /*stride_sample_dst=*/0,
+            /*ids_stride=*/1, stream);
     }
-    mul_mat_vec_q_switch_type(
-        /*vx=*/W, /*type_x=*/GGML_TYPE_Q4_K,
-        /*vy=*/(const void *)x8,
-        /*ids=*/ids, /*fusion=*/fusion,
-        /*dst=*/out,
-        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/1,
-        /*stride_row_x=*/(int)row_blocks,
-        /*stride_col_y=*/(int)y_channel_stride,
-        /*stride_col_dst=*/M,
-        /*nchannels_x=*/n_groups,
-        /*nchannels_y=*/flat_channels,
-        /*nchannels_dst=*/flat_channels,
-        /*stride_channel_x=*/(int)weight_channel_stride,
-        /*stride_channel_y=*/(int)y_channel_stride,
-        /*stride_channel_dst=*/M,
-        /*nsamples_x=*/1, /*nsamples_dst=*/1,
-        /*stride_sample_x=*/0, /*stride_sample_y=*/0,
-        /*stride_sample_dst=*/0,
-        /*ids_stride=*/1, stream);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: grouped MMVQ launch failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -5;
     }
-    ds4_mmq_sanitize_f32(
-        out, (uint64_t)(uint32_t)flat_channels * (uint64_t)(uint32_t)M,
-        stream);
+    if (!fused_grouped) {
+        ds4_mmq_sanitize_f32(
+            out, (uint64_t)(uint32_t)flat_channels * (uint64_t)(uint32_t)M,
+            stream);
+    }
     return 0;
 }
 

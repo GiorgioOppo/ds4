@@ -23616,8 +23616,22 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             (in_dim % 256u) == 0 &&
             getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") == NULL) {
             const int16_t nsg = 2;
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8);
+            id<MTLComputePipelineState> pipeline = nil;
+            bool token_pair = false;
+            // M1 Max measurements consistently improve the Q-b shape, while
+            // K4096 Q-A/KV results are mixed. Keep that pair, one-token decode,
+            // other devices, quality and TP on their established dispatch.
+            if (ds4_gpu_device_is_m1_apple_silicon() &&
+                !g_quality_mode && g_tp_split_world <= 1 &&
+                in_dim == 1024u && out_dim == 32768u && n_tok >= 2u &&
+                (inner_offset & 7u) == 0 && // ushort4 weight loads
+                getenv("DS4_METAL_DISABLE_Q4_QB_TOKEN_PAIR") == NULL) {
+                pipeline = ds4_gpu_get_mul_mv_ext_pipeline(
+                    "kernel_mul_mv_q4_K_dense_token_pair_f32", nsg, 8);
+                token_pair = pipeline != nil;
+            }
+            if (!pipeline) pipeline = ds4_gpu_get_mul_mv_ext_pipeline(
+                "kernel_mul_mv_q4_K_dense_f32", nsg, 8);
             if (pipeline) {
                 ds4_gpu_q8_0_matvec_args args = {
                     .ne00 = (int32_t)in_dim,
@@ -23650,7 +23664,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:32 atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
-                                                      (NSUInteger)n_tok,
+                                                      token_pair ? (NSUInteger)((n_tok + 1u) / 2u) : (NSUInteger)n_tok,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);

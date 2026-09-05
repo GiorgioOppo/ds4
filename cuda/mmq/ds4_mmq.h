@@ -1095,6 +1095,12 @@ int ds4_mmq_q4_K_dense_vec_with_weight_residency(
 // only Q8_1 quantization and launch setup are shared.  Returns
 // DS4_MMQ_NOT_APPLICABLE before enqueue when its GB10/scratch/shape gates do
 // not hold.
+// On eligible NVIDIA aligned row cohorts, the default specialized store
+// also removes the ids producer, output clear and standalone sanitizer.
+// DS4_CUDA_DISABLE_Q4_GROUPED_MMVQ_FUSION (any defined value) restores those
+// three operations without disabling grouped dispatch. Scratch size and the
+// batch opt-in below are unchanged; this switch is independent of the dense
+// DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE rollback.
 int ds4_mmq_q4_K_grouped_vec(
     const void  * W_q4_K,
     const float * X_f32,
