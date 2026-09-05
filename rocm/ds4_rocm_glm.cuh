@@ -1110,6 +1110,7 @@ __global__ static void glm_store_indexer_k_kernel(
         __syncthreads();
     }
     const float mean = partial[0] / (float)head_dim;
+    __syncthreads();
     float ss = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
         const float d = src[i] - mean;
@@ -1401,6 +1402,7 @@ __global__ static void glm_attention_full_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    __syncthreads();
     float local_sum = 0.0f;
     for (uint32_t row = threadIdx.x; row < visible; row += blockDim.x) {
         const float w = expf(scores[row] - max_score);
@@ -1758,6 +1760,7 @@ __global__ static void glm_attention_indexed_decode_split_partial_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    __syncthreads();
     float *out = partial_lora + ((uint64_t)block * n_head + head) * kv_lora_dim;
     float *ms = partial_ms + ((uint64_t)block * n_head + head) * 2u;
     if (!isfinite(max_score)) {
@@ -2000,6 +2003,7 @@ __global__ static void glm_attention_indexed_decode_split_reduce_kernel(
         __syncthreads();
     }
     const float max_m = red[0];
+    __syncthreads();
     if (!isfinite(max_m)) {
         for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
             heads[(uint64_t)head * value_dim + d] = 0.0f;
@@ -3324,6 +3328,7 @@ __global__ static void glm_causal_gemm_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
         const float v = s < visible ? expf(row[s] - max_score) : 0.0f;
@@ -3441,8 +3446,10 @@ __global__ static void glm_selected_gemm_rope_to_f16_kernel(
 __global__ static void glm_selected_gemm_softmax_f16_kernel(
         __half *probs,
         float *scores,
+        const int32_t *selected,
         uint32_t n_tokens,
         uint32_t n_selected,
+        uint32_t cache_cap,
         float scale) {
     const uint32_t token = blockIdx.x;
     if (token >= n_tokens) return;
@@ -3450,7 +3457,9 @@ __global__ static void glm_selected_gemm_softmax_f16_kernel(
     __shared__ float reduce[256];
     float vmax = -INFINITY;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = row[s] * scale;
+        const int32_t cache_row = selected[(uint64_t)token * n_selected + s];
+        const float v = cache_row >= 0 && (uint32_t)cache_row < cache_cap ?
+            row[s] * scale : -INFINITY;
         row[s] = v;
         vmax = fmaxf(vmax, v);
     }
@@ -3464,9 +3473,10 @@ __global__ static void glm_selected_gemm_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = expf(row[s] - max_score);
+        const float v = isfinite(max_score) ? expf(row[s] - max_score) : 0.0f;
         row[s] = v;
         sum += v;
     }
@@ -3539,8 +3549,10 @@ __global__ static void glm_selected_gemm_gather_heads_f16_kernel(
 __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
         __half *probs,
         float *scores,
+        const int32_t *selected,
         uint32_t n_tokens,
         uint32_t n_selected,
+        uint32_t cache_cap,
         uint32_t head_count,
         uint32_t head_capacity,
         float scale) {
@@ -3553,7 +3565,9 @@ __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
     __shared__ float reduce[256];
     float vmax = -INFINITY;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = row[s] * scale;
+        const int32_t cache_row = selected[(uint64_t)token * n_selected + s];
+        const float v = cache_row >= 0 && (uint32_t)cache_row < cache_cap ?
+            row[s] * scale : -INFINITY;
         row[s] = v;
         vmax = fmaxf(vmax, v);
     }
@@ -3567,9 +3581,10 @@ __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float v = expf(row[s] - max_score);
+        const float v = isfinite(max_score) ? expf(row[s] - max_score) : 0.0f;
         row[s] = v;
         sum += v;
     }
@@ -4004,11 +4019,11 @@ static int glm_attention_indexed_lora_selected_gemm(
         float beta_fast,
         float beta_slow) {
     if (!g_cublas_ready || !lora_out || !q || !qk_low ||
-        !kv_lora_cache || !k_rope_cache || !selected ||
+        !kv_lora_cache || (qk_rope != 0u && !k_rope_cache) || !selected ||
         n_tokens < 64u || n_tokens > 256u ||
         n_selected == 0u || n_selected > cache_cap ||
         n_head == 0u || kv_lora_dim == 0u ||
-        qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        (qk_rope & 1u) != 0u ||
         n_tokens > INT_MAX || n_selected > INT_MAX ||
         kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
         return 0;
@@ -4105,32 +4120,34 @@ static int glm_attention_indexed_lora_selected_gemm(
     }
     glm_selected_gemm_profile_end(
         &profile, GLM_SELECTED_PROFILE_KV_GATHER);
-    const uint64_t rope_pairs = selected_rows * (qk_rope >> 1u);
-    const uint32_t rope_blocks =
-        (uint32_t)min((rope_pairs + 255u) / 256u, 4096ull);
-    glm_selected_gemm_profile_begin(&profile);
-    glm_selected_gemm_rope_to_f16_kernel<<<rope_blocks, 256>>>(
-        rope_h,
-        (const char *)k_rope_cache->ptr,
-        (const int32_t *)selected->ptr,
-        n_tokens,
-        n_selected,
-        qk_rope,
-        cache_cap,
-        cache_f16,
-        n_ctx_orig,
-        freq_base,
-        freq_scale,
-        ext_factor,
-        attn_factor,
-        beta_fast,
-        beta_slow);
-    if (!cuda_ok(cudaGetLastError(),
-                 "glm selected attention rope gather launch")) {
-        return 0;
+    if (qk_rope != 0u) {
+        const uint64_t rope_pairs = selected_rows * (qk_rope >> 1u);
+        const uint32_t rope_blocks =
+            (uint32_t)min((rope_pairs + 255u) / 256u, 4096ull);
+        glm_selected_gemm_profile_begin(&profile);
+        glm_selected_gemm_rope_to_f16_kernel<<<rope_blocks, 256>>>(
+            rope_h,
+            (const char *)k_rope_cache->ptr,
+            (const int32_t *)selected->ptr,
+            n_tokens,
+            n_selected,
+            qk_rope,
+            cache_cap,
+            cache_f16,
+            n_ctx_orig,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm selected attention rope gather launch")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_ROPE_GATHER);
     }
-    glm_selected_gemm_profile_end(
-        &profile, GLM_SELECTED_PROFILE_ROPE_GATHER);
 
     const float one = 1.0f;
     const float zero = 0.0f;
@@ -4213,48 +4230,53 @@ static int glm_attention_indexed_lora_selected_gemm(
         }
         glm_selected_gemm_profile_end(
             &profile, GLM_SELECTED_PROFILE_LORA_SCORE);
-        glm_selected_gemm_profile_begin(&profile);
-        st = cublasGemmStridedBatchedEx(
-            g_cublas,
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            (int)n_selected,
-            (int)tile_heads,
-            (int)qk_rope,
-            &one,
-            rope_h,
-            CUDA_R_16F,
-            (int)qk_rope,
-            rope_stride,
-            qrope_h,
-            CUDA_R_16F,
-            (int)qk_rope,
-            qrope_stride,
-            &one,
-            scores,
-            CUDA_R_32F,
-            (int)n_selected,
-            score_stride,
-            (int)n_tokens,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "glm selected attention rope score gemm")) {
-            return 0;
+        if (qk_rope != 0u) {
+            glm_selected_gemm_profile_begin(&profile);
+            st = cublasGemmStridedBatchedEx(
+                g_cublas,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                (int)n_selected,
+                (int)tile_heads,
+                (int)qk_rope,
+                &one,
+                rope_h,
+                CUDA_R_16F,
+                (int)qk_rope,
+                rope_stride,
+                qrope_h,
+                CUDA_R_16F,
+                (int)qk_rope,
+                qrope_stride,
+                &one,
+                scores,
+                CUDA_R_32F,
+                (int)n_selected,
+                score_stride,
+                (int)n_tokens,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, "glm selected attention rope score gemm")) {
+                return 0;
+            }
+            glm_selected_gemm_profile_end(
+                &profile, GLM_SELECTED_PROFILE_ROPE_SCORE);
         }
-        glm_selected_gemm_profile_end(
-            &profile, GLM_SELECTED_PROFILE_ROPE_SCORE);
         glm_selected_gemm_profile_begin(&profile);
         if (head_tile == 1u) {
             glm_selected_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
-                probs, scores, n_tokens, n_selected, scale);
+                probs, scores, (const int32_t *)selected->ptr,
+                n_tokens, n_selected, cache_cap, scale);
         } else {
             const dim3 softmax_grid(n_tokens, tile_heads, 1u);
             glm_selected_gemm_softmax_heads_f16_kernel<<<
                 softmax_grid, 256>>>(
                     probs,
                     scores,
+                    (const int32_t *)selected->ptr,
                     n_tokens,
                     n_selected,
+                    cache_cap,
                     tile_heads,
                     head_tile,
                     scale);

@@ -116,6 +116,25 @@ static void test_payload_tokens(void) {
 }
 
 #ifndef DS4_NO_GPU
+static void test_glm_attention_budget(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    ds4_glm_gpu_graph *g = calloc(1, sizeof(*g));
+    assert(g);
+    g->glm53 = true;
+    g->compact_cache_cap = 16384;
+    const uint32_t capacities[] = {1024, 4096, 8192, 16384};
+    for (size_t i = 0; i < sizeof(capacities) / sizeof(*capacities); i++) {
+        g->ctx_cap = capacities[i];
+        assert(glm_graph_dense_compact_attention_limit(g) == 2051);
+        g->full_kv_cache = true;
+        assert(glm_graph_dense_compact_attention_limit(g) == 2051);
+        g->full_kv_cache = false;
+    }
+    free(g);
+    g_ds4_shape = saved_shape;
+}
+
 enum { POOL_DIM = 128, POOL_ROWS = 12, MODEL_BYTES = 16384 };
 static float pool_raw[POOL_ROWS * POOL_DIM], pool_gates[POOL_ROWS * POOL_DIM];
 
@@ -213,6 +232,7 @@ int main(void) {
     test_session_memory();
     test_payload_tokens();
 #ifndef DS4_NO_GPU
+    test_glm_attention_budget();
     test_glm_spec_rollback();
 #endif
     puts("session state tests: ok");

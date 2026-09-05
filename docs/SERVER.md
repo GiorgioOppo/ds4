@@ -64,7 +64,7 @@ four times. Idle slots can be cached before reuse; active requests are not evict
 | --- | --- |
 | Metal, resident Flash | Native shared-expert/QKV batching where supported |
 | Metal, GLM 5.2 | Ordered fallback |
-| Metal, GLM 5.3 | Native batching below token 4096; ordered fallback afterward |
+| Metal, GLM 5.3 | Native batching through 2051 visible tokens; ordered fallback afterward |
 | CUDA, supported multi-GPU Flash TP layout | Native grouped decode and mixed prefill/decode |
 | Single-GPU CUDA, including Spark | Ordered fallback |
 

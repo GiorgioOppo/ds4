@@ -28137,6 +28137,7 @@ __global__ static void glm_dense_attn_causal_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t col = threadIdx.x; col < visible; col += blockDim.x) {
@@ -28491,7 +28492,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
     return cuda_ok(cudaGetLastError(), "glm attn lora causal launch");
 }
 
-extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -28557,6 +28558,25 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
                 attn_factor, beta_fast, beta_slow, scale);
     }
     return cuda_ok(cudaGetLastError(), "glm attn lora selected launch");
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens, uint32_t n_selected, uint32_t cache_cap,
+        bool cache_f16, uint32_t n_head, uint32_t kv_lora_dim,
+        uint32_t qk_nope, uint32_t qk_rope, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    return ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+        lora_out, q, qk_low, kv_lora_cache, k_rope_cache, selected,
+        n_tokens, n_selected, cache_cap, cache_f16, n_head, kv_lora_dim,
+        qk_nope, qk_rope, n_ctx_orig, freq_base, freq_scale, ext_factor,
+        attn_factor, beta_fast, beta_slow);
 }
 
 extern "C" int ds4_gpu_glm_attention_indexed_batch_typed_tensor(

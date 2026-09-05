@@ -42057,10 +42057,10 @@ static bool glm53_graph_use_indexed_prefill(
 
 static uint32_t glm_graph_dense_compact_attention_limit(
         const ds4_glm_gpu_graph *g) {
-    /* GLM-5.3 attends densely through its normal 4K work window. Above it,
-     * the pool-4 selector supplies the sparse history. */
-    if (g && g->glm53 && !g->full_kv_cache) return g->ctx_cap;
-    return glm_graph_indexer_top_k_limit();
+    /* The incomplete GLM 5.3 pool is always included. Dense attention is
+     * equivalent through top_k + pool_size - 1, not the work-window size. */
+    return g && g->glm53 ? glm53_graph_indexer_selected_limit() :
+                          glm_graph_indexer_top_k_limit();
 }
 
 static uint32_t glm_graph_limit_indexed_prefill_chunk(
@@ -43270,10 +43270,11 @@ static bool glm_graph_alloc_slice(
     if (g->ctx_size > g->ctx_cap) {
         fprintf(stderr,
                 "ds4: GLM session ctx=%u (model max=%u); "
-                "full-attention prefill/work cap=%u; compact indexed decode is used beyond the cap\n",
+                "prefill/work cap=%u; dense attention limit=%u\n",
                 g->ctx_size,
                 glm_graph_model_context_limit(),
-                g->ctx_cap);
+                g->ctx_cap,
+                glm_graph_dense_compact_attention_limit(g));
     }
 
     const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -50342,6 +50343,11 @@ static bool glm_graph_forward_indexed_tokens(
                 uint32_t slice = n_tokens - t0;
                 if (slice > attn_slice_cap) slice = attn_slice_cap;
                 const bool slice_causal = slice_pos < dense_limit;
+#ifdef DS4_ROCM_BUILD
+                /* The selected-row GEMM gathers a bounded KV tile. Larger
+                 * sparse batches otherwise fall back to scalar attention. */
+                if (!slice_causal && slice > 256u) slice = 256u;
+#endif
                 if (slice_causal && slice > dense_limit - slice_pos) {
                     slice = dense_limit - slice_pos;
                 }
@@ -50422,7 +50428,10 @@ static bool glm_graph_forward_indexed_tokens(
                                 DS4_ROPE_YARN_BETA_FAST,
                                 DS4_ROPE_YARN_BETA_SLOW);
                     } else {
-                        rc = ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+                        /* GLM 5.3 pads the incomplete pool with invalid IDs. */
+                        rc = (g->glm53 ?
+                                ds4_gpu_glm_attention_indexed_batch_lora_tensor :
+                                ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor)(
                                 attn_lora_view,
                                 q_view,
                                 qk_low_view,
