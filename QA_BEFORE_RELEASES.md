@@ -999,6 +999,32 @@ tests, record aggregate and per-session decode speed.
 - Run the backend-specific batch tests in sections 4 and 8. Fast single-session
   decode does not substitute for aggregate multi-session throughput.
 
+For M5 routed-prefill changes, run `make test-metal-moe-prefill`. It compares
+gate/up, FP16 intermediate, expert partials and final outputs against the
+unpacked path, including empty experts, tile tails and scratch reuse.
+Then build `make metal-prefill-variant-bench metal-decode-schedule-bench` and
+use a resident Flash Q2 or mixed Q2/Q4 model for interleaved full-logit checks:
+
+```sh
+speed-bench/metal_prefill_variant_bench -m "$MODEL" \
+  --prompt-file speed-bench/promessi_sposi.txt --prefix-tokens 2048 \
+  --warmup-tokens 2048 --candidate-env DS4_METAL_DISABLE_ROUTED_MPP_PACKED
+speed-bench/metal_prefill_variant_bench -m "$MODEL" \
+  --prompt-file speed-bench/promessi_sposi.txt --prefix-tokens 16384 \
+  --initial-tokens 12288 --warmup-tokens 2048 \
+  --candidate-env DS4_METAL_DISABLE_ROUTED_MPP_PACKED
+speed-bench/metal_decode_schedule_bench -m "$MODEL" \
+  --prompt-file speed-bench/promessi_sposi.txt --prefix-tokens 8192 \
+  --ctx 9216 --tokens 256 --candidate-env DS4_METAL_DISABLE_ROUTED_MPP_PACKED
+```
+
+Here `control` is the default fast path; `candidate` disables packing.
+Require exact logits and no decode regression. On M5 Max, Flash Vision Exp
+Q2 measured 734.40 versus 711.89 t/s at 2K; mixed Q2/Q4 measured 615.01
+versus 604.62 t/s for a 4K append to 12K. Decode was unchanged. These are
+interleaved sustained measurements, not cold-run peaks. Packing is an M5
+resident-prefill optimization; it does not claim pre-M5 or streaming gains.
+
 These are the last known good observations available when this gate was added.
 They are reference points for matching hardware and workloads, not performance
 claims across different models or contexts.
