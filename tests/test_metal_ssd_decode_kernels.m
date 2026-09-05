@@ -331,7 +331,202 @@ static void test_q8(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     require(hash(gate) == gh && hash(up) == uh, "Q8 weight mutated");
 }
 
-int main(void) {
+static void test_q4_dense_pair(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                              id<MTLComputePipelineState> __strong p[2],
+                              int k, int rows_a, int rows_b, int tokens, int padding) {
+    // Standalone oracle and sequential pair. Pad physical weight rows through
+    // a full threadgroup for the unchanged classic two-row loader, while
+    // keeping logical/output extents exact. This padding is fixture-only.
+    int rows[2] = {rows_a, rows_b};
+    id<MTLBuffer> w[2], out[2][2];
+    mv_args args[2];
+    uint64_t wh[2];
+    uint32_t seed = 7919u + k + rows_a + rows_b + tokens + padding;
+    for (int m = 0; m < 2; ++m) {
+        NSUInteger stride = (k / 256 + padding * (m+1)) * sizeof(q4_block);
+        NSUInteger bytes = ((rows[m] + 3u) & ~3u) * stride;
+        w[m] = buffer(dev, bytes);
+        q4_block *blocks = data(w[m]);
+        for (NSUInteger b = 0; b < bytes / sizeof(*blocks); ++b) {
+            blocks[b].d = b % 17 ? 0x2400 + (random_u32(&seed) & 0x3ff) : 0;
+            blocks[b].dmin = b % 13 ? 0x1c00 + (random_u32(&seed) & 0x3ff) : 0;
+            for (int i = 0; i < 12; ++i) blocks[b].scales[i] = random_u32(&seed) >> 24;
+            for (int i = 0; i < 128; ++i) blocks[b].qs[i] = random_u32(&seed) >> 24;
+        }
+        wh[m] = hash(w[m]);
+        args[m] = (mv_args){.ne00=k, .ne01=rows[m], .ne02=1,
+            .nb00=1, .nb01=stride, .nb02=bytes, .nb03=bytes,
+            .ne10=k, .ne11=tokens, .ne12=1, .nb10=4, .nb11=(uint64_t)k*4,
+            .nb12=(uint64_t)k*tokens*4, .nb13=(uint64_t)k*tokens*4,
+            .ne0=rows[m], .ne1=tokens, .nr0=2, .r2=1, .r3=1};
+        for (int arm = 0; arm < 2; ++arm) out[arm][m] = output(dev, rows[m]*tokens);
+    }
+    id<MTLBuffer> x = buffer(dev, k*tokens*sizeof(float));
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        fill_x(x, k*tokens, &seed);
+        uint64_t xh = hash(x);
+        for (int arm = 0; arm < 2; ++arm) {
+            for (int m = 0; m < 2; ++m) for (int i = 0; i < rows[m]*tokens; ++i)
+                ((uint32_t *)data(out[arm][m]))[i] = poison;
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:p[arm]];
+            [enc setThreadgroupMemoryLength:32 atIndex:0];
+            if (arm == 0) {
+                [enc setBuffer:x offset:GUARD atIndex:2];
+                for (int m = 0; m < 2; ++m) {
+                    [enc setBytes:&args[m] length:sizeof(mv_args) atIndex:0];
+                    [enc setBuffer:w[m] offset:GUARD atIndex:1];
+                    [enc setBuffer:out[arm][m] offset:GUARD atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake((rows[m]+3)/4, tokens, 1)
+                         threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+                }
+            } else {
+                for (int m = 0; m < 2; ++m) {
+                    [enc setBytes:&args[m] length:sizeof(mv_args) atIndex:m];
+                    [enc setBuffer:w[m] offset:GUARD atIndex:2+m];
+                    [enc setBuffer:out[arm][m] offset:GUARD atIndex:5+m];
+                }
+                [enc setBuffer:x offset:GUARD atIndex:4];
+                int max_rows = rows_a > rows_b ? rows_a : rows_b;
+                [enc dispatchThreadgroups:MTLSizeMake((max_rows+3)/4, tokens, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+            }
+            [enc endEncoding]; finish(cb);
+        }
+        for (int m = 0; m < 2; ++m)
+            equal_output(out[0][m], out[1][m], tokens, rows[m], rows[m]);
+        require(hash(x) == xh, "Q4 dense pair input mutated");
+    }
+    require(hash(w[0]) == wh[0] && hash(w[1]) == wh[1], "Q4 dense pair weight mutated");
+}
+
+typedef struct {
+    __strong id<MTLComputePipelineState> p[4]; // old/new single, old/new pair
+    __strong id<MTLBuffer> w[2], x, out[4][2];
+    mv_args args[2];
+    int rows[2], nsg, k;
+} projection_fixture;
+
+static void init_projection(projection_fixture *f, id<MTLDevice> dev,
+                            id<MTLComputePipelineState> __strong p[4], int nsg,
+                            int k, int rows_a, int rows_b, int padding) {
+    *f = (projection_fixture){0};
+    f->rows[0] = rows_a; f->rows[1] = rows_b; f->nsg = nsg; f->k = k;
+    uint32_t seed = 71u + k + rows_a + rows_b + padding;
+    for (int arm = 0; arm < 4; ++arm) f->p[arm] = p[arm];
+    for (int m = 0; m < 2; ++m) {
+        // The legacy single kernel reads two weight rows even on odd tails.
+        // Pad only its fixture allocation, not args.ne01 or the output. The
+        // paired kernels must independently guard the true row extents.
+        NSUInteger stride = (k/32 + padding*(m+1)) * sizeof(q8_block);
+        NSUInteger bytes = ((f->rows[m] + 1u) & ~1u) * stride;
+        f->w[m] = buffer(dev, bytes);
+        q8_block *w = data(f->w[m]);
+        for (NSUInteger b = 0; b < bytes / sizeof(*w); ++b) {
+            w[b].d = b % 17 ? 0x1800 + (random_u32(&seed) & 0x3ff) : 0;
+            for (int i = 0; i < 32; ++i) w[b].qs[i] = (int)(random_u32(&seed) >> 24) - 128;
+        }
+        f->args[m] = (mv_args){.ne00=k, .ne01=f->rows[m], .ne02=1,
+            .nb00=34, .nb01=stride, .nb02=bytes, .nb03=bytes,
+            .ne10=k, .ne11=1, .ne12=1, .nb10=4, .nb11=(uint64_t)k*4,
+            .nb12=(uint64_t)k*4, .nb13=(uint64_t)k*4,
+            .ne0=f->rows[m], .ne1=1, .nr0=2, .r2=1, .r3=1};
+        for (int arm = 0; arm < 4; ++arm) f->out[arm][m] = output(dev, f->rows[m]);
+    }
+    f->x = buffer(dev, k * sizeof(float));
+    fill_x(f->x, k, &seed);
+}
+
+static void encode_projection(projection_fixture *f, id<MTLComputeCommandEncoder> enc, int arm) {
+    [enc setComputePipelineState:f->p[arm]];
+    if (arm < 2) {
+        [enc setBuffer:f->x offset:GUARD atIndex:2];
+        [enc setThreadgroupMemoryLength:256 atIndex:0];
+        for (int m = 0; m < 2; ++m) {
+            [enc setBytes:&f->args[m] length:sizeof(mv_args) atIndex:0];
+            [enc setBuffer:f->w[m] offset:GUARD atIndex:1];
+            [enc setBuffer:f->out[arm][m] offset:GUARD atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((f->rows[m]+1)/2, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, f->nsg, 1)];
+        }
+    } else {
+        [enc setBytes:&f->args[0] length:sizeof(mv_args) atIndex:0];
+        [enc setBytes:&f->args[1] length:sizeof(mv_args) atIndex:1];
+        [enc setBuffer:f->w[0] offset:GUARD atIndex:2];
+        [enc setBuffer:f->w[1] offset:GUARD atIndex:3];
+        [enc setBuffer:f->x offset:GUARD atIndex:4];
+        [enc setBuffer:f->out[arm][0] offset:GUARD atIndex:5];
+        [enc setBuffer:f->out[arm][1] offset:GUARD atIndex:6];
+        [enc setThreadgroupMemoryLength:512 atIndex:0];
+        int rows = f->rows[0] > f->rows[1] ? f->rows[0] : f->rows[1];
+        [enc dispatchThreadgroups:MTLSizeMake((rows+1)/2, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, f->nsg, 1)];
+    }
+}
+
+static void compare_projection(projection_fixture *f) {
+    for (int m = 0; m < 2; ++m) for (int arm = 1; arm < 4; ++arm)
+        equal_output(f->out[0][m], f->out[arm][m], 1, f->rows[m], f->rows[m]);
+}
+
+static void test_projection(projection_fixture *f, id<MTLCommandQueue> queue) {
+    uint64_t wh[2] = {hash(f->w[0]), hash(f->w[1])};
+    uint32_t seed = 513;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        fill_x(f->x, f->k, &seed);
+        uint64_t xh = hash(f->x);
+        for (int arm = 0; arm < 4; ++arm) {
+            for (int m = 0; m < 2; ++m) for (int row = 0; row < f->rows[m]; ++row)
+                ((uint32_t *)data(f->out[arm][m]))[row] = poison;
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            encode_projection(f, enc, arm);
+            [enc endEncoding]; finish(cb);
+        }
+        compare_projection(f);
+        require(hash(f->x) == xh, "Q8 projection input mutated");
+    }
+    require(hash(f->w[0]) == wh[0] && hash(f->w[1]) == wh[1], "Q8 projection weight mutated");
+}
+
+static int compare_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static void bench_projection(projection_fixture *f, id<MTLCommandQueue> queue) {
+    enum { SAMPLES = 12, REPEATS = 128 };
+    double times[4][SAMPLES];
+    // Alternate all four arms and reverse the order every round; two warmups.
+    for (int round = -2; round < SAMPLES; ++round) for (int position = 0; position < 4; ++position) {
+        int arm = (round & 1) ? 3-position : position;
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        for (int r = 0; r < REPEATS; ++r) encode_projection(f, enc, arm);
+        [enc endEncoding]; finish(cb);
+        if (round >= 0) {
+            require(cb.GPUEndTime > cb.GPUStartTime, "GPU timestamps unavailable");
+            times[arm][round] = (cb.GPUEndTime - cb.GPUStartTime) * 1.e6 / REPEATS;
+        }
+    }
+    double median[4];
+    for (int arm = 0; arm < 4; ++arm) {
+        qsort(times[arm], SAMPLES, sizeof(double), compare_double);
+        median[arm] = (times[arm][SAMPLES/2-1] + times[arm][SAMPLES/2]) * .5;
+    }
+    compare_projection(f);
+    printf("Q8 MV kernel-only K=%d M=%d+%d NSG=%d: separate %.3f -> %.3f us (%+.2f%%), pair %.3f -> %.3f us (%+.2f%% time).\n",
+           f->k, f->rows[0], f->rows[1], f->nsg, median[0], median[1],
+           100.*(median[1]/median[0]-1.), median[2], median[3], 100.*(median[3]/median[2]-1.));
+}
+
+int main(int argc, char **argv) {
+    BOOL bench = argc == 2 && strcmp(argv[1], "--bench-q8-mv") == 0;
+    if (argc > 1 && !bench) {
+        fprintf(stderr, "usage: %s [--bench-q8-mv]\n", argv[0]);
+        return 2;
+    }
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         require(dev != nil, "no Metal device (run on a Mac with GPU access)");
@@ -357,6 +552,23 @@ int main(void) {
                 }
         }
         printf("Q4: 16 bitwise cases passed (slots/address, offsets, routing, clamp).\n");
+        id<MTLComputePipelineState> q4p[2] = {
+            pipeline(dev, lib, @"kernel_mul_mv_q4_K_dense_f32", 2),
+            pipeline(dev, lib, @"kernel_mul_mv_q4_K_dense_pair_f32", 2),
+        };
+        const int q4_shapes[][3] = {
+            {256,1,3}, {512,6,4}, {768,5,9}, {1024,32,32},
+            {4096,1024,512}, {4096,512,1024}, {7168,66,34}, {256,65538,65540},
+        };
+        const int q4_tokens[] = {1,3,8};
+        for (unsigned s = 0; s < sizeof(q4_shapes)/sizeof(q4_shapes[0]); ++s)
+            for (unsigned t = 0; t < sizeof(q4_tokens)/sizeof(q4_tokens[0]); ++t)
+                for (int padding = 0; padding <= 2; padding += 2) {
+                    test_q4_dense_pair(dev, queue, q4p, q4_shapes[s][0],
+                                       q4_shapes[s][1], q4_shapes[s][2], q4_tokens[t], padding);
+                    ++cases;
+                }
+        printf("Q4 dense pair: 48 bitwise cases passed (unequal/odd rows, strides, 1/3/8 tokens).\n");
         for (int nsg = 4; nsg <= 8; nsg += 4) for (int store = 0; store < 2; ++store) {
             NSString *base = store ? @"kernel_dsv4_shared_gate_up_swiglu_q8_0" :
                                      @"kernel_dsv4_shared_mid_swiglu_q8_0";
@@ -370,7 +582,35 @@ int main(void) {
                 }
         }
         printf("Q8: 32 bitwise cases passed (4/8 simdgroups, mid-only alias, clamp, repeated dispatch).\n");
-        printf("PASS: %d SSD decode kernel cases on %s; no model or SSD I/O measured.\n",
+        for (int nsg = 4; nsg <= 8; nsg += 4) {
+            id<MTLComputePipelineState> p[4] = {
+                pipeline(dev, lib, @"kernel_mul_mv_q8_0_f32", nsg),
+                pipeline(dev, lib, @"kernel_mul_mv_q8_0_f32_single_barrier", nsg),
+                pipeline(dev, lib, @"kernel_mul_mv_q8_0_f32_pair", nsg),
+                pipeline(dev, lib, @"kernel_mul_mv_q8_0_f32_pair_single_barrier", nsg),
+            };
+            const int shapes[][3] = {
+                {32,2,2}, {32,1,3}, {256,3,1}, {1024,65,33},
+                {4096,1024,512}, {4096,512,1024}, {7168,66,34},
+                {4096,2048,2048}, {32,65538,65540},
+            };
+            for (unsigned s = 0; s < sizeof(shapes)/sizeof(shapes[0]); ++s)
+                for (int padding = 0; padding <= 2; padding += 2) {
+                    projection_fixture f;
+                    init_projection(&f, dev, p, nsg, shapes[s][0], shapes[s][1], shapes[s][2], padding);
+                    test_projection(&f, queue);
+                    ++cases;
+                }
+            if (bench) {
+                projection_fixture f;
+                init_projection(&f, dev, p, nsg, 4096, 1024, 512, 0);
+                test_projection(&f, queue);
+                bench_projection(&f, queue);
+                if (nsg != 4) printf("NSG=%d candidate is benchmark-only; production keeps the legacy kernel.\n", nsg);
+            }
+        }
+        printf("Q8 projections: 36 bitwise cases passed (single/pair, unequal/odd rows, independent strides).\n");
+        printf("PASS: %d Metal decode kernel cases on %s; no model or SSD I/O measured.\n",
                cases, dev.name.UTF8String);
     }
     return 0;

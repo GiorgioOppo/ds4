@@ -119,6 +119,7 @@ help:
 	@echo "  make bench-metal-argmax-top1  Time full argsort versus resident top-1 without GGUF/SSD"
 	@echo "  make test-metal-iq2-midonly  Check M1 IQ2 addr mid-only output and sentinels"
 	@echo "  make test-metal-ssd-decode-kernels  Bitwise Q4/Q8 SSD decode kernel oracle (no model)"
+	@echo "  make bench-metal-q8-mv  Bitwise checks and kernel-only Q8 decode reduction A/B"
 	@echo "  make test-metal-iq2-live-index  Check IQ2 SSD live-cache index policy and fallback"
 	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
@@ -384,12 +385,15 @@ test-metal-exactn-oracle: tests/test_metal_exactn_oracle
 speed-bench/metal_q4_dense_pair_bench: speed-bench/metal_q4_dense_pair_bench.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 
-.PHONY: test-metal-ssd-decode-kernels
+.PHONY: test-metal-ssd-decode-kernels bench-metal-q8-mv
 tests/test_metal_ssd_decode_kernels: tests/test_metal_ssd_decode_kernels.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 
 test-metal-ssd-decode-kernels: tests/test_metal_ssd_decode_kernels
 	./tests/test_metal_ssd_decode_kernels
+
+bench-metal-q8-mv: tests/test_metal_ssd_decode_kernels
+	./tests/test_metal_ssd_decode_kernels --bench-q8-mv
 
 metal-q4-dense-pair-bench: speed-bench/metal_q4_dense_pair_bench
 

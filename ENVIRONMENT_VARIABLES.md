@@ -42,6 +42,30 @@ GPU target. It checks exact quantized bytes/scales, group slicing, buffer guards
 the dual producer, and graph replay. `make test-q8-quantize-host` only checks the
 reduction topology and rounding on CPU, not CUDA compilation or GPU execution.
 
+## Metal Q8 dense decode reductions
+
+`DS4_METAL_DISABLE_Q8_MV_SINGLE_BARRIER=1` restores the two-barrier reduction
+for ordinary Q8_0 decode matvecs and paired q_a/KV-style projections. Unset
+uses disjoint writers for zero padding and partial sums, a single barrier,
+and only simdgroup zero performs the final reduction. The accumulation tree,
+thread count, and output values are unchanged.
+
+The default applies to eligible single-token, non-TP, non-quality calls with
+4 simdgroups, in resident and SSD modes. Single matvecs require even output
+rows; paired matvecs retain their independent row guards. Other geometries,
+prefill, TP flag-producing kernels, and shared-expert SwiGLU kernels keep their
+previous dispatch. Any defined value, including `0`, enables the rollback.
+
+`make test-metal-ssd-decode-kernels` also checks these projections against both
+the legacy single and paired kernels. `make bench-metal-q8-mv` additionally
+times resident synthetic K=4096, M=1024+512 projections using GPU timestamps,
+two warmup rounds and 12 alternating/reversed-order samples per arm, each
+containing 128 logical projection pairs. These kernel-only timings exclude
+model execution and SSD reads; they do not establish end-to-end speedups.
+The benchmark also measures the 8-simdgroup candidate, but production retains
+the legacy kernel there because repeated local measurements were inconsistent
+and one paired run regressed. See the [measurement notes](speed-bench/metal_q8_mv_single_barrier.md).
+
 ## Metal SSD decode kernels
 
 These controls preserve the previous kernels for independent A/B tests. Both

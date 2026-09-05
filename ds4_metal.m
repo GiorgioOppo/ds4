@@ -23014,6 +23014,25 @@ int ds4_gpu_dsv4_topk_mask_tensor(
     return 1;
 }
 
+static id<MTLComputePipelineState> ds4_gpu_q8_decode_mv_pipeline(
+        int16_t nsg, uint64_t out_dim, bool pair) {
+    const char *legacy = pair ? "kernel_mul_mv_q8_0_f32_pair" :
+                                "kernel_mul_mv_q8_0_f32";
+    // The two-row single matvec has no weight-row tail guard. Keep it on
+    // even extents; the paired kernel guards each matrix independently.
+    // Repeated M1 Max A/B runs improved NSG=4; NSG=8 paired timings regressed
+    // in the second run. Preserve the existing kernel for every non-4 shape.
+    if (!g_quality_mode && g_tp_split_world <= 1 && out_dim > 0 &&
+        (pair || out_dim % 2u == 0) && nsg == 4 &&
+        getenv("DS4_METAL_DISABLE_Q8_MV_SINGLE_BARRIER") == NULL) {
+        const char *candidate = pair ? "kernel_mul_mv_q8_0_f32_pair_single_barrier" :
+                                       "kernel_mul_mv_q8_0_f32_single_barrier";
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(candidate, nsg);
+        if (pipeline) return pipeline;
+    }
+    return ds4_gpu_get_mul_mv_pipeline(legacy, nsg);
+}
+
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -23101,7 +23120,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+                ds4_gpu_q8_decode_mv_pipeline(mv_dispatch.nsg, out_dim, false);
             if (!pipeline) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -23970,7 +23989,7 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         args0.nr0 = dispatch0.nr0;
         args1.nr0 = dispatch1.nr0;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_pair", dispatch0.nsg);
+            ds4_gpu_q8_decode_mv_pipeline(dispatch0.nsg, out0_dim, true);
         if (!pipeline) return 0;
 
         int owned = 0;

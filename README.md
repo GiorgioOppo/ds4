@@ -1117,6 +1117,17 @@ the two-layer reserve, but it can be reduced by the same final memory check.
 Non-routed weights, KV cache, graph scratch, and activations need additional
 memory.
 
+Metal Q8_0 dense decode matvecs and paired projections also use a single
+reduction barrier on eligible non-TP/non-quality 4-simdgroup paths,
+in both resident and SSD modes. Only the output-owning simdgroup performs the
+final reduction, with the same sum order and launch geometry. Set
+`DS4_METAL_DISABLE_Q8_MV_SINGLE_BARRIER=1` to restore their previous kernels.
+This does not change prefill or the separate shared-expert SwiGLU policy.
+`make bench-metal-q8-mv` runs bitwise checks followed by a resident synthetic
+kernel-only A/B; full-model and SSD throughput still need separate tests.
+Eight-simdgroup paths retain the legacy kernel after mixed local A/B results;
+see [measurement notes](speed-bench/metal_q8_mv_single_barrier.md).
+
 Metal SSD decode enables two kernel specializations by default on eligible
 non-quality, non-TP paths. Q4_K selected experts (six cache slots or
 address tables) load activations once for gate/up and compute SwiGLU from
