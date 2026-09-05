@@ -1117,6 +1117,40 @@ the two-layer reserve, but it can be reduced by the same final memory check.
 Non-routed weights, KV cache, graph scratch, and activations need additional
 memory.
 
+Metal SSD decode enables two kernel specializations by default on eligible
+non-quality, non-TP paths. Q4_K selected experts (six cache slots or
+address tables) load activations once for gate/up and compute SwiGLU from
+registers; the separate Q8_0 shared-expert gate/up kernel uses one threadgroup
+barrier instead of two, with the same reduction order and launch geometry.
+The Q8 shared-expert change can apply to both AProjQ4 and AProjQ8 models; the
+Q4 change requires Q4_K routed-expert weights. Neither changes SSD reads,
+cache policy, prefill, CUDA, or ROCm.
+
+For tester A/B runs, set either rollback independently (any defined value,
+including `0`, disables it):
+
+```sh
+DS4_METAL_DISABLE_SSD_Q4_PAIR_SHARED_X=1 \
+DS4_METAL_DISABLE_SSD_Q8_SINGLE_BARRIER=1 \
+./ds4 -m ./ds4flash.gguf --ssd-streaming
+```
+
+Unset both variables for the candidate run. Keep model, cache size, prompt,
+context, and SSD/cache warmup identical between arms; compare each rollback
+separately to attribute changes. `make test-metal-ssd-decode-kernels` runs a
+GGUF-free bitwise GPU oracle with guarded buffers. It does not measure SSD or
+end-to-end performance; throughput gains still require model-backed A/B tests.
+
+CUDA's raw Q8_0 activation quantizers also use a default-on warp reduction
+outside quality mode, for both resident and SSD decode/prefill. The ordinary
+and group-slice producers drop six block barriers; the dual Q8_K/Q8_0 producer
+drops seven in its Q8_0 phase without changing the Q8_K signed-max reduction.
+Launch geometry, stream, rounding, and padding are preserved. This does not
+change the separate MMQ Q8_1 path. Use
+`DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE=1` in a fresh process to restore the
+previous kernels. Test correctness with `make test-cuda-q8-quantize` on a CUDA
+host, then measure end-to-end throughput with identical model/cache settings.
+
 Metal SSD+DSpark also has an experimental, support-aware pre-cap for A/B tests.
 Set `DS4_METAL_DSPARK_SAFE_EXPERT_COUNT=1` to convert a numeric count to bytes
 and cap it, when measurable, after accounting for the target's non-routed

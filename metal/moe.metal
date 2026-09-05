@@ -5156,45 +5156,22 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
         sgitg);
 }
 
-// Same release-path fusion as the IQ2_XXS kernel above for the Q4_K expert
-// variant.  The Q4 pair path reuses the existing exact matvec implementation
-// for gate and up, then the same lane that wrote each row derives the routed
-// SwiGLU input.  This keeps Q4 behavior aligned with the Q2 optimization while
-// preserving the old pair projection arithmetic.
-kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
-        device const char * src0_gate,
-        device const char * src0_up,
-        device const char * src1,
-        device       char * dst_gate,
-        device       char * dst_up,
-        device       char * dst_mid,
-        device const char * ids,
-        device const char * weights,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const int iid1 = tgpig.z / args.nei0;
-    const int idx  = tgpig.z % args.nei0;
-
-    tgpig.z = 0;
-
-    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
-    const int i02b = i02 - args.tp_expert_base;
-    const int64_t i11 = idx % args.ne11;
-    const int64_t i12 = iid1;
-
-    device const char *src0_gate_cur = src0_gate + (int64_t)i02b * args.nb02;
-    device const char *src0_up_cur   = src0_up   + (int64_t)i02b * args.nb02;
-    device const char *src1_cur      = src1      + i11 * args.nb11 + i12 * args.nb12;
-
-    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
-    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
-
+// Gate/up share the activation load and sumy terms, preserving each projection's
+// accumulation order. Reused by resident and streamed-expert entry points.
+inline void kernel_mul_mv_q4_K_pair_shared_x_impl(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate_cur,
+        device const char *src0_up_cur,
+        device const char *src1_cur,
+        device char *dst_gate_cur,
+        device char *dst_up_cur,
+        device char *dst_mid,
+        device const char *weights,
+        uint64_t pair_row,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
@@ -5208,7 +5185,6 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
     device float *gate_f32 = (device float *)dst_gate_cur;
     device float *up_f32 = (device float *)dst_up_cur;
-    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
     const float c = act.clamp_value;
@@ -5328,6 +5304,47 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
+}
+
+kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
+    const int i02b = i02 - args.tp_expert_base;
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char *src0_gate_cur = src0_gate + (int64_t)i02b * args.nb02;
+    device const char *src0_up_cur   = src0_up   + (int64_t)i02b * args.nb02;
+    device const char *src1_cur      = src1      + i11 * args.nb11 + i12 * args.nb12;
+
+    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    kernel_mul_mv_q4_K_pair_shared_x_impl(
+        args, act, src0_gate_cur, src0_up_cur, src1_cur,
+        dst_gate_cur, dst_up_cur, dst_mid, weights,
+        (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx,
+        tgpig, tiisg, sgitg);
 
     (void)tiitg;
 }
@@ -5915,7 +5932,8 @@ kernel void kernel_mul_mv_table_q4_K_pair_swiglu_f32(
     (void)tiitg;
 }
 
-kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
+template<bool SHARED_X>
+kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const ulong * gate_addrs,
@@ -5951,6 +5969,15 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
 
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    if (SHARED_X) {
+        kernel_mul_mv_q4_K_pair_shared_x_impl(
+            args, act, src0_gate_cur, src0_up_cur, src1_cur,
+            dst_gate_cur, dst_up_cur, dst_mid, weights,
+            (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx,
+            tgpig, tiisg, sgitg);
+        return;
+    }
 
     ds4_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
@@ -6006,6 +6033,12 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
     (void)tiitg;
 }
 
+typedef decltype(kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl<false>) kernel_mul_mv_addr_q4_K_pair_swiglu_f32_t;
+template [[host_name("kernel_mul_mv_addr_q4_K_pair_swiglu_f32")]]
+kernel kernel_mul_mv_addr_q4_K_pair_swiglu_f32_t kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl<false>;
+template [[host_name("kernel_mul_mv_addr_q4_K_pair_swiglu_f32_shared_x")]]
+kernel kernel_mul_mv_addr_q4_K_pair_swiglu_f32_t kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl<true>;
+
 kernel void kernel_q4_gather_slots6(
         constant ds4_metal_q4_gather_slots6_args &args,
         device const char *src_group0,
@@ -6050,7 +6083,8 @@ kernel void kernel_q4_gather_slots6(
     out[chunk] = src[chunk];
 }
 
-kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
+template<bool SHARED_X>
+kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const char * src0_gate0,
@@ -6099,6 +6133,15 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
+    if (SHARED_X) {
+        kernel_mul_mv_q4_K_pair_shared_x_impl(
+            args, act, src0_gate_cur, src0_up_cur, src1_cur,
+            dst_gate_cur, dst_up_cur, dst_mid, weights,
+            (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx,
+            tgpig, tiisg, sgitg);
+        return;
+    }
+
     ds4_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
@@ -6152,6 +6195,12 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
 
     (void)tiitg;
 }
+
+typedef decltype(kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl<false>) kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_t;
+template [[host_name("kernel_mul_mv_slots6_q4_K_pair_swiglu_f32")]]
+kernel kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_t kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl<false>;
+template [[host_name("kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_shared_x")]]
+kernel kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_t kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl<true>;
 
 static inline device const char *ds4_q4_group24_select(
         uint32_t group_id,

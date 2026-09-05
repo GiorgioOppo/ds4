@@ -473,7 +473,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP>
+template<short NR0, bool STORE_GATE_UP, bool SINGLE_BARRIER = false>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -549,7 +549,9 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         sh_gate[row] = shmem_f32 + NW * row;
         sh_up[row]   = shmem_f32 + NW * (NR0 + row);
-        if (sgitg == 0) {
+        // Leaders own [0, NSG); zero only the disjoint padding lanes in the
+        // single-barrier variant. The final 32-lane reduction is unchanged.
+        if (sgitg == 0 && (!SINGLE_BARRIER || tiisg >= NSG)) {
             sh_gate[row][tiisg] = 0.0f;
             sh_up[row][tiisg] = 0.0f;
         }
@@ -557,7 +559,7 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         sumu[row] = simd_sum(sumu[row]);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!SINGLE_BARRIER) threadgroup_barrier(mem_flags::mem_threadgroup);
 
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         if (tiisg == 0) {
@@ -614,6 +616,34 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
+
+// SSD decode specialization: same launch geometry and reduction tree, one
+// cross-simdgroup rendezvous instead of two. Host dispatch requires NSG <= 32.
+template<bool STORE_GATE_UP>
+kernel void kernel_dsv4_shared_swiglu_q8_0_single_barrier(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        constant float &clamp_value,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, STORE_GATE_UP, true>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_dsv4_shared_swiglu_q8_0_single_barrier<true>)
+    shared_swiglu_q8_0_single_barrier_t;
+template [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_single_barrier")]]
+kernel shared_swiglu_q8_0_single_barrier_t kernel_dsv4_shared_swiglu_q8_0_single_barrier<true>;
+template [[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_single_barrier")]]
+kernel shared_swiglu_q8_0_single_barrier_t kernel_dsv4_shared_swiglu_q8_0_single_barrier<false>;
 
 // Same body as kernel_dsv4_shared_gate_up_swiglu_q8_0_impl with the row
 // bound taken from a thread value instead of args.ne01 (GPU-decided lane

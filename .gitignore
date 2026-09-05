@@ -29,6 +29,9 @@
 /tests/test_metal_q4_qb_f16_cache
 /tests/test_metal_q4_prefill_pair
 /tests/test_metal_q4_streams
+/tests/test_metal_ssd_decode_kernels
+/tests/test_q8_quantize_host
+/tests/test_cuda_q8_quantize
 /tests/test_mxfp4_cuda
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal

@@ -80,6 +80,19 @@ tests/test_quantizer_indexer_q4: tests/test_quantizer_indexer_q4.c gguf-tools/qu
 test-quantizer-indexer-q4: gguf-tools/deepseek4-quantize tests/test_quantizer_indexer_q4
 	./tests/test_quantizer_indexer_q4 ./gguf-tools/deepseek4-quantize
 
+.PHONY: test-q8-quantize-host test-cuda-q8-quantize
+tests/test_q8_quantize_host: tests/test_cuda_q8_quantize.cpp
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -o $@ $<
+
+test-q8-quantize-host: tests/test_q8_quantize_host
+	./tests/test_q8_quantize_host
+
+tests/test_cuda_q8_quantize: tests/test_cuda_q8_quantize.cpp cuda/ds4_q8_quantize.cuh
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -x cu -o $@ $<
+
+test-cuda-q8-quantize: tests/test_cuda_q8_quantize
+	./tests/test_cuda_q8_quantize
+
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench metal-q4-prefill-pair-bench metal-q4-mm-tail-cull-bench metal-q4-attn-out-a-direct-bench metal-iq2-moe-tail-cull-bench metal-iq2-moe-top8-pair-bench check-mxfp4-half-lut test-mxfp4-metal
 
@@ -105,6 +118,7 @@ help:
 	@echo "  make test-metal-argmax-top1  Check the resident production-shape Metal decode argmax"
 	@echo "  make bench-metal-argmax-top1  Time full argsort versus resident top-1 without GGUF/SSD"
 	@echo "  make test-metal-iq2-midonly  Check M1 IQ2 addr mid-only output and sentinels"
+	@echo "  make test-metal-ssd-decode-kernels  Bitwise Q4/Q8 SSD decode kernel oracle (no model)"
 	@echo "  make test-metal-iq2-live-index  Check IQ2 SSD live-cache index policy and fallback"
 	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
@@ -369,6 +383,13 @@ test-metal-exactn-oracle: tests/test_metal_exactn_oracle
 
 speed-bench/metal_q4_dense_pair_bench: speed-bench/metal_q4_dense_pair_bench.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-ssd-decode-kernels
+tests/test_metal_ssd_decode_kernels: tests/test_metal_ssd_decode_kernels.m $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+test-metal-ssd-decode-kernels: tests/test_metal_ssd_decode_kernels
+	./tests/test_metal_ssd_decode_kernels
 
 metal-q4-dense-pair-bench: speed-bench/metal_q4_dense_pair_bench
 
@@ -763,7 +784,7 @@ $(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_image.o ds4_rocm.o
 test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
 	./$(GLM53_KDA_ROCM_TEST)
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/ds4_q8_quantize.cuh
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -1059,5 +1080,7 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
+	rm -f tests/test_q8_quantize_host tests/test_cuda_q8_quantize
+	rm -f tests/test_metal_ssd_decode_kernels
 	rm -f speed-bench/metal_iq2_moe_top8_pair_bench
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_q4_dense_pair_bench speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench speed-bench/metal_iq2_moe_tail_cull_bench speed-bench/gpu_iq2_moe_prefill_bench_rocm speed-bench/gpu_iq2_moe_prefill_bench_cuda speed-bench/rocm_q4_prefill_bench speed-bench/cuda_q4_prefill_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_quantizer_indexer_q4 tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/bench_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_q4_dense_pair tests/test_metal_session_batch tests/test_metal_q4_streams tests/test_metal_q4_prefill_pair tests/test_metal_indexer_q4 tests/test_metal_q4_attn_exactn tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_qb_f16_cache tests/test_metal_exactn_oracle tests/test_metal_dspark_capture tests/test_metal_argmax_top1 tests/test_metal_iq2_midonly tests/test_metal_iq2_ssd_grouped_mm tests/test_metal_iq2_live_index tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o cuda/mmq/*.o cuda/mmq/test/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

@@ -24591,8 +24591,19 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         const char *fn_name = store_gate_up ?
             "kernel_dsv4_shared_gate_up_swiglu_q8_0" :
             "kernel_dsv4_shared_mid_swiglu_q8_0";
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(fn_name, mv_dispatch.nsg);
+        id<MTLComputePipelineState> pipeline = nil;
+        // Keep the resident/quality/TP paths unchanged. Padding and partial
+        // sums have disjoint writers, so SSD decode needs just one barrier.
+        if (g_ssd_streaming_mode && !g_quality_mode && g_tp_split_world <= 1 &&
+            out_dim % 2u == 0 &&
+            (mv_dispatch.nsg == 4 || mv_dispatch.nsg == 8) &&
+            getenv("DS4_METAL_DISABLE_SSD_Q8_SINGLE_BARRIER") == NULL) {
+            const char *ssd_fn = store_gate_up ?
+                "kernel_dsv4_shared_gate_up_swiglu_q8_0_single_barrier" :
+                "kernel_dsv4_shared_mid_swiglu_q8_0_single_barrier";
+            pipeline = ds4_gpu_get_mul_mv_pipeline(ssd_fn, mv_dispatch.nsg);
+        }
+        if (!pipeline) pipeline = ds4_gpu_get_mul_mv_pipeline(fn_name, mv_dispatch.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -48143,6 +48154,24 @@ int ds4_gpu_routed_moe_one_tensor(
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline :
             g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline);
+        id<MTLComputePipelineState> q4_addr_pair_swiglu_pipeline =
+            g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline;
+        bool use_ssd_q4_pair_shared_x = false;
+        if (g_ssd_streaming_mode && !g_quality_mode && g_tp_split_world <= 1 &&
+            (use_q4_selected_slots || use_q4_expert_address_table) &&
+            gate_args.ne00 % 256 == 0 && gate_args.ne0 % 4 == 0 &&
+            getenv("DS4_METAL_DISABLE_SSD_Q4_PAIR_SHARED_X") == NULL) {
+            const char *ssd_fn = use_q4_selected_slots ?
+                "kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_shared_x" :
+                "kernel_mul_mv_addr_q4_K_pair_swiglu_f32_shared_x";
+            id<MTLComputePipelineState> ssd_pipeline =
+                ds4_gpu_get_mul_mv_pipeline(ssd_fn, 2);
+            if (ssd_pipeline) {
+                if (use_q4_selected_slots) slots_pair_swiglu_pipeline = ssd_pipeline;
+                else q4_addr_pair_swiglu_pipeline = ssd_pipeline;
+                use_ssd_q4_pair_shared_x = true;
+            }
+        }
         id<MTLComputePipelineState> slots_sum6_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_q2_k_sum6_pipeline :
             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_sum6_pipeline :
@@ -49089,7 +49118,9 @@ int ds4_gpu_routed_moe_one_tensor(
             use_q4_group8_experts ? "q4_group8_pair_swiglu" :
             use_q4_group24_experts ? "q4_group24_split_gate_up" :
             use_q4_exact_tensor_id ? "q4_exact_pair_swiglu" :
-            use_q4_expert_address_table ? "q4_addr_pair_swiglu" :
+            use_q4_expert_address_table ?
+                (use_ssd_q4_pair_shared_x ? "q4_addr_pair_swiglu_shared_x" :
+                                          "q4_addr_pair_swiglu") :
             use_q4_expert_table ? "q4_table_pair_swiglu" :
             use_q4_gather_slots ? "q4_gather_slots6_pair_swiglu" :
             use_m1_iq2_addr_mid_only ?
@@ -49101,7 +49132,9 @@ int ds4_gpu_routed_moe_one_tensor(
             use_stream_expert_addr_table ? "iq2_stream_addr_pair_swiglu" :
             use_iq2_selected_slots ? "iq2_slots6_pair_swiglu" :
             use_mxfp4_selected_slots ? "mxfp4_slots6_pair_swiglu" :
-            use_q4_selected_slots ? "q4_slots6_pair_swiglu" :
+            use_q4_selected_slots ?
+                (use_ssd_q4_pair_shared_x ? "q4_slots6_pair_swiglu_shared_x" :
+                                          "q4_slots6_pair_swiglu") :
             (fuse_pair_swiglu ? "pair_swiglu" :
             ((!g_quality_mode &&
               ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && g_moe_mul_mv_id_iq2_xxs_pair_pipeline) ||
@@ -49289,7 +49322,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 .clamp_value = clamp,
             };
             ok = ds4_gpu_encode_mul_mv_addr_q4_pair_swiglu(cb,
-                                                           g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline,
+                                                           q4_addr_pair_swiglu_pipeline,
                                                            &gate_args,
                                                            &act_args,
                                                            gate_table,

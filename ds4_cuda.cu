@@ -147,6 +147,7 @@ static int g_xdev_sync_debug;
 static int g_xdev_force_cuda_peer;
 static int g_xdev_force_host_bounce;
 static int g_cuda_disable_qkv_rms_fused;
+static int g_cuda_disable_q8_quant_warp_reduce;
 static int g_cuda_no_window_attention;
 static int g_cuda_decode_heads8_online;
 static int g_cuda_decode_score4;
@@ -353,6 +354,8 @@ static void cuda_xdev_env_refresh(void) {
 
 static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_disable_qkv_rms_fused = getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL;
+    g_cuda_disable_q8_quant_warp_reduce =
+        getenv("DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE") != NULL;
     g_cuda_no_window_attention = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
     g_cuda_decode_heads8_online = getenv("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL;
     g_cuda_decode_score4 = getenv("DS4_CUDA_DECODE_SCORE4") != NULL;
@@ -10715,83 +10718,10 @@ __device__ __forceinline__ static int32_t dot_i8x32_aligned_int4(
     return dot;
 }
 
-__global__ static void quantize_q8_0_f32_kernel(
-        int8_t *xq,
-        float *xscale,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t blocks) {
-    uint64_t b = blockIdx.x;
-    uint64_t tok = blockIdx.y;
-    if (b >= blocks) return;
-    uint64_t i0 = b * 32;
-    uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-    const float *xr = x + tok * in_dim + i0;
+#include "cuda/ds4_q8_quantize.cuh"
 
-    float a = 0.0f;
-    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
-    __shared__ float vals[32];
-    vals[threadIdx.x] = a;
-    __syncthreads();
-    for (uint32_t stride = 16; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    const float d = vals[0] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
-    int8_t *dst = xq + (tok * blocks + b) * 32;
-    if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
-        v = v > 127 ? 127 : (v < -128 ? -128 : v);
-        dst[threadIdx.x] = (int8_t)v;
-    } else {
-        dst[threadIdx.x] = 0;
-    }
-}
-
-__global__ static void quantize_q8_0_group_slice_rows_kernel(
-        int8_t *xq,
-        float *xscale,
-        const float *x,
-        uint64_t group_dim,
-        uint64_t blocks,
-        uint32_t n_groups_total,
-        uint32_t group0,
-        uint32_t group_cnt) {
-    const uint64_t b = blockIdx.x;
-    const uint64_t packed_row = blockIdx.y;
-    if (b >= blocks) return;
-    const uint64_t token = packed_row / group_cnt;
-    const uint64_t group = group0 + packed_row - token * group_cnt;
-    const uint64_t i0 = b * 32u;
-    const uint64_t bn = group_dim - i0 < 32u ? group_dim - i0 : 32u;
-    const float *xr = x +
-        (token * n_groups_total + group) * group_dim + i0;
-
-    float a = 0.0f;
-    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
-    __shared__ float vals[32];
-    vals[threadIdx.x] = a;
-    __syncthreads();
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) {
-            vals[threadIdx.x] =
-                fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    const float d = vals[0] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (threadIdx.x == 0u) xscale[packed_row * blocks + b] = d;
-    int8_t *dst = xq + (packed_row * blocks + b) * 32u;
-    if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
-        v = v > 127 ? 127 : (v < -128 ? -128 : v);
-        dst[threadIdx.x] = (int8_t)v;
-    } else {
-        dst[threadIdx.x] = 0;
-    }
+static inline bool cuda_q8_quant_warp_reduce_enabled(void) {
+    return !g_quality_mode && !g_cuda_disable_q8_quant_warp_reduce;
 }
 
 __global__ static void matmul_q8_0_preq_kernel(
@@ -21271,7 +21201,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+        xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
@@ -21442,12 +21374,9 @@ extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
                  "matmul_q8_0_top1 clear")) {
         return 0;
     }
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(
-            xq,
-            xscale,
-            (const float *)x->ptr,
-            in_dim,
-            blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), (unsigned)blocks, 0,
+        xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_top1 quantize launch")) return 0;
     matmul_q8_0_top1_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             best_key,
@@ -21509,12 +21438,9 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     const dim3 qgrid((unsigned)slice_blocks, (unsigned)n_tok, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
-            xq,
-            xscale,
-            (const float *)x->ptr,
-            in_count,
-            slice_blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), qgrid, 0,
+        xq, xscale, (const float *)x->ptr, in_count, slice_blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice quantize launch")) return 0;
     const dim3 grid(((unsigned)out_dim + 7u) / 8u,
                     (unsigned)n_tok, 1u);
@@ -21586,12 +21512,9 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)slice_blocks, 32>>>(
-            xq,
-            xscale,
-            (const float *)x->ptr,
-            in_count,
-            slice_blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), (unsigned)slice_blocks, 0,
+        xq, xscale, (const float *)x->ptr, in_count, slice_blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice_hc_expand_add quantize launch")) return 0;
     matmul_q8_0_kslice_hc_expand_add_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             (float *)out_hc->ptr,
@@ -21793,7 +21716,9 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+        xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     if (n_tok != 1) {
         if (force_decode_warp &&
@@ -22086,8 +22011,9 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     dim3 qgrid((unsigned)blocks, n_rows, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
-            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+        xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(),
                  "q8_0 decode rows exact quantize launch")) {
         return 0;
@@ -22156,8 +22082,9 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     dim3 qgrid((unsigned)blocks, n_rows, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
-            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+        xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(),
                  "q8_0 pair decode rows exact quantize launch")) {
         return 0;
@@ -22248,9 +22175,9 @@ static int cuda_q8_hc_matmul_prepare(
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    quantize_q8_0_f32_kernel<<<
-        (unsigned)blocks, 32, 0, cuda_decode_stream()>>>(
-            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_cuda_launch_q8_0_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), (unsigned)blocks, cuda_decode_stream(),
+        xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(),
                  "matmul_q8_0_hc_expand quantize launch")) {
         return 0;
@@ -25744,11 +25671,9 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         float *xscale = (float *)((char *)tmp + scale_offset);
         const int use_dp4a = cuda_q8_use_dp4a();
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-        quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq,
-                                                xscale,
-                                                (const float *)heads->ptr,
-                                                group_dim,
-                                                blocks_a);
+        ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+            xq, xscale, (const float *)heads->ptr, group_dim, blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
         int grouped_mma_done = 0;
         if (n_tokens >= 8u) {
@@ -25909,15 +25834,9 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_group_slice_rows_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(
-            xq,
-            xscale,
-            (const float *)heads->ptr,
-            group_dim,
-            blocks_a,
-            n_groups_total,
-            group0,
-            group_cnt);
+    ds4_cuda_launch_q8_0_group_slice_quantize(
+        cuda_q8_quant_warp_reduce_enabled(), qgrid, cuda_decode_stream(),
+        xq, xscale, (const float *)heads->ptr, group_dim, blocks_a, n_groups_total, group0, group_cnt);
     if (!cuda_ok(cudaGetLastError(),
                  "attention_output_low_q8 rows prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, n_rows, 1u);
@@ -26116,8 +26035,9 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
         if (!tmp) return 0;
         xq = (int8_t *)tmp;
         xscale = (float *)((char *)tmp + scale_offset);
-        quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(
-                xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        ds4_cuda_launch_q8_0_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), (unsigned)blocks, cuda_decode_stream(),
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
         if (!cuda_ok(cudaGetLastError(),
                      "shared mid q8 exact quantize launch")) {
             return 0;
@@ -26929,90 +26849,6 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
         if (qv > 127) qv = 127;
         if (qv < -128) qv = -128;
         yb->qs[tid] = (int8_t)qv;
-    }
-    __syncthreads();
-    if (tid < CUDA_QK_K / 16) {
-        int sum = 0;
-        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
-        yb->bsums[tid] = (int16_t)sum;
-    }
-    if (tid == 0) yb->d = 1.0f / iscale_s;
-}
-
-/* Decode-only dual quantizer.  The Q8_0 half mirrors
- * quantize_q8_0_f32_kernel's 32-thread reduction and expression order, while
- * the Q8_K half remains byte-for-byte the ordinary routed-MoE quantizer. */
-__global__ static void q8_K_q8_0_quantize_kernel(
-        cuda_block_q8_K *out,
-        int8_t *q8_0,
-        float *q8_0_scale,
-        const float *x,
-        uint32_t in_dim,
-        uint32_t n_rows) {
-    const uint32_t b = blockIdx.x;
-    const uint32_t row = blockIdx.y;
-    if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
-    const float *xr = x + (uint64_t)row * in_dim +
-                      (uint64_t)b * CUDA_QK_K;
-    cuda_block_q8_K *yb = out +
-        (uint64_t)row * (in_dim / CUDA_QK_K) + b;
-    __shared__ float abs_part[256];
-    __shared__ float val_part[256];
-    __shared__ float maxv_s;
-    __shared__ float iscale_s;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    const float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
-
-    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
-    __syncthreads();
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            abs_part[tid] = fmaxf(abs_part[tid], abs_part[tid + stride]);
-        }
-        __syncthreads();
-    }
-    const uint32_t q8_blocks = in_dim / 32u;
-    const uint32_t q8_block = b * 8u + warp;
-    const float d = abs_part[warp * 32u] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (lane == 0u) {
-        q8_0_scale[(uint64_t)row * q8_blocks + q8_block] = d;
-    }
-    int qv = (int)lrintf(v * id);
-    qv = qv > 127 ? 127 : (qv < -128 ? -128 : qv);
-    q8_0[((uint64_t)row * q8_blocks + q8_block) * 32u + lane] =
-        (int8_t)qv;
-    __syncthreads();
-
-    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
-    val_part[tid] = v;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
-            abs_part[tid] = abs_part[tid + stride];
-            val_part[tid] = val_part[tid + stride];
-        }
-        __syncthreads();
-    }
-    const float amax = abs_part[0];
-    if (amax == 0.0f) {
-        if (tid == 0) yb->d = 0.0f;
-        if (tid < CUDA_QK_K) yb->qs[tid] = 0;
-        if (tid < CUDA_QK_K / 16) yb->bsums[tid] = 0;
-        return;
-    }
-    if (tid == 0) {
-        maxv_s = val_part[0];
-        iscale_s = -127.0f / maxv_s;
-    }
-    __syncthreads();
-    if (tid < CUDA_QK_K) {
-        int kv = (int)lrintf(iscale_s * xr[tid]);
-        if (kv > 127) kv = 127;
-        if (kv < -128) kv = -128;
-        yb->qs[tid] = (int8_t)kv;
     }
     __syncthreads();
     if (tid < CUDA_QK_K / 16) {
@@ -33018,9 +32854,9 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         int8_t *shared_xq = (int8_t *)shared_prequant->ptr;
         float *shared_scale = (float *)((char *)shared_prequant->ptr +
                                         shared_scale_offset);
-        q8_K_q8_0_quantize_kernel<<<xq_grid, 256>>>(
-                xq, shared_xq, shared_scale, (const float *)x->ptr,
-                expert_in_dim, 1u);
+        ds4_cuda_launch_q8_dual_quantize(
+            cuda_q8_quant_warp_reduce_enabled(), xq_grid, 0,
+            xq, shared_xq, shared_scale, (const float *)x->ptr, expert_in_dim, 1u);
     } else {
         q8_K_quantize_kernel<<<xq_grid, 256>>>(
                 xq, (const float *)x->ptr, expert_in_dim, 1u);

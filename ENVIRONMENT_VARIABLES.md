@@ -22,6 +22,41 @@ changing them.  Unless a row says otherwise:
 - `STATS`, `PROFILE`, and `ORACLE` are diagnostic and may perturb timing;
 - benchmark controls and candidates in separate processes.
 
+## CUDA Q8 activation quantization
+
+`DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE=1` restores the shared-memory
+32-lane maximum reduction. Unset uses warp shuffles by default outside quality
+mode, removing six block barriers from ordinary/group-slice Q8_0 quantization
+and seven from the Q8_0 phase of the dual Q8_K/Q8_0 producer. The signed-max
+Q8_K phase, rounding, padding, grid, thread count, and launch stream are unchanged.
+
+This affects raw Q8_0 activation producers in decode and prefill (resident or
+SSD) and eligible dual-producer MoE calls, including Q4 models. It does not
+change the separate MMQ Q8_1 producer, weight quantization, or ROCm. The flag
+is presence-based (even `0` rolls back) and is read at CUDA initialization;
+use separate processes for A/B tests.
+
+`make test-cuda-q8-quantize CUDA_ARCH=sm_121` builds a standalone GPU oracle
+for both production specializations; replace the architecture with the tester's
+GPU target. It checks exact quantized bytes/scales, group slicing, buffer guards,
+the dual producer, and graph replay. `make test-q8-quantize-host` only checks the
+reduction topology and rounding on CPU, not CUDA compilation or GPU execution.
+
+## Metal SSD decode kernels
+
+These controls preserve the previous kernels for independent A/B tests. Both
+specializations default on only for eligible SSD decode, outside quality and
+tensor-parallel modes; they do not change SSD I/O, prefill, or CUDA/ROCm.
+
+| Variable | Default behavior and purpose |
+| --- | --- |
+| `DS4_METAL_DISABLE_SSD_Q4_PAIR_SHARED_X=1` | Restore sequential gate/up projections for six selected Q4_K experts bound through cache slots or GPU address tables. Unset reuses activation loads for both projections and computes SwiGLU from registers, preserving diagnostic gate/up outputs. |
+| `DS4_METAL_DISABLE_SSD_Q8_SINGLE_BARRIER=1` | Restore two barriers in the separate Q8_0 shared-expert gate/up or mid-only kernel. Unset uses one barrier with disjoint shared-memory writers and the same 4/8-simdgroup geometry and reduction tree. Applies to eligible shared-expert calls in both AProjQ4 and AProjQ8 models. |
+
+Any defined value, including `0`, activates a rollback. Unset it to test the
+candidate. `make test-metal-ssd-decode-kernels` checks bitwise kernel parity
+without a model; use identical model/cache/context settings for throughput A/B.
+
 ## Greedy top-1 readback
 
 | Variable | Default behavior and purpose |
