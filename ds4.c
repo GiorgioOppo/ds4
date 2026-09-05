@@ -44,6 +44,9 @@
 #include "ds4_distributed.h"
 #include "ds4_image.h"
 #include "ds4_tp.h"
+#ifdef DS4_ROCM_BUILD
+#include "ds4_linux_memory.h"
+#endif
 
 /* TP context for the verify-block RDMA window (set with the gate callbacks). */
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
@@ -3120,6 +3123,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     return true;
 }
 
+#ifndef DS4_ROCM_BUILD
 static bool accelerator_cache_q8_tensors(const ds4_model *m,
                                          const uint64_t *span_offsets,
                                          const uint64_t *span_sizes,
@@ -3143,6 +3147,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
     }
     return true;
 }
+#endif
 
 static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
@@ -3162,7 +3167,12 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
         return false;
     }
+#ifndef DS4_ROCM_BUILD
     if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+#endif
+    /* ROCm expands Q8 weights lazily, after required session and support-model
+     * allocations. An eager optional cache can otherwise starve those buffers
+     * on unified-memory devices. */
     const double t1 = now_sec();
 #ifdef DS4_ROCM_BUILD
     const char *accelerator_name = "ROCm";
@@ -41420,25 +41430,6 @@ static uint64_t glm_graph_host_memory_bytes(void) {
 #endif
 }
 
-#ifdef DS4_ROCM_BUILD
-static uint64_t glm_graph_host_available_memory_bytes(void) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return 0;
-    char line[256];
-    uint64_t available = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        unsigned long long kib = 0;
-        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
-            available = kib > UINT64_MAX / 1024ull ?
-                UINT64_MAX : (uint64_t)kib * 1024ull;
-            break;
-        }
-    }
-    fclose(fp);
-    return available;
-}
-#endif
-
 static uint64_t glm_graph_streaming_active_model_bytes(
         const ds4_weights *weights) {
     if (!weights) return 0;
@@ -41521,8 +41512,8 @@ static bool glm_graph_memory_guard_budget(
         uint64_t *budget_out,
         double   *fraction_out,
         double   *reserve_gib_out) {
-#ifndef DS4_ROCM_BUILD
     (void)load_slice;
+#ifndef DS4_ROCM_BUILD
     (void)ssd_streaming;
 #endif
     uint64_t budget_base = glm_graph_host_memory_bytes();
@@ -41530,9 +41521,9 @@ static bool glm_graph_memory_guard_budget(
         budget_base = ds4_gpu_recommended_working_set_size();
     }
 #ifdef DS4_ROCM_BUILD
-    uint64_t host_available =
-        glm_graph_host_available_memory_bytes();
-    if (!ssd_streaming && host_available != 0) {
+    uint64_t host_available = 0;
+    const bool host_memory_known = ds4_linux_nonmovable_memory(&host_available);
+    if (!ssd_streaming && host_memory_known) {
         /* The resident model is charged in model_bytes below. Keep the
          * pre-upload availability baseline so later session guards do not
          * charge the same ROCm allocation once through MemAvailable too. */
@@ -41541,7 +41532,7 @@ static bool glm_graph_memory_guard_budget(
         }
         host_available = g_glm_rocm_guard_available_baseline;
     }
-    if (host_available != 0 && host_available < budget_base) {
+    if (host_memory_known && host_available < budget_base) {
         budget_base = host_available;
     }
 #endif
@@ -41553,7 +41544,9 @@ static bool glm_graph_memory_guard_budget(
         glm_graph_memory_guard_default_reserve_gib(
                 budget_base, model_bytes, ds4_model_is_glm53());
 #ifdef DS4_ROCM_BUILD
-    if (load_slice && !ssd_streaming) {
+    if (!ssd_streaming) {
+        /* The host baseline already excludes CMA. Reserve usable OS memory,
+         * rather than applying the Metal physical-memory reserve a second time. */
         double rocm_reserve_gib = glm_graph_bytes_to_gib(budget_base) / 16.0;
         if (rocm_reserve_gib < 8.0) rocm_reserve_gib = 8.0;
         if (rocm_reserve_gib < default_reserve_gib) {
@@ -62823,8 +62816,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
 #ifdef DS4_ROCM_BUILD
-    g_glm_rocm_guard_available_baseline =
-        glm_graph_host_available_memory_bytes();
+    g_glm_rocm_guard_available_baseline = 0;
+    (void)ds4_linux_nonmovable_memory(&g_glm_rocm_guard_available_baseline);
 #endif
     e->model.fd = -1;
     e->mtp_model.fd = -1;
