@@ -999,6 +999,12 @@ tests, record aggregate and per-session decode speed.
 - Run the backend-specific batch tests in sections 4 and 8. Fast single-session
   decode does not substitute for aggregate multi-session throughput.
 
+For M5 dense-kernel changes, run `MTL_DEBUG_LAYER=1 make test-metal-dense-mpp`.
+It checks Q8 decode and Q4_0/Q4_K prefill against exactly representable CPU
+dots, including repeated calls, partial token tiles and untouched output tails.
+Keep host threadgroup allocations in sync with kernel staging: the dense
+double-buffered TensorOps kernel needs 8 KiB, not 4 KiB.
+
 For M5 routed-prefill changes, run `make test-metal-moe-prefill`. It compares
 gate/up, FP16 intermediate, expert partials and final outputs against the
 unpacked path, including empty experts, tile tails and scratch reuse.
