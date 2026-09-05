@@ -864,6 +864,7 @@ kernel void kernel_glm_store_indexer_k(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float mean = scratch[0] / (float)head_dim;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float ss = 0.0f;
     for (uint i = tid; i < head_dim; i += nth) {
@@ -1490,6 +1491,7 @@ kernel void kernel_glm_attention_full(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float max_score = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint s = tid; s < visible; s += nth) {
@@ -2911,6 +2913,7 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float max_m = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_denom = 0.0f;
     if (tid < n_blocks) {
@@ -3095,6 +3098,7 @@ kernel void kernel_glm_attention_indexed_decode(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         const float max_score = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float local_sum = 0.0f;
         for (uint s = tid; s < args.n_selected; s += nth) {
@@ -3193,6 +3197,7 @@ kernel void kernel_glm_attention_indexed_decode(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float max_score = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint s = tid; s < args.n_selected; s += nth) {
@@ -3356,6 +3361,7 @@ kernel void kernel_glm_attention_indexed_batch(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float max_score = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint s = tid; s < args.n_selected; s += nth) {
@@ -3542,6 +3548,7 @@ kernel void kernel_glm_attention_indexed_batch_group2(
     }
     const float max_score0 = red0[0];
     const float max_score1 = red1[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum0 = 0.0f;
     float local_sum1 = 0.0f;

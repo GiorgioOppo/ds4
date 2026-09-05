@@ -336,6 +336,19 @@ fi
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-dspark-fixture.XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
+run_logged() {
+    out=$1
+    err=$2
+    shift 2
+    if "$@" >"$out" 2>"$err"; then
+        return 0
+    else
+        status=$?
+        cat "$err" >&2
+        return "$status"
+    fi
+}
+
 run_variant() {
     mode=$1
     prompt=$2
@@ -368,9 +381,9 @@ run_variant() {
         --seed "$SEED" --nothink -p "$prompt"
 
     if [ "$mode" = dspark ]; then
-        DS4_DSPARK_STATS=1 "$@" >"$stdout_file" 2>"$stderr_file"
+        DS4_DSPARK_STATS=1 run_logged "$stdout_file" "$stderr_file" "$@"
     else
-        "$@" >"$stdout_file" 2>"$stderr_file"
+        run_logged "$stdout_file" "$stderr_file" "$@"
     fi
 }
 
@@ -446,11 +459,15 @@ run_case() {
     cuda_exactn_full=$(stats_field "$stats" cuda_exactn_full)
     exactn_union_full=$(stats_field "$stats" exactn_union_full)
     exactn_full=$(stats_field "$stats" exactn_full)
+    first_tokens=$(stats_field "$stats" first_tokens)
+    seed_batches=$(stats_field "$stats" seed_batches)
     partial=${partial:-0}
     errors=${errors:-0}
     verifier_unavailable=${verifier_unavailable:-0}
     proposed=${proposed:-0}
     accepted_draft=${accepted_draft:-0}
+    first_tokens=${first_tokens:-0}
+    seed_batches=${seed_batches:-0}
     direct_full=${direct_full:-0}
     direct_partial=${direct_partial:-0}
     exact2_attempt=${exact2_attempt:-0}
@@ -560,6 +577,10 @@ run_case() {
        { [ "$metal_device_proposer_fallback" -ne 0 ] ||
          [ "$metal_device_proposer_policy_mismatch" -ne 0 ]; }; then
         echo "dspark-fixture: Metal device proposer fallback/mismatch for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$accepted_draft" -gt "$proposed" ] || [ "$seed_batches" -gt "$first_tokens" ]; then
+        echo "dspark-fixture: inconsistent seed/draft accounting for $id: $stats" >&2
         return 1
     fi
     if [ "$PROPOSAL_QUALITY_GUARD_ACTIVE" -ne 0 ] && [ "$id" = c_add ] &&

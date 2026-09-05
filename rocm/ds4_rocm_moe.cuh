@@ -3702,7 +3702,6 @@ __device__ __forceinline__ static float q2_K_dequant_256_scaled_w32(
     return d * scale * q - dmin * mn;
 }
 
-
 template <int BN, int BK>
 __device__ __forceinline__ static void q2_K_dequant_tile_half_rowwise(
         half *shB,
