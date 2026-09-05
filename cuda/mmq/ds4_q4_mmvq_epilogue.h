@@ -4,13 +4,15 @@
 #include <stdint.h>
 #include <limits.h>
 
-// The generic NVIDIA N=1 MMVQ owns one row, or four for small K. Admit
-// complete four-row cohorts so every output is overwritten and the legacy
-// small-K loader never reads a padded weight row. Keep its signed block
-// indices representable as well. Device/backend and opt-out checks are host
-// policy; the persistent K1024 experiment keeps its original epilogue.
+// Generic NVIDIA MMVQ owns one row (four for small K) at N=1 and two rows
+// at N=2..8. Keep complete four-row cohorts for both paths: every output is
+// overwritten and neither loader needs padded weights. Bound signed weight
+// block indices and the uint32 column/output offsets for the multi-token
+// store. Device/backend and opt-out checks are host policy; the persistent
+// K1024 experiment keeps its original epilogue.
 static inline bool ds4_q4_mmvq_epilogue_shape_ok(int M, int N, int K) {
-    return M > 0 && M % 4 == 0 && N == 1 && K > 0 && K % 256 == 0 &&
+    return M > 0 && M % 4 == 0 && N >= 1 && N <= 8 && K > 0 && K % 256 == 0 &&
+           (uint64_t)M * (uint64_t)N <= UINT32_MAX &&
            (uint64_t)M * (uint64_t)(K / 256) <= INT_MAX;
 }
 

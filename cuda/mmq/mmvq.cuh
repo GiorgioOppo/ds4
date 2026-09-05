@@ -21,12 +21,12 @@ void mul_mat_vec_q_switch_type(
         const int ids_stride, cudaStream_t stream);
 
 #if !defined(GGML_USE_HIP)
-// Dense Q4_K N=1 only. Same canonical dispatch/reduction, with the final
+// Dense Q4_K N=1..8. Same canonical dispatch/reduction, with the final
 // nonfinite-to-zero pass fused into the output store. Caller admits complete
 // row cohorts, owns activation quantization and checks cudaGetLastError().
 void ds4_mmvq_q4_K_dense_sanitized(
         const void *weights, const void *q8_1, float *out,
-        int M, int K, int stride_col_y, cudaStream_t stream);
+        int M, int N, int K, int stride_col_y, cudaStream_t stream);
 
 // Token-major grouped Q4 attention-A. Uses grid.y % n_groups instead of ids;
 // caller checks full row cohorts and representable weight/Q8/output offsets.

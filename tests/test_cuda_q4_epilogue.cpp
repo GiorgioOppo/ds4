@@ -36,17 +36,18 @@ static void host_tests() {
     const int ks[] = {0, 1, 255, 256, 512, 1024, 1536, 1792, 2048, 4096, 8192};
     for (int m = 0; m <= 1025; ++m) for (int n = 0; n <= 9; ++n) for (int k : ks) {
         const bool eligible = ds4_q4_mmvq_epilogue_shape_ok(m, n, k);
-        const bool expected = m > 0 && m % 4 == 0 && n == 1 && k > 0 && k % 256 == 0;
+        const bool expected = m > 0 && m % 4 == 0 && n >= 1 && n <= 8 && k > 0 && k % 256 == 0;
         require(eligible == expected, "shape admission mismatch");
         if (eligible) {
-            // NVIDIA's canonical Q4 N=1 dispatcher: four rows when K<2048,
-            // otherwise one. Removing memset is valid only with full coverage.
-            const int rows_per_block = k < 2048 ? 4 : 1;
-            std::vector<unsigned> writes(m, 0);
+            // Canonical NVIDIA: N=1 has four rows for K<2048, otherwise one;
+            // every N=2..8 variant has two. Check all token columns as well.
+            const int rows_per_block = n == 1 ? (k < 2048 ? 4 : 1) : 2;
+            std::vector<unsigned> writes(size_t(m)*n, 0);
             for (int block = 0; block < m / rows_per_block; ++block)
-                for (int lane = 0; lane < rows_per_block; ++lane)
-                    ++writes[block*rows_per_block + lane];
-            for (unsigned count : writes) require(count == 1, "row coverage mismatch");
+                for (int j = 0; j < n; ++j)
+                    for (int lane = 0; lane < rows_per_block; ++lane)
+                        ++writes[size_t(j)*m + block*rows_per_block + lane];
+            for (unsigned count : writes) require(count == 1, "token/row coverage mismatch");
         }
         ++shapes;
     }
@@ -54,6 +55,15 @@ static void host_tests() {
     require(!ds4_q4_mmvq_epilogue_shape_ok(4, 1, -256), "negative K admitted");
     require(!ds4_q4_mmvq_epilogue_shape_ok(INT_MAX-3, 1, 512), "block index overflow admitted");
     require(ds4_q4_mmvq_epilogue_shape_ok(INT_MAX-3, 1, 256), "valid index bound rejected");
+    require(!ds4_q4_mmvq_epilogue_shape_ok(4, -1, 256), "negative N admitted");
+    for (int n = 1; n <= 8; ++n) {
+        const uint64_t output_bound = uint64_t(UINT32_MAX) / n;
+        const uint64_t bound = output_bound < uint64_t(INT_MAX) ? output_bound : uint64_t(INT_MAX);
+        const int aligned = int(bound / 4u * 4u);
+        require(ds4_q4_mmvq_epilogue_shape_ok(aligned, n, 256), "valid batch output bound rejected");
+        if (aligned <= INT_MAX - 4)
+            require(!ds4_q4_mmvq_epilogue_shape_ok(aligned+4, n, 256), "batch output offset overflow admitted");
+    }
     std::printf("PASS: %zu sanitizer patterns, %zu shape/coverage cases, index bounds.\n",
         random_patterns + sizeof(special) / sizeof(special[0]), shapes);
 
@@ -227,6 +237,8 @@ static void gpu_case(int m0, int m1, int n, int k, bool nonfinite, bool pair) {
                     arm.candidate ? "candidate graph did not remove the expected sanitizer/pre-clear nodes" :
                                     "rollback did not restore the graph");
             check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            // Opt-out changes must not rewrite an already captured batch.
+            rollback.set(arm.candidate ? "1" : nullptr);
             for (int replay = 0; replay < 3; ++replay) {
                 poison(); check(cudaGraphLaunch(executable, stream));
             }
@@ -391,10 +403,21 @@ static void gpu_tests() {
     ScopedEnv persistent_oracle("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE"); persistent_oracle.set(nullptr);
     const int shapes[][4] = {{4,8,1,256}, {32,16,1,1024}, {32,12,1,1792},
         {64,36,1,2048}, {1024,512,1,4096}, {512,1024,1,4096},
-        {128,64,1,8192}, {32768,4,1,1024}, {33,12,1,512}, {16,32,2,1024}};
+        {128,64,1,8192}, {32768,4,1,1024}, {33,12,1,512}};
     unsigned cases = 0;
     for (const auto &s : shapes) for (bool nonfinite : {false, true}) for (bool pair : {false, true}) {
         gpu_case(s[0], s[1], s[2], s[3], nonfinite, pair);
+        ++cases;
+    }
+    const int batch_shapes[][3] = {{16,32,1024}, {1024,512,4096},
+                                   {33,12,512}, {128,64,8192}};
+    for (int n = 2; n <= 8; ++n) for (const auto &s : batch_shapes)
+        for (bool nonfinite : {false, true}) for (bool pair : {false, true}) {
+            gpu_case(s[0], s[1], n, s[2], nonfinite, pair);
+            ++cases;
+        }
+    for (int n : {2,4,8}) for (bool nonfinite : {false, true}) for (bool pair : {false, true}) {
+        gpu_case(32768,4,n,1024,nonfinite,pair);
         ++cases;
     }
     std::printf("PASS: %u CUDA production Q4 epilogue cases. No throughput claim.\n", cases);

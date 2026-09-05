@@ -4723,7 +4723,7 @@ static void ds4_mmq_launch_dense_vec(
         bool fused_epilogue, cudaStream_t stream) {
 #if !defined(GGML_USE_HIP)
     if (fused_epilogue) {
-        ds4_mmvq_q4_K_dense_sanitized(W, x8, out, M, K, (int)stride_col_y, stream);
+        ds4_mmvq_q4_K_dense_sanitized(W, x8, out, M, N, K, (int)stride_col_y, stream);
         return;
     }
 #else
@@ -4902,7 +4902,7 @@ int ds4_mmq_dense_vec_impl(
         return -2;
     }
 
-    // Dense N=1 MMVQ fully overwrites aligned row cohorts. Sanitize in the
+    // Dense N=1..8 MMVQ fully overwrites aligned row cohorts. Sanitize in the
     // output-owning lane to avoid both the pre-clear and the post-read kernel.
     // Leave the independent persistent experiment and its oracle untouched.
     const bool fused_epilogue = !q4_k1024_eligible &&
