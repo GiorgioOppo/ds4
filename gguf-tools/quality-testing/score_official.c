@@ -22,7 +22,7 @@ static void die(const char *msg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
-            "[--quality] "
+            "[--quality] [--rendered-prompt] "
             "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
             "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
@@ -586,6 +586,7 @@ int main(int argc, char **argv) {
     int ctx_size = 4096;
     bool ctx_set = false;
     bool quality = false;
+    bool rendered_prompt = false;
     const char *gpu_vram_arg = NULL;
     const char *gpu_devices_arg = NULL;
     bool cuda_tensor_parallel = false;
@@ -622,6 +623,8 @@ int main(int argc, char **argv) {
 
         if (!strcmp(arg, "--quality")) {
             quality = true;
+        } else if (!strcmp(arg, "--rendered-prompt")) {
+            rendered_prompt = true;
         } else if (!strcmp(arg, "--gpu-vram")) {
             gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -811,7 +814,10 @@ int main(int argc, char **argv) {
 
         ds4_tokens prompt = {0};
         ds4_tokens target = {0};
-        ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
+        if (rendered_prompt)
+            ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+        else
+            ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
         ds4_tokenize_text(engine, cont_text, &target);
 
         if (prompt.len + target.len + 1 >= ctx_size) {

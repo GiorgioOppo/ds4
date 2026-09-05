@@ -151,6 +151,8 @@ top-logprob slices, so do not replace them with one sampled chat answer.
 
 - Build the scorer:
   `make -C gguf-tools quality-score`.
+- Run `make test-quality-api` and
+  `python3 tests/test_glm_reference_render.py` after scorer or fixture changes.
 - Match every Flash GGUF to the fixture captured from the same checkpoint.
   The current release checkpoint is 0731 and uses
   `tests/test-vectors/flash-0731/`; the older undated GGUF uses the preserved
@@ -189,6 +191,16 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   `0.300804038`, `90/100`, and `9.48` on M3 Ultra. Its paired BF16-layout
   control scored `0.300477636`, `90/100`, and `9.48`; the Q8 layout won 54 of
   100 cases despite its `0.109%` higher aggregate NLL.
+- For GLM 5.3 attention changes, also run the eight long Z.AI FP8 cases.
+  First run `python3 gguf-tools/quality-testing/render_glm_references.py
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long`, then
+  score its `manifest-rendered.tsv` at context 8192 with `--rendered-prompt`.
+  This preserves the official low-effort template and returned reasoning
+  before scoring the answer. Every prompt crosses the 2,051-token boundary.
+  Compare the default path against the scalar control on the same fixture.
+  Z.AI supplies no output logprobs; do not report zero logprob-error columns
+  as API parity. The historical 100-case numbers above use a no-thinking
+  prefix and are not directly comparable to rendered-prefix scores.
 - Run the same GLM fixture for reduced-precision GLM release files.  The Q2
   routed reference is lower quality but should stay near first-token match
   `92/100`, API top-1 agreement about `0.890`, and API pair-order agreement
