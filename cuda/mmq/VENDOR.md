@@ -94,6 +94,12 @@ Symbols the vendored files reference, and how they resolve in this directory:
 
 ## Re-syncing with upstream
 
+DS4 also specializes `mul_mat_vec_q` with a default-false sanitized-output
+template parameter. The CUDA-only `ds4_mmvq_q4_K_dense_sanitized` adapter reuses
+the canonical Q4_K N=1 dispatch and only maps nonfinite results to zero at the
+store. Preserve that specialization and `ds4_q4_mmvq_epilogue.h` on re-sync;
+the generic/legacy instantiations and MoE entry points retain their old stores.
+
 When upstream lands a bugfix or perf improvement we want, the procedure is:
 
 ```sh

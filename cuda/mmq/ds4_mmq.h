@@ -1058,6 +1058,10 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// On NVIDIA Turing+, aligned N=1 calls fuse output sanitization into the
+// canonical MMVQ store, skipping the pre-clear and standalone sanitizer.
+// DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE (presence, even "0") restores both.
+// Prefill, other quant types and the K1024 persistent experiment are unchanged.
 int ds4_mmq_q4_K_dense_vec(
     const void  * W_q4_K,
     const float * X_f32,

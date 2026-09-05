@@ -1117,6 +1117,19 @@ the two-layer reserve, but it can be reduced by the same final memory check.
 Non-routed weights, KV cache, graph scratch, and activations need additional
 memory.
 
+CUDA Q4_K dense MMVQ decode on NVIDIA Turing+ fuses its NaN/Inf-to-zero
+sanitizer into the matvec output store on eligible one-token, four-row-aligned
+shapes. The matvec fully overwrites those outputs, so both the pre-clear and
+the separate sanitizer launch are skipped. The shared-activation pair applies
+the same policy independently to each leg. Dot products, reduction order,
+warp count, streams and quantization are unchanged; so are prefill, grouped/MoE
+kernels, HIP and the persistent K1024 experiment. Set
+`DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE=1` to restore the previous path (any defined
+value, even `0`, rolls back). `make test-cuda-q4-epilogue CUDA_ARCH=sm_121`
+provides the focused GPU/graph oracle; this change has only host validation
+locally, with GPU correctness and performance pending tester runs. See the
+[test and measurement notes](speed-bench/cuda_q4_mmvq_epilogue.md).
+
 Metal Q8_0 dense decode matvecs and paired projections also use a single
 reduction barrier on eligible non-TP/non-quality 4-simdgroup paths,
 in both resident and SSD modes. Only the output-owning simdgroup performs the

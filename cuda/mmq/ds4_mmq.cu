@@ -19,6 +19,7 @@
 //   IQ2_XXS MoE _id ....... pending (Phase 4)
 
 #include "ds4_mmq.h"
+#include "ds4_q4_mmvq_epilogue.h"
 
 #include "common.cuh"
 #include "mmq.cuh"
@@ -4699,6 +4700,50 @@ q4_K_dense_vec_k1024_persistent_kernel(
     }
 }
 
+static bool ds4_mmq_q4_epilogue_eligible(
+        ggml_type type, int M, int N, int K, int device) {
+#if !defined(GGML_USE_HIP)
+    if (type != GGML_TYPE_Q4_K || !ds4_q4_mmvq_epilogue_shape_ok(M, N, K)) return false;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING &&
+           getenv("DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE") == nullptr;
+#else
+    GGML_UNUSED_VARS(type, M, N, K, device);
+    return false;
+#endif
+}
+
+// Single and shared-activation pair projections use the same dense layout.
+// Keep backend selection and stride construction in one place; callers own
+// output clearing, sanitization, and launch error handling.
+template <ggml_type type>
+static void ds4_mmq_launch_dense_vec(
+        const void *W, const void *x8, float *out,
+        int M, int N, int K, int64_t stride_col_y,
+        bool fused_epilogue, cudaStream_t stream) {
+#if !defined(GGML_USE_HIP)
+    if (fused_epilogue) {
+        ds4_mmvq_q4_K_dense_sanitized(W, x8, out, M, K, (int)stride_col_y, stream);
+        return;
+    }
+#else
+    GGML_UNUSED_VARS(fused_epilogue);
+#endif
+    const ggml_cuda_mm_fusion_args_device fusion = {};
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W, /*type_x=*/type, /*vy=*/x8,
+        /*ids=*/nullptr, /*fusion=*/fusion, /*dst=*/out,
+        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
+        /*stride_row_x=*/(int)((int64_t)K / ggml_blck_size(type)),
+        /*stride_col_y=*/(int)stride_col_y, /*stride_col_dst=*/M,
+        /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1,
+        /*stride_channel_x=*/0, /*stride_channel_y=*/(int)((int64_t)N * stride_col_y),
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+        /*ids_stride=*/0, stream);
+}
+
 template <ggml_type type>
 int ds4_mmq_dense_vec_impl(
         const char  * tag,
@@ -4857,21 +4902,13 @@ int ds4_mmq_dense_vec_impl(
         return -2;
     }
 
-    // Dense (no ids): per upstream dispatch (mmvq.cu:1121-1127),
-    //   ncols_dst          = ne1  = N
-    //   nchannels_y        = ne12 = 1
-    //   nchannels_dst      = ne2  = 1
-    //   stride_col_y       = s11  = ne10_padded / QK8_1
-    //   stride_channel_y   = s12  = N * (ne10_padded / QK8_1)
-    const int64_t blck      = ggml_blck_size(type);
-    const int64_t s01_row   = (int64_t)K / blck;
-    const int64_t s11_y     = ne10_padded / QK8_1;
-    const int64_t s12_y     = (int64_t)N * s11_y;
-    const int64_t s1_dst    = (int64_t)M;
-
-    ggml_cuda_mm_fusion_args_device fusion = {};
-
-    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+    // Dense N=1 MMVQ fully overwrites aligned row cohorts. Sanitize in the
+    // output-owning lane to avoid both the pre-clear and the post-read kernel.
+    // Leave the independent persistent experiment and its oracle untouched.
+    const bool fused_epilogue = !q4_k1024_eligible &&
+        ds4_mmq_q4_epilogue_eligible(type, M, N, K, dev);
+    if (!fused_epilogue)
+        (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
 
     bool q4_k1024_persistent = false;
     if constexpr (type == GGML_TYPE_Q4_K) {
@@ -4889,24 +4926,8 @@ int ds4_mmq_dense_vec_impl(
     }
 
     if (!q4_k1024_persistent) {
-        mul_mat_vec_q_switch_type(
-            /*vx=*/W, /*type_x=*/type,
-            /*vy=*/(const void *)x8,
-            /*ids=*/nullptr, /*fusion=*/fusion,
-            /*dst=*/out_f32,
-            /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
-            /*stride_row_x=*/(int)s01_row,
-            /*stride_col_y=*/(int)s11_y,
-            /*stride_col_dst=*/(int)s1_dst,
-            /*nchannels_x=*/1,
-            /*nchannels_y=*/1,
-            /*nchannels_dst=*/1,
-            /*stride_channel_x=*/0,
-            /*stride_channel_y=*/(int)s12_y,
-            /*stride_channel_dst=*/0,
-            /*nsamples_x=*/1, /*nsamples_dst=*/1,
-            /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
-            /*ids_stride=*/0, stream);
+        ds4_mmq_launch_dense_vec<type>(
+            W, x8, out_f32, M, N, K, ne10_padded / QK8_1, fused_epilogue, stream);
     }
 
     err = cudaGetLastError();
@@ -4916,7 +4937,7 @@ int ds4_mmq_dense_vec_impl(
         return -3;
     }
     const uint64_t out_count = (uint64_t)M * (uint64_t)N;
-    ds4_mmq_sanitize_f32(out_f32, out_count, stream);
+    if (!fused_epilogue) ds4_mmq_sanitize_f32(out_f32, out_count, stream);
     if (q4_k1024_oracle) {
         ds4_mmq_sanitize_f32(q4_k1024_candidate.get(), out_count, stream);
         if (cudaGetLastError() != cudaSuccess) {
@@ -5042,68 +5063,35 @@ int ds4_mmq_dense_pair_vec_impl(
         return -2;
     }
 
-    const int64_t blck = ggml_blck_size(type);
-    const int64_t s01_row = (int64_t)K / blck;
     const int64_t s11_y = ne10_padded / QK8_1;
-    const int64_t s12_y = (int64_t)N * s11_y;
-    ggml_cuda_mm_fusion_args_device fusion = {};
 
-    /* Keep each leg's memset, canonical MMVQ dispatch, error check, and
-     * sanitizer in the same order as two dense_vec calls.  Only the activation
-     * quantization/allocation above is shared. */
-    cudaMemsetAsync(out0_f32, 0,
+    // Each aligned single-token leg fuses its own sanitizer. Keep both original
+    // matvec launches and their arithmetic; only setup/epilogue work is removed.
+    const bool fused0 = ds4_mmq_q4_epilogue_eligible(type, M0, N, K, dev);
+    const bool fused1 = ds4_mmq_q4_epilogue_eligible(type, M1, N, K, dev);
+    if (!fused0) cudaMemsetAsync(out0_f32, 0,
                     (size_t)M0 * (size_t)N * sizeof(float), stream);
-    mul_mat_vec_q_switch_type(
-        /*vx=*/W0, /*type_x=*/type,
-        /*vy=*/(const void *)x8,
-        /*ids=*/nullptr, /*fusion=*/fusion,
-        /*dst=*/out0_f32,
-        /*ncols_x=*/K, /*nrows_x=*/M0, /*ncols_dst=*/N,
-        /*stride_row_x=*/(int)s01_row,
-        /*stride_col_y=*/(int)s11_y,
-        /*stride_col_dst=*/M0,
-        /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1,
-        /*stride_channel_x=*/0,
-        /*stride_channel_y=*/(int)s12_y,
-        /*stride_channel_dst=*/0,
-        /*nsamples_x=*/1, /*nsamples_dst=*/1,
-        /*stride_sample_x=*/0, /*stride_sample_y=*/0,
-        /*stride_sample_dst=*/0,
-        /*ids_stride=*/0, stream);
+    ds4_mmq_launch_dense_vec<type>(
+        W0, x8, out0_f32, M0, N, K, s11_y, fused0, stream);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: first dense MMVQ launch failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out0_f32, (uint64_t)M0 * (uint64_t)N, stream);
+    if (!fused0) ds4_mmq_sanitize_f32(out0_f32, (uint64_t)M0 * (uint64_t)N, stream);
 
-    cudaMemsetAsync(out1_f32, 0,
+    if (!fused1) cudaMemsetAsync(out1_f32, 0,
                     (size_t)M1 * (size_t)N * sizeof(float), stream);
-    mul_mat_vec_q_switch_type(
-        /*vx=*/W1, /*type_x=*/type,
-        /*vy=*/(const void *)x8,
-        /*ids=*/nullptr, /*fusion=*/fusion,
-        /*dst=*/out1_f32,
-        /*ncols_x=*/K, /*nrows_x=*/M1, /*ncols_dst=*/N,
-        /*stride_row_x=*/(int)s01_row,
-        /*stride_col_y=*/(int)s11_y,
-        /*stride_col_dst=*/M1,
-        /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1,
-        /*stride_channel_x=*/0,
-        /*stride_channel_y=*/(int)s12_y,
-        /*stride_channel_dst=*/0,
-        /*nsamples_x=*/1, /*nsamples_dst=*/1,
-        /*stride_sample_x=*/0, /*stride_sample_y=*/0,
-        /*stride_sample_dst=*/0,
-        /*ids_stride=*/0, stream);
+    ds4_mmq_launch_dense_vec<type>(
+        W1, x8, out1_f32, M1, N, K, s11_y, fused1, stream);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: second dense MMVQ launch failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -4;
     }
-    ds4_mmq_sanitize_f32(out1_f32, (uint64_t)M1 * (uint64_t)N, stream);
+    if (!fused1) ds4_mmq_sanitize_f32(out1_f32, (uint64_t)M1 * (uint64_t)N, stream);
     return 0;
 }
 

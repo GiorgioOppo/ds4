@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MIT
+// Host: shared admission/sanitizer checks. nvcc: production MMVQ/API/graph oracle.
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#include "../cuda/mmq/ds4_mmq.h"
+#endif
+#include "../cuda/mmq/ds4_q4_mmvq_epilogue.h"
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+static void require(bool ok, const char *message) {
+    if (!ok) { std::fprintf(stderr, "Q4 epilogue: %s\n", message); std::exit(1); }
+}
+static uint32_t random_u32(uint32_t &state) { return state = state*1664525u + 1013904223u; }
+static void check_bits(uint32_t bits) {
+    float v; std::memcpy(&v, &bits, sizeof(v));
+    const uint32_t expected = std::isfinite(v) ? bits : 0u;
+    require(ds4_q4_mmvq_sanitize_bits(bits) == expected, "sanitizer bit mismatch");
+}
+static void host_tests() {
+    const uint32_t special[] = {0u, 0x80000000u, 1u, 0x80000001u,
+        0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
+        0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+        0x7fc00000u, 0xffc00000u, 0x7f800001u, 0xffffffffu};
+    for (uint32_t bits : special) check_bits(bits);
+    uint32_t seed = 127;
+    constexpr unsigned random_patterns = 1u << 22;
+    for (unsigned i = 0; i < random_patterns; ++i) check_bits(random_u32(seed));
+
+    size_t shapes = 0;
+    const int ks[] = {0, 1, 255, 256, 512, 1024, 1536, 1792, 2048, 4096, 8192};
+    for (int m = 0; m <= 1025; ++m) for (int n = 0; n <= 9; ++n) for (int k : ks) {
+        const bool eligible = ds4_q4_mmvq_epilogue_shape_ok(m, n, k);
+        const bool expected = m > 0 && m % 4 == 0 && n == 1 && k > 0 && k % 256 == 0;
+        require(eligible == expected, "shape admission mismatch");
+        if (eligible) {
+            // NVIDIA's canonical Q4 N=1 dispatcher: four rows when K<2048,
+            // otherwise one. Removing memset is valid only with full coverage.
+            const int rows_per_block = k < 2048 ? 4 : 1;
+            std::vector<unsigned> writes(m, 0);
+            for (int block = 0; block < m / rows_per_block; ++block)
+                for (int lane = 0; lane < rows_per_block; ++lane)
+                    ++writes[block*rows_per_block + lane];
+            for (unsigned count : writes) require(count == 1, "row coverage mismatch");
+        }
+        ++shapes;
+    }
+    require(!ds4_q4_mmvq_epilogue_shape_ok(-4, 1, 256), "negative M admitted");
+    require(!ds4_q4_mmvq_epilogue_shape_ok(4, 1, -256), "negative K admitted");
+    require(!ds4_q4_mmvq_epilogue_shape_ok(INT_MAX-3, 1, 512), "block index overflow admitted");
+    require(ds4_q4_mmvq_epilogue_shape_ok(INT_MAX-3, 1, 256), "valid index bound rejected");
+    std::printf("PASS: %zu sanitizer patterns, %zu shape/coverage cases, index bounds.\n",
+        random_patterns + sizeof(special) / sizeof(special[0]), shapes);
+}
+
+#ifdef __CUDACC__
+static void check(cudaError_t e) {
+    if (e != cudaSuccess) { std::fprintf(stderr, "%s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+struct ScopedEnv {
+    const char *name;
+    bool present;
+    std::string original;
+    explicit ScopedEnv(const char *n) : name(n), present(std::getenv(n) != nullptr),
+        original(present ? std::getenv(n) : "") {}
+    ScopedEnv(const ScopedEnv &) = delete;
+    ScopedEnv &operator=(const ScopedEnv &) = delete;
+    void set(const char *value) {
+        require((value ? setenv(name, value, 1) : unsetenv(name)) == 0, "environment update failed");
+    }
+    ~ScopedEnv() { if (present) setenv(name, original.c_str(), 1); else unsetenv(name); }
+};
+struct Buffer {
+    static constexpr size_t guard = 256;
+    unsigned char *base = nullptr;
+    size_t bytes;
+    explicit Buffer(size_t n) : bytes(n) {
+        check(cudaMalloc(reinterpret_cast<void **>(&base), bytes + 2*guard));
+        check(cudaMemset(base, 0xa5, bytes + 2*guard));
+    }
+    ~Buffer() { cudaFree(base); }
+    Buffer(const Buffer &) = delete;
+    Buffer &operator=(const Buffer &) = delete;
+    template<typename T> T *ptr() { return reinterpret_cast<T *>(base + guard); }
+    std::vector<unsigned char> read() {
+        std::vector<unsigned char> all(bytes + 2*guard);
+        check(cudaMemcpy(all.data(), base, all.size(), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < guard; ++i)
+            require(all[i] == 0xa5 && all[guard + bytes + i] == 0xa5, "guard overwritten");
+        return {all.begin() + guard, all.end() - guard};
+    }
+};
+struct Q4Block { uint16_t d, dmin; uint8_t scales[12], qs[128]; };
+static_assert(sizeof(Q4Block) == 144, "Q4_K ABI");
+struct GraphCounts { size_t kernels = 0, memsets = 0; };
+static GraphCounts graph_counts(cudaGraph_t graph) {
+    size_t count = 0;
+    check(cudaGraphGetNodes(graph, nullptr, &count));
+    std::vector<cudaGraphNode_t> nodes(count);
+    check(cudaGraphGetNodes(graph, nodes.data(), &count));
+    GraphCounts result;
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        check(cudaGraphNodeGetType(node, &type));
+        result.kernels += type == cudaGraphNodeTypeKernel;
+        result.memsets += type == cudaGraphNodeTypeMemset;
+    }
+    return result;
+}
+
+static void gpu_case(int m0, int m1, int n, int k, bool nonfinite, bool pair) {
+    uint32_t seed = 65537u + m0 + m1 + n + k;
+    // Legacy small-K MMVQ reads a complete cohort even for odd M. Pad only
+    // physical weights; true output dimensions and their guards remain exact.
+    std::vector<Q4Block> weights[2] = {
+        std::vector<Q4Block>(size_t((m0+3)/4*4)*(k/256)),
+        std::vector<Q4Block>(size_t((m1+3)/4*4)*(k/256))};
+    for (auto &matrix : weights) for (size_t i = 0; i < matrix.size(); ++i) {
+        auto &b = matrix[i];
+        b.d = 0x2400u + (random_u32(seed) & 0x3ffu);
+        b.dmin = i % 7 ? 0x1c00u + (random_u32(seed) & 0x3ffu) : 0u;
+        if (nonfinite) {
+            const uint16_t values[] = {0x7c00, 0xfc00, 0x7e00, 0x7c01};
+            b.d = values[(i/(k/256)) % 4];
+        }
+        for (auto &v : b.scales) v = random_u32(seed) >> 24;
+        for (auto &v : b.qs) v = random_u32(seed) >> 24;
+    }
+    Buffer w0(weights[0].size()*sizeof(Q4Block)), w1(weights[1].size()*sizeof(Q4Block)),
+        x(size_t(n)*k*sizeof(float)), y0(size_t(m0)*n*sizeof(float)), y1(size_t(m1)*n*sizeof(float));
+    check(cudaMemcpy(w0.ptr<void>(), weights[0].data(), w0.bytes, cudaMemcpyHostToDevice));
+    check(cudaMemcpy(w1.ptr<void>(), weights[1].data(), w1.bytes, cudaMemcpyHostToDevice));
+    cudaStream_t stream;
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    ScopedEnv rollback("DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE");
+    auto launch = [&] {
+        if (pair) {
+            require(ds4_mmq_q4_K_dense_pair_vec(w0.ptr<void>(), w1.ptr<void>(), x.ptr<float>(),
+                y0.ptr<float>(), y1.ptr<float>(), m0, m1, n, k, stream) == 0, "pair enqueue failed");
+        } else {
+            require(ds4_mmq_q4_K_dense_vec(w0.ptr<void>(), x.ptr<float>(), y0.ptr<float>(),
+                m0, n, k, stream) == 0, "first single enqueue failed");
+            require(ds4_mmq_q4_K_dense_vec(w1.ptr<void>(), x.ptr<float>(), y1.ptr<float>(),
+                m1, n, k, stream) == 0, "second single enqueue failed");
+        }
+        check(cudaGetLastError());
+    };
+    auto poison = [&] {
+        check(cudaMemsetAsync(y0.ptr<void>(), 0xff, y0.bytes, stream));
+        check(cudaMemsetAsync(y1.ptr<void>(), 0xff, y1.bytes, stream));
+    };
+    // Start with the legacy reference. Every defined value must disable the
+    // candidate, including "0" and an empty string (presence-based opt-out).
+    struct Arm { const char *rollback_value; bool candidate; };
+    const Arm arms[] = {{"1", false}, {nullptr, true}, {"0", false}, {"", false}};
+    const size_t eligible_legs = size_t(ds4_q4_mmvq_epilogue_shape_ok(m0, n, k)) +
+                                 size_t(ds4_q4_mmvq_epilogue_shape_ok(m1, n, k));
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        std::vector<float> input(size_t(n)*k);
+        for (size_t i = 0; i < input.size(); ++i) {
+            input[i] = repeat == 0 ? (i & 1 ? -0.f : 0.f) :
+                (int(random_u32(seed) % 8193u) - 4096) / 1024.f;
+        }
+        check(cudaMemcpyAsync(x.ptr<void>(), input.data(), x.bytes, cudaMemcpyHostToDevice, stream));
+        std::array<std::vector<unsigned char>, 2> reference;
+        GraphCounts reference_counts;
+        bool first_arm = true;
+        for (const Arm &arm : arms) {
+            rollback.set(arm.rollback_value);
+            poison(); launch(); check(cudaStreamSynchronize(stream));
+            const std::array<std::vector<unsigned char>, 2> output = {y0.read(), y1.read()};
+            if (first_arm) reference = output;
+            else require(output == reference, "direct output not bitwise equal");
+            for (const auto &v : output) for (size_t i = 0; i < v.size(); i += sizeof(uint32_t)) {
+                uint32_t bits; std::memcpy(&bits, v.data()+i, sizeof(bits));
+                require((bits & 0x7f800000u) != 0x7f800000u, "nonfinite/unwritten result");
+                if (nonfinite) require(bits == 0u, "nonfinite result was not sanitized to +0");
+            }
+
+            // Warmup above resolves lazy module loading and pool allocation.
+            // Capture contains production work only, not the output poison.
+            cudaGraph_t graph;
+            cudaGraphExec_t executable;
+            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+            launch();
+            check(cudaStreamEndCapture(stream, &graph));
+            const GraphCounts counts = graph_counts(graph);
+            if (first_arm) reference_counts = counts;
+            const size_t removed = arm.candidate ? eligible_legs : 0;
+            require(reference_counts.kernels == counts.kernels + removed &&
+                    reference_counts.memsets == counts.memsets + removed,
+                    arm.candidate ? "candidate graph did not remove the expected sanitizer/pre-clear nodes" :
+                                    "rollback did not restore the graph");
+            check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            for (int replay = 0; replay < 3; ++replay) {
+                poison(); check(cudaGraphLaunch(executable, stream));
+            }
+            check(cudaStreamSynchronize(stream));
+            require(y0.read() == reference[0] && y1.read() == reference[1], "graph output not bitwise equal");
+            check(cudaGraphExecDestroy(executable));
+            check(cudaGraphDestroy(graph));
+            first_arm = false;
+        }
+        const auto after_x = x.read();
+        require(!std::memcmp(after_x.data(), input.data(), x.bytes), "input mutated");
+    }
+    const auto after_w0 = w0.read(), after_w1 = w1.read();
+    require(!std::memcmp(after_w0.data(), weights[0].data(), w0.bytes) &&
+            !std::memcmp(after_w1.data(), weights[1].data(), w1.bytes), "weights mutated");
+    check(cudaStreamDestroy(stream));
+    std::printf("PASS: %s M=%d+%d N=%d K=%d %s (direct/graph/rollback/canaries).\n",
+        pair ? "pair" : "single", m0, m1, n, k, nonfinite ? "NaN/Inf" : "finite");
+}
+static void gpu_tests() {
+    cudaDeviceProp props{};
+    check(cudaGetDeviceProperties(&props, 0));
+    require(props.major > 7 || (props.major == 7 && props.minor >= 5), "oracle requires NVIDIA Turing or newer");
+    require(ds4_mmq_init(0) == 0, "MMQ initialization failed");
+    ScopedEnv persistent("DS4_CUDA_NO_Q4_K1024_PERSISTENT"); persistent.set("1");
+    ScopedEnv require_persistent("DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT"); require_persistent.set(nullptr);
+    ScopedEnv persistent_oracle("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE"); persistent_oracle.set(nullptr);
+    const int shapes[][4] = {{4,8,1,256}, {32,16,1,1024}, {32,12,1,1792},
+        {64,36,1,2048}, {1024,512,1,4096}, {512,1024,1,4096},
+        {128,64,1,8192}, {32768,4,1,1024}, {33,12,1,512}, {16,32,2,1024}};
+    unsigned cases = 0;
+    for (const auto &s : shapes) for (bool nonfinite : {false, true}) for (bool pair : {false, true}) {
+        gpu_case(s[0], s[1], s[2], s[3], nonfinite, pair);
+        ++cases;
+    }
+    std::printf("PASS: %u CUDA production Q4 epilogue cases. No throughput claim.\n", cases);
+}
+#endif
+
+int main() {
+    host_tests();
+#ifdef __CUDACC__
+    gpu_tests();
+#else
+    std::puts("Host-only check: CUDA kernel compilation and GPU parity still require nvcc/device.");
+#endif
+    return 0;
+}

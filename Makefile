@@ -81,6 +81,13 @@ test-quantizer-indexer-q4: gguf-tools/deepseek4-quantize tests/test_quantizer_in
 	./tests/test_quantizer_indexer_q4 ./gguf-tools/deepseek4-quantize
 
 .PHONY: test-q8-quantize-host test-cuda-q8-quantize
+.PHONY: test-q4-epilogue-host test-cuda-q4-epilogue
+tests/test_q4_epilogue_host: tests/test_cuda_q4_epilogue.cpp cuda/mmq/ds4_q4_mmvq_epilogue.h
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -o $@ $<
+
+test-q4-epilogue-host: tests/test_q4_epilogue_host
+	./tests/test_q4_epilogue_host
+
 tests/test_q8_quantize_host: tests/test_cuda_q8_quantize.cpp
 	$(CXX) -O2 -Wall -Wextra -std=c++17 -o $@ $<
 
@@ -120,6 +127,7 @@ help:
 	@echo "  make test-metal-iq2-midonly  Check M1 IQ2 addr mid-only output and sentinels"
 	@echo "  make test-metal-ssd-decode-kernels  Bitwise Q4/Q8 SSD decode kernel oracle (no model)"
 	@echo "  make bench-metal-q8-mv  Bitwise checks and kernel-only Q8 decode reduction A/B"
+	@echo "  make test-q4-epilogue-host  Check CUDA Q4 epilogue bits and admission without a GPU"
 	@echo "  make test-metal-iq2-live-index  Check IQ2 SSD live-cache index policy and fallback"
 	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
@@ -460,6 +468,7 @@ help:
 	@echo "  make test-mmq-parity-cuda CUDA_ARCH=sm_N  Run quantized CUDA kernel parity tests"
 	@echo "  make test-mmq-q4-grouped-q81-cuda CUDA_ARCH=sm_N  Run focused grouped Q8_1 byte-parity tests"
 	@echo "  make test-mmq-q4-16warp-cuda CUDA_ARCH=sm_N  Run focused Q4 16-warp bitwise/canary oracle"
+	@echo "  make test-cuda-q4-epilogue CUDA_ARCH=sm_N  Check Q4 decode epilogue parity, rollback and graph nodes"
 	@echo "  make test-rocm-q4-parity        Run ROCm Q4_K dense/pair/prefill oracle"
 	@echo "  make test-strix-rocm-q4-prefill Require gfx1151 and run tiled-prefill oracle"
 	@echo "  make test-strix-rocm-q4-parity  Require a visible gfx1151 device and run the Q4 tests"
@@ -608,6 +617,15 @@ test-mmq-q4-grouped-q81-cuda: cuda/mmq/test/test_mmq_parity
 
 test-mmq-q4-16warp-cuda: cuda/mmq/test/test_mmq_parity
 	./cuda/mmq/test/test_mmq_parity --q4-16warp
+
+tests/test_cuda_q4_epilogue.o: tests/test_cuda_q4_epilogue.cpp cuda/mmq/ds4_q4_mmvq_epilogue.h cuda/mmq/ds4_mmq.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -x cu $(MMQ_INCLUDES) -c -o $@ $<
+
+tests/test_cuda_q4_epilogue: tests/test_cuda_q4_epilogue.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-cuda-q4-epilogue: tests/test_cuda_q4_epilogue
+	./tests/test_cuda_q4_epilogue
 
 speed-bench/gpu_iq2_moe_prefill_bench_rocm.o: speed-bench/gpu_iq2_moe_prefill_bench.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -std=c11 -DDS4_ROCM_BUILD -DDS4_BENCH_ROCM -I. -c -o $@ $<
@@ -797,7 +815,7 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_de
 cuda/mmq/ds4_ggml_stubs.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
-cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/ds4_mmq_q4_16warp.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
+cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/ds4_mmq_q4_16warp.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh cuda/mmq/ds4_q4_mmvq_epilogue.h cuda/mmq/mmvq.cuh
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/ds4_mmq_d2r.o: cuda/mmq/ds4_mmq_d2r.cu cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
@@ -812,7 +830,7 @@ cuda/mmq/quantize.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/common.
 cuda/mmq/mmid.o: cuda/mmq/mmid.cu cuda/mmq/mmid.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
-cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh
+cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh cuda/mmq/ds4_q4_mmvq_epilogue.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
@@ -824,7 +842,7 @@ ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
-cuda/mmq/ds4_mmq.rocm.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh cuda/mmq/vendors/hip.h
+cuda/mmq/ds4_mmq.rocm.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh cuda/mmq/vendors/hip.h cuda/mmq/ds4_q4_mmvq_epilogue.h cuda/mmq/mmvq.cuh
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
 cuda/mmq/quantize.rocm.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/mmq.cuh cuda/mmq/vendors/hip.h
@@ -833,7 +851,7 @@ cuda/mmq/quantize.rocm.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/co
 cuda/mmq/mmid.rocm.o: cuda/mmq/mmid.cu cuda/mmq/mmid.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/vendors/hip.h
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
-cuda/mmq/mmvq.rocm.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh cuda/mmq/vendors/hip.h
+cuda/mmq/mmvq.rocm.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh cuda/mmq/vendors/hip.h cuda/mmq/ds4_q4_mmvq_epilogue.h
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
 cuda/mmq/d2r_stubs.rocm.o: cuda/mmq/test/d2r_stubs.cu cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/vendors/hip.h
@@ -1084,6 +1102,7 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
+	rm -f tests/test_q4_epilogue_host tests/test_cuda_q4_epilogue
 	rm -f tests/test_q8_quantize_host tests/test_cuda_q8_quantize
 	rm -f tests/test_metal_ssd_decode_kernels
 	rm -f speed-bench/metal_iq2_moe_top8_pair_bench
