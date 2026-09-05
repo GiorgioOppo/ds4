@@ -31656,17 +31656,17 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->tp_batch_rows == n_tokens && n_tokens > 0 &&
         g->tp_world == 2 &&
         g->tp_batch_out && g->tp_batch_in;
+    const bool tp_batched_moe = tp_split_batch_moe && !g->quality && !g->ssd_streaming &&
+        n_tokens > 1 && n_tokens <= 6 &&
+        ds4_gpu_device_is_m5_apple_silicon() &&
+        getenv("DS4_METAL_DISABLE_TP_BATCH_MOE") == NULL;
     const bool cuda_tp_owned_batch_moe =
         g->cuda_tp_ep && g->cuda_tp_prefill_ffn;
     if (ok && cuda_tp_owned_batch_moe) {
         ok = metal_graph_encode_mixed_routed_rows(
                 g, decode_items, decode_count, model, layer, il, n_tokens);
-    } else if (ok && tp_split_batch_moe) {
-        /* Verify-block expert split: run the contiguous-half split
-         * single-token routed kernels per row into the slab batch-out
-         * rows, exchange all rows with one gate, then materialize the
-         * combined routed output.  The add is commutative, so both ranks
-         * compute bit-identical sums and stay in lockstep. */
+    } else if (ok && tp_split_batch_moe && !tp_batched_moe) {
+        /* Reference schedule: evaluate each row's owned experts separately. */
         const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
         for (uint32_t r = 0; ok && r < n_tokens; r++) {
             ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
@@ -31713,15 +31713,11 @@ static bool metal_graph_encode_layer_ffn_batch(
             ds4_gpu_tensor_free(x_row);
             ds4_gpu_tensor_free(out_row);
         }
-        if (ok) ok = ds4_gpu_tp_batch_gate_encode(il, n_tokens) != 0;
-        if (ok) {
-            ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g),
-                                    g->tp_batch_out[il],
-                                    g->tp_batch_in[il],
-                                    (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
-        }
     } else if (ok) {
-        ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
+        /* Batched kernels apply the same expert ownership to every row and
+         * write directly into the registered exchange slab under TP. */
+        ok = ds4_gpu_routed_moe_batch_tensor(tp_batched_moe ? g->tp_batch_out[il] :
+                                               metal_graph_batch_routed_out(g),
                                                metal_graph_batch_routed_gate(g),
                                                metal_graph_batch_routed_up(g),
                                                metal_graph_batch_routed_mid(g),
@@ -31750,6 +31746,15 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16,
                                                false) != 0;
+    }
+    if (ok && tp_split_batch_moe && !cuda_tp_owned_batch_moe) {
+        ok = ds4_gpu_tp_batch_gate_encode(il, n_tokens) != 0;
+        if (ok) {
+            ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g),
+                                    g->tp_batch_out[il],
+                                    g->tp_batch_in[il],
+                                    (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+        }
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
@@ -54274,13 +54279,16 @@ static bool ds4_session_dspark_seed_batch_enabled(
     if (!s || !s->engine) return false;
     const ds4_engine *e = s->engine;
     const ds4_layer_weights *layer = &e->weights.layer[DS4_N_LEADING_DENSE];
-    /* Keep streaming, TP and unmeasured weight/device combinations on their
+    /* Keep streaming and unmeasured weight/device combinations on their
      * existing schedule. No sampling decision is changed by this dispatch. */
     return e->backend == DS4_BACKEND_METAL && !e->ssd_streaming &&
-           !e->tp.active && !e->dspark_exact_sampling &&
+           !e->dspark_exact_sampling &&
            ds4_gpu_device_is_m5_apple_silicon() &&
-           layer->ffn_gate_exps && layer->ffn_gate_exps->type == 16u &&
-           layer->ffn_down_exps && layer->ffn_down_exps->type == 10u;
+           layer->ffn_gate_exps && layer->ffn_down_exps &&
+           ((layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+             layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) ||
+            (e->tp.active && layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+             layer->ffn_down_exps->type == DS4_TENSOR_MXFP4));
 }
 
 static bool ds4_dspark_scheduler_enabled(const ds4_session *s) {
@@ -74095,7 +74103,6 @@ static int ds4_session_eval_speculative_argmax_impl(
     const bool seed_batch_dspark =
         can_prepare_support_draft &&
         e->support_kind == DS4_SUPPORT_DSPARK &&
-        !e->tp.active &&
         ds4_session_dspark_seed_batch_enabled(s) &&
         sample_argmax(s->logits, DS4_N_VOCAB) == first_token;
     if (seed_batch_dspark) {

@@ -25,6 +25,7 @@
 /tests/cuda_long_context_smoke
 /tests/test_layer_pack
 /tests/test_metal_session_batch
+/tests/test_metal_tp_spec
 /tests/test_metal_moe_prefill
 /tests/test_metal_dense_mpp
 /tests/test_mxfp4_cuda

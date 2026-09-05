@@ -4835,11 +4835,12 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_tp_static_f32(
         ushort tiitg [[thread_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const int idx = (int)tgpig.z;
-    const int32_t expert = ((device const int32_t *)ids)[idx];
+    const uint token = tgpig.z / args.nei0;
+    const uint idx = tgpig.z % args.nei0;
+    const int32_t expert = ((device const int32_t *)(ids + token * args.nbi1))[idx];
     if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) return;
 
-    const uint64_t pair_row = (uint64_t)idx;
+    const uint64_t pair_row = (uint64_t)token * args.nei0 + idx;
     device const float *route =
         (device const float *)(weights + pair_row * act.weight_stride);
     device char *gate_cur = dst_gate + pair_row * args.ne0 * sizeof(float);
@@ -4852,7 +4853,8 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_tp_static_f32(
         src0_up + (int64_t)local_expert * args.nb02;
     tgpig.z = 0;
     kernel_mul_mv_mxfp4_pair_swiglu_static_impl(
-        args, act, gate_expert, up_expert, src1, gate_cur, up_cur, mid_cur,
+        args, act, gate_expert, up_expert, src1 + token * args.nb12,
+        gate_cur, up_cur, mid_cur,
         route[0], shmem, tgpig, tiisg, sgitg);
     (void)tiitg;
 }
@@ -6664,7 +6666,9 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_tp_full_rows_static_f32(
     const short NSG = FC_mul_mv_nsg;
     const uint32_t first_row =
         (uint32_t)((tgpig.x * NSG + sgitg) * N_R0_MXFP4);
-    device const int32_t *token_ids = (device const int32_t *)ids;
+    const uint token = tgpig.y;
+    device const int32_t *token_ids = (device const int32_t *)(ids + token * args.nbi1);
+    device const char *token_src1 = src1 + token * args.nb12;
     threadgroup float *lut = (threadgroup float *)shmem;
     if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6678,12 +6682,12 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_tp_full_rows_static_f32(
         device const char *expert_base =
             src0s + (int64_t)local_expert * args.nb02;
         device const float *y =
-            (device const float *)(src1 + (uint64_t)slot * args.nb11);
+            (device const float *)(token_src1 + (uint64_t)slot * args.nb11);
         sumf += ds4_mxfp4_accumulate_full_rows_static(
             expert_base, y, first_row, lut, tiisg);
     }
 
-    device float *out = (device float *)dst;
+    device float *out = (device float *)(dst + token * args.nb1);
     FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
         const float value = simd_sum(sumf[row]);
         if (tiisg == 0) {
@@ -9084,6 +9088,7 @@ kernel void kernel_mul_mm_id_mpp_packed(
 typedef decltype(kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mm_id_packed_t;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
 template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_mul_mm_id_mxfp4_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_mxfp4, 2, dequantize_mxfp4>;
 
 // Routed-expert grouped matmul on the Metal4 TensorOps/MPP pipeline. The
 // barrier after mm.run prevents the next K iteration from replacing staged

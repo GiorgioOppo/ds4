@@ -1043,8 +1043,9 @@ normally chosen target token, not a successful draft prediction.
 Resident M5 Q2 uses seed batching for longer proposals; short proposals first
 decode the seed normally. Poor acceptance windows pause drafting for 32
 cycles before trying again. `DS4_DSPARK_SEED_BATCH=0` retains the previous
-schedule for diagnostic comparisons. Streaming, TP, exact sampling and other
-device/weight combinations retain their existing defaults.
+schedule for diagnostic comparisons. This also applies to two-M5 TP with Q2,
+mixed Q2/Q4 and MXFP4 experts. Streaming, exact sampling and other device/weight
+combinations retain their existing defaults.
 
 Compare code and prose, not just a high-acceptance copy prompt. Use at least
 256 generated tokens at temperatures 0 and 1; also sweep 2K/4K/8K/16K live
@@ -1067,6 +1068,76 @@ These are three-run medians, alternating schedules with the matching drafter,
 `--nothink --top-p 0.95 --min-p 0.05 --seed 12345`. The prompt is:
 "Write a complete C hash table implementation with string keys, insert, find,
 delete, and a test main. Output only C code."
+
+For two-M5 TP, test the MXFP4 and mixed Q2/Q4 Vision Exp models with their
+matching drafter. Use the same sampling settings and 256-token C prompt above,
+plus the prompt "Write an unpredictable surreal scene with constantly changing
+imagery and no repeated phrases." September 5 measurements (two repetitions,
+reversed order on the second; both hosts on RDMA, 50/50 residency):
+
+| Model and prompt | Previous TP DSpark | Default TP DSpark |
+| --- | ---: | ---: |
+| MXFP4, C hash table, temperature 0 | 41.09 t/s | 50.76 t/s |
+| MXFP4, C hash table, temperature 1 | 41.47 t/s | 48.15 t/s |
+| MXFP4, prose, temperature 1 | 38.62 t/s | 45.99 t/s |
+| Mixed Q2/Q4, C hash table, temperature 0 | 40.60 t/s | 49.52 t/s |
+| Mixed Q2/Q4, C hash table, temperature 1 | 41.74 t/s | 46.36 t/s |
+| Mixed Q2/Q4, prose, temperature 1 | 37.64 t/s | 44.16 t/s |
+
+Plain MXFP4 TP measured 53.19/50.93 t/s on that C prompt at temperature 0/1.
+These DSpark gains are relative to previous DSpark, not a claim that speculation
+always beats ordinary decode or that two hosts deliver twice the speed.
+
+Also compare ordinary MXFP4 TP with and without
+`DS4_METAL_DISABLE_ROUTED_MPP_PACKED=1`, using Promessi Sposi at 2K/4K/8K/16K
+live frontiers. Repeat in reversed order and compare full frontier logits.
+September 5 adjacent controls suggested roughly 3-5% faster prefill, but both
+paths slowed during sustained runs; 16K results were variable. Five of six
+runs were byte-identical at every frontier. One late control differed from
+another control at 8K/16K (maximum 0.163/0.167, unchanged argmax), so investigate
+reproducibility before attributing a difference to a new kernel.
+The final adjacent old/new 2K/4K/8K runs measured 813.53/683.68/707.97 versus
+888.45/703.16/691.96 prefill t/s; steady decode was 52.39/47.31/46.12 versus
+52.33/47.38/46.29 t/s, with byte-identical frontier logits. This confirms
+unchanged ordinary decode, not a uniform prefill gain at every context.
+
+With DSpark, the continued-context 2K/4K/8K check measured 44.03/41.88/41.76
+generation t/s versus 40.22/37.47/36.20 before these changes. All three prompt
+frontiers matched the ordinary baseline byte-for-byte. The first 20 cases of
+the checkpoint-matched Vision Exp continuation scorer were also byte-identical:
+1280 target tokens, average NLL 0.179928298, first-token matches 19/20,
+average common prefix 17 tokens. These are focused comparisons, not a full
+100-case quality pass.
+
+Require `MTL_DEBUG_LAYER=1 make test-metal-moe-prefill` on both M5s. This covers
+packed MXFP4 prefill, both expert-ownership halves, tiny batches and the actual
+4096/2048/4096 static shapes. Static two-to-six-row outputs must be exact against
+per-row decode. The synthetic static-shape model uses about 3.2 GiB of memory.
+`DS4_METAL_DISABLE_TP_BATCH_MOE=1` restores per-row verifier experts for diagnosis;
+`DS4_METAL_DISABLE_M5_TP_MXFP4_STATIC=1` disables the static specialization.
+Neither is needed to enable the fast path.
+
+Build `make tests/test_metal_tp_spec`. With the worker connected as usual,
+run the coordinator with:
+
+```sh
+DS4_DSPARK_SCHEDULER=0 DS4_DSPARK_SPEC_LOG=1 \
+  ./tests/test_metal_tp_spec "$MODEL" "$DSPARK" 10.99.0.2 9991 rdma_en1
+```
+
+This checks committed tokens against serial target logits at 127- and
+4095-token prefixes, then appends to each live speculative cache. Require
+six-token commits and exercise partial prefixes, including five of six tokens.
+The test uses the existing verifier oracle's 2.0-logit near-argmax bound; the
+September 5 MXFP4 maxima were 0 and 0.0984. Also run the acceptance checks with
+`--mtp-exact-sampling` and with forced low-confidence proposals. Both ranks must
+exit cleanly, with no verifier errors or unexplained replay fallbacks.
+Exact sampling under TP still intentionally replays partially rejected blocks;
+those replays are expected, and seed batching must remain disabled in this mode.
+One September 5 two-session run failed at the initial RDMA big-gate barrier.
+Both ranks exited cleanly; instrumented and ordinary retries, plus four- and
+six-session runs, passed. The cause was not established. Keep transport failures
+in the record even when reruns pass; do not hide them by increasing timeouts.
 
 Do not discard slow runs as noise: separate-process tests sometimes varied
 by about 20%, including ordinary decoding. Vision Exp prose showed slower
