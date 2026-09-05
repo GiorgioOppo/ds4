@@ -41,7 +41,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 9u
+#define DS4_TP_PROTOCOL_VERSION 10u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -2299,6 +2299,13 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
+int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
+                       uint64_t seq, int token, int limit) {
+    if (limit < 1 || limit > 2) return 0;
+    ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
+    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
+}
+
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
@@ -2535,13 +2542,20 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
-    case DS4_TP_FRAME_EVAL: {
+    case DS4_TP_FRAME_EVAL:
+    case DS4_TP_FRAME_GLM_MTP: {
         ds4_tp_eval_command msg;
         if (bytes != sizeof(msg)) { ok = 0; break; }
         memcpy(&msg, payload, sizeof(msg));
         command->session_id = msg.session_id;
         command->seq = msg.seq;
         command->value = msg.token;
+        if (ftype == DS4_TP_FRAME_GLM_MTP) {
+            if (msg.reserved < 1 || msg.reserved > 2) { ok = 0; break; }
+            command->limit = (int)msg.reserved;
+        } else if (msg.reserved != 0) {
+            ok = 0;
+        }
         break;
     }
     case DS4_TP_FRAME_EVAL_BATCH: {
@@ -2864,6 +2878,14 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         } else if (command.type == DS4_TP_FRAME_EVAL) {
             if (ds4_session_eval(session, command.value, err, sizeof(err)) != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker eval: %s", err);
+                rc = 1;
+            }
+        } else if (command.type == DS4_TP_FRAME_GLM_MTP) {
+            int spec_rc = ds4_session_glm_tp_spec_cycle(
+                session, command.value, command.limit, err, sizeof(err));
+            if (!ds4_tp_send_command_ack(tp, command.session_id,
+                                         spec_rc < 0 ? 1 : 0) || spec_rc < 0) {
+                ds4_log(stderr, DS4_LOG_ERROR, "tp worker GLM MTP: %s", err);
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_VERIFY) {
