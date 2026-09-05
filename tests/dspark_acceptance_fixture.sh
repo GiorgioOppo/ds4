@@ -187,15 +187,25 @@ run_case() {
     partial=$(printf '%s\n' "$stats" | sed -n 's/.* partial=\([0-9][0-9]*\).*/\1/p')
     errors=$(printf '%s\n' "$stats" | sed -n 's/.*errors=\([0-9][0-9]*\).*/\1/p')
     accepted_draft=$(printf '%s\n' "$stats" | sed -n 's/.*accepted_draft=\([0-9][0-9]*\).*/\1/p')
+    proposed=$(printf '%s\n' "$stats" | sed -n 's/.* proposed=\([0-9][0-9]*\).*/\1/p')
+    first_tokens=$(printf '%s\n' "$stats" | sed -n 's/.* first_tokens=\([0-9][0-9]*\).*/\1/p')
+    seed_batches=$(printf '%s\n' "$stats" | sed -n 's/.* seed_batches=\([0-9][0-9]*\).*/\1/p')
     direct_full=$(printf '%s\n' "$stats" | sed -n 's/.*direct_full=\([0-9][0-9]*\).*/\1/p')
     direct_partial=$(printf '%s\n' "$stats" | sed -n 's/.*direct_partial=\([0-9][0-9]*\).*/\1/p')
     partial=${partial:-0}
     errors=${errors:-0}
     accepted_draft=${accepted_draft:-0}
+    proposed=${proposed:-0}
+    first_tokens=${first_tokens:-0}
+    seed_batches=${seed_batches:-0}
     direct_full=${direct_full:-0}
     direct_partial=${direct_partial:-0}
     if [ "$errors" -ne 0 ]; then
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$accepted_draft" -gt "$proposed" ] || [ "$seed_batches" -gt "$first_tokens" ]; then
+        echo "dspark-fixture: inconsistent seed/draft accounting for $id: $stats" >&2
         return 1
     fi
     if [ "$PROPOSAL_QUALITY_GUARD_ACTIVE" -ne 0 ] && [ "$id" = c_add ] &&

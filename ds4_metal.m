@@ -42903,9 +42903,9 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED") == NULL;
         /*
          * MTP verification is neither normal decode nor large prefill: the
-         * target model must verify a tiny suffix (up to DSpark's 5-token
-         * block) in one layer-major pass.  For that shape the prefill
-         * expert-major GEMM path
+         * target model must verify a tiny suffix (DSpark's 5-token block,
+         * optionally preceded by its seed) in one layer-major pass. For that
+         * shape the prefill expert-major GEMM path
          * is too large, but the decode pair kernels are exactly the right
          * primitive: they read the same activation once and compute routed
          * gate/up together for every selected expert row.  Keep this limited to
@@ -42914,7 +42914,10 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
-            n_tokens <= 5u &&
+            (n_tokens <= 5u ||
+             (n_tokens == 6u && ds4_gpu_device_is_m5_apple_silicon() &&
+              (gate_type == DS4_METAL_TENSOR_IQ2_XXS ||
+               gate_type == DS4_METAL_TENSOR_Q4_K))) &&
             !use_q4_batch_expert_table &&
             !use_mm_id &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && g_moe_mul_mv_id_iq2_xxs_pair_pipeline) ||

@@ -2581,7 +2581,11 @@ static void print_size(uint64_t bytes) {
 #define DS4_DSPARK_MAX_TARGET_LAYERS 8
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
+#ifdef __APPLE__
+#define DS4_SPEC_PREFIX_SLOTS 5
+#else
 #define DS4_SPEC_PREFIX_SLOTS 4
+#endif
 
 static bool ds4_dspark_rocm_gfx1151_fast_path(void) {
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
@@ -37009,7 +37013,7 @@ static bool metal_graph_verify_suffix_tops_impl(
 
     const bool saved_capture = g->spec_capture_prefixes;
     /* The slot count bounds retained prefixes, not the verify block length.
-     * Seed-plus-five blocks still need fresh states for prefixes one to four. */
+     * Seed-plus-five blocks still need fresh states for every partial prefix. */
     g->spec_capture_prefixes = capture_prefix1 && n_tokens > 1u;
     const char *split_head_env = getenv("DS4_DSPARK_VERIFY_SPLIT_HEAD");
     const bool fuse_head =
@@ -54102,6 +54106,7 @@ typedef struct {
 typedef struct ds4_dspark_spec_stats {
     uint64_t cycles;
     uint64_t first_tokens;
+    uint64_t seed_batches;
     uint64_t proposed_tokens;
     uint64_t accepted_draft_tokens;
     uint64_t full_accepts;
@@ -54265,7 +54270,17 @@ static bool ds4_session_dspark_seed_batch_enabled(
         const ds4_session *s) {
     const char *env = getenv("DS4_DSPARK_SEED_BATCH");
     if (env && env[0]) return env[0] != '0';
-    return ds4_session_dspark_rocm_gfx1151_fast_path(s);
+    if (ds4_session_dspark_rocm_gfx1151_fast_path(s)) return true;
+    if (!s || !s->engine) return false;
+    const ds4_engine *e = s->engine;
+    const ds4_layer_weights *layer = &e->weights.layer[DS4_N_LEADING_DENSE];
+    /* Keep streaming, TP and unmeasured weight/device combinations on their
+     * existing schedule. No sampling decision is changed by this dispatch. */
+    return e->backend == DS4_BACKEND_METAL && !e->ssd_streaming &&
+           !e->tp.active && !e->dspark_exact_sampling &&
+           ds4_gpu_device_is_m5_apple_silicon() &&
+           layer->ffn_gate_exps && layer->ffn_gate_exps->type == 16u &&
+           layer->ffn_down_exps && layer->ffn_down_exps->type == 10u;
 }
 
 static bool ds4_dspark_scheduler_enabled(const ds4_session *s) {
@@ -54282,8 +54297,10 @@ static uint32_t ds4_dspark_scheduler_window(const ds4_session *s) {
     return v ? v : 4;
 }
 
-static uint32_t ds4_dspark_scheduler_skip_cycles(void) {
+static uint32_t ds4_dspark_scheduler_skip_cycles(const ds4_session *s) {
     const uint32_t fallback =
+        s && s->engine->backend == DS4_BACKEND_METAL &&
+        ds4_session_dspark_seed_batch_enabled(s) ? 32u :
         ds4_dspark_rocm_gfx1151_fast_path() ? 4u : 2u;
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SKIP", fallback);
 }
@@ -54518,7 +54535,7 @@ static void ds4_session_dspark_scheduler_note(
             ds4_session_dspark_scheduler_reset(s);
             return;
         }
-        s->dspark_sched_skip = ds4_dspark_scheduler_skip_cycles();
+        s->dspark_sched_skip = ds4_dspark_scheduler_skip_cycles(s);
         if (many_no_draft || slow_accept || measured_unprofitable) {
             const uint32_t slow_skip = ds4_dspark_scheduler_slow_skip_cycles();
             if (s->dspark_sched_skip < slow_skip) {
@@ -64549,10 +64566,14 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
         st->cycles ?
             (double)st->accepted_draft_tokens / (double)st->cycles : 0.0;
     const double extra_ms = st->propose_ms + st->total_ms;
-    const double net_saved_ms = st->saved_ms - extra_ms;
+    char net_saved[48];
+    /* Seed batches include an ordinary target step, often without any timed
+     * standalone step to estimate its cost. Do not print a fictitious saving. */
+    if (st->seed_batches) snprintf(net_saved, sizeof(net_saved), "n/a");
+    else snprintf(net_saved, sizeof(net_saved), "%.3f", st->saved_ms - extra_ms);
     fprintf(stderr,
             "ds4: DSpark stats cycles=%llu first_tokens=%llu proposed=%llu "
-            "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f "
+            "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f seed_batches=%llu "
             "full=%llu partial=%llu direct_full=%llu direct_partial=%llu "
             "replay_fallbacks=%llu miss_first=%llu no_draft=%llu "
             "no_room=%llu invalid=%llu scheduler_skips=%llu "
@@ -64563,7 +64584,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "snapshot=%.3f verify=%.3f verify_upload=%.3f "
             "verify_layer=%.3f verify_head=%.3f verify_read=%.3f "
             "verify_fused_head=%llu replay=%.3f spec_total=%.3f "
-            "target=%.3f saved=%.3f net_saved=%.3f "
+            "target=%.3f saved=%.3f net_saved=%s "
             "draft_len_hist=%s accepted_len_hist=%s\n",
             (unsigned long long)st->cycles,
             (unsigned long long)st->first_tokens,
@@ -64571,6 +64592,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             (unsigned long long)st->accepted_draft_tokens,
             accept_rate,
             avg_accept,
+            (unsigned long long)st->seed_batches,
             (unsigned long long)st->full_accepts,
             (unsigned long long)st->partial_accepts,
             (unsigned long long)st->direct_full_commits,
@@ -64605,7 +64627,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             st->total_ms,
             st->target_ms,
             st->saved_ms,
-            net_saved_ms,
+            net_saved,
             draft_hist,
             accept_hist);
 }
@@ -70069,6 +70091,11 @@ static int ds4_session_eval_dspark_speculative_argmax(
         int          accepted_cap,
         char        *err,
         size_t       errlen) {
+    /* n_accept == 0 means the already-chosen seed is inside this batch. */
+    const int seed_tokens = n_accept == 0 ? 1 : 0;
+    /* Preserve the separately tuned CUDA/ROCm scheduling policy. */
+    const int scheduler_seed_tokens =
+        s && s->engine->backend == DS4_BACKEND_METAL ? seed_tokens : 0;
     const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
     const bool stats_enabled = s && ds4_dspark_stats_enabled();
     const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled(s);
@@ -70087,6 +70114,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
     if (stats_enabled) {
         s->dspark_stats.cycles++;
         if (n_accept > 0) s->dspark_stats.first_tokens++;
+        s->dspark_stats.seed_batches += (uint64_t)seed_tokens;
     }
     if (spec_log) {
         fprintf(stderr,
@@ -70153,9 +70181,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
     }
     if (stats_enabled) {
-        s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+        s->dspark_stats.proposed_tokens += (uint64_t)(draft_n - seed_tokens);
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
-                                  (uint32_t)draft_n);
+                                  (uint32_t)(draft_n - seed_tokens));
     }
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
@@ -70312,12 +70340,13 @@ static int ds4_session_eval_dspark_speculative_argmax(
             s->dspark_stats.full_accepts++;
             s->dspark_stats.direct_full_commits++;
             s->dspark_stats.accepted_draft_tokens +=
-                (uint64_t)emitted_drafts;
+                (uint64_t)(emitted_drafts - seed_tokens);
+            s->dspark_stats.first_tokens += (uint64_t)seed_tokens;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
-                                      (uint32_t)emitted_drafts);
+                                      (uint32_t)(emitted_drafts - seed_tokens));
         }
         ds4_session_dspark_scheduler_note(
-                s, (uint32_t)emitted_drafts, false,
+                s, (uint32_t)(emitted_drafts - scheduler_seed_tokens), false,
                 DS4_DSPARK_SCHED_EXTRA_MS());
         if (spec_log) {
             fprintf(stderr,
@@ -70384,13 +70413,14 @@ static int ds4_session_eval_dspark_speculative_argmax(
                 s->dspark_stats.partial_accepts++;
                 s->dspark_stats.direct_partial_commits++;
                 s->dspark_stats.accepted_draft_tokens +=
-                    (uint64_t)emitted_drafts;
+                    (uint64_t)(emitted_drafts - seed_tokens);
+                s->dspark_stats.first_tokens += (uint64_t)seed_tokens;
                 ds4_dspark_stats_note_len(
                         s->dspark_stats.accepted_len_hist,
-                        (uint32_t)emitted_drafts);
+                        (uint32_t)(emitted_drafts - seed_tokens));
             }
             ds4_session_dspark_scheduler_note(
-                    s, (uint32_t)emitted_drafts, false,
+                    s, (uint32_t)(emitted_drafts - scheduler_seed_tokens), false,
                     DS4_DSPARK_SCHED_EXTRA_MS());
             if (spec_log) {
                 fprintf(stderr,
@@ -70407,10 +70437,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
     }
 
-    /* A seed-plus-five verifier can accept five rows before rejecting the
-     * sixth. Keep the normal four-prefix capture schedule (a fifth capture
-     * perturbs the hot verifier), restore prefix four, and evaluate only the
-     * fifth row instead of replaying the whole accepted prefix. */
+    /* Larger support blocks can outgrow the retained prefixes. If just one
+     * accepted token lacks a capture, replay it after the last saved prefix
+     * instead of replaying the whole accepted block. */
     if (ok && !tp_verify_sent &&
         commit_drafts == (int)DS4_SPEC_PREFIX_SLOTS + 1 &&
         commit_drafts < draft_n) {
@@ -70448,13 +70477,14 @@ static int ds4_session_eval_dspark_speculative_argmax(
                 s->dspark_stats.replay_ms +=
                     (now_sec() - replay_t0) * 1000.0;
                 s->dspark_stats.accepted_draft_tokens +=
-                    (uint64_t)emitted_drafts;
+                    (uint64_t)(emitted_drafts - seed_tokens);
+                s->dspark_stats.first_tokens += (uint64_t)seed_tokens;
                 ds4_dspark_stats_note_len(
                         s->dspark_stats.accepted_len_hist,
-                        (uint32_t)emitted_drafts);
+                        (uint32_t)(emitted_drafts - seed_tokens));
             }
             ds4_session_dspark_scheduler_note(
-                    s, (uint32_t)emitted_drafts, false,
+                    s, (uint32_t)(emitted_drafts - scheduler_seed_tokens), false,
                     DS4_DSPARK_SCHED_EXTRA_MS());
             if (spec_log) {
                 fprintf(stderr,
@@ -70583,16 +70613,19 @@ static int ds4_session_eval_dspark_speculative_argmax(
         if (stats_enabled) {
             if (replayed_drafts == draft_n) s->dspark_stats.full_accepts++;
             else s->dspark_stats.partial_accepts++;
-            s->dspark_stats.accepted_draft_tokens += (uint64_t)replayed_drafts;
+            s->dspark_stats.accepted_draft_tokens +=
+                (uint64_t)(replayed_drafts - seed_tokens);
+            s->dspark_stats.first_tokens += (uint64_t)seed_tokens;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
-                                      (uint32_t)replayed_drafts);
+                                      (uint32_t)(replayed_drafts - seed_tokens));
         }
     } else if (stats_enabled) {
         ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
     }
     ds4_session_dspark_scheduler_note(
             s,
-            (uint32_t)replayed_drafts,
+            (uint32_t)(replayed_drafts > scheduler_seed_tokens ?
+                       replayed_drafts - scheduler_seed_tokens : 0),
             false,
             DS4_DSPARK_SCHED_EXTRA_MS());
     if (spec_log) {
@@ -74068,22 +74101,53 @@ static int ds4_session_eval_speculative_argmax_impl(
     if (seed_batch_dspark) {
         s->dspark_draft_valid = false;
         s->dspark_draft_len = 0;
+        bool attempted_verify = false;
         if (ds4_session_prepare_dspark_draft(
                 s, first_token, (uint32_t)s->checkpoint.len) &&
             s->dspark_draft_valid &&
             s->dspark_draft_len > 0 &&
             s->dspark_draft_len < DS4_DSPARK_MAX_BLOCK_SIZE) {
+            /* A short, low-confidence suffix rarely repays a batched seed.
+             * Decode the seed once, then check the already-prepared first
+             * draft against its logits without running another proposal. */
+            if (e->backend == DS4_BACKEND_METAL && s->dspark_draft_len < 3) {
+                if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0)
+                    return -1;
+                accepted[0] = first_token;
+                return ds4_session_eval_dspark_speculative_argmax(
+                    s, 1, max_tokens, eos_token, ignore_eos, think_mode,
+                    accepted, accepted_cap, err, errlen);
+            }
             memmove(s->dspark_draft_tokens + 1,
                     s->dspark_draft_tokens,
                     (size_t)s->dspark_draft_len *
                         sizeof(s->dspark_draft_tokens[0]));
             s->dspark_draft_tokens[0] = first_token;
             s->dspark_draft_len++;
+            attempted_verify = true;
             const int fused_n =
                 ds4_session_eval_dspark_speculative_argmax(
                     s, 0, max_tokens, eos_token, ignore_eos, think_mode,
                     accepted, accepted_cap, err, errlen);
             if (fused_n != 0) return fused_n;
+        }
+        if (e->backend == DS4_BACKEND_METAL) {
+            /* A declined proposal already consumed this cycle's confidence and
+             * scheduler decision. Do not draft the same seed again after decode. */
+            if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0)
+                return -1;
+            accepted[0] = first_token;
+            if (!attempted_verify) {
+                ds4_session_dspark_scheduler_note(s, 0, true,
+                                                  s->dspark_last_propose_ms);
+                if (ds4_dspark_stats_enabled()) {
+                    s->dspark_stats.cycles++;
+                    s->dspark_stats.no_draft++;
+                    ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+                }
+            }
+            if (ds4_dspark_stats_enabled()) s->dspark_stats.first_tokens++;
+            return 1;
         }
     }
     if (ds4_session_eval_probe_tp(s,

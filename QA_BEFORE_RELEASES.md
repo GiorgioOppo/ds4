@@ -1034,6 +1034,48 @@ versus 604.62 t/s for a 4K append to 12K. Decode was unchanged. These are
 interleaved sustained measurements, not cold-run peaks. Packing is an M5
 resident-prefill optimization; it does not claim pre-M5 or streaming gains.
 
+For Metal DSpark changes, test matching 0731 and Vision Exp target/drafter
+pairs. Run the acceptance fixture at temperature 0, at temperature 1 with
+forced partial acceptance, and with `--mtp-exact-sampling`. Require zero
+verifier errors and consistent seed/draft counters. A batched seed is a
+normally chosen target token, not a successful draft prediction.
+
+Resident M5 Q2 uses seed batching for longer proposals; short proposals first
+decode the seed normally. Poor acceptance windows pause drafting for 32
+cycles before trying again. `DS4_DSPARK_SEED_BATCH=0` retains the previous
+schedule for diagnostic comparisons. Streaming, TP, exact sampling and other
+device/weight combinations retain their existing defaults.
+
+Compare code and prose, not just a high-acceptance copy prompt. Use at least
+256 generated tokens at temperatures 0 and 1; also sweep 2K/4K/8K/16K live
+frontiers with continued prefill. Record ordinary decode, old DSpark and
+default DSpark separately. Seed batching must not make low-acceptance cases
+worse than the previous DSpark path. It does not promise to beat ordinary
+decode on every prompt. Run the six-session full-logit batch oracle too,
+since a six-row verifier shares routed kernels with session batching.
+
+September 4 M5 measurements, 256 generated tokens, 4096 allocated context:
+
+| Model and prompt | Previous DSpark | Default DSpark |
+| --- | ---: | ---: |
+| 0731 Q2, C hash table, temperature 0 | 55.71 t/s | 62.95 t/s |
+| 0731 Q2, C hash table, temperature 1 | 50.95 t/s | 61.58 t/s |
+| Vision Exp mixed Q2/Q4, C hash table, temperature 0 | 41.65 t/s | 48.86 t/s |
+| Vision Exp mixed Q2/Q4, C hash table, temperature 1 | 43.56 t/s | 47.24 t/s |
+
+These are three-run medians, alternating schedules with the matching drafter,
+`--nothink --top-p 0.95 --min-p 0.05 --seed 12345`. The prompt is:
+"Write a complete C hash table implementation with string keys, insert, find,
+delete, and a test main. Output only C code."
+
+Do not discard slow runs as noise: separate-process tests sometimes varied
+by about 20%, including ordinary decoding. Vision Exp prose showed slower
+outliers; matched GPU-monitored reruns measured about 41.1 versus 38.4 t/s,
+and alternating within one loaded engine measured 40.4 versus 36.7 t/s
+(medians after warm-up).
+Investigate fresh-process variability separately from kernel cost. Ordinary
+decoding still wins on this low-acceptance prompt.
+
 These are the last known good observations available when this gate was added.
 They are reference points for matching hardware and workloads, not performance
 claims across different models or contexts.
