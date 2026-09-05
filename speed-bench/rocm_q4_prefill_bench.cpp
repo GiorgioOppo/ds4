@@ -49,6 +49,8 @@ extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_get_calls(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_wmma_k64_get_calls(void);
 extern "C" void ds4_rocm_test_q4_prefill_lds_stream_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_stream_get_calls(void);
+extern "C" void ds4_rocm_test_q4_prefill_lds_vector_reset(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_vector_get_calls(void);
 
 namespace {
 
@@ -80,6 +82,8 @@ constexpr const char *kPrefillRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8";
 constexpr const char *kLdsDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_LDS_STREAM";
+constexpr const char *kLdsVectorDisable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_LDS_VECTOR";
 constexpr const char *kK1024Tile4Disable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4";
 constexpr const char *kK1024Tile4SsdEnable =
@@ -129,6 +133,7 @@ static_assert(sizeof(block_q8_K_host) == 292u,
 enum class bench_case {
     all,
     lds,
+    lds_vector,
     dense,
     pair,
     qb,
@@ -896,8 +901,9 @@ bool run_q8_quantizer(const config &cfg, ds4_gpu_tensor *x,
 // Isolate this change: same quantizer, tile shape, grid and launch count.
 // Public-API HIP-event timing includes Q8_K quantization in both arms.
 bool run_lds(const model_fixture &model, const config &cfg,
-             uint32_t n_tokens, bool qb) {
+             uint32_t n_tokens, bool qb, bool vector_only = false) {
     env_snapshot lds_guard(kLdsDisable);
+    env_snapshot vector_guard(kLdsVectorDisable);
     const uint32_t k = qb ? kQbK : kDenseK;
     const uint32_t m = qb ? kQbM : kDenseM;
     const uint64_t elements = (uint64_t)n_tokens * m;
@@ -910,32 +916,42 @@ bool run_lds(const model_fixture &model, const config &cfg,
         const uint64_t offset = qb ? model.weights[set].qb_offset :
                                      model.weights[set].dense_offset;
         ds4_rocm_test_q4_prefill_lds_stream_reset();
+        ds4_rocm_test_q4_prefill_lds_vector_reset();
         const int rc = ds4_gpu_matmul_quant_tensor(
             out, model.data, model.size, offset, kQ4Type, k, m, x.ptr, n_tokens);
         const uint64_t calls = ds4_rocm_test_q4_prefill_lds_stream_get_calls();
-        if (rc == 0 || calls != (optimized ? 1u : 0u)) {
-            std::fprintf(stderr, "Q4 LDS benchmark wrong path: optimized=%d rc=%d calls=%llu\n",
-                         optimized, rc, (unsigned long long)calls);
+        const uint64_t vector_calls = ds4_rocm_test_q4_prefill_lds_vector_get_calls();
+        if (rc == 0 || calls != (optimized || vector_only ? 1u : 0u) ||
+            vector_calls != (optimized && vector_only ? 1u : 0u)) {
+            std::fprintf(stderr, "Q4 LDS benchmark wrong path: optimized=%d vector_only=%d rc=%d calls=%llu vector_calls=%llu\n",
+                         optimized, vector_only, rc, (unsigned long long)calls,
+                         (unsigned long long)vector_calls);
             return false;
         }
         return true;
     };
     const arm baseline = {
-        "lds_legacy",
+        vector_only ? "lds_stream_scalar" : "lds_legacy",
         [&]() {
             if (qb) select_k1024_tile4(); else select_tile8(false);
-            (void)setenv(kLdsDisable, "1", 1);
+            if (vector_only) (void)unsetenv(kLdsDisable);
+            else (void)setenv(kLdsDisable, "1", 1);
+            (void)setenv(kLdsVectorDisable, "1", 1);
         },
         [&](uint32_t set) { return enqueue(set, reference.ptr, false); }};
     const arm optimized = {
-        "lds_stream",
+        vector_only ? "lds_stream_vector" : "lds_stream",
         [&]() {
             if (qb) select_k1024_tile4(); else select_tile8(false);
             (void)unsetenv(kLdsDisable);
+            if (vector_only) (void)unsetenv(kLdsVectorDisable);
+            else (void)setenv(kLdsVectorDisable, "1", 1);
         },
         [&](uint32_t set) { return enqueue(set, candidate.ptr, true); }};
     return benchmark_arms(
-        qb ? "q_b_lds" : "dense_lds", n_tokens, k, m, cfg, baseline, optimized,
+        vector_only ? (qb ? "q_b_lds_vector" : "dense_lds_vector") :
+                      (qb ? "q_b_lds" : "dense_lds"),
+        n_tokens, k, m, cfg, baseline, optimized,
         [&]() {
             return poison_output(reference.ptr, bytes, 0x7fc10001u) &&
                    poison_output(candidate.ptr, bytes, 0x7fc20002u);
@@ -1891,7 +1907,7 @@ void usage(FILE *stream, const char *argv0) {
         stream,
         "usage: %s [options]\n\n"
         "Resident ROCm Q4_K prefill kernel A/B (HIP event timing only).\n\n"
-        "  --case all|lds|dense|pair|qb|outb|output\n"
+        "  --case all|lds|lds_vector|dense|pair|qb|outb|output\n"
         "                              comparison to run (default: all)\n"
         "  --tokens N[,N...]          token counts, each 9..4096\n"
         "  --full                     use 9,16,17,31,32,33,128,256,257,512,4096\n"
@@ -1901,6 +1917,8 @@ void usage(FILE *stream, const char *argv0) {
         "  -h, --help                 show this help\n\n"
         "lds isolates the Q4 LDS loader/final-fence rollback at K4096 and\n"
         "Q-b K1024, with bitwise checks, launch evidence and identical tiling.\n"
+        "lds_vector isolates four-word vs scalar LDS copies with the same\n"
+        "streaming fence schedule; lds keeps the previous scalar-only A/B.\n"
         "dense compares legacy/TILE8, times the raw canonical/wave32 Q8_K\n"
         "quantizer kernels on gfx1151, and TILE8/direct WMMA there for N>=256\n"
         "at K=4096,M=1024. pair compares\n"
@@ -1974,6 +1992,7 @@ config parse_options(int argc, char **argv) {
             const char *value = need_value(&i, argc, argv);
             if (!std::strcmp(value, "all")) cfg.selected = bench_case::all;
             else if (!std::strcmp(value, "lds")) cfg.selected = bench_case::lds;
+            else if (!std::strcmp(value, "lds_vector")) cfg.selected = bench_case::lds_vector;
             else if (!std::strcmp(value, "dense")) cfg.selected = bench_case::dense;
             else if (!std::strcmp(value, "pair")) cfg.selected = bench_case::pair;
             else if (!std::strcmp(value, "qb")) cfg.selected = bench_case::qb;
@@ -2116,6 +2135,11 @@ int main(int argc, char **argv) {
             if (includes(cfg.selected, bench_case::lds)) {
                 ok = run_lds(model, cfg, n_tokens, false) &&
                      run_lds(model, cfg, n_tokens, true) && ok;
+                if (!ok) break;
+            }
+            if (includes(cfg.selected, bench_case::lds_vector)) {
+                ok = run_lds(model, cfg, n_tokens, false, true) &&
+                     run_lds(model, cfg, n_tokens, true, true) && ok;
                 if (!ok) break;
             }
             if (includes(cfg.selected, bench_case::dense)) {

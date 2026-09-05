@@ -223,6 +223,13 @@ loaders/barriers. Decode, WMMA, quantization and tile geometry are unchanged.
 Host checks pass, but HIP compilation, GPU parity and performance measurement
 remain pending. See [the Q4 LDS tester notes](speed-bench/rocm_q4_prefill_lds.md).
 
+Aligned tiles additionally use four-word LDS copies, with scalar fallback
+for misaligned addresses/strides and partial words. Set
+`DS4_ROCM_DISABLE_Q4_PREFILL_LDS_VECTOR=1` to restore scalar streaming while
+retaining the improved fence schedule. The older LDS_STREAM rollback disables
+both changes. GPU code generation and gains still need AMD validation; see
+[the isolated vector-copy A/B](speed-bench/rocm_q4_prefill_lds_vector.md).
+
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.

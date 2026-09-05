@@ -183,6 +183,11 @@ explicit enqueue-only hook, excluding environment parsing, model lookup, and
 policy selection. The
 comparisons are:
 
+- `lds`: original versus scalar-streaming LDS copy/fence schedule, with
+  vector copies disabled on both arms;
+- `lds_vector`: scalar streaming versus aligned four-word copies at K4096
+  and the K1024 `q_b` shape, retaining the same barriers and tile geometry.
+  See [the vector-copy tester notes](rocm_q4_prefill_lds_vector.md).
 - `dense`: legacy versus TILE8 at the Flash Q-A `K=4096,M=1024` shape;
 - `pair`: two TILE8 calls versus the fused Q-A/KV
   `K=4096,M=(1024+512)` path;

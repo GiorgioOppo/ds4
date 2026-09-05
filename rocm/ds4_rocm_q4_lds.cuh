@@ -36,6 +36,64 @@ DS4_Q4_LDS_INLINE void copy_thread(
     }
 }
 
+// Four-word copies are valid only when every token row has the same 16-byte
+// alignment. Q8_K blocks themselves are only four-byte aligned (292 bytes).
+DS4_Q4_LDS_INLINE bool vector_copy_aligned(
+        const uint32_t *dst, const uint32_t *src, uint64_t src_stride_words) {
+    return (((uintptr_t)dst | (uintptr_t)src) & 15u) == 0u &&
+           (src_stride_words & 3u) == 0u;
+}
+
+DS4_Q4_LDS_INLINE void copy_four(uint32_t *dst, const uint32_t *src) {
+    // Fixed-size memcpy preserves the packed block's aliasing semantics.
+    // Alignment is established by the caller, not assumed for arbitrary Q8_K.
+    __builtin_memcpy(__builtin_assume_aligned(dst, 16),
+                     __builtin_assume_aligned(src, 16), 16);
+}
+
+template<uint32_t BLOCKS>
+DS4_Q4_LDS_INLINE void copy_thread_vector(
+        uint32_t *dst, const uint32_t *src, uint32_t tid, uint32_t threads,
+        uint32_t nt, uint32_t nb, uint64_t src_stride_words) {
+    static_assert(BLOCKS == 4u || BLOCKS == 8u, "Q4 LDS tile must be TILE4/8");
+    if (!vector_copy_aligned(dst, src, src_stride_words)) {
+        copy_thread<BLOCKS>(dst, src, tid, threads, nt, nb, src_stride_words);
+        return;
+    }
+    constexpr uint32_t pitch = BLOCKS * block_words;
+    constexpr uint32_t pitch4 = pitch / 4u;
+    const uint32_t vectors = nt * pitch4;
+    if (nb == BLOCKS && src_stride_words == pitch) {
+        for (uint32_t i = tid; i < vectors; i += threads)
+            copy_four(dst + 4u * i, src + 4u * i);
+    } else {
+        const uint32_t valid_words = nb * block_words;
+        for (uint32_t i = tid; i < vectors; i += threads) {
+            const uint32_t p = i / pitch4;
+            const uint32_t word = (i - p * pitch4) * 4u;
+            if (word + 4u <= valid_words) {
+                copy_four(dst + 4u * i,
+                          src + (uint64_t)p * src_stride_words + word);
+            } else {
+                // Never read beyond the last valid Q8_K block or initialize
+                // padding which the existing scalar schedule leaves alone.
+                for (uint32_t j = 0u; j < 4u && word + j < valid_words; ++j)
+                    dst[4u * i + j] = src[(uint64_t)p * src_stride_words + word + j];
+            }
+        }
+    }
+}
+
+template<uint32_t BLOCKS, bool VECTOR>
+DS4_Q4_LDS_INLINE void copy_thread_selected(
+        uint32_t *dst, const uint32_t *src, uint32_t tid, uint32_t threads,
+        uint32_t nt, uint32_t nb, uint64_t src_stride_words) {
+    if constexpr (VECTOR)
+        copy_thread_vector<BLOCKS>(dst, src, tid, threads, nt, nb, src_stride_words);
+    else
+        copy_thread<BLOCKS>(dst, src, tid, threads, nt, nb, src_stride_words);
+}
+
 // All workgroup threads use the same K loop. The final tile is read only:
 // register reduction/output stores cannot overwrite LDS, so no reuse fence
 // is necessary after it. The producer-to-consumer barrier remains mandatory.

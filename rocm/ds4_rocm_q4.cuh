@@ -907,7 +907,7 @@ rocm_q4_K_lane4_sum_f32(float v) {
     return v;
 }
 
-template<bool STREAM_LDS>
+template<bool STREAM_LDS, bool VECTOR_LDS = false>
 __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
         float *out,
         const char *w_base,
@@ -915,7 +915,8 @@ __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
         uint64_t row_bytes,
         uint32_t out_dim,
         uint32_t n_tok) {
-    __shared__ cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
+    __shared__ __align__(VECTOR_LDS ? 16 : alignof(cuda_block_q8_K))
+        cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
                                          [ROCM_Q4_PREFILL_K1024_KBLOCK_TILE];
 
     const uint32_t tid = threadIdx.x;
@@ -937,7 +938,7 @@ __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
     /* The complete K dimension fits one LDS tile.  Flatten the copy so
      * neighboring threads read consecutive words across token/block rows. */
     if (STREAM_LDS) {
-        ds4_rocm_q4_lds::copy_thread<ROCM_Q4_PREFILL_K1024_KBLOCK_TILE>(
+        ds4_rocm_q4_lds::copy_thread_selected<ROCM_Q4_PREFILL_K1024_KBLOCK_TILE, VECTOR_LDS>(
             reinterpret_cast<uint32_t *>(sxq),
             reinterpret_cast<const uint32_t *>(xq + (uint64_t)tok0 * 4u),
             tid, blockDim.x, nt, 4u, 4u * ROCM_Q4_Q8K_WORDS);
@@ -980,7 +981,7 @@ __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
     }
 }
 
-template<bool STREAM_LDS>
+template<bool STREAM_LDS, bool VECTOR_LDS = false>
 __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
         float *out,
         const char *w_base,
@@ -991,7 +992,8 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
         uint32_t n_tok,
         uint64_t xq_token_stride,
         uint64_t out_token_stride) {
-    __shared__ cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
+    __shared__ __align__(VECTOR_LDS ? 16 : alignof(cuda_block_q8_K))
+        cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
                                          [ROCM_Q4_PREFILL_KBLOCK_TILE];
 
     const uint32_t tid = threadIdx.x;
@@ -1024,7 +1026,7 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
         if (STREAM_LDS) {
             const uint64_t src_block = (uint64_t)tok0 * xq_token_stride +
                 (uint64_t)group * xq_blocks + b0;
-            ds4_rocm_q4_lds::copy_thread<ROCM_Q4_PREFILL_KBLOCK_TILE>(
+            ds4_rocm_q4_lds::copy_thread_selected<ROCM_Q4_PREFILL_KBLOCK_TILE, VECTOR_LDS>(
                 reinterpret_cast<uint32_t *>(sxq),
                 reinterpret_cast<const uint32_t *>(xq + src_block),
                 tid, blockDim.x, nt, nb,
@@ -1083,7 +1085,7 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
  * projection up to the larger one's row count.  Each workgroup still handles
  * only one weight matrix: this preserves the standalone TILE8 block walk and
  * its accumulation order while removing the second host launch. */
-template<bool STREAM_LDS>
+template<bool STREAM_LDS, bool VECTOR_LDS = false>
 __global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
         float *out0,
         float *out1,
@@ -1095,7 +1097,8 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
         uint32_t out0_dim,
         uint32_t out1_dim,
         uint32_t n_tok) {
-    __shared__ cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
+    __shared__ __align__(VECTOR_LDS ? 16 : alignof(cuda_block_q8_K))
+        cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
                                          [ROCM_Q4_PREFILL_KBLOCK_TILE];
 
     const uint32_t tid = threadIdx.x;
@@ -1128,7 +1131,7 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_pair_kernel(
         if (STREAM_LDS) {
             const uint64_t src_block = (uint64_t)tok0 * xq_blocks +
                 b0;
-            ds4_rocm_q4_lds::copy_thread<ROCM_Q4_PREFILL_KBLOCK_TILE>(
+            ds4_rocm_q4_lds::copy_thread_selected<ROCM_Q4_PREFILL_KBLOCK_TILE, VECTOR_LDS>(
                 reinterpret_cast<uint32_t *>(sxq),
                 reinterpret_cast<const uint32_t *>(xq + src_block),
                 tid, blockDim.x, nt, nb,
@@ -1191,11 +1194,29 @@ static int rocm_q4_K_prefill_lds_stream_enabled(void) {
     return getenv("DS4_ROCM_DISABLE_Q4_PREFILL_LDS_STREAM") == NULL;
 }
 
-// Compile both schedules so rollback retains the original loader/barriers.
+// Counts vector-capable launches, not actual vector instructions: a strided
+// or misaligned activation tile can still use the scalar device fallback.
+static thread_local uint64_t g_rocm_q4_prefill_lds_vector_launches;
+extern "C" void ds4_rocm_test_q4_prefill_lds_vector_reset(void) {
+    g_rocm_q4_prefill_lds_vector_launches = 0;
+}
+extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_vector_get_calls(void) {
+    return g_rocm_q4_prefill_lds_vector_launches;
+}
+static int rocm_q4_K_prefill_lds_vector_enabled(void) {
+    return getenv("DS4_ROCM_DISABLE_Q4_PREFILL_LDS_VECTOR") == NULL;
+}
+
+// Independent rollbacks retain scalar streaming and the original schedule.
 template<typename... Args>
 static void rocm_q4_K_prefill_k1024_tile4_launch(dim3 grid, Args... args) {
     if (rocm_q4_K_prefill_lds_stream_enabled()) {
-        rocm_matmul_q4_K_prefill_k1024_tile4_kernel<true><<<grid, 256>>>(args...);
+        if (rocm_q4_K_prefill_lds_vector_enabled()) {
+            rocm_matmul_q4_K_prefill_k1024_tile4_kernel<true, true><<<grid, 256>>>(args...);
+            ++g_rocm_q4_prefill_lds_vector_launches;
+        } else {
+            rocm_matmul_q4_K_prefill_k1024_tile4_kernel<true><<<grid, 256>>>(args...);
+        }
         ++g_rocm_q4_prefill_lds_stream_launches;
     } else {
         rocm_matmul_q4_K_prefill_k1024_tile4_kernel<false><<<grid, 256>>>(args...);
@@ -1205,7 +1226,12 @@ static void rocm_q4_K_prefill_k1024_tile4_launch(dim3 grid, Args... args) {
 template<typename... Args>
 static void rocm_q4_K_prefill_tile8_strided_launch(dim3 grid, Args... args) {
     if (rocm_q4_K_prefill_lds_stream_enabled()) {
-        rocm_matmul_q4_K_prefill_tile8_strided_kernel<true><<<grid, 256>>>(args...);
+        if (rocm_q4_K_prefill_lds_vector_enabled()) {
+            rocm_matmul_q4_K_prefill_tile8_strided_kernel<true, true><<<grid, 256>>>(args...);
+            ++g_rocm_q4_prefill_lds_vector_launches;
+        } else {
+            rocm_matmul_q4_K_prefill_tile8_strided_kernel<true><<<grid, 256>>>(args...);
+        }
         ++g_rocm_q4_prefill_lds_stream_launches;
     } else {
         rocm_matmul_q4_K_prefill_tile8_strided_kernel<false><<<grid, 256>>>(args...);
@@ -1215,7 +1241,12 @@ static void rocm_q4_K_prefill_tile8_strided_launch(dim3 grid, Args... args) {
 template<typename... Args>
 static void rocm_q4_K_prefill_tile8_pair_launch(dim3 grid, Args... args) {
     if (rocm_q4_K_prefill_lds_stream_enabled()) {
-        rocm_matmul_q4_K_prefill_tile8_pair_kernel<true><<<grid, 256>>>(args...);
+        if (rocm_q4_K_prefill_lds_vector_enabled()) {
+            rocm_matmul_q4_K_prefill_tile8_pair_kernel<true, true><<<grid, 256>>>(args...);
+            ++g_rocm_q4_prefill_lds_vector_launches;
+        } else {
+            rocm_matmul_q4_K_prefill_tile8_pair_kernel<true><<<grid, 256>>>(args...);
+        }
         ++g_rocm_q4_prefill_lds_stream_launches;
     } else {
         rocm_matmul_q4_K_prefill_tile8_pair_kernel<false><<<grid, 256>>>(args...);

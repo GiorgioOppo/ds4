@@ -74,6 +74,8 @@ extern "C" int ds4_rocm_test_q4_pair_pre_enqueue_failure_policy(
     int prefill_scope, int tile8_required, int q8_wave32_required);
 extern "C" void ds4_rocm_test_q4_prefill_lds_stream_reset(void);
 extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_stream_get_calls(void);
+extern "C" void ds4_rocm_test_q4_prefill_lds_vector_reset(void);
+extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_vector_get_calls(void);
 
 namespace {
 
@@ -112,6 +114,8 @@ constexpr const char *kPrefillRequire =
     "DS4_ROCM_REQUIRE_Q4_PREFILL_TILE8";
 constexpr const char *kPrefillLdsDisable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_LDS_STREAM";
+constexpr const char *kPrefillLdsVectorDisable =
+    "DS4_ROCM_DISABLE_Q4_PREFILL_LDS_VECTOR";
 constexpr const char *kPrefillK1024Tile4Disable =
     "DS4_ROCM_DISABLE_Q4_PREFILL_K1024_TILE4";
 constexpr const char *kPrefillK1024Tile4SsdEnable =
@@ -730,17 +734,31 @@ template<typename Enqueue>
 bool run_prefill_lds_rollback_oracle(
         Enqueue enqueue, std::initializer_list<lds_output_check> outputs) {
     env_snapshot disable(kPrefillLdsDisable);
-    for (const char *value : {static_cast<const char *>(nullptr), "1", "0", ""}) {
+    env_snapshot vector_disable(kPrefillLdsVectorDisable);
+    // Both presence-based controls, including their precedence. The new
+    // rollback must keep scalar streaming; the older one disables both.
+    for (const char *value : {static_cast<const char *>(nullptr), "1", "0", ""})
+    for (const char *vector_value : {static_cast<const char *>(nullptr), "1", "0", ""}) {
         if ((value ? setenv(kPrefillLdsDisable, value, 1) :
                      unsetenv(kPrefillLdsDisable)) != 0) return false;
+        if ((vector_value ? setenv(kPrefillLdsVectorDisable, vector_value, 1) :
+                            unsetenv(kPrefillLdsVectorDisable)) != 0) return false;
         for (const auto &out : outputs)
             if (!write_tensor(out.tensor, *out.sentinel)) return false;
         ds4_rocm_test_q4_prefill_lds_stream_reset();
+        ds4_rocm_test_q4_prefill_lds_vector_reset();
         if (enqueue() <= 0) return false;
         const uint64_t calls = ds4_rocm_test_q4_prefill_lds_stream_get_calls();
+        const uint64_t vector_calls = ds4_rocm_test_q4_prefill_lds_vector_get_calls();
         if ((value == nullptr && calls == 0u) || (value != nullptr && calls != 0u)) {
             std::fprintf(stderr, "Q4 LDS opt-out '%s': unexpected launches=%llu FAIL\n",
                          value ? value : "unset", (unsigned long long)calls);
+            return false;
+        }
+        if (vector_calls != (!value && !vector_value ? calls : 0u)) {
+            std::fprintf(stderr, "Q4 LDS vector opt-out '%s' (stream '%s'): launches=%llu FAIL\n",
+                         vector_value ? vector_value : "unset", value ? value : "unset",
+                         (unsigned long long)vector_calls);
             return false;
         }
         for (const auto &out : outputs) {

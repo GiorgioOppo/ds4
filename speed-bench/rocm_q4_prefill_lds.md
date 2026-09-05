@@ -8,6 +8,11 @@ throughput improvement or percentage is claimed.
 
 ## Scope and changes
 
+This note describes the scalar streaming schedule. The subsequent
+[four-word copy extension](rocm_q4_prefill_lds_vector.md) has an independent
+rollback. The `--case lds` benchmark below explicitly disables that extension
+on both arms, retaining the original scalar-only comparison.
+
 Only the existing exact Q4_K/Q8_K tiled-prefill kernels change:
 
 - Standalone K1024 TILE4 copies the entire activation tile as consecutive
