@@ -705,7 +705,14 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
 	./tests/test_mxfp4_dot
 
+.PHONY: test-quality-api
+# Only the scorer's JSON parser is needed; discard the unused engine entry point.
+test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_official.c
+	$(CC) $(QUALITY_CFLAGS) -I. -ffunction-sections -fdata-sections -o tests/test_quality_api tests/test_quality_api.c -Wl,$(if $(filter Darwin,$(UNAME_S)),-dead_strip,--gc-sections) -lm
+	./tests/test_quality_api
+
 clean:
+	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands

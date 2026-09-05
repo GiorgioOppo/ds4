@@ -390,35 +390,56 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
     }
 }
 
-static bool api_ref_load(const char *path, api_ref *ref) {
-    memset(ref, 0, sizeof(*ref));
-    if (!path || !path[0]) return false;
-    char *json = read_file(path);
-    const char *p = strstr(json, "\"logprobs\"");
-    if (p) p = strstr(p, "\"content\"");
-    if (p) p = strchr(p, '[');
-    if (!p) {
-        free(json);
-        return false;
+static const char *json_member(const char *p, const char *name) {
+    if (!p || *(p = json_ws(p)) != '{') return NULL;
+    p++;
+    while (*p) {
+        char key[64];
+        if (!json_key(&p, key, sizeof(key))) return NULL;
+        p = json_ws(p);
+        if (*p++ != ':') return NULL;
+        p = json_ws(p);
+        if (!strcmp(key, name)) return p;
+        const char *end = json_skip_value(p);
+        if (end == p) return NULL;
+        p = json_ws(end);
+        if (*p++ != ',') return NULL;
     }
+    return NULL;
+}
+
+static bool api_ref_parse(const char *json, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    const char *p = json_member(json, "choices");
+    if (!p || *p != '[') return false;
+    p = json_member(json_ws(p + 1), "logprobs");
+    p = json_member(p, "content");
+    if (!p || *p != '[') return false;
     p++;
     while (1) {
         p = json_ws(p);
         if (*p == ']') {
-            free(json);
             return ref->n_pos > 0;
         }
         api_pos pos = {0};
-        if (!api_parse_pos(&p, &pos)) {
+        if (!api_parse_pos(&p, &pos) || !isfinite(pos.logprob)) {
             api_pos_free(&pos);
             api_ref_free(ref);
-            free(json);
             return false;
         }
         api_ref_add_pos(ref, &pos);
         p = json_ws(p);
         if (*p == ',') p++;
     }
+}
+
+static bool api_ref_load(const char *path, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    if (!path || !path[0]) return false;
+    char *json = read_file(path);
+    bool ok = api_ref_parse(json, ref);
+    free(json);
+    return ok;
 }
 
 static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
