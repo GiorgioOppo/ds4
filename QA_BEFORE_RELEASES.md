@@ -766,6 +766,11 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   receiving explicit permission to use `192.168.60.250` for this QA pass.
 - Run:
   `make cuda-regression`.
+- After aligned Q8 scratch changes, run `make test-cuda-q8-scratch
+  CUDA_ARCH=sm_121`, also under Compute Sanitizer. Dense and paired outputs
+  must be exact with reused scratch, an undersized buffer, and captured graph
+  replays after input changes. Include full-model prefill and decode logits;
+  a short token comparison cannot detect stale scratch contents.
 - For native MXFP4 changes, run
   `make test-mxfp4-cuda CUDA_ARCH=native` on the multi-GPU CUDA host only after
   receiving explicit permission for `192.168.60.250`, and
