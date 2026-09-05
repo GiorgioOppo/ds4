@@ -2085,14 +2085,18 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+#ifdef DS4_TP_HAVE_VERBS
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
     const double t_start = dbg ? tp_now_sec() : 0.0;
+#endif
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
     if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+#ifdef DS4_TP_HAVE_VERBS
     const double t_hs = dbg ? tp_now_sec() : 0.0;
+#endif
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr,

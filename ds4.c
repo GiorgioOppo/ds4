@@ -23345,6 +23345,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 (ds4_gpu_device_is_pre_m5_apple_silicon() ||
                  ds4_gpu_device_is_m5_apple_silicon()) &&
                 ds4_gpu_kv_rope_fp8_fuse_available() != 0) {
+#if defined(__APPLE__)
                 {
                     /* Fold the kv task into this layer's KV staging kernel
                      * (byte-exact); DS4_METAL_DISABLE_KV_NORM_DEFER=1 keeps
@@ -23353,6 +23354,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     if (defer_kv < 0) defer_kv = getenv("DS4_METAL_DISABLE_KV_NORM_DEFER") == NULL;
                     if (defer_kv && g->tp_world == 2) ds4_gpu_dsv4_qkv_norm_defer_kv_next();
                 }
+#endif
                 kv_norm_store_fused =
                     ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
                             metal_graph_qr_norm(g),
@@ -26173,9 +26175,14 @@ static bool metal_graph_encode_decode_layer_phase(
          * routed_out. */
         const uint32_t tp_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
         if (!tp_fold_ffn) {
+#if defined(__APPLE__)
             ok = ds4_gpu_add_tensor_tp_flag(g->tp_out[tp_slot], metal_graph_shared_out(g),
                                             metal_graph_routed_out(g), DS4_N_EMBD,
                                             il, DS4_TP_GATE_FFN) != 0;
+#else
+            ok = ds4_gpu_add_tensor(g->tp_out[tp_slot], metal_graph_shared_out(g),
+                                    metal_graph_routed_out(g), DS4_N_EMBD) != 0;
+#endif
         }
         if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) {
@@ -37053,6 +37060,7 @@ static bool metal_graph_verify_suffix_tops_impl(
     if (rocm_dspark_fast) ds4_gpu_set_dspark_verify_mode(true);
 #endif
     const double layer_t0 = timing ? now_sec() : 0.0;
+#if defined(__APPLE__)
     const bool tp_block = g->tp_batch_rows != 0 && g_tp_block_ctx != NULL;
     if (getenv("DS4_TP_BIG_GATE_DEBUG"))
         fprintf(stderr, "ds4: verify block: rows %u world %d ctx %p tp_block %d\n",
@@ -37061,6 +37069,7 @@ static bool metal_graph_verify_suffix_tops_impl(
         fprintf(stderr, "ds4: TP verify-block window setup failed\n");
         ok = false;
     }
+#endif
     ok = ok && ds4_gpu_begin_commands() != 0;
     const bool dspark_capture_active =
         ok &&
@@ -37139,10 +37148,12 @@ static bool metal_graph_verify_suffix_tops_impl(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+#if defined(__APPLE__)
     if (tp_block && !ds4_tp_batch_block_end(g_tp_block_ctx)) {
         fprintf(stderr, "ds4: TP verify-block window did not complete\n");
         ok = false;
     }
+#endif
     if (ok && getenv("DS4_DSPARK_EXPERT_OVERLAP")) {
         /* Diagnostic: distinct routed experts selected by the block's rows
          * in the last layer (bounds the gain of a multi-row expert kernel). */
