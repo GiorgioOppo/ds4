@@ -123,7 +123,10 @@ numbers in the QA report so omissions are visible.
    both successful loads. Corrupt checkpoints must still be rejected.
 10. Run `make dspark-verify-depth` with matching 0731 target and drafter files.
     Strict capture must skip layers without a compressor and compare every
-    captured compressor layer.
+    captured compressor layer. Repeat with the matching Vision Exp pair.
+    The test also verifies a six-token seed-plus-draft block and restores each
+    retained prefix, comparing compressor and index-cache row counts against
+    ordinary decode. Short output comparisons alone can miss stale frontiers.
 11. Send the same long GLM 5.2 prompt twice to one server session. The second
     request must report `cache_source: memory-rewind`, reuse through one token
     before the prompt boundary, and produce the same greedy output as a fresh

@@ -37008,9 +37008,9 @@ static bool metal_graph_verify_suffix_tops_impl(
     if (!ok) return false;
 
     const bool saved_capture = g->spec_capture_prefixes;
-    g->spec_capture_prefixes =
-        capture_prefix1 && n_tokens > 1u &&
-        n_tokens <= DS4_SPEC_PREFIX_SLOTS + 1u;
+    /* The slot count bounds retained prefixes, not the verify block length.
+     * Seed-plus-five blocks still need fresh states for prefixes one to four. */
+    g->spec_capture_prefixes = capture_prefix1 && n_tokens > 1u;
     const char *split_head_env = getenv("DS4_DSPARK_VERIFY_SPLIT_HEAD");
     const bool fuse_head =
         !split_head_env || !split_head_env[0] ||
@@ -70236,9 +70236,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
                                             &s->checkpoint,
                                             (uint32_t)start,
                                             (uint32_t)draft_n,
-                                            draft_n > 1 &&
-                                                draft_n <=
-                                                    (int)DS4_SPEC_PREFIX_SLOTS + 1,
+                                            draft_n > 1,
                                             true,
                                             row_tops,
                                             NULL,
@@ -70778,8 +70776,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
         ok = metal_graph_verify_suffix_tops(
             &s->graph, &e->model, &e->weights, &s->checkpoint,
             (uint32_t)start, (uint32_t)draft_n,
-            draft_n > 1 &&
-                draft_n <= (int)DS4_SPEC_PREFIX_SLOTS + 1,
+            draft_n > 1,
             true, draft_n > 1 ? row_tops : NULL, NULL,
             stats_enabled ? &verify_timing : NULL);
         if (stats_enabled) {
@@ -71029,9 +71026,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                                              &s->checkpoint,
                                              (uint32_t)start,
                                              (uint32_t)draft_n,
-                                             draft_n > 1 &&
-                                                 draft_n <=
-                                                     (int)DS4_SPEC_PREFIX_SLOTS + 1,
+                                             draft_n > 1,
                                              false,
                                              draft_n > 1 ? row_tops : NULL,
                                              NULL,
@@ -74924,3 +74919,49 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+
+#ifndef DS4_NO_GPU
+/* Test the actual compressor frontiers, not just a short continuation whose
+ * raw attention window can hide a stale speculative prefix. */
+bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt) {
+    ds4_session *ref = NULL, *spec = NULL;
+    bool ok = ds4_session_create(&ref, engine, 32768) == 0 &&
+              ds4_session_create(&spec, engine, 32768) == 0;
+    int tokens[6], tops[6];
+    uint32_t counts[6][DS4_MAX_LAYER], index_counts[6][DS4_MAX_LAYER];
+    char err[160];
+    if (ok) ok = ds4_session_sync(ref, prompt, err, sizeof(err)) == 0 &&
+                 ds4_session_sync(spec, prompt, err, sizeof(err)) == 0;
+    for (int i = 0; i < 6 && ok; i++) {
+        tokens[i] = ds4_session_argmax(ref);
+        ok = ds4_session_eval(ref, tokens[i], err, sizeof(err)) == 0;
+        memcpy(counts[i], ref->graph.layer_n_comp, sizeof(counts[i]));
+        memcpy(index_counts[i], ref->graph.layer_n_index_comp, sizeof(index_counts[i]));
+    }
+    const uint32_t start = (uint32_t)prompt->len;
+    if (ok) {
+        for (int i = 0; i < 6; i++) token_vec_push(&spec->checkpoint, tokens[i]);
+        ok = metal_graph_verify_suffix_tops(&spec->graph, &engine->model,
+            &engine->weights, &spec->checkpoint, start, 6, true, false,
+            tops, NULL, NULL);
+    }
+    for (uint32_t prefix = 1; prefix <= DS4_SPEC_PREFIX_SLOTS && ok; prefix++) {
+        ok = spec_frontier_commit_prefix(spec, prefix);
+        for (uint32_t layer = 0; layer < DS4_N_LAYER && ok; layer++) {
+            if (ds4_layer_compress_ratio(layer) == 0) continue;
+            if (spec->graph.layer_n_comp[layer] != counts[prefix-1][layer] ||
+                (ds4_layer_compress_ratio(layer) == 4 &&
+                 spec->graph.layer_n_index_comp[layer] != index_counts[prefix-1][layer])) {
+                fprintf(stderr, "ds4-test: stale speculative prefix=%u layer=%u "
+                    "comp=%u/%u index=%u/%u\n", prefix, layer,
+                    spec->graph.layer_n_comp[layer], counts[prefix-1][layer],
+                    spec->graph.layer_n_index_comp[layer], index_counts[prefix-1][layer]);
+                ok = false;
+            }
+        }
+    }
+    ds4_session_free(spec);
+    ds4_session_free(ref);
+    return ok;
+}
+#endif

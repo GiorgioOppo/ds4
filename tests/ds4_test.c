@@ -6,6 +6,7 @@
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
+bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -6746,6 +6747,8 @@ static void test_dspark_verify_depth(void) {
         ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
         ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
         TEST_ASSERT(prompt.len > 0);
+
+        TEST_ASSERT(ds4_test_dspark_prefix_capture(engine, &prompt));
 
         spec = malloc((size_t)TEST_DSPARK_MAXGEN * sizeof(*spec));
         TEST_ASSERT(spec != NULL);
