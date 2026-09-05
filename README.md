@@ -79,16 +79,31 @@ So, while this project attempts to be usable for the featured models and the mos
 
 ## Start Here
 
-Choose the guide for your machine. Each starts with the build, a suitable
-model, and a first run; more involved setups are linked from there.
+```sh
+git clone https://github.com/antirez/ds4.git
+cd ds4
+```
 
-| Guide | Start with |
+Choose your build. The platform guides cover prerequisites, memory sizing,
+and hardware-specific setups:
+
+| Platform guide | Build |
 | --- | --- |
-| [Getting started](docs/GETTING_STARTED.md) | Downloading, building, and the first chat |
-| [Metal on Apple Silicon](docs/METAL.md) | M3/M5 Macs, memory sizing, and larger models |
-| [DGX Spark](docs/DGX_SPARK.md) | Single-GPU GB10 CUDA inference |
-| [Strix Halo](docs/STRIX_HALO.md) | Framework Desktop and other ROCm Strix Halo systems |
-| [One or more CUDA cards](docs/CUDA_MULTI_GPU.md) | Layer placement and multi-user serving, including Ada/L40S |
+| [Metal on Apple Silicon](docs/METAL.md) | `make` |
+| [DGX Spark](docs/DGX_SPARK.md) | `make cuda-spark` |
+| [Strix Halo / Framework Desktop](docs/STRIX_HALO.md) | `make strix-halo` |
+| [One or more CUDA cards, including Ada/L40S](docs/CUDA_MULTI_GPU.md) | `make cuda-generic` |
+
+For a first run on a 96 or 128 GB machine, download DeepSeek V4 Flash Q2:
+
+```sh
+./download_model.sh ds4f-q2
+```
+
+Downloads go in `gguf/`. Repeat the command to resume an interrupted download.
+Leave memory for the context and runtime buffers as well as the model.
+See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
+on a smaller Mac.
 
 ## Everyday Use
 
@@ -104,6 +119,9 @@ Once built and with a model downloaded:
 The default model is `ds4flash.gguf`, a link updated by main-model downloads.
 Pass `-m FILE` to choose explicitly. Commands normally run from the repository
 root; use `--chdir /path/to/ds4` when launching elsewhere.
+
+The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
+for API access and multiple sessions.
 
 The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
 `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
@@ -205,8 +223,6 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
-[QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md) contains the release matrix,
-including the conditions for using remote test machines.
 
 ## Logo
 

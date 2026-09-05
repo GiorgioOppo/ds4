@@ -1,6 +1,6 @@
 # Metal on Apple Silicon
 
-[README](../README.md) | [Getting started](GETTING_STARTED.md)
+[README](../README.md) | [Getting started](../README.md#start-here)
 
 ## Build and run
 

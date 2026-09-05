@@ -1,6 +1,6 @@
 # Models and Vision
 
-[README](../README.md) | [Getting started](GETTING_STARTED.md)
+[README](../README.md) | [Getting started](../README.md#start-here)
 
 DwarfStar is not a general GGUF runner. Use the download targets below: other
 GGUFs may have unsupported tensor layouts, metadata, or quantization mixes.
@@ -9,6 +9,10 @@ Run `./download_model.sh --help` for filenames and all available targets.
 Main-model downloads update `ds4flash.gguf`. Encoders, draft models, packaged
 FP8 weights, and split PRO pieces do not. Pass `-m FILE` to avoid depending on
 which model was downloaded last.
+
+Some downloads require the Hugging Face CLI; the script prints installation
+instructions when needed. Authentication is optional for public weights;
+your cached Hugging Face token or `HF_TOKEN` is used when present.
 
 ## DeepSeek V4
 

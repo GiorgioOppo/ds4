@@ -1,6 +1,6 @@
 # NVIDIA CUDA GPUs
 
-[README](../README.md) | [Getting started](GETTING_STARTED.md)
+[README](../README.md) | [Getting started](../README.md#start-here)
 
 **Ada Lovelace is supported, including 48 GB L40S cards.** This is an important
 use case: a model whose other inference implementations require newer GPUs

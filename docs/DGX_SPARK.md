@@ -1,6 +1,6 @@
 # DGX Spark
 
-[README](../README.md) | [Getting started](GETTING_STARTED.md)
+[README](../README.md) | [Getting started](../README.md#start-here)
 
 This is the single-GPU GB10 path. Use the NVIDIA driver and CUDA development
 toolkit for the machine; the build needs `nvcc` and cuBLAS.

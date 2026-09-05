@@ -1,6 +1,6 @@
 # AMD Strix Halo
 
-[README](../README.md) | [Getting started](GETTING_STARTED.md)
+[README](../README.md) | [Getting started](../README.md#start-here)
 
 The reference system is a 128 GB Strix Halo with Radeon 8060S (`gfx1151`),
 such as the Framework Desktop. The ROCm build uses the standard binary names
