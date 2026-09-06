@@ -12,6 +12,7 @@ public func resetDecodeProfile() { decoder.resetProfile() }
     public func resetConversation(systemPrompt: String?) {
         self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
         committedIds = []
+        visionBlocks = []
         needsClose = false
         kvDirty = false   // next generation starts at pos 0 and resets the compressor
         lastDiskStoreCount = 0
@@ -169,7 +170,7 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         // secondo scambio in poi. Qualunque mismatch (chat GUI interlacciata
         // sullo stesso motore, transcript diverso, stato sporco) ricade nel
         // reset di sempre: prefill freddo, correttezza invariata.
-        if !kvDirty, !committedIds.isEmpty, ids.count > committedIds.count,
+        if visionBlocks.isEmpty, !kvDirty, !committedIds.isEmpty, ids.count > committedIds.count,
            ids.starts(with: committedIds) {
             DS4Log.info("server", "KV riusato in memoria (\(committedIds.count) token già caldi)")
             return run(suffixIds: Array(ids.dropFirst(committedIds.count)),

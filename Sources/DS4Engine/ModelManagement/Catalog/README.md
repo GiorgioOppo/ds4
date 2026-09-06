@@ -2,6 +2,12 @@
 
 # ModelManagement/Catalog
 
+`DeepSeekV4VisionCatalog.swift` pins the Vision-Exp language variants and the
+separate encoder. IQ2XXS and mixed IQ2XXS/Q4_K run in local image chat with the
+encoder; MXFP4 and the Vision DSpark draft remain download-only. Encoder entries
+are accessories and cannot replace the active language model. See
+[Vision setup and validation](../../../../docs/DEEPSEEK-VISION.md).
+
 Contains the typed cross-family catalog used by the GUI. In addition to
 monolithic models and independent shard packages, it includes Kimi K3 as five
 consecutive fragments of one logical GGUF.

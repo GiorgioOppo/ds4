@@ -5,6 +5,26 @@ final class DeepSeekV4ConfigurationTests: XCTestCase {
 
     static let modelPath = "/Users/oppog/Downloads/ds4-main/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
 
+    func testVisionCheckpointUsesItsTrainingEpsilonAndRequiresMatchingMetadata() throws {
+        let revision = "e46e16bf6035c6f317eb2ac7458eb0362926d402"
+        let epsilon = try DeepSeekV4Configuration.checkpointRmsEpsilon(
+            variant: .flash, checkpoint: "vision-exp", sidecarRequired: true, sourceRevision: revision)
+        XCTAssertEqual(epsilon, Float(1.0e-20))
+        XCTAssertNotEqual(epsilon, DeepSeekV4Defaults.rmsEps)
+        XCTAssertEqual(try DeepSeekV4Configuration.checkpointRmsEpsilon(
+            variant: .flash, checkpoint: nil, sidecarRequired: nil, sourceRevision: nil),
+            DeepSeekV4Defaults.rmsEps)
+        for (variant, checkpoint, required, source) in [
+            (DeepSeekV4Variant.pro, "vision-exp", true, revision),
+            (.flash, "vision-exp", false, revision),
+            (.flash, "vision-exp", true, "other-revision"),
+            (.flash, "unknown", true, revision),
+        ] {
+            XCTAssertThrowsError(try DeepSeekV4Configuration.checkpointRmsEpsilon(
+                variant: variant, checkpoint: checkpoint, sidecarRequired: required, sourceRevision: source))
+        }
+    }
+
     // MARK: Compression-ratio formula (port of ds4_expected_layer_compress_ratio)
 
     func testFlashCompressRatioFormula() {

@@ -52,6 +52,7 @@ targets:
     dependencies:
       - target: DS4Core
       - sdk: Metal.framework
+      - sdk: MetalPerformanceShaders.framework
 
   DS4Engine:
     type: library.static
@@ -103,6 +104,24 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.dwarfstar.tests
         # Codeless/logic test bundle — no signing identity needed locally.
         CODE_SIGN_STYLE: Automatic
+
+  DwarfStarTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/DwarfStarTests
+        excludes: ["**/*.md", "*.md"]
+    dependencies:
+      - target: DwarfStar
+      - target: DS4Core
+      - target: DS4Engine
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.dwarfstar.app-tests
+        CODE_SIGN_STYLE: Automatic
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/DwarfStar.app/Contents/MacOS/DwarfStar"
+        BUNDLE_LOADER: "$(TEST_HOST)"
 
   DwarfStar:
     type: application
@@ -161,6 +180,7 @@ schemes:
       gatherCoverageData: false
       targets:
         - DS4CoreTests
+        - DwarfStarTests
     profile:
       config: Release
     analyze:

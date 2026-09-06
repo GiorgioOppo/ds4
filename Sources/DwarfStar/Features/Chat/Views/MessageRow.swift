@@ -18,6 +18,9 @@ struct MessageRow: View {
             HStack {
                 if message.role == .user { Spacer(minLength: 40) }
                 VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
+                    Text(message.role == .user ? "Tu" : "Assistente")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
                     if !message.reasoning.isEmpty {
                         ReasoningView(text: message.reasoning)
                     }
@@ -29,14 +32,12 @@ struct MessageRow: View {
                                 Text(message.text).textSelection(.enabled)
                             }
                         }
-                        .padding(10)
+                        .padding(14)
                         .background(bubbleColor)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .contextMenu {
-                            if message.role == .assistant {
-                                Button("Copia risposta", systemImage: "doc.on.doc") {
-                                    copyResponse()
-                                }
+                            Button("Copia messaggio", systemImage: "doc.on.doc") {
+                                copyResponse()
                             }
                         }
                         if message.role == .assistant {
@@ -58,6 +59,9 @@ struct MessageRow: View {
                     if !message.attachments.isEmpty {
                         AttachmentBadges(names: message.attachments)
                     }
+                    if !message.images.isEmpty {
+                        ChatImagePreviews(images: message.images)
+                    }
                     if !message.toolStreamText.isEmpty {
                         ToolStreamView(text: message.toolStreamText)
                     }
@@ -71,7 +75,7 @@ struct MessageRow: View {
     }
 
     private var bubbleColor: Color {
-        message.role == .user ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12)
+        message.role == .user ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.07)
     }
 
     private func copyResponse() {

@@ -113,13 +113,20 @@ extension ChatStore {
         previousToolRoundFingerprints = []
     }
 
-    /// First non-empty user line, for an auto title.
-    private static func deriveTitle(from messages: [UIMessage]) -> String {
-        guard let first = messages.first(where: { $0.role == .user && !$0.text.isEmpty }) else {
-            return ChatSession.untitled
+    /// Use the earliest user turn, including attachment-only conversations, so
+    /// their title remains recognizable and searchable in conversation history.
+    static func deriveTitle(from messages: [UIMessage]) -> String {
+        for message in messages where message.role == .user {
+            let typed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let line = typed.split(separator: "\n").first {
+                return String(line.prefix(48))
+            }
+            if let name = (message.images.map(\.name) + message.attachments)
+                .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                return String(name.prefix(48))
+            }
         }
-        let line = first.text.split(separator: "\n").first.map(String.init) ?? first.text
-        return String(line.prefix(48))
+        return ChatSession.untitled
     }
 
 }

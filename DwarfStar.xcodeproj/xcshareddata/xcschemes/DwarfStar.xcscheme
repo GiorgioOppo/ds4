@@ -50,6 +50,17 @@
                ReferencedContainer = "container:DwarfStar.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "FD95D929F971889D48D18A2D"
+               BuildableName = "DwarfStarTests.xctest"
+               BlueprintName = "DwarfStarTests"
+               ReferencedContainer = "container:DwarfStar.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>

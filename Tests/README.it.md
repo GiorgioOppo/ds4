@@ -15,6 +15,9 @@ fedeli.
   creazione del runtime.
 - **`DS4CoreTests/Engine/`** copre il protocollo distribuito, la persistenza,
   la sicurezza dei progetti, la gestione dei modelli, la diagnostica e i tool.
+- **`DwarfStarTests/`** copre compatibilità delle chat salvate, conservazione degli
+  allegati testuali e immagini, replay della cronologia e titoli delle chat con
+  soli allegati, senza creare un chat store o caricare un modello.
 
 ```sh
 make test        # oppure: swift test
@@ -25,7 +28,8 @@ make test        # oppure: swift test
 I test sono anche collegati al `.xcodeproj` generato come bundle di logic test
 `DS4CoreTests`, senza app host. Dopo aver generato il progetto, apri
 `DwarfStar.xcodeproj` e premi **Cmd+U**. Lo schema `DwarfStar` ha l'azione
-Test collegata a `DS4CoreTests`.
+Test collegata a `DS4CoreTests` e al bundle `DwarfStarTests` ospitato dall’app.
+SwiftPM esegue i test dei contratti dell’app senza avviare la GUI.
 
 ```sh
 make xcodeproj

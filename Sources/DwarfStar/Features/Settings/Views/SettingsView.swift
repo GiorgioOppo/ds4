@@ -25,6 +25,7 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             Form {
                 modelSection
+                visionSection
                 huggingFaceSection
                 Section("Mode") {
                     Picker("Execution", selection: $settings.mode) {
@@ -67,6 +68,29 @@ struct SettingsView: View {
     }
 
     // MARK: Hugging Face token
+
+    private var visionSection: some View {
+        Section("DeepSeek Vision · sperimentale") {
+            Text(store.visionConfigurationNote)
+                .font(.callout)
+            HStack {
+                Label(settings.visionEncoderPath.isEmpty ? "Nessun encoder selezionato"
+                      : (settings.visionEncoderPath as NSString).lastPathComponent,
+                      systemImage: "photo.on.rectangle")
+                    .lineLimit(1).truncationMode(.middle)
+                    .help(settings.visionEncoderPath)
+                Spacer()
+                Button("Scegli encoder…") { store.pickVisionEncoder() }
+                Button("Scarica…") { showModelDownloads = true }
+            }
+            Text("Servono due file: un modello Flash Vision Experimental e il suo encoder. Il normale Flash 0731 è solo testo. Le immagini restano su questo Mac e vengono conservate con la chat.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let note = store.attachmentNote {
+                Text(note).font(.caption).foregroundStyle(.orange)
+            }
+        }
+        .disabled(store.phase == .loading || store.isGenerating || store.benchRunning)
+    }
 
     /// Configuration for the token the model downloader sends as
     /// `Authorization: Bearer`. Stored in the KEYCHAIN (never UserDefaults — a

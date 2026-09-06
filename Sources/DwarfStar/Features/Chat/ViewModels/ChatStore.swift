@@ -816,7 +816,9 @@ final class ChatStore {
     /// Used to warn before they overflow the context window.
     var attachmentTokenEstimate: Int? {
         guard !attachments.isEmpty else { return nil }
-        return attachments.reduce(0) { $0 + $1.content.count } / 4
+        return attachments.reduce(0) { total, attachment in
+            total + (attachment.imageData == nil ? attachment.content.count / 4 : 384)
+        }
     }
     var think = false
     var isGenerating = false

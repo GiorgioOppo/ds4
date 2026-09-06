@@ -42,6 +42,10 @@ public actor InferenceService: DS4Logging {
     /// decoder stays concrete; this descriptor is for selection, UI and optional
     /// feature gates only.
     let backendDescriptor: RuntimeModelDescriptor
+    let visionEncoder: DeepSeekV4VisionEncoder?
+    public nonisolated let visionEnabled: Bool
+    public nonisolated let loadedVisionEncoderPath: String?
+    var visionBlocks: [DeepSeekV4VisionPromptBlock] = []
 
     // Append-only conversation state: `committedIds` are the exact token ids already
     // in the KV cache. Each turn prefills ONLY the new suffix and appends here, so
@@ -93,7 +97,8 @@ public actor InferenceService: DS4Logging {
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil,
-                frozenUsageSeed: Data? = nil) throws {
+                frozenUsageSeed: Data? = nil,
+                visionEncoderPath: String? = nil) throws {
         Self.log("revisione \(Self.engineRevision)")
         // Active DS4_* knobs, in the log of EVERY consumer (GUI included): "does
         // the app even see the env vars?" must be answerable from the log alone.
@@ -139,6 +144,13 @@ public actor InferenceService: DS4Logging {
                 + "GUI serve \(selection.backend.rawValue) col suo motore "
                 + "dedicato (ChatStore), mentre benchmark/auto-tune/"
                 + "distribuito non hanno ancora quel backend.")
+        }
+        let isVision = DeepSeekV4VisionEncoder.isVisionLanguageModel(openedModel)
+        if isVision {
+            guard let visionEncoderPath, !visionEncoderPath.isEmpty else {
+                throw VisionChatError.configuration("Il modello Vision Experimental richiede DeepSeek-V4-Flash-Vision-Encoder.gguf. Selezionalo in Impostazioni → DeepSeek Vision.")
+            }
+            try DeepSeekV4VisionEncoder.validateModel(path: visionEncoderPath)
         }
         self.model = openedModel
         self.backendDescriptor = selection.descriptor
@@ -187,7 +199,20 @@ public actor InferenceService: DS4Logging {
                                                                        nLayers: geometry.nLayers, maxKeys: contextSize,
                                                                        cacheSlots: expertCacheSlots,
                                                                        geometry: geometry)
-        if let requested = env["DS4_DSPARK_GGUF"], !requested.isEmpty {
+        if isVision {
+            guard let visionEncoderPath, !visionEncoderPath.isEmpty else {
+                throw VisionChatError.configuration("Il modello Vision Experimental richiede DeepSeek-V4-Flash-Vision-Encoder.gguf. Selezionalo in Impostazioni → DeepSeek Vision.")
+            }
+            let encoder = try DeepSeekV4VisionEncoder(modelPath: visionEncoderPath, runtime: rt)
+            try decoder.configureVision(visualRouterBias: encoder.visualRouterBias,
+                                        hashRouterBias: encoder.hashRouterBias)
+            self.visionEncoder = encoder
+        } else {
+            self.visionEncoder = nil
+        }
+        self.visionEnabled = isVision
+        self.loadedVisionEncoderPath = isVision ? visionEncoderPath : nil
+        if !isVision, let requested = env["DS4_DSPARK_GGUF"], !requested.isEmpty {
             let supportPath = requested == "1"
                 ? DSparkSupportModel.locate(near: modelPath)
                 : requested
@@ -241,6 +266,10 @@ public actor InferenceService: DS4Logging {
     /// architecture such as Qwen.
     public nonisolated static func inspectModel(path: String) throws -> RuntimeModelDescriptor {
         try RuntimeBackendFactory.inspect(modelPath: path)
+    }
+
+    public nonisolated static func validateVisionEncoder(path: String) throws {
+        try DeepSeekV4VisionEncoder.validateModel(path: path)
     }
 
     /// Drain model-owned GPU/I/O background work before an in-process reload.

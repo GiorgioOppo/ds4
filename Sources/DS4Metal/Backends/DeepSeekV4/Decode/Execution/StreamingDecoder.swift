@@ -30,6 +30,7 @@ public final class StreamingDecoder {
     let embedTable: GPUTensor
     let out: OutputHeadWeights
     let rmsEps: Float, hcEps: Float
+    var visionRouterBias: [GPUTensor] = []
 
     /// Optional DSpark target-hidden capture and executable stage-0 graph.
     /// Nil on the ordinary path, so attaching DSpark cannot alter baseline

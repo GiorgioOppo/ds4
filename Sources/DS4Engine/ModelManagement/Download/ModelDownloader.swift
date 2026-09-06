@@ -25,6 +25,8 @@ public enum ModelDownloader {
             + [DeepSeekV4AccessoryCatalog.mtp,
                DeepSeekV4AccessoryCatalog.dspark,
                DeepSeekV4AccessoryCatalog.dspark0731,
+               DeepSeekV4VisionCatalog.encoder,
+               DeepSeekV4VisionCatalog.dspark,
                LagunaAccessoryCatalog.dflash]
     }
 

@@ -135,7 +135,11 @@ extension InferenceService {
         var ctx = subContext(for: target, agent: agent, toolNames: tools,
                              delegableToolNames: delegationCeiling)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
-        if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
+        if kvDirty, !committedIds.isEmpty {
+            _ = try decoder.prefill(tokens: committedIds, startPos: 0,
+                                    embeddingOverrides: visionEmbeddingOverrides)
+            kvDirty = false
+        }
 
         // Snapshot the MAIN context and restore it however the sub-agent ends.
         let savedIds = committedIds, savedClose = needsClose, savedDirty = kvDirty, savedDisk = lastDiskStoreCount

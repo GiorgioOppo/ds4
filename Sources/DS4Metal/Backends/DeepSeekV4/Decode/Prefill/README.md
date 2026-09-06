@@ -12,6 +12,10 @@ Efficient prompt ingestion with layer-major processing and batching.
 - [`PrefillStage.swift`](PrefillStage.swift): staging buffer for a group of tokens.
 - [`PrefillGather.swift`](PrefillGather.swift): background expert gather with
   synchronized delivery to the caller.
+- [`StreamingDecoder+Vision.swift`](StreamingDecoder+Vision.swift): complete
+  image blocks, absolute embedding overrides and checkpoint-specific visual
+  routing. It stages future raw keys for bidirectional image attention while
+  preserving causal compressed visibility.
 
 ## Flow
 
@@ -23,7 +27,10 @@ in the main configuration.
 
 ## Modification rules
 
-The result must be equivalent to a sequence of single forwards. A started
+Text prefill must be equivalent to a sequence of single forwards. Image
+blocks are bidirectional and must remain whole across chunk boundaries;
+validate them against the Vision reference instead of causal single forwards.
+A started
 worker must always be awaited, including on error paths. Limit temporary
 memory to the chunk and measure token/s, peak RAM and SSD pressure
 separately.

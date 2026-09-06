@@ -2,6 +2,11 @@
 
 # DwarfStar — native LLM inference on macOS
 
+**New: experimental DeepSeek Vision in local chat.** Select the Vision-Exp
+checkpoint and separate encoder from the download catalog, then attach images.
+The interface adds guided setup, searchable chat history and a more accessible
+composer. Setup, validation status and limitations: [DeepSeek Vision](docs/DEEPSEEK-VISION.md).
+
 DwarfStar is a native Swift / SwiftUI application for running local language
 models on Apple Silicon with a **pure-Swift Metal inference engine**.
 **DeepSeek V4** is the operational backend today: Flash and the single-file

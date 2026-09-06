@@ -15,6 +15,9 @@ struct UIMessage: Identifiable {
     /// Names of text files imported with this (user) message — shown as badges; the
     /// full content was folded into the turn actually sent to the model.
     var attachments: [String] = []
+    /// Original context survives reopening, including imported text and images.
+    var modelText: String? = nil
+    var images: [ChatImage] = []
     /// Set on a `.tool` message that reports an isolated sub-agent run (question,
     /// answer, and a collapsible trace of its internal steps).
     var subAgent: InferenceService.SubAgentRun?
@@ -29,6 +32,6 @@ struct ChatAttachment: Identifiable, Equatable {
     let id = UUID()
     let name: String
     let content: String
-    var bytes: Int { content.utf8.count }
+    var imageData: Data? = nil
+    var bytes: Int { imageData?.count ?? content.utf8.count }
 }
-

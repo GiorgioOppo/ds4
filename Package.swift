@@ -63,7 +63,7 @@ let package = Package(
             name: "DS4Metal",
             dependencies: ["DS4Core"],
             exclude: markdownFiles(in: "Sources/DS4Metal"),
-            linkerSettings: [.linkedFramework("Metal")]
+            linkerSettings: [.linkedFramework("Metal"), .linkedFramework("MetalPerformanceShaders")]
         ),
 
         // Unit tests for the pure-Swift engine modules (kernels, graph, GGUF,
@@ -96,6 +96,14 @@ let package = Package(
                 // reuses a cached evaluation of this dynamic manifest.
                 "Features/SWEBench/README.md",
             ])
+        ),
+
+        // App conversation contracts are tested without launching a model or
+        // constructing ChatStore (which restores the user's application state).
+        .testTarget(
+            name: "DwarfStarTests",
+            dependencies: ["DwarfStar", "DS4Core", "DS4Engine"],
+            exclude: markdownFiles(in: "Tests/DwarfStarTests")
         ),
 
         // Pure-Swift engine demo CLI: drives DS4Core + DS4Metal directly (Metal

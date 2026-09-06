@@ -20,8 +20,9 @@ enum ModelPicker {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.title = "Choose a GGUF Model"
-        panel.prompt = "Open"
+        panel.title = "Scegli un modello GGUF"
+        panel.prompt = "Seleziona modello"
+        panel.message = "Seleziona il modello principale. L'encoder immagini e i componenti DSpark si configurano separatamente."
         if let gguf = UTType(filenameExtension: "gguf") {
             panel.allowedContentTypes = [gguf, .data]   // prefer .gguf, still allow any file
         }
@@ -126,9 +127,9 @@ enum ModelPicker {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.title = "Grant Access to the Model's Folder"
-        panel.prompt = "Grant"
-        panel.message = "Select the folder that contains the GGUF: existing sidecar caches (\u{201C}.q4dense\u{201D}, \u{201C}.expbundle\u{201D}) become reusable and nothing is rebuilt inside the app container."
+        panel.title = "Autorizza la cartella del modello"
+        panel.prompt = "Consenti accesso"
+        panel.message = "Scegli la cartella del GGUF per riutilizzare l'encoder immagini e le cache già presenti, senza duplicare i file."
         if let p = modelPath, !p.isEmpty {
             panel.directoryURL = URL(fileURLWithPath: (p as NSString).deletingLastPathComponent,
                                      isDirectory: true)

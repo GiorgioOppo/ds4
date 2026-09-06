@@ -51,8 +51,17 @@ extension ChatStore {
     func send() {
         let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard EngineActivityGate.shared.activeOwner == nil,
-              let backend = chatBackend, !isGenerating,
+              isReady, let backend = chatBackend, !isGenerating,
               !(typed.isEmpty && attachments.isEmpty) else { return }
+        let imageAttachments = attachments.compactMap { attachment in
+            attachment.imageData.map { ChatImage(name: attachment.name, data: $0) }
+        }
+        let usesVision = !imageAttachments.isEmpty || messages.contains { !$0.images.isEmpty }
+        guard !usesVision || canAttachImages else {
+            attachmentNote = "Questa chat contiene immagini. Carica DeepSeek Vision e il suo encoder, oppure avvia una nuova chat per il modello solo testo."
+            return
+        }
+        let visionService = service
         let epoch = beginConversationWork()
         let atts = attachments
         let text = Self.composeUserText(typed: typed, attachments: atts)
@@ -68,11 +77,14 @@ extension ChatStore {
         let primed = enginePrimed
             && engineProjectSignature == resolved.projectSignature
         let history = primed ? [] : Self.chatTurns(from: messages)
+        let visionHistory = primed ? nil : Self.visionChatTurns(from: messages)
         let sys = primed ? nil : (resolved.agent.systemPrompt.isEmpty
                                   ? nil : resolved.agent.systemPrompt)
         enginePrimed = true
         engineProjectSignature = resolved.projectSignature
-        messages.append(UIMessage(role: .user, text: typed, attachments: atts.map(\.name)))
+        messages.append(UIMessage(role: .user, text: typed,
+                                  attachments: atts.filter { $0.imageData == nil }.map(\.name),
+                                  modelText: text, images: imageAttachments))
         let index = appendAssistant()
         isGenerating = true
         toolRounds = 0                     // fresh user turn resets the tool-loop guard
@@ -89,12 +101,19 @@ extension ChatStore {
         generation = Task(priority: .userInitiated) { [weak self] in
             // Un solo percorso per entrambi i motori: il contratto
             // ChatBackend copre send e sendWithHistory.
-            let stream = primed
-                ? await backend.send(userText: text, thinkMode: mode,
-                                     sampling: params, maxTokens: 4096)
-                : await backend.sendWithHistory(
+            let stream: AsyncThrowingStream<GenEvent, Error>
+            if usesVision, let visionService {
+                stream = await visionService.sendWithImages(userText: text, images: imageAttachments,
+                    history: visionHistory, systemPrompt: sys, thinkMode: mode,
+                    sampling: params, maxTokens: 4096)
+            } else if primed {
+                stream = await backend.send(userText: text, thinkMode: mode,
+                                            sampling: params, maxTokens: 4096)
+            } else {
+                stream = await backend.sendWithHistory(
                     history, userText: text, systemPrompt: sys,
                     thinkMode: mode, sampling: params, maxTokens: 4096)
+            }
             guard let self, self.ownsConversationWork(epoch) else { return }
             await self.consume(stream, into: index, epoch: epoch)
             guard self.ownsConversationWork(epoch) else { return }
@@ -170,6 +189,9 @@ extension ChatStore {
             }
         }
         isGenerating = false
+        // A cancelled image prefill may have committed none of the user's turn.
+        // Replay its persisted image payload on the next send.
+        if messages.contains(where: { !$0.images.isEmpty }) { enginePrimed = false }
         status = ""
         finishIfIdle(epoch: epoch)
     }

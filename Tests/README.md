@@ -12,6 +12,9 @@ against CPU-faithful implementations where useful.
   decode/cache behavior, model loading, and runtime creation.
 - **`DS4CoreTests/Engine/`** covers distributed protocol, persistence, project
   safety, model management, diagnostics, and tools.
+- **`DwarfStarTests/`** covers saved-chat compatibility, text/image attachment
+  preservation, history replay, and attachment-only conversation titles without
+  constructing a chat store or loading a model.
 
 ```sh
 make test        # or: swift test
@@ -22,7 +25,8 @@ make test        # or: swift test
 The tests are also wired into the generated `.xcodeproj` as the `DS4CoreTests`
 logic-test bundle, without an app host. After generating the project, open
 `DwarfStar.xcodeproj` and press **Cmd+U**. The `DwarfStar` scheme has its Test
-action connected to `DS4CoreTests`.
+action connected to `DS4CoreTests` and the `DwarfStarTests` application-hosted
+bundle. SwiftPM runs the app contract tests without launching the GUI.
 
 ```sh
 make xcodeproj

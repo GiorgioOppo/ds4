@@ -96,6 +96,7 @@ extension StreamingDecoder {
                                 geometry: DSV4RuntimeGeometry) throws -> StreamingDecoder {
         let dims = try resolvedRuntimeDims(dims, model: model, geometry: geometry,
                                            nLayers: nLayers)
+        let rmsEps: Float = model.string("deepseek4.checkpoint_variant") == "vision-exp" ? 1.0e-20 : rmsEps
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                     layerProvider: { try GGUFWeights.layer(rt, model, $0) },
@@ -124,6 +125,7 @@ extension StreamingDecoder {
         // owns the early layers and the global metadata).
         let dims = try resolvedRuntimeDims(dims, model: shards.primary, geometry: geometry,
                                            nLayers: nLayers)
+        let rmsEps: Float = shards.primary.string("deepseek4.checkpoint_variant") == "vision-exp" ? 1.0e-20 : rmsEps
         let headShard = shards.shard(owning: "output.weight")
             ?? shards.shard(owning: "token_embd.weight") ?? shards.primary
         let (embed, head) = try GGUFWeights.outputHead(rt, headShard)
@@ -149,6 +151,7 @@ extension StreamingDecoder {
                                             geometry: DSV4RuntimeGeometry) throws -> StreamingDecoder {
         let dims = try resolvedRuntimeDims(dims, model: model, geometry: geometry,
                                            nLayers: nLayers)
+        let rmsEps: Float = model.string("deepseek4.checkpoint_variant") == "vision-exp" ? 1.0e-20 : rmsEps
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
         let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"   // default ON; opt-out with =0
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
@@ -231,6 +234,7 @@ extension StreamingDecoder {
                                                   geometry: DSV4RuntimeGeometry) throws -> StreamingDecoder {
         let dims = try resolvedRuntimeDims(dims, model: model, geometry: geometry,
                                            nLayers: nLayers)
+        let rmsEps: Float = model.string("deepseek4.checkpoint_variant") == "vision-exp" ? 1.0e-20 : rmsEps
         LoadProgress.shared.set(0.02, "Apertura pesi…")
         let (embed, headMapped) = try GGUFWeights.outputHeadMapped(rt, model)
         var head = headMapped
@@ -620,6 +624,7 @@ extension StreamingDecoder {
                                              geometry: DSV4RuntimeGeometry) throws -> StreamingDecoder {
         let dims = try resolvedRuntimeDims(dims, model: model, geometry: geometry,
                                            nLayers: nLayers)
+        let rmsEps: Float = model.string("deepseek4.checkpoint_variant") == "vision-exp" ? 1.0e-20 : rmsEps
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
         // Memoize per-layer weights: dense (incl. NSA compressor) are COPIED resident
         // and reused across tokens; experts are no-copy mmap. Without this the ~8GB of

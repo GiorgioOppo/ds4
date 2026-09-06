@@ -40,6 +40,8 @@ struct StoredMessage: Codable {
     var reasoning: String
     var text: String
     var attachments: [String]
+    var modelText: String? = nil
+    var images: [ChatImage]? = nil
     var toolCalls: [StoredToolCall]
     var subAgent: StoredSubAgent?
 }

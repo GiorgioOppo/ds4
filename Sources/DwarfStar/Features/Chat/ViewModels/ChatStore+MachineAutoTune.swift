@@ -280,6 +280,10 @@ extension ChatStore {
     /// settings are changed once, after the winning engine passes its final
     /// prompt-restoring RAM/swap probe.
     func runAutoTune(distributedRuntimeActive: Bool) {
+        guard service?.visionEnabled != true else {
+            benchStatus = "L’auto-tune con ricaricamento non è ancora disponibile per Vision Experimental. Usa i controlli manuali e ricarica il modello."
+            return
+        }
         guard settings.mode == .local else {
             benchStatus = "L'auto-tune macchina richiede la modalità Locale."
             return

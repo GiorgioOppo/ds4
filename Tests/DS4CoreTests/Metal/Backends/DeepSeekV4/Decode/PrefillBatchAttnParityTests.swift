@@ -44,7 +44,11 @@ final class PrefillBatchAttnParityTests: XCTestCase {
         try runPrefillParity(expectFullLayer: false)
     }
 
-    private func runPrefillParity(expectFullLayer: Bool) throws {
+    func testVisionPrefillKeepsImageBlockWholeAcrossTinyChunks() throws {
+        try runPrefillParity(expectFullLayer: false, vision: true)
+    }
+
+    private func runPrefillParity(expectFullLayer: Bool, vision: Bool = false) throws {
         let rt = try makeRuntime()
         let d = DSV4Dims(nEmbd: 512, nHC: 4, headDim: 512, nHead: 2, qRank: 256, qDim: 1024,
                          sharedFfn: 512, nExperts: 256, expertFfn: 256, k: 6, nRot: 64, vocab: 1024,
@@ -96,6 +100,29 @@ final class PrefillBatchAttnParityTests: XCTestCase {
                                                          try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes),
                                                          try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes))
                                              })
+        if vision {
+            let visualBias = [[Float]](repeating: [Float](repeating: 0, count: d.nExperts), count: nLayer)
+            let hashBias = [[Float]](repeating: [Float](repeating: 0, count: d.nExperts), count: 3)
+            try reference.configureVision(visualRouterBias: visualBias, hashRouterBias: hashBias)
+            try prefiller.configureVision(visualRouterBias: visualBias, hashRouterBias: hashBias)
+            let tokens = [d.vocab + 1, d.vocab, d.vocab + 2, d.vocab + 3, d.vocab + 4, 6]
+            var overrides: [Int: [Float]] = [:]
+            for i in 0..<5 { overrides[i] = (0..<d.nEmbd).map { _ in rf() } }
+            // The caller may ask for a chunk smaller than a single image. The
+            // whole visual block must still execute together, and the resident
+            // and gathered-expert paths must produce the same text logits.
+            let expected = try reference.prefill(tokens: tokens, chunk: 32, embeddingOverrides: overrides)
+            let actual = try prefiller.prefill(tokens: tokens, chunk: 1, embeddingOverrides: overrides)
+            XCTAssertEqual(actual.count, expected.count)
+            for i in actual.indices {
+                XCTAssertTrue(actual[i].isFinite)
+                XCTAssertEqual(actual[i], expected[i], accuracy: max(1, abs(expected[i])) * 1e-4)
+            }
+            XCTAssertThrowsError(try prefiller.prefill(tokens: tokens, embeddingOverrides: [:]))
+            XCTAssertThrowsError(try prefiller.prefill(tokens: [d.vocab, d.vocab + 2],
+                                                       embeddingOverrides: overrides))
+            return
+        }
         try XCTSkipUnless(prefiller.prefillBatchAttn, "DS4_PREFILL_BATCH_ATTN disabled in env")
 
         let tokens = (0..<12).map { _ in Int(abs(rf() * 1000)) % d.vocab }

@@ -18,3 +18,7 @@ The flow is `UIMessage` -> `StoredMessage` -> one JSON file per chat under
 Application Support, and the reverse when a session is opened. Preserve
 backward-compatible decoding when adding fields; use defaults or optional
 properties rather than making existing chat files unreadable.
+
+Optional `modelText` and `images` fields preserve attached document contents
+and original image bytes. Reopening a vision chat rebuilds both modalities;
+old sessions without these fields fall back to their visible message text.

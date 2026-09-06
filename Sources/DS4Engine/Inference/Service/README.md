@@ -12,6 +12,9 @@ operation on the decoder.
 - `InferenceService+Generation.swift`: prefill, sampling, streaming and
   checkpoints.
 - `InferenceService+Agents.swift`: agent profile selection.
+- `InferenceService+Vision.swift`: local image encoding, trusted visual token
+  blocks and replay. Image conversations retain absolute embedding overrides
+  for interrupted prefill recovery and bypass token-only disk KV caches.
 
 ## Flow
 

@@ -7,6 +7,8 @@ Presentazione SwiftUI per le conversazioni:
 - `ChatTabView` sceglie il contenuto locale, distribuito, di caricamento o di
   onboarding.
 - `ChatView` compone la trascrizione, la toolbar e l'editor del prompt.
+- `ChatEmptyState` offre spunti modificabili e contiene il popover
+  `ChatResponseSettings` per campionamento e ragionamento.
 - `MessageRow`, `MarkdownView` e `ToolMessageViews` renderizzano il contenuto
   dei messaggi.
 - `AttachmentViews`, `ToolSheets` e `ChatListView` forniscono controlli
@@ -28,6 +30,13 @@ L'header usa il descrittore del modello ispezionato/caricato e non assume mai
 un fallback DeepSeek. I controlli di tool e reasoning vengono renderizzati
 solo quando il backend selezionato dichiara la corrispondente capacità di
 runtime.
+La toolbar usa due righe per mantenere visibili modello e azioni della chat anche
+alla larghezza minima della finestra. La cronologia permette di cercare per titolo,
+mostra un menu di azioni per ogni riga e chiede conferma prima dell’eliminazione.
+Il composer supporta Comando-Invio per inviare ed Esc per interrompere la risposta;
+Comando-N inizia una nuova conversazione. Le anteprime immagini e l’indicatore
+Vision dipendono dalla capacità immagini configurata; gli allegati di testo
+rimangono disponibili.
 
 Durante lo streaming dei token, l'autoscroll della trascrizione è senza
 animazione e limitato a cinque aggiornamenti al secondo. Questo impedisce che
@@ -35,3 +44,7 @@ animazioni `ScrollViewProxy` sovrapposte sopravvivano allo smontaggio del
 pannello Chat quando l'utente passa a un'altra sezione della sidebar; la
 generazione resta di proprietà di `ChatStore` e continua a girare attraverso
 la navigazione.
+Scorrere verso i messaggi precedenti sospende l’inseguimento della risposta; un
+pulsante torna all’ultimo messaggio e lo riprende. Tornare in fondo manualmente
+lo riattiva. La geometria del contenuto distingue lo scorrimento dell’utente
+dall’allungamento della risposta.

@@ -76,7 +76,14 @@ extension StreamingDecoder {
     /// NOT reset the recurrent compressor and continues the KV cache from the given
     /// position (the caller guarantees positions 0..startPos-1 are already valid) —
     /// this is what enables KV reuse across turns (prefill only the new suffix).
-    public func prefill(tokens: [Int], startPos: Int = 0, chunk: Int = 512) throws -> [Float] {
+    public func prefill(tokens: [Int], startPos: Int = 0, chunk: Int = 512,
+                        embeddingOverrides: [Int: [Float]] = [:]) throws -> [Float] {
+        guard !tokens.isEmpty, startPos >= 0, startPos <= maxKeys,
+              tokens.count <= maxKeys - startPos else {
+            throw MetalError.unsupported("prefill: input vuoto o contesto insufficiente")
+        }
+        let imageSpans = try DeepSeekV4VisionAttention.spans(tokens: tokens, vocabularySize: d.vocab)
+        try validateVisionOverrides(tokens: tokens, startPos: startPos, overrides: embeddingOverrides)
         precondition(!tokens.isEmpty)
         if startPos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }   // fresh sequence
         var lastHC: GPUTensor?
@@ -89,12 +96,18 @@ extension StreamingDecoder {
         let step = max(1, envChunk ?? chunk)
         do {
             while start < tokens.count {
-                let end = min(start + step, tokens.count)
+                let imageSpan = imageSpans.first { $0.block.lowerBound == start }
+                let nextImage = imageSpans.first { $0.block.lowerBound > start }?.block.lowerBound ?? tokens.count
+                let end = imageSpan?.block.upperBound ?? min(start + step, tokens.count, nextImage)
                 // Drain the ObjC autorelease pool per chunk: Metal command buffers /
                 // encoders are autoreleased, and a long prefill inside one pool scope
                 // accumulates them all — transient footprint grows with the prompt.
                 let hiddens = try withPrefillAutoreleasePool {
-                    try prefillRange(tokens, start: start, end: end, posBase: startPos)
+                    if imageSpan != nil {
+                        return try prefillVisionBlock(Array(tokens[start..<end]),
+                            startPos: startPos + start, embeddingOverrides: embeddingOverrides)
+                    }
+                    return try prefillRange(tokens, start: start, end: end, posBase: startPos)
                 }
                 lastHC = hiddens.last
                 start = end

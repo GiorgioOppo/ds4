@@ -2,6 +2,12 @@
 
 # DeepSeekV4/Decode/Prefill
 
+`StreamingDecoder+Vision.swift` gestisce blocchi immagine interi, embedding
+per posizione assoluta e routing visuale specifico del checkpoint. Mantiene
+causali i token compressi e prepara le chiavi raw future per l'attenzione
+bidirezionale. La parità con singoli forward causali riguarda soltanto il testo:
+per le immagini si usa il riferimento Vision e non si spezzano i blocchi.
+
 Ingestione efficiente del prompt con elaborazione layer-major e batching.
 
 ## File principali

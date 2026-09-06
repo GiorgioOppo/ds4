@@ -7,17 +7,59 @@ import DS4Engine
 struct DownloadView: View {
     @Bindable var store: ChatStore
     @State private var runner = DownloadRunner()
+    @State private var searchText = ""
+    @State private var filter = CatalogFilter.runnable
     @Environment(\.dismiss) private var dismiss
+
+    private enum CatalogFilter: String, CaseIterable, Identifiable {
+        case runnable = "Pronti all'uso"
+        case vision = "Vision"
+        case accessories = "Accessori"
+        case all = "Tutti"
+        var id: String { rawValue }
+    }
+
+    private var visibleEntries: [ModelCatalogEntry] {
+        ModelCatalogRegistry.downloadEntries.filter { entry in
+            let matchesFilter = switch filter {
+            case .runnable: entry.isSelectable
+            case .vision: entry.requiresVisionEncoder || entry.id == .visionEncoder || entry.id == .visionDSparkSupport
+            case .accessories: entry.artifacts.allSatisfy { $0.role == .optionalComponent }
+            case .all: true
+            }
+            let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return matchesFilter && (query.isEmpty
+                || entry.displayName.localizedCaseInsensitiveContains(query)
+                || entry.summary.localizedCaseInsensitiveContains(query))
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
 
+            HStack {
+                Picker("Mostra modelli", selection: $filter) {
+                    ForEach(CatalogFilter.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                TextField("Cerca modelli", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 220)
+                    .accessibilityLabel("Cerca nel catalogo modelli")
+            }
+
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(ModelCatalogRegistry.downloadEntries) { entry in
+                    if visibleEntries.isEmpty {
+                        ContentUnavailableView.search(text: searchText)
+                            .padding()
+                    }
+                    ForEach(visibleEntries) { entry in
                         catalogRow(entry)
-                        if entry.id != ModelCatalogRegistry.downloadEntries.last?.id {
+                        if entry.id != visibleEntries.last?.id {
                             Divider()
                         }
                     }
@@ -123,6 +165,12 @@ struct DownloadView: View {
                 runtimeLabel(entry.runtimeAvailability)
             }
             .font(.caption)
+
+            if entry.requiresVisionEncoder {
+                Label("Immagini: abbina l'encoder dalla scheda Vision (933 MB).", systemImage: "photo")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             if installation.state == .partial {
                 let local = installation.localBytes + installation.partialBytes
@@ -232,6 +280,14 @@ struct DownloadView: View {
             } label: {
                 Label("Annulla", systemImage: "xmark.circle")
             }
+        } else if installation.state == .installed, entry.id == .visionEncoder,
+                  let path = installation.pathsByTargetID[DeepSeekV4VisionCatalog.encoder.id] {
+            let selected = pathsAreEqual(path, store.settings.visionEncoderPath)
+            Button { _ = store.selectVisionEncoder(path: path) } label: {
+                Label(selected ? "Encoder selezionato" : "Usa encoder",
+                      systemImage: selected ? "checkmark.circle.fill" : "photo.badge.checkmark")
+            }
+            .disabled(selected || runner.isRunning)
         } else if installation.state == .installed, entry.isSelectable,
                   let path = selectedPath(for: entry, installation: installation) {
             HStack {
@@ -245,6 +301,7 @@ struct DownloadView: View {
                           systemImage: isSelected ? "checkmark.circle.fill" : "circle")
                 }
                 .disabled(isSelected || runner.isRunning)
+                .help("Usa questo modello nella chat")
             }
         } else if installation.state == .installed {
             if runner.updateState(for: entry) == .available {

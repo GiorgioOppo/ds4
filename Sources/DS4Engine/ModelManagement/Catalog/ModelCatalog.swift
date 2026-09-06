@@ -11,6 +11,11 @@ public enum ModelCatalogID: String, CaseIterable, Identifiable, Sendable, Hashab
     case flashQ4Imatrix = "q4-imatrix"
     case flashQ4Imatrix0731 = "q4-imatrix-0731"
     case flashMXFP40731 = "mxfp4-0731"
+    case flashVisionQ2 = "ds4f-vision-q2"
+    case flashVisionQ2Q4 = "ds4f-vision-q2-q4"
+    case flashVisionMXFP4 = "ds4f-vision-mxfp4"
+    case visionEncoder = "ds4f-vision-encoder"
+    case visionDSparkSupport = "ds4f-vision-dspark"
     case proQ2Imatrix = "pro-q2-imatrix"
     case proQ4Split = "pro-q4-split"
     case glm52IQ2XXS = "glm-5.2-iq2-xxs"
@@ -64,6 +69,13 @@ public struct HuggingFaceSource: Sendable, Hashable {
 
     public static let deepSeekV4 = Self(
         repository: "antirez/deepseek-v4-gguf"
+    )
+
+    /// Vision-Exp is a separate checkpoint. Pin all matching language,
+    /// encoder and draft artifacts to the same verified publication.
+    public static let deepSeekV4Vision = Self(
+        repository: "antirez/deepseek-v4-gguf",
+        revision: "f71f23d552d664e523b422157b2befbf74040380"
     )
 
     public static let glm52 = Self(
@@ -202,6 +214,15 @@ public struct ModelCatalogEntry: Sendable, Identifiable, Hashable {
     public var primaryArtifact: ModelTarget? {
         guard isSelectable else { return nil }
         return artifacts[0]
+    }
+
+    /// Image understanding requires the matching encoder sidecar. The encoder
+    /// is acquired separately and must never replace the active language model.
+    public var requiresVisionEncoder: Bool {
+        switch id {
+        case .flashVisionQ2, .flashVisionQ2Q4, .flashVisionMXFP4: true
+        default: false
+        }
     }
 
     /// Raw consecutive pieces of one GGUF. They are deliberately kept
@@ -551,7 +572,7 @@ public enum LagunaModelCatalog {
 /// Cross-family source of truth rendered by the downloader UI.
 public enum ModelCatalogRegistry {
     public static let entries: [ModelCatalogEntry] =
-        DeepSeekV4ModelCatalog.entries + GLM52ModelCatalog.entries
+        DeepSeekV4ModelCatalog.entries + DeepSeekV4VisionCatalog.entries + GLM52ModelCatalog.entries
             + LagunaModelCatalog.entries + KimiK3ModelCatalog.entries
 
     public static let selectableEntries: [ModelCatalogEntry] = entries.filter(\.isSelectable)
@@ -562,6 +583,7 @@ public enum ModelCatalogRegistry {
     /// DSpark sidecar cannot accidentally replace the active main model.
     public static let downloadEntries: [ModelCatalogEntry] =
         entries + DeepSeekV4AccessoryCatalog.downloadEntries
+            + DeepSeekV4VisionCatalog.accessoryEntries
 
     public static func entry(_ id: ModelCatalogID) -> ModelCatalogEntry? {
         entries.first { $0.id == id }

@@ -94,6 +94,7 @@ extension ChatStore {
         // Folder grant (sandbox): re-arm access to the model's directory so the
         // sidecar caches next to the GGUF stay readable across launches.
         ModelPicker.restoreFolderBookmark()
+        restoreVisionEncoderBookmark()
     }
 
     /// Scan the configured directories for GGUF files.
@@ -153,6 +154,7 @@ extension ChatStore {
             }
         }
         let path = modelPath, ctx = contextSize
+        let visionPath = settings.visionEncoderPath
         let cacheSlots = expertCacheSlots
         let lagunaKVInitial = max(256, min(self.lagunaKVInitial, ctx))
         let glmResident = glmResidentLayers
@@ -367,7 +369,8 @@ extension ChatStore {
                                 modelPath: path,
                                 contextSize: ctx,
                                 systemPrompt: nil,   // set by applyAgent below
-                                expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil))
+                                expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil,
+                                visionEncoderPath: visionPath.isEmpty ? nil : visionPath))
                         } catch {
                             cont.resume(throwing: error)
                         }

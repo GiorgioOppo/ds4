@@ -37,4 +37,8 @@ final class AppSettings {
     }
 
     var modelName: String { (modelPath as NSString).lastPathComponent }
+
+    var visionEncoderPath: String = UserDefaults.standard.string(forKey: "DS4VisionEncoderPath") ?? "" {
+        didSet { UserDefaults.standard.set(visionEncoderPath, forKey: "DS4VisionEncoderPath") }
+    }
 }

@@ -29,6 +29,8 @@ extension StoredMessage {
         self.reasoning = m.reasoning
         self.text = m.text
         self.attachments = m.attachments
+        self.modelText = m.modelText
+        self.images = m.images.isEmpty ? nil : m.images
         self.toolCalls = m.toolCalls.map { StoredToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON) }
         self.subAgent = m.subAgent.map {
             StoredSubAgent(target: $0.target, question: $0.question, answer: $0.answer, steps: $0.steps)
@@ -44,6 +46,8 @@ extension UIMessage {
                   toolStreamText: "",
                   toolCalls: s.toolCalls.map { ToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON) },
                   attachments: s.attachments,
+                  modelText: s.modelText,
+                  images: s.images ?? [],
                   subAgent: s.subAgent.map {
                       InferenceService.SubAgentRun(target: $0.target, question: $0.question,
                                                    answer: $0.answer, steps: $0.steps)
@@ -53,14 +57,13 @@ extension UIMessage {
 
 extension ChatStore {
     /// Rebuild engine turns from the visible transcript to re-prime a reopened chat.
-    /// Attachments (one-shot context) are not restored; tool results are re-fed by
-    /// their displayed content so the model keeps the thread.
+    /// Imported text is preserved; old sessions fall back to visible text.
     static func chatTurns(from messages: [UIMessage]) -> [ChatTurn] {
         var turns: [ChatTurn] = []
         for m in messages {
             switch m.role {
             case .user:
-                turns.append(.user(m.text))
+                turns.append(.user(m.modelText ?? m.text))
             case .assistant:
                 if m.text.isEmpty && m.toolCalls.isEmpty { continue }
                 turns.append(.assistant(text: m.text, toolCalls: m.toolCalls))
@@ -73,5 +76,12 @@ extension ChatStore {
         }
         return turns
     }
-}
 
+    static func visionChatTurns(from messages: [UIMessage]) -> [VisionChatTurn] {
+        messages.flatMap { message in
+            chatTurns(from: [message]).map {
+                VisionChatTurn(turn: $0, images: message.role == .user ? message.images : [])
+            }
+        }
+    }
+}

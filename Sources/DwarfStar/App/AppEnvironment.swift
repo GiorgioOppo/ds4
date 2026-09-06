@@ -9,17 +9,20 @@ import Darwin
 /// we ship `metal/` (kernel sources, required), and optionally the `ds4*`
 /// helper binaries under `bin/` and `speed-bench/`.
 enum AppEnvironment {
-    /// Root of the upstream ds4 project on this machine. Hardcoded for the
-    /// user's machine; override with the DS4_ROOT environment variable.
+    /// Resolve the checkout without depending on a developer's home directory.
+    /// DS4_ROOT remains available for an explicit models/helpers location.
     static let projectRoot: String = {
         if let env = ProcessInfo.processInfo.environment["DS4_ROOT"], !env.isEmpty {
             return env
         }
-        return "/Users/oppog/Downloads/ds4-main"
+        return checkoutRoot
     }()
 
     /// Root of the DS4-gui project itself (where the bundled metal/ kernels live).
-    static let guiRoot: String = (projectRoot as NSString).appendingPathComponent("DS4-gui")
+    private static let checkoutRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent().path
+    static let guiRoot: String = checkoutRoot
 
     static var isBundled: Bool {
         Bundle.main.bundleURL.pathExtension == "app"
@@ -75,8 +78,9 @@ enum AppEnvironment {
     /// Flash GGUF; in a bundle we have no bundled model, so the user selects one.
     static var defaultModelPath: String {
         if isBundled { return "" }
-        return (projectRoot as NSString).appendingPathComponent(
+        let path = (projectRoot as NSString).appendingPathComponent(
             "gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf")
+        return FileManager.default.isReadableFile(atPath: path) ? path : ""
     }
 
     static func binary(_ name: String) -> String {

@@ -15,6 +15,28 @@ enum AppSection: String, CaseIterable, Identifiable {
     case diagnostics = "Diagnostics"
 
     var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .chat: return "Chat"
+        case .settings: return "Modelli e impostazioni"
+        case .agents: return "Agenti"
+        case .mcp: return "Connessioni MCP"
+        case .project: return "Progetti"
+        case .tuning: return "Ottimizzazione"
+        case .server: return "Server API"
+        case .distributed: return "Worker distribuito"
+        case .benchmark: return "Benchmark"
+        case .sweBench: return "Swift-bench"
+        case .conversion: return "Conversione modelli"
+        case .diagnostics: return "Diagnostica"
+        }
+    }
+
+    static let workspace: [AppSection] = [.chat, .project, .agents]
+    static let configuration: [AppSection] = [.settings, .mcp]
+    static let advanced: [AppSection] = [.tuning, .server, .distributed, .benchmark,
+                                         .sweBench, .conversion, .diagnostics]
     var icon: String {
         switch self {
         case .chat: return "bubble.left.and.bubble.right"
@@ -61,11 +83,43 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(AppSection.allCases, selection: $selection) { section in
-                Label(section.rawValue, systemImage: section.icon).tag(section)
+            List(selection: $selection) {
+                Section("Spazio di lavoro") {
+                    navigationRows(AppSection.workspace)
+                }
+                Section("Configurazione") {
+                    navigationRows(AppSection.configuration)
+                }
+                Section("Strumenti avanzati") {
+                    navigationRows(AppSection.advanced)
+                }
             }
-            .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 220)
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
             .navigationTitle("DwarfStar")
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Button { selection = .settings } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: engineStatus.icon)
+                            .foregroundStyle(engineStatus.color)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(engineStatus.title)
+                                .font(.caption.weight(.medium))
+                            Text(settings.mode == .local ? "Esecuzione locale" : "Esecuzione distribuita")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right").font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(12)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(.bar)
+                .help("Apri la configurazione del modello e del motore")
+            }
         } detail: {
             VStack(spacing: 0) {
                 if store.benchRunning {
@@ -76,9 +130,9 @@ struct RootView: View {
                             .font(.caption)
                             .lineLimit(1)
                         Spacer()
-                        Button("Apri Settings") { selection = .settings }
+                        Button("Apri impostazioni") { selection = .settings }
                             .font(.caption)
-                        Button("Stop", role: .destructive) { store.cancelAutoTune() }
+                        Button("Interrompi", role: .destructive) { store.cancelAutoTune() }
                             .font(.caption)
                     }
                     .padding(.horizontal, 12)
@@ -120,6 +174,31 @@ struct RootView: View {
                 // or mutate the single engine while the tuner swaps services.
                 .allowsHitTesting(!store.benchRunning || selection == .settings)
             }
+        }
+    }
+
+    private func navigationRows(_ sections: [AppSection]) -> some View {
+        ForEach(sections) { section in
+            Label(section.title, systemImage: section.icon)
+                .lineLimit(1)
+                .help(section.title)
+                .tag(section)
+        }
+    }
+
+    private var engineStatus: (title: String, icon: String, color: Color) {
+        if settings.mode == .distributed {
+            return ("Motore distribuito", "network", .secondary)
+        }
+        switch store.phase {
+        case .ready:
+            return ("Modello pronto", "checkmark.circle.fill", .green)
+        case .loading:
+            return ("Caricamento in corso…", "hourglass", .accentColor)
+        case .failed:
+            return ("Controlla il modello", "exclamationmark.triangle", .orange)
+        case .needsModel:
+            return ("Configura il modello", "shippingbox", .secondary)
         }
     }
 }

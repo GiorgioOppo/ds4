@@ -101,6 +101,8 @@ public struct DeepSeekV4Shape: Sendable, Equatable {
 /// ratios, and per-layer SwiGLU clamp. Port of config_validate_model.
 public struct DeepSeekV4Configuration: Sendable {
     public let shape: DeepSeekV4Shape
+    public let isVisionExperimental: Bool
+    public let rmsEpsilon: Float
     public let compressRatios: [UInt32]      // one per layer
     public let swigluClampExp: [Float]       // one per layer
     public let ropeFreqBase: Float
@@ -116,6 +118,16 @@ public struct DeepSeekV4Configuration: Sendable {
     static func f32Matches(_ got: Float, _ expected: Float) -> Bool {
         let scale = abs(expected) > 1 ? abs(expected) : 1
         return abs(got - expected) <= scale * 1.0e-6
+    }
+
+    static func checkpointRmsEpsilon(variant: DeepSeekV4Variant, checkpoint: String?,
+                                      sidecarRequired: Bool?, sourceRevision: String?) throws -> Float {
+        guard let checkpoint else { return DeepSeekV4Defaults.rmsEps }
+        guard checkpoint == "vision-exp", variant == .flash, sidecarRequired == true,
+              sourceRevision == "e46e16bf6035c6f317eb2ac7458eb0362926d402" else {
+            throw DeepSeekV4ConfigurationError.unsupportedShape("unsupported DeepSeek Vision checkpoint metadata")
+        }
+        return 1.0e-20
     }
 
     public var descriptor: ModelDescriptor {
@@ -193,6 +205,12 @@ public struct DeepSeekV4Configuration: Sendable {
                 "layers=\(nLayer) embd=\(nEmbd) heads=\(nHead) q_lora=\(nLoraQ) out_groups=\(nOutGroup) experts=\(nExpert) ff_exp=\(nFFExp) indexer_top_k=\(nIndexerTopK)")
         }
         self.shape = selected
+        let checkpoint = model.string("deepseek4.checkpoint_variant")
+        isVisionExperimental = checkpoint != nil
+        rmsEpsilon = try Self.checkpointRmsEpsilon(
+            variant: selected.variant, checkpoint: checkpoint,
+            sidecarRequired: model.bool("deepseek4.vision.sidecar_required"),
+            sourceRevision: model.string("general.source.revision"))
 
         // Expert groups must be absent/zero (config_expect_u32 == 0).
         let nGroups = model.u32("deepseek4.expert_group_count") ?? 0
@@ -288,9 +306,12 @@ public struct DeepSeekV4Configuration: Sendable {
                                             expected: "\(selected.expertWeightScale)", got: "\(ews)")
         }
         let rmsEps = try reqF32("attention.layer_norm_rms_epsilon")
-        if !Self.f32Matches(rmsEps, DeepSeekV4Defaults.rmsEps) {
+        let epsilonMatches = isVisionExperimental
+            ? rmsEps.isFinite && abs(rmsEps - rmsEpsilon) <= rmsEpsilon * 1.0e-6
+            : Self.f32Matches(rmsEps, rmsEpsilon)
+        if !epsilonMatches {
             throw DeepSeekV4ConfigurationError.mismatch("attention.layer_norm_rms_epsilon",
-                                            expected: "\(DeepSeekV4Defaults.rmsEps)", got: "\(rmsEps)")
+                                            expected: "\(rmsEpsilon)", got: "\(rmsEps)")
         }
         let hcEps = try reqF32("hyper_connection.epsilon")
         if !Self.f32Matches(hcEps, DeepSeekV4Defaults.hcEps) {

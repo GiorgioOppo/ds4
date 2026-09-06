@@ -144,6 +144,7 @@ extension ChatStore {
             // User-initiated stop: keep the partial text, no error banner.
         } catch {
             guard ownsConversationWork(epoch) else { return }
+            enginePrimed = false
             let tail = EngineLog.shared.tail()
             if index < messages.count {
                 messages[index].text += "\n[errore: \(error)]"

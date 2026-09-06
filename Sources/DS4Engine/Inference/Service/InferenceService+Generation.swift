@@ -71,7 +71,7 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         // checkpoint that is an exact token prefix of this prompt and prefill only
         // the remainder. Covers both a fresh chat (system/agent prefix) and the
         // stateless HTTP server (each request re-sends the whole transcript).
-        if committedIds.isEmpty, !kvDirty, let store = diskKV,
+        if visionBlocks.isEmpty, committedIds.isEmpty, !kvDirty, let store = diskKV,
            let hit = store.findLongestPrefix(of: suffixIds, modelName: modelName) {
             continuation.yield(.progress("ripristino KV da disco (\(hit.tokens.count) token)…"))
             // Streaming restore: one layer at a time from file to KV buffers,
@@ -91,6 +91,7 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         }
 
         let startPos = committedIds.count
+        let imageOverrides = visionEmbeddingOverrides
         guard startPos + suffixIds.count < contextSize else {
             throw InferenceError.contextExceeded(prompt: startPos + suffixIds.count, context: contextSize)
         }
@@ -108,7 +109,8 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             // Recover from an interrupted generation: replay the exact committed ids
             // from position 0 (resets the recurrent compressor) — slow once, correct.
             continuation.yield(.progress("ripristino KV (\(committedIds.count) token)…"))
-            _ = try decoder.prefill(tokens: committedIds, startPos: 0)
+            _ = try decoder.prefill(tokens: committedIds, startPos: 0,
+                                    embeddingOverrides: imageOverrides)
         }
 
         // Prefill ONLY the new suffix; positions 0..startPos-1 are reused from the KV.
@@ -162,6 +164,7 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             }
             var end = min(pfDone + pfChunk, suffixIds.count)
             if checkpointRel > pfDone && checkpointRel < end { end = checkpointRel }
+            end = visionPrefillEnd(start: startPos + pfDone, proposedEnd: startPos + end) - startPos
             // `chunk:` va passato ESPLICITAMENTE: il default del decoder è 512,
             // quindi ometterlo faceva risuddividere a 512 la fetta che questo
             // ciclo aveva già tagliato a DS4_PREFILL_CHUNK — il knob della GUI
@@ -170,10 +173,10 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             // mai. Qui la granularità esterna e quella interna coincidono.
             lastLogits = try decoder.prefill(tokens: Array(suffixIds[pfDone..<end]),
                                              startPos: startPos + pfDone,
-                                             chunk: pfChunk)
+                                             chunk: pfChunk, embeddingOverrides: imageOverrides)
             if resumablePrefill { committedIds.append(contentsOf: suffixIds[pfDone..<end]) }
             pfDone = end
-            if checkpointRel > 0 && pfDone == checkpointRel, let store = diskKV {
+            if visionBlocks.isEmpty, checkpointRel > 0 && pfDone == checkpointRel, let store = diskKV {
                 // Il prefisso condiviso è appena entrato nel KV: checkpoint SUBITO,
                 // non a fine generazione — uno stream annullato a metà decode o
                 // una conversazione nuova con lo stesso system prompt ripartono
@@ -562,7 +565,7 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         kvDirty = false                         // clean completion: KV matches committedIds
         saveExpertUsage()                       // persist the usage imatrix (cheap)
         // Disk KV checkpoint (interval-gated: each entry is tens of MB).
-        if let store = diskKV,
+        if visionBlocks.isEmpty, let store = diskKV,
            committedIds.count - lastDiskStoreCount >= store.options.storeIntervalTokens {
             continuation.yield(.progress("salvataggio KV su disco…"))
             // First checkpoint of a conversation = "cold" (anchor: the shared

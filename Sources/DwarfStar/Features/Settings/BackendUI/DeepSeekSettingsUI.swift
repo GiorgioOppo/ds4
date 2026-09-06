@@ -46,7 +46,12 @@ private struct DeepSeekBenchmarkExtras: View {
                         || dist.coordLoading || dist.isGenerating || dist.benchmarkActive
                 )
             }
-            .disabled(store.benchRunning || store.phase != .ready || store.isGenerating)
+            .disabled(store.benchRunning || store.phase != .ready || store.isGenerating
+                      || store.service?.visionEnabled == true)
+            if store.service?.visionEnabled == true {
+                Text("Auto-tune con ricaricamento non disponibile per Vision Experimental.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         if let reportURL = store.autoTuneReportURL {
             HStack(spacing: 8) {
