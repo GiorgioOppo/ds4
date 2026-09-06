@@ -9,6 +9,7 @@ enum MiniToolBenchResultFilter: String, CaseIterable, Identifiable {
     case passed = "Superati"
     case failed = "Non superati"
     case incomplete = "Incompleti"
+    case errors = "Con errori"
     var id: String { rawValue }
 }
 
@@ -240,6 +241,7 @@ final class MiniToolBenchController {
             case .passed: matchesFilter = task.passed
             case .failed: matchesFilter = task.completed && !task.passed
             case .incomplete: matchesFilter = !task.completed
+            case .errors: matchesFilter = task.hasExecutionErrors
             }
             return matchesSearch && matchesFilter
         }.sorted { $0.task.localizedStandardCompare($1.task) == .orderedAscending }
@@ -309,9 +311,16 @@ final class MiniToolBenchController {
                 self.resultSearch = ""
                 self.resultFilter = .all
                 self.isImporting = false
-                self.statusMessage = "Importati \(loaded.tasks.count) risultati verificati."
+                self.statusMessage = "Importati \(loaded.tasks.count) risultati."
+                    + (loaded.executionErrorCount > 0 ? " \(loaded.executionErrorCount) errori nei tentativi di esecuzione." : "")
                 if managed {
-                    self.managedStatus = "Esecuzione terminata. Risultati importati."
+                    if loaded.allTasksFailedBeforeInference {
+                        self.managedStatus = loaded.failureBeforeInferenceTitle
+                        self.managedError = loaded.failureBeforeInferenceMessage
+                            + (loaded.primaryExecutionIssue.map { "\n" + $0.summary } ?? "")
+                    } else {
+                        self.managedStatus = "Esecuzione terminata. Risultati importati."
+                    }
                     self.appendManagedLog(self.statusMessage ?? "Risultati importati")
                 }
             } catch is CancellationError {
@@ -334,6 +343,11 @@ final class MiniToolBenchController {
         if !NSWorkspace.shared.open(url) {
             errorMessage = "Nessuna applicazione disponibile per aprire \(url.lastPathComponent)."
         }
+    }
+
+    func copyErrorDetails(for task: MiniToolBenchTaskResult) {
+        guard task.hasExecutionErrors else { return }
+        copy(task.executionErrorDetails, message: "Dettagli degli errori di \(task.task) copiati.")
     }
 
     func revealReport() {

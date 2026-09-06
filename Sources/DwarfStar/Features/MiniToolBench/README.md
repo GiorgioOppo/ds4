@@ -20,8 +20,15 @@ Podman Linux VM and imports verified results. Task code runs in Linux containers
    the VM when needed. A new VM uses four CPUs, 4 GiB RAM and a 60 GiB disk.
 4. The first run prepares uv 0.12.10, managed Python 3.12, Harbor 0.20.0,
    podman-compose 1.6.0 and the pinned upstream checkout. Later runs reuse them.
-   The button runs doctor before starting the selected tests and automatically
-   imports the exported summary, task details and transcripts when finished.
+   The button runs doctor and starts an inert container to check execution and
+   endpoint DNS before starting the selected tests. It automatically imports
+   the exported summary, task details and transcripts when finished.
+
+Podman 6 removed `slirp4netns`. The managed integration substitutes an external
+network overlay: `bridge` for rootful Podman and `pasta:--map-gw` for rootless
+Podman. The pinned runner, task files and verifiers remain unchanged. A failed
+container preflight stops before any benchmark attempt; its temporary Compose
+project is removed, including on cancellation.
 
 The main panel shows phases and live logs. Stop sends a durable cancellation
 request into Linux, including during setup; it targets only this run's process
@@ -117,6 +124,20 @@ in the denominator. The attempt budget comes from matching `run-meta.json`;
 the app never labels an imported summary pass@2 merely because the current UI
 configuration selects two attempts. Different suites and profiles stay separate.
 
+Attempts with exceptions include an **Errore** details button and can be shown
+with the **Con errori** filter. The app distinguishes container setup failures
+from verifier results. When all attempts have a recognized startup failure and
+the task and summary counters record zero tokens, a banner explains that the
+run did not measure model quality. Zero usage alone does not establish that
+inference never started. A suite that finishes each task in a few seconds can therefore
+indicate an environment failure rather than fast inference.
+
+The upstream context recommendation is separate from container startup. With
+Harbor's 8,000-token summarization reserve, a real 8,192-token context can require
+frequent summaries after the initial turn. Only advertise the loaded backend's
+actual capacity. The API returns `context_length_exceeded` for overflow so the
+agent can recognize it and attempt its normal context recovery.
+
 ## Validation
 
 `MiniToolBenchTests` covers command construction, CLI option preservation,
@@ -124,6 +145,7 @@ official result contracts, missing files and unsafe/mixed artifact references.
 `LocalServerModelTests` covers real context advertisement separately from the
 completion limit. `MiniToolBenchRunnerTests` checks VM selection and the SSH
 protocol. `python3 -m unittest discover -s Tests/BootstrapTests -v` checks setup,
-doctor-before-run, export and cancellation with fake subprocesses. These tests
+doctor and container preflight before run, Podman network compatibility, export
+and cancellation with fake subprocesses. These tests
 do not run model inference or task containers.
 An end-to-end score requires the Linux runtime and a loaded model.

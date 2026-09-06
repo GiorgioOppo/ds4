@@ -119,14 +119,20 @@ def check_cancelled():
         raise Cancelled()
 
 
+def strip_ansi(text):
+    """Remove CSI display controls emitted by the Compose provider in pipes."""
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+
+
 def notice_cancellation():
     if not _cancelled and _cancel_marker is not None and _cancel_marker.exists():
         request_cancel(signal.SIGINT, None)
 
 
-def run_process(arguments, *, cwd=None, env=None, timeout=600, check=True):
+def run_process(arguments, *, cwd=None, env=None, timeout=600, check=True, cancellable=True):
     global _child
-    check_cancelled()
+    if cancellable:
+        check_cancelled()
     tail = collections.deque(maxlen=2000)
     pending = b""
     started = time.monotonic()
@@ -139,14 +145,16 @@ def run_process(arguments, *, cwd=None, env=None, timeout=600, check=True):
     )
     _child = process
     update_control()
-    notice_cancellation()
-    if _cancelled:
+    if cancellable:
+        notice_cancellation()
+    if cancellable and _cancelled:
         signal_child(signal.SIGINT)
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     try:
         while selector.get_map() or process.poll() is None:
-            notice_cancellation()
+            if cancellable:
+                notice_cancellation()
             now = time.monotonic()
             if timeout is not None and now - started > timeout and not timed_out:
                 timed_out = True
@@ -154,7 +162,7 @@ def run_process(arguments, *, cwd=None, env=None, timeout=600, check=True):
                 emit("log", message="Tempo massimo della fase di preparazione raggiunto.")
             if timed_out and now - started > timeout + 10:
                 signal_child(signal.SIGKILL)
-            if _cancelled and _cancel_time is not None:
+            if cancellable and _cancelled and _cancel_time is not None:
                 elapsed = now - _cancel_time
                 if elapsed >= 20 and escalation < 1:
                     signal_child(signal.SIGTERM)
@@ -173,11 +181,11 @@ def run_process(arguments, *, cwd=None, env=None, timeout=600, check=True):
                         line, pending = pending.split(b"\n", 1)
                     else:
                         line, pending = pending[:32768], pending[32768:]
-                    text = line.decode("utf-8", errors="replace").rstrip("\r")
+                    text = strip_ansi(line.decode("utf-8", errors="replace").rstrip("\r"))
                     tail.append(text)
                     emit("log", message=text)
         if pending:
-            text = pending.decode("utf-8", errors="replace")
+            text = strip_ansi(pending.decode("utf-8", errors="replace"))
             tail.append(text)
             emit("log", message=text)
         code = process.wait()
@@ -193,7 +201,8 @@ def run_process(arguments, *, cwd=None, env=None, timeout=600, check=True):
                 process.wait()
         _child = None
         update_control()
-    check_cancelled()
+    if cancellable:
+        check_cancelled()
     output = "\n".join(tail)
     if timed_out:
         raise BootstrapError("Preparazione interrotta per timeout; puoi riprovare.")
@@ -290,6 +299,102 @@ def owned_workspace(request):
     return root
 
 
+def install_runtime_compatibility(root, repository, python, podman, env):
+    _, description = run_process([podman, "--version"], env=env, timeout=30)
+    match = re.search(r"\bpodman version (\d+)\.", description, re.IGNORECASE)
+    if not match:
+        raise BootstrapError("Impossibile determinare la versione di Podman per configurare la rete.")
+    major = int(match.group(1))
+    # Podman 6 removed slirp4netns and only supports pasta in rootless mode.
+    # Rootful bridge retains the VM's gvproxy route to the Mac through
+    # host.containers.internal; rootless pasta explicitly allows host access.
+    network = "slirp4netns:allow_host_loopback=true"
+    if major >= 6:
+        _, rootless = run_process([podman, "info", "--format={{.Host.Security.Rootless}}"], env=env, timeout=30)
+        rootless = rootless.strip()
+        if rootless not in {"true", "false"}:
+            raise BootstrapError("Impossibile determinare se Podman è rootless; configurazione della rete interrotta.")
+        network = "pasta:--map-gw" if rootless == "true" else "bridge"
+    compatibility = root / "compat"
+    compatibility.mkdir(exist_ok=True, mode=0o700)
+    overlay = compatibility / "terminal-network-loopback.json"
+    write_json(overlay, {"services": {"main": {"network_mode": network}}})
+    original = repository / "compat/podman/terminal-network-podman-loopback.json"
+    adapter = compatibility / "docker-runtime.py"
+    # The official shim still handles project directories, image names, bind
+    # labels and compose cp. Replace only its exact known network-overlay path,
+    # after it delegates to TBENCH_REAL_DOCKER; never edit the pinned checkout.
+    adapter.write_text("import os, sys\nfrom pathlib import Path\n"
+        + "original = " + repr(str(original.resolve())) + "\n"
+        + "replacement = " + repr(str(overlay)) + "\n"
+        + "runtime = " + repr(str(podman)) + "\n"
+        + "arguments = sys.argv[1:]\n"
+        + "if arguments and arguments[0] == 'compose':\n"
+        + "    for index, value in enumerate(arguments):\n"
+        + "        if index and arguments[index - 1] in {'-f', '--file'} and str(Path(value).resolve()) == original:\n"
+        + "            arguments[index] = replacement\n"
+        + "        elif value.startswith(('-f=', '--file=')) and str(Path(value.split('=', 1)[1]).resolve()) == original:\n"
+        + "            arguments[index] = value.split('=', 1)[0] + '=' + replacement\n"
+        + "os.execv(runtime, [runtime, *arguments])\n")
+    adapter.chmod(0o600)
+    docker = root / "bin/docker"
+    docker.write_text("#!/bin/sh\nexec " + shlex.quote(str(python)) + " " + shlex.quote(str(adapter)) + " \"$@\"\n")
+    docker.chmod(0o700)
+    emit("log", message=f"Compatibilità Podman {major}: rete {network}; checkout ufficiale invariato.")
+
+
+def container_preflight(root, repository, env, run_directory, configuration):
+    emit("phase", message="Verifica reale di avvio ed esecuzione del container, senza richieste al modello…")
+    project = "dwarfstar-preflight-" + uuid.uuid4().hex
+    directory = run_directory / "preflight"
+    directory.mkdir(exist_ok=True, mode=0o700)
+    compose = directory / "compose.json"
+    # Reuse the official smoke task's cached image and instruction set. An
+    # inert shell tests the same image/runtime compatibility without executing
+    # its task, agent or verifier and without mounting host directories.
+    image = "docker.io/alexgshaw/git-leak-recovery:20251031"
+    write_json(compose, {"services": {"main": {
+        "image": image, "entrypoint": ["/bin/sh", "-c", 'trap "exit 0" TERM INT; sleep 120 & wait'],
+        "network_mode": "none", "labels": {"org.dwarfstar.preflight": project},
+    }}})
+    probe_env = {**env,
+        "TBENCH_REAL_DOCKER": str(root / "bin/docker"),
+        "TBENCH_CONTAINER_RUNTIME": "podman", "TBENCH_CONTAINER_NETWORK_MODE": "podman-loopback",
+        "TBENCH_JOBS_DIR": str(repository / "jobs"),
+        "PATH": str(repository / "compat/podman") + os.pathsep + env.get("PATH", ""),
+    }
+    command = [repository / "compat/podman/docker", "compose", "--project-directory", directory,
+               "-f", compose, "--project-name", project]
+    cleanup_code = 0
+    try:
+        run_process([*command, "up", "--detach"], cwd=directory, env=probe_env, timeout=900)
+        _, output = run_process([*command, "exec", "-T", "main", "/bin/sh", "-c",
+                                 "printf 'DWARFSTAR_PREFLIGHT_OK\\n'"],
+                                cwd=directory, env=probe_env, timeout=60)
+        # podman-compose may prefix even non-TTY exec output with an ANSI reset.
+        # Remove CSI display controls, then require a whole acknowledgement
+        # line so a command echo or an error quoting the token cannot pass.
+        plain_output = strip_ansi(output)
+        if "DWARFSTAR_PREFLIGHT_OK" not in plain_output.splitlines():
+            raise BootstrapError("Il container non ha confermato l’esecuzione del comando di verifica.")
+        endpoint = urlsplit(field(configuration, "endpoint", required=True))
+        run_process([*command, "exec", "-T", "main", "/usr/bin/getent", "--", "ahosts", endpoint.hostname],
+                    cwd=directory, env=probe_env, timeout=30)
+        emit("log", message="DNS del container verificato; disponibilità e autenticazione dell’endpoint verificate dal doctor nella VM.")
+    except BootstrapError as error:
+        raise BootstrapError("Il controllo del container è fallito prima dei task; nessun tentativo è stato consumato. " + str(error)) from error
+    finally:
+        # A cancellation must still tear down this one owned Compose project.
+        cleanup_code, _ = run_process([*command, "down"], cwd=directory, env=probe_env,
+                                      timeout=45, check=False, cancellable=False)
+        if cleanup_code:
+            emit("log", message=f"Pulizia del container di verifica non riuscita: progetto {project}.")
+    check_cancelled()
+    if cleanup_code:
+        raise BootstrapError("Il controllo è terminato ma la pulizia del suo container non è riuscita; prova interrotta.")
+    emit("log", message="Container avviato ed eseguito correttamente; progetto di verifica rimosso.")
+
+
 def prepare(root):
     check_cancelled()
     podman = shutil.which("podman")
@@ -359,6 +464,7 @@ def prepare(root):
     _, dirty = run_process(["git", "-C", repository, "status", "--porcelain", "--untracked-files=no"], env=env, timeout=30)
     if revision.strip() != REVISION or remote.strip().removesuffix(".git") != REPOSITORY.removesuffix(".git") or dirty.strip():
         raise BootstrapError("Il checkout del runner è stato modificato o ha una revisione diversa; DwarfStar non lo resetta.")
+    install_runtime_compatibility(root, repository, python, podman, env)
     emit("prepared", workspace=str(root), repository=str(repository), revision=REVISION)
     return python, repository, env
 
@@ -486,6 +592,7 @@ def main():
             emit("phase", message="Verifica di endpoint, modello e prerequisiti…")
             run_process([python, repository / "terminal_bench.py", "doctor", *connection_arguments(configuration)],
                         cwd=repository, env=env, timeout=180)
+            container_preflight(root, repository, env, run_directory, configuration)
         if action == "run":
             write_json(run_directory / "run-requested.json", {"run_id": run_id, "revision": REVISION})
             emit("phase", message="Esecuzione dei task e dei verificatori nei container…")

@@ -191,7 +191,7 @@ final class LocalServer: @unchecked Sendable {
             // leggere il motivo — un 503 anonimo fa sembrare rotto il server
             // quando il problema è la richiesta.
             onLog("errore richiesta: \(e)\n")
-            try? await send(conn, Self.httpError(400, "\(e)", cors: config.cors))
+            try? await send(conn, Self.inferenceErrorResponse(e, cors: config.cors))
         } catch {
             onLog("errore richiesta: \(error)\n")
             try? await send(conn, Self.httpError(503, "internal error", cors: config.cors))

@@ -30,6 +30,41 @@ final class LocalServerModelTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testContextOverflowUsesRecoverableOpenAIErrorCode() throws {
+        let data = LocalServer.inferenceErrorResponse(
+            .contextExceeded(prompt: 8_193, context: 8_192), cors: true)
+        let http = try XCTUnwrap(String(data: data, encoding: .utf8))
+        let separator = try XCTUnwrap(http.range(of: "\r\n\r\n"))
+        let headers = String(http[..<separator.lowerBound])
+        let body = String(http[separator.upperBound...])
+        let error = try XCTUnwrap(try object(body)["error"] as? [String: Any])
+
+        XCTAssertTrue(headers.hasPrefix("HTTP/1.1 400 Bad Request\r\n"))
+        XCTAssertTrue(headers.contains("Content-Type: application/json\r\n"))
+        XCTAssertTrue(headers.contains("Content-Length: \(body.utf8.count)\r\n"))
+        XCTAssertTrue(headers.contains("Access-Control-Allow-Origin: *\r\n"))
+        XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+        XCTAssertEqual(error["code"] as? String, "context_length_exceeded")
+        let message = try XCTUnwrap(error["message"] as? String)
+        XCTAssertTrue(message.lowercased().contains("context length exceeded"))
+        XCTAssertTrue(message.contains("8193"))
+        XCTAssertTrue(message.contains("8192"))
+    }
+
+    func testOrdinaryBadRequestIsNotLabeledAsContextOverflow() throws {
+        let message = "invalid JSON body: \"quoted\"\nnext line"
+        let data = LocalServer.httpError(400, message, cors: false)
+        let http = try XCTUnwrap(String(data: data, encoding: .utf8))
+        let separator = try XCTUnwrap(http.range(of: "\r\n\r\n"))
+        let body = String(http[separator.upperBound...])
+        let error = try XCTUnwrap(try object(body)["error"] as? [String: Any])
+
+        XCTAssertEqual(error["message"] as? String, message)
+        XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+        XCTAssertNil(error["code"])
+        XCTAssertFalse(http[..<separator.lowerBound].contains("Access-Control-Allow-Origin"))
+    }
+
     private func makeServer(contextSize: Int, completionDefault: Int) -> LocalServer {
         LocalServer(backend: ModelMetadataBackend(contextSize: contextSize),
                     modelName: "loaded-\"model.gguf",

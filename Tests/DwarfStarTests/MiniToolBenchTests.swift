@@ -258,6 +258,181 @@ final class MiniToolBenchTests: XCTestCase {
         XCTAssertEqual(report.summary.passRate, 0)
     }
 
+    private func infrastructureFailureTask() -> [String: Any] {
+        var row = task(passed: false)
+        row["completed"] = false
+        row["tokens"] = ["input": 0, "output": 0, "cached": 0]
+        row["attempts"] = (1...2).map { attempt -> [String: Any] in
+            ["attempt": attempt, "passed": false, "duration_ms": 1_500,
+             "tokens": ["input": 0, "output": 0, "cached": 0],
+             "exception": ["exception_type": "RuntimeError",
+                 "exception_message": "Docker compose command failed for environment git-leak-recovery. Return code: 125. Error: slirp4netns support has been removed, use --network=pasta instead",
+                 "exception_traceback": "Traceback: environment.start -> compose up",
+                 "occurred_at": "2026-09-06T12:47:14.720686"]]
+        }
+        return row
+    }
+
+    private func writeInfrastructureFailure(in folder: URL, row: [String: Any]? = nil) throws {
+        var document = summary(passed: 0)
+        document["tokens"] = ["input": 0, "output": 0, "cached": 0]
+        try write(document, name: "summary.json", in: folder)
+        try write(row ?? infrastructureFailureTask(), name: "results-git-leak-recovery.json", in: folder)
+    }
+
+    func testContainerFailuresAreDiagnosedWithoutChangingOfficialScore() throws {
+        let folder = try directory()
+        try writeInfrastructureFailure(in: folder)
+        let report = try MiniToolBenchReport.load(from: folder)
+        XCTAssertEqual(report.summary.totalTasks, 1)
+        XCTAssertEqual(report.summary.passedTasks, 0)
+        XCTAssertEqual(report.summary.passRate, 0)
+        XCTAssertEqual(report.tasksWithExecutionErrors, 1)
+        XCTAssertEqual(report.executionErrorCount, 2)
+        XCTAssertEqual(report.infrastructureErrorCount, 2)
+        XCTAssertTrue(report.allTasksFailedBeforeInference)
+        XCTAssertEqual(report.failureBeforeInferenceTitle, "Ambiente di esecuzione bloccato")
+        XCTAssertTrue(report.failureBeforeInferenceMessage.contains("0 token"))
+        XCTAssertTrue(report.failureBeforeInferenceMessage.contains("non misura la qualità del modello"))
+        XCTAssertTrue(report.primaryExecutionIssue?.summary.contains("slirp4netns") == true)
+        XCTAssertEqual(report.tasks.first?.attempts?.first?.exception?.exceptionType, "RuntimeError")
+        XCTAssertEqual(report.tasks.first?.attempts?.first?.exception?.occurredAt, "2026-09-06T12:47:14.720686")
+    }
+
+    func testMissingTokenUsageCannotEstablishFailureBeforeInference() throws {
+        let folder = try directory()
+        for level in ["summary", "task"] {
+            var row = infrastructureFailureTask()
+            if level == "task" { row.removeValue(forKey: "tokens") }
+            try writeInfrastructureFailure(in: folder, row: row)
+            if level == "summary" {
+                var document = summary(passed: 0); document.removeValue(forKey: "tokens")
+                try write(document, name: "summary.json", in: folder)
+            }
+            let report = try MiniToolBenchReport.load(from: folder)
+            XCTAssertEqual(report.executionErrorCount, 2)
+            XCTAssertFalse(report.allTasksFailedBeforeInference, level)
+        }
+    }
+
+    func testPodmanStartupFailureWithNullAttemptUsageMatchesHarborReport() throws {
+        let folder = try directory()
+        var row = infrastructureFailureTask()
+        var attempts = row["attempts"] as! [[String: Any]]
+        attempts[0]["tokens"] = ["input": NSNull(), "output": NSNull(), "cached": NSNull()]
+        attempts[1].removeValue(forKey: "tokens")
+        row["attempts"] = attempts
+        try writeInfrastructureFailure(in: folder, row: row)
+        let report = try MiniToolBenchReport.load(from: folder)
+        XCTAssertTrue(report.allTasksFailedBeforeInference)
+        XCTAssertEqual(report.infrastructureErrorCount, 2)
+
+        attempts[0]["tokens"] = ["input": 1, "output": 0]
+        row["attempts"] = attempts
+        try writeInfrastructureFailure(in: folder, row: row)
+        XCTAssertFalse(try MiniToolBenchReport.load(from: folder).allTasksFailedBeforeInference)
+    }
+
+    func testGenericFailureWithUnknownAttemptUsageDoesNotProveNoInference() throws {
+        let folder = try directory()
+        var row = infrastructureFailureTask()
+        row["attempts"] = [["attempt": 1, "passed": false,
+            "exception": ["exception_type": "RuntimeError", "exception_message": "Docker compose command failed for environment git-leak-recovery"]]]
+        try writeInfrastructureFailure(in: folder, row: row)
+        let report = try MiniToolBenchReport.load(from: folder)
+        XCTAssertEqual(report.infrastructureErrorCount, 1)
+        XCTAssertFalse(report.allTasksFailedBeforeInference)
+    }
+
+    func testZeroCountersWithGenericOrAgentFailureDoNotProveNoInference() throws {
+        let folder = try directory()
+        for type in ["RuntimeError", "AgentTimeoutError"] {
+            var row = infrastructureFailureTask()
+            row["attempts"] = [["attempt": 1, "passed": false,
+                "tokens": ["input": 0, "output": 0, "cached": 0],
+                "exception": ["exception_type": type, "exception_message": "Agent execution interrupted"]]]
+            try writeInfrastructureFailure(in: folder, row: row)
+            let report = try MiniToolBenchReport.load(from: folder)
+            XCTAssertEqual(report.executionErrorCount, 1)
+            XCTAssertFalse(report.allTasksFailedBeforeInference, type)
+        }
+    }
+
+    func testPartialDetailsDoNotDiagnoseAllTasksBeforeInference() throws {
+        let folder = try directory()
+        var document = summary(["results-git-leak-recovery.json", "results-missing.json"], passed: 0)
+        document["tokens"] = ["input": 0, "output": 0, "cached": 0]
+        try write(document, name: "summary.json", in: folder)
+        try write(infrastructureFailureTask(), name: "results-git-leak-recovery.json", in: folder)
+        let report = try MiniToolBenchReport.load(from: folder)
+        XCTAssertEqual(report.executionErrorCount, 2)
+        XCTAssertFalse(report.allTasksFailedBeforeInference)
+        XCTAssertEqual(report.summary.totalTasks, 2)
+    }
+
+    func testModelTimeoutIsNotMisclassifiedAsContainerInfrastructureFailure() throws {
+        let folder = try directory()
+        try write(summary(passed: 0), name: "summary.json", in: folder)
+        var row = task(passed: false); row["completed"] = false
+        row["attempts"] = [["attempt": 1, "passed": false,
+            "tokens": ["input": 100, "output": 50, "cached": 20],
+            "exception": ["exception_type": "AgentTimeoutError", "exception_message": "Agent exceeded its timeout after generating a response"]]]
+        try write(row, name: "results-git-leak-recovery.json", in: folder)
+        let report = try MiniToolBenchReport.load(from: folder)
+        XCTAssertEqual(report.executionErrorCount, 1)
+        XCTAssertEqual(report.infrastructureErrorCount, 0)
+        XCTAssertFalse(report.allTasksFailedBeforeInference)
+        XCTAssertEqual(report.primaryExecutionIssue?.title, "AgentTimeoutError")
+    }
+
+    func testSuccessfulRetryKeepsPassAndHistoricalExceptionDetails() throws {
+        let folder = try directory()
+        try write(summary(), name: "summary.json", in: folder)
+        var row = task()
+        var attempts = row["attempts"] as! [[String: Any]]
+        attempts[0]["exception"] = ["exception_type": "RuntimeError",
+            "exception_message": "Docker compose command failed for environment git-leak-recovery"]
+        row["attempts"] = attempts
+        try write(row, name: "results-git-leak-recovery.json", in: folder)
+        let report = try MiniToolBenchReport.load(from: folder)
+        XCTAssertEqual(report.summary.passRate, 1)
+        XCTAssertEqual(report.tasks.first?.passed, true)
+        XCTAssertEqual(report.executionErrorCount, 1)
+        XCTAssertFalse(report.allTasksFailedBeforeInference)
+        XCTAssertTrue(report.tasks[0].executionErrorDetails.contains("Tentativo 1"))
+    }
+
+    func testOptionalExceptionFieldsAndInertCopyableDiagnosticText() throws {
+        let folder = try directory()
+        var row = infrastructureFailureTask()
+        row["attempts"] = [["attempt": 1, "passed": false,
+            "tokens": ["input": 0, "output": 0, "cached": 0],
+            "exception": ["exception_type": "RuntimeError",
+                "exception_message": "\u{001B}[31mcontainer failed\u{001B}[0m; $(printf literal) \\x1b[4mtext\\x1b[0m"]]]
+        try writeInfrastructureFailure(in: folder, row: row)
+        let report = try MiniToolBenchReport.load(from: folder)
+        let details = report.tasks[0].executionErrorDetails
+        XCTAssertTrue(details.contains("$(printf literal)"))
+        XCTAssertFalse(details.contains("\u{001B}"))
+        XCTAssertFalse(details.contains("\\x1b"))
+        XCTAssertNil(report.tasks[0].primaryException?.exceptionTraceback)
+        XCTAssertNil(report.tasks[0].primaryException?.occurredAt)
+    }
+
+    func testNullAndAbsentExceptionsRemainCompatibleWithOlderReports() throws {
+        let folder = try directory()
+        var row = task()
+        var attempts = row["attempts"] as! [[String: Any]]
+        attempts[0].removeValue(forKey: "exception")
+        row["attempts"] = attempts
+        try write(summary(), name: "summary.json", in: folder)
+        try write(row, name: "results-git-leak-recovery.json", in: folder)
+        let report = try MiniToolBenchReport.load(from: folder)
+        XCTAssertEqual(report.executionErrorCount, 0)
+        XCTAssertFalse(report.tasks[0].hasExecutionErrors)
+        XCTAssertFalse(report.allTasksFailedBeforeInference)
+    }
+
     func testMalformedSummariesAreRejected() throws {
         let folder = try directory()
         let mutations: [(String, Any)] = [("schema_version", 5), ("total_tasks", -1),

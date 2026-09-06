@@ -8,6 +8,7 @@ struct MiniToolBenchView: View {
     @State private var showAdvanced = false
     @State private var showSetup = false
     @State private var showManual = false
+    @State private var selectedErrorTask: MiniToolBenchTaskResult?
 
     private enum Panel: String, CaseIterable, Identifiable {
         case preparation = "Esegui test"
@@ -58,6 +59,7 @@ struct MiniToolBenchView: View {
         } message: {
             Text(controller.errorMessage ?? "")
         }
+        .sheet(item: $selectedErrorTask) { task in errorDetails(task) }
     }
 
     private var header: some View {
@@ -288,16 +290,20 @@ struct MiniToolBenchView: View {
     @ViewBuilder private var results: some View {
         if let report = controller.report {
             VStack(alignment: .leading, spacing: 16) {
-                reportSummary(report)
-                if !report.warnings.isEmpty {
-                    DisclosureGroup("Note sul report (\(report.warnings.count))") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(Array(report.warnings.enumerated()), id: \.offset) { _, warning in
-                                Label(warning, systemImage: "info.circle").font(.caption)
-                            }
-                        }.padding(.top, 6)
-                    }.foregroundStyle(.secondary)
-                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        reportSummary(report)
+                        if !report.warnings.isEmpty {
+                            DisclosureGroup("Note sul report (\(report.warnings.count))") {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(Array(report.warnings.enumerated()), id: \.offset) { _, warning in
+                                        Label(warning, systemImage: "info.circle").font(.caption)
+                                    }
+                                }.padding(.top, 6)
+                            }.foregroundStyle(.secondary)
+                        }
+                    }
+                }.frame(maxHeight: 350)
                 HStack {
                     TextField("Cerca task", text: $controller.resultSearch)
                         .textFieldStyle(.roundedBorder).frame(maxWidth: 280)
@@ -320,6 +326,18 @@ struct MiniToolBenchView: View {
                     TableColumn("Durata") { task in
                         Text(duration(task.durationMS)).monospacedDigit()
                     }.width(85)
+                    TableColumn("Errore") { task in
+                        if let issue = task.primaryException {
+                            Button { selectedErrorTask = task } label: {
+                                Label("Dettagli", systemImage: "exclamationmark.bubble")
+                            }
+                            .buttonStyle(.link)
+                            .help(issue.summary)
+                            .accessibilityLabel("Mostra errori di \(task.task): \(issue.title)")
+                        } else {
+                            Text("—").foregroundStyle(.secondary)
+                        }
+                    }.width(100)
                     TableColumn("Transcript") { task in
                         if report.transcriptURL(for: task) != nil {
                             Button { controller.openTranscript(for: task) } label: {
@@ -354,6 +372,23 @@ struct MiniToolBenchView: View {
     private func reportSummary(_ report: MiniToolBenchReport) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
+                if report.allTasksFailedBeforeInference {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(report.failureBeforeInferenceTitle, systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline)
+                        Text(report.failureBeforeInferenceMessage)
+                            .font(.callout)
+                        if let issue = report.primaryExecutionIssue {
+                            Text(issue.summary).font(.callout)
+                        }
+                        Button("Mostra i task con errori") { controller.resultFilter = .errors }
+                            .buttonStyle(.link)
+                    }
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                }
                 HStack(alignment: .firstTextBaseline) {
                     Text("\(report.summary.passedTasks) / \(report.summary.totalTasks)")
                         .font(.system(size: 30, weight: .semibold, design: .rounded)).monospacedDigit()
@@ -362,7 +397,7 @@ struct MiniToolBenchView: View {
                     Text(report.summary.passRate, format: .percent.precision(.fractionLength(1)))
                         .font(.title2.weight(.semibold)).monospacedDigit()
                 }
-                Text("Esiti verificati sul totale esportato. Il report può contenere una prova parziale o tentativi di esecuzioni precedenti.")
+                Text("Esiti riportati dal runner sul totale esportato. Il report può contenere una prova parziale o tentativi di esecuzioni precedenti.")
                     .font(.caption).foregroundStyle(.secondary)
                 Divider()
                 Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 8) {
@@ -380,6 +415,12 @@ struct MiniToolBenchView: View {
                     }
                     if let budget = report.attemptBudget {
                         GridRow { summaryField("Budget tentativi dichiarato", value: String(budget)) }
+                    }
+                    if report.executionErrorCount > 0 {
+                        GridRow {
+                            summaryField("Errori di esecuzione", value: "\(report.executionErrorCount) tentativi in \(report.tasksWithExecutionErrors) task")
+                            summaryField("Errori dell’ambiente container", value: String(report.infrastructureErrorCount))
+                        }
                     }
                 }
                 HStack {
@@ -402,10 +443,63 @@ struct MiniToolBenchView: View {
     }
 
     private func resultLabel(_ task: MiniToolBenchTaskResult) -> some View {
-        let title = task.passed ? "Superato" : (task.completed ? "Non superato" : "Incompleto")
-        let icon = task.passed ? "checkmark.circle.fill" : (task.completed ? "xmark.circle" : "clock")
+        let title: String
+        let icon: String
+        if task.passed { title = "Superato"; icon = "checkmark.circle.fill" }
+        else if task.completed { title = "Non superato"; icon = "xmark.circle" }
+        else if task.hasInfrastructureFailure { title = "Errore ambiente"; icon = "exclamationmark.triangle" }
+        else if task.hasExecutionErrors { title = "Errore esecuzione"; icon = "exclamationmark.circle" }
+        else { title = "Incompleto"; icon = "clock" }
         return Label(title, systemImage: icon)
-            .font(.callout).foregroundStyle(task.passed ? Color.green : Color.secondary)
+            .font(.callout).foregroundStyle(task.passed ? Color.green : (!task.completed && task.hasExecutionErrors ? Color.orange : Color.secondary))
+    }
+
+    private func errorDetails(_ task: MiniToolBenchTaskResult) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Errori di esecuzione").font(.title2.bold())
+                    Text(task.task).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                }
+                Spacer()
+                Button("Chiudi") { selectedErrorTask = nil }.keyboardShortcut(.cancelAction)
+            }
+            if let issue = task.primaryException {
+                Label(issue.summary, systemImage: "info.circle")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(Array(task.attemptsWithErrors.enumerated()), id: \.offset) { _, attempt in
+                        if let exception = attempt.exception {
+                            GroupBox("Tentativo \(attempt.attempt) · \(exception.exceptionType)") {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    if let occurredAt = exception.occurredAt {
+                                        Text("Ora registrata: \(occurredAt)").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Text(exception.displayMessage)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                    if let traceback = exception.displayTraceback, !traceback.isEmpty {
+                                        DisclosureGroup("Traceback") {
+                                            Text(traceback).font(.system(.caption2, design: .monospaced))
+                                                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                                .padding(.top, 6)
+                                        }
+                                    }
+                                }.padding(8)
+                            }
+                        }
+                    }
+                }
+            }
+            Button { controller.copyErrorDetails(for: task) } label: {
+                Label("Copia dettagli degli errori", systemImage: "doc.on.doc")
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 560, idealWidth: 740, maxWidth: 820, minHeight: 360, idealHeight: 540, maxHeight: 680)
     }
 
     private func labeledField(_ title: String, text: Binding<String>, prompt: String) -> some View {

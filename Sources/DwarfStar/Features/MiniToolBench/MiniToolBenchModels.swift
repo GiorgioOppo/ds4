@@ -164,6 +164,9 @@ struct MiniToolBenchTokenUsage: Decodable, Sendable {
     let input: Int?
     let output: Int?
     let cached: Int?
+
+    /// Missing usage is unknown, never evidence that inference did not start.
+    var recordsZeroUsage: Bool { input == 0 && output == 0 && (cached == nil || cached == 0) }
 }
 
 struct MiniToolBenchSummary: Decodable, Sendable {
@@ -189,13 +192,68 @@ struct MiniToolBenchSummary: Decodable, Sendable {
     }
 }
 
+struct MiniToolBenchException: Decodable, Sendable {
+    let exceptionType: String
+    let exceptionMessage: String
+    let exceptionTraceback: String?
+    let occurredAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case exceptionType = "exception_type", exceptionMessage = "exception_message"
+        case exceptionTraceback = "exception_traceback", occurredAt = "occurred_at"
+    }
+
+    var isRemovedPodmanNetwork: Bool {
+        exceptionMessage.localizedCaseInsensitiveContains("slirp4netns support has been removed")
+    }
+
+    /// These signatures concern provisioning the environment, rather than a
+    /// failed task verifier or an agent timeout after model-generated work.
+    var isInfrastructureFailure: Bool {
+        isRemovedPodmanNetwork
+            || exceptionMessage.localizedCaseInsensitiveContains("Docker compose command failed for environment")
+            || exceptionMessage.localizedCaseInsensitiveContains("failed to create container")
+            || exceptionMessage.localizedCaseInsensitiveContains("cannot connect to the Docker daemon")
+            || exceptionMessage.localizedCaseInsensitiveContains("unable to connect to Podman socket")
+    }
+
+    var title: String {
+        if isRemovedPodmanNetwork { return "Rete Podman non supportata" }
+        if isInfrastructureFailure { return "Ambiente container non disponibile" }
+        return exceptionType.isEmpty ? "Errore di esecuzione" : exceptionType
+    }
+
+    var summary: String {
+        if isRemovedPodmanNetwork {
+            return "I container usano slirp4netns, rimosso nella versione di Podman installata. L’ambiente non riesce ad avviarsi."
+        }
+        if exceptionMessage.localizedCaseInsensitiveContains("Docker compose command failed for environment") {
+            return "Docker Compose non è riuscito ad avviare l’ambiente del task. Apri i dettagli per leggere il comando e l’errore del container."
+        }
+        let firstLine = displayMessage.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init)
+        return String((firstLine ?? exceptionType).prefix(240))
+    }
+
+    var displayMessage: String { Self.readable(exceptionMessage) }
+    var displayTraceback: String? { exceptionTraceback.map(Self.readable) }
+
+    private static func readable(_ text: String) -> String {
+        // Reports can contain terminal ANSI styling, both literal and escaped
+        // inside subprocess error strings. Keep the command text as inert data.
+        text.replacingOccurrences(of: "\u{001B}\\[[0-?]*[ -/]*[@-~]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\\x1b\[[0-?]*[ -/]*[@-~]"#, with: "", options: .regularExpression)
+    }
+}
+
 struct MiniToolBenchAttempt: Decodable, Identifiable, Sendable {
     var id: Int { attempt }
     let attempt: Int
     let passed: Bool
     let durationMS: Double?
     let transcript: String?
-    enum CodingKeys: String, CodingKey { case attempt, passed, durationMS = "duration_ms", transcript }
+    let exception: MiniToolBenchException?
+    let tokens: MiniToolBenchTokenUsage?
+    enum CodingKeys: String, CodingKey { case attempt, passed, durationMS = "duration_ms", transcript, exception, tokens }
 }
 
 struct MiniToolBenchTaskResult: Decodable, Identifiable, Sendable {
@@ -214,6 +272,29 @@ struct MiniToolBenchTaskResult: Decodable, Identifiable, Sendable {
         case task, passed, completed, attempts, durationMS = "duration_ms", tokens, transcript, model, suite
         case profileHash = "profile_hash"
     }
+
+    var attemptsWithErrors: [MiniToolBenchAttempt] { (attempts ?? []).filter { $0.exception != nil } }
+    var hasExecutionErrors: Bool { !attemptsWithErrors.isEmpty }
+    var hasInfrastructureFailure: Bool { attemptsWithErrors.contains { $0.exception?.isInfrastructureFailure == true } }
+    var primaryException: MiniToolBenchException? {
+        attemptsWithErrors.compactMap(\.exception).first { $0.isInfrastructureFailure }
+            ?? attemptsWithErrors.first?.exception
+    }
+
+    var executionErrorDetails: String {
+        var parts = ["Task: \(task)"]
+        for attempt in attemptsWithErrors {
+            guard let exception = attempt.exception else { continue }
+            var detail = "Tentativo \(attempt.attempt) — \(exception.exceptionType)"
+            if let time = exception.occurredAt { detail += "\nOra registrata: \(time)" }
+            detail += "\n\n" + exception.displayMessage
+            if let traceback = exception.displayTraceback, !traceback.isEmpty {
+                detail += "\n\nTraceback:\n" + traceback
+            }
+            parts.append(detail)
+        }
+        return parts.joined(separator: "\n\n")
+    }
 }
 
 struct MiniToolBenchReport: Sendable {
@@ -222,6 +303,49 @@ struct MiniToolBenchReport: Sendable {
     let warnings: [String]
     let attemptBudget: Int?
     let directory: URL
+
+    var tasksWithExecutionErrors: Int { tasks.filter(\.hasExecutionErrors).count }
+    var executionErrorCount: Int { tasks.reduce(0) { $0 + $1.attemptsWithErrors.count } }
+    var infrastructureErrorCount: Int {
+        tasks.reduce(0) { sum, task in
+            sum + task.attemptsWithErrors.filter { $0.exception?.isInfrastructureFailure == true }.count
+        }
+    }
+
+    /// Require complete task details and explicit zero usage in the exported
+    /// summary and tasks, together with a recognized container-startup failure.
+    /// Zero counters alone do not prove that inference never started. Harbor
+    /// leaves attempt counters null when the removed Podman network prevents
+    /// container creation; no attempt counter may contradict that diagnosis.
+    var allTasksFailedBeforeInference: Bool {
+        guard summary.totalTasks > 0, tasks.count == summary.totalTasks,
+              summary.passedTasks == 0, summary.tokens?.recordsZeroUsage == true else { return false }
+        return tasks.allSatisfy { task in
+            guard !task.passed, !task.completed, task.tokens?.recordsZeroUsage == true,
+                  let attempts = task.attempts, !attempts.isEmpty else { return false }
+            return attempts.allSatisfy { attempt in
+                guard !attempt.passed, attempt.exception?.isRemovedPodmanNetwork == true else { return false }
+                let counters = [attempt.tokens?.input, attempt.tokens?.output, attempt.tokens?.cached].compactMap { $0 }
+                return counters.allSatisfy { $0 == 0 }
+            }
+        }
+    }
+
+    var failureBeforeInferenceTitle: String {
+        infrastructureErrorCount == executionErrorCount && executionErrorCount > 0
+            ? "Ambiente di esecuzione bloccato" : "Esecuzione interrotta prima dell’inferenza"
+    }
+
+    var failureBeforeInferenceMessage: String {
+        "\(summary.totalTasks) task interrotti, 0 token registrati. Questo report non misura la qualità del modello."
+    }
+
+    var primaryExecutionIssue: MiniToolBenchException? {
+        let errors = tasks.flatMap(\.attemptsWithErrors).compactMap(\.exception)
+        return errors.first { $0.isRemovedPodmanNetwork }
+            ?? errors.first { $0.isInfrastructureFailure }
+            ?? errors.first
+    }
 
     /// A selected directory grants access to its summary and sibling results.
     /// A standalone summary is useful too, but missing details are explicit.

@@ -23,10 +23,22 @@ extension LocalServer {
         return out
     }
 
-    static func httpError(_ status: Int, _ message: String, cors: Bool) -> Data {
-        let payload: [String: Any] = ["error": ["message": message, "type": "invalid_request_error"]]
+    static func httpError(_ status: Int, _ message: String, cors: Bool, code: String? = nil) -> Data {
+        var error: [String: Any] = ["message": message, "type": "invalid_request_error"]
+        if let code { error["code"] = code }
+        let payload: [String: Any] = ["error": error]
         let body = (try? JSONSerialization.data(withJSONObject: payload)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         return response(status, contentType: "application/json", body: body, cors: cors)
+    }
+
+    static func inferenceErrorResponse(_ error: InferenceError, cors: Bool) -> Data {
+        switch error {
+        case .contextExceeded:
+            // OpenAI clients and Harbor use this code/message to compact history
+            // and retry the request when the loaded model's context is full.
+            return httpError(400, "Context length exceeded: \(error)", cors: cors,
+                             code: "context_length_exceeded")
+        }
     }
 
     static func anthropicError(_ status: Int, _ message: String, cors: Bool) -> Data {
@@ -56,4 +68,3 @@ extension LocalServer {
 
     enum ServerError: Error { case badPort, timeout, bodyTooLarge }
 }
-
