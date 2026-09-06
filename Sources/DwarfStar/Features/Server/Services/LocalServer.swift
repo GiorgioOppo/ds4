@@ -224,7 +224,7 @@ final class LocalServer: @unchecked Sendable {
         }
         if req.method == "GET", req.path == "/v1/models" {
             try await send(conn, Self.response(200, contentType: "application/json",
-                                               body: modelsJSON(), cors: config.cors))
+                                               body: await modelsJSON(), cors: config.cors))
             return
         }
         let modelPrefix = "/v1/models/"
@@ -234,7 +234,7 @@ final class LocalServer: @unchecked Sendable {
             // e risolto su quello caricato, come nel body delle completions.
             let id = String(req.path.dropFirst(modelPrefix.count))
             try await send(conn, Self.response(200, contentType: "application/json",
-                                               body: modelJSON(resolveModel(id.isEmpty ? nil : id)),
+                                               body: await modelJSON(resolveModel(id.isEmpty ? nil : id)),
                                                cors: config.cors))
             return
         }

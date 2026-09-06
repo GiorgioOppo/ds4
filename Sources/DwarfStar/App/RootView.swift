@@ -10,7 +10,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case server = "Server"
     case distributed = "Worker"
     case benchmark = "Benchmark"
-    case sweBench = "Swift-bench"
+    case miniToolBench = "Mini Tool Bench"
     case conversion = "Conversione"
     case diagnostics = "Diagnostics"
 
@@ -27,7 +27,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .server: return "Server API"
         case .distributed: return "Worker distribuito"
         case .benchmark: return "Benchmark"
-        case .sweBench: return "Swift-bench"
+        case .miniToolBench: return "Mini Tool Bench"
         case .conversion: return "Conversione modelli"
         case .diagnostics: return "Diagnostica"
         }
@@ -36,7 +36,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     static let workspace: [AppSection] = [.chat, .project, .agents]
     static let configuration: [AppSection] = [.settings, .mcp]
     static let advanced: [AppSection] = [.tuning, .server, .distributed, .benchmark,
-                                         .sweBench, .conversion, .diagnostics]
+                                         .miniToolBench, .conversion, .diagnostics]
     var icon: String {
         switch self {
         case .chat: return "bubble.left.and.bubble.right"
@@ -48,7 +48,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .server: return "server.rack"
         case .distributed: return "cpu"
         case .benchmark: return "gauge.with.dots.needle.67percent"
-        case .sweBench: return "wrench.and.screwdriver"
+        case .miniToolBench: return "terminal"
         case .conversion: return "arrow.triangle.2.circlepath"
         case .diagnostics: return "stethoscope"
         }
@@ -64,7 +64,7 @@ struct RootView: View {
     @State private var distributed: DistributedController
     @State private var server: ServerController
     @State private var bench: BenchController
-    @State private var sweBench: SWEBenchController
+    @State private var miniToolBench: MiniToolBenchController
     @State private var diagnostics: DiagnosticsController
     @State private var conversion = SafetensorsConversionController()
     @State private var selection: AppSection? = .chat
@@ -74,10 +74,11 @@ struct RootView: View {
         self.settings = settings
         self.mcp = mcp
         let distributed = DistributedController(settings: settings)
+        let server = ServerController(settings: settings, store: store)
         _distributed = State(initialValue: distributed)
-        _server = State(initialValue: ServerController(settings: settings, store: store))
+        _server = State(initialValue: server)
+        _miniToolBench = State(initialValue: MiniToolBenchController(store: store, server: server))
         _bench = State(initialValue: BenchController(settings: settings, dist: distributed, store: store))
-        _sweBench = State(initialValue: SWEBenchController(store: store))
         _diagnostics = State(initialValue: DiagnosticsController(settings: settings))
     }
 
@@ -162,8 +163,9 @@ struct RootView: View {
                         WorkerView(controller: distributed)
                     case .benchmark:
                         BenchView(controller: bench)
-                    case .sweBench:
-                        SWEBenchView(controller: sweBench)
+                    case .miniToolBench:
+                        MiniToolBenchView(controller: miniToolBench,
+                                          openServer: { selection = .server })
                     case .conversion:
                         SafetensorsConversionView(controller: conversion)
                     case .diagnostics:
@@ -172,7 +174,7 @@ struct RootView: View {
                 }
                 // Navigation remains available, but no other screen may retain
                 // or mutate the single engine while the tuner swaps services.
-                .allowsHitTesting(!store.benchRunning || selection == .settings)
+                .allowsHitTesting(!store.benchRunning || selection == .settings || selection == .miniToolBench)
             }
         }
     }

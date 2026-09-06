@@ -19,12 +19,18 @@ extension LocalServer {
         return "[" + parts.joined(separator: ",") + "]"
     }
 
-    func modelsJSON() -> String {
-        "{\"object\":\"list\",\"data\":[" + modelJSON(modelId) + "]}"
+    func modelsJSON() async -> String {
+        let model = await modelJSON(modelId)
+        return "{\"object\":\"list\",\"data\":[" + model + "]}"
     }
 
-    func modelJSON(_ id: String) -> String {
-        "{\"id\":\(jsonString(id)),\"object\":\"model\",\"created\":1767225600,\"owned_by\":\"dwarfstar\",\"name\":\(jsonString(modelName)),\"max_completion_tokens\":\(config.maxTokens)}"
+    func modelJSON(_ id: String) async -> String {
+        // Advertise the loaded backend's actual context, not the server's
+        // per-response token default or the GGUF's theoretical maximum.
+        // Consumers such as Terminal-Bench Mini use this for their agent budget.
+        let contextSize = await backend.modelInfo().contextSize
+        let context = contextSize > 0 ? ",\"context_length\":\(contextSize)" : ""
+        return "{\"id\":\(jsonString(id)),\"object\":\"model\",\"created\":1767225600,\"owned_by\":\"dwarfstar\",\"name\":\(jsonString(modelName)),\"max_completion_tokens\":\(config.maxTokens)\(context)}"
     }
 
     /// Quote + escape an arbitrary string as a JSON string literal.
@@ -34,4 +40,3 @@ extension LocalServer {
         return String(str.dropFirst().dropLast())   // strip the surrounding [ ]
     }
 }
-

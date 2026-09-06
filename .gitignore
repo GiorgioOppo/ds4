@@ -15,3 +15,6 @@ DwarfStar *.xcodeproj/
 
 # Instruments traces (binary, large — never commit)
 *.trace
+
+# Python tests for the Linux VM bootstrap.
+__pycache__/

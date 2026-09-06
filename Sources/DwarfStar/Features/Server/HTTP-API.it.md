@@ -19,6 +19,12 @@ Le richieste in streaming e non-streaming usano la stessa sorgente di eventi
 dell'engine. Il server riporta il basename effettivo del GGUF anche quando una
 richiesta fornisce un altro identificatore di modello.
 
+La scoperta del modello (`/v1/models` e `/v1/models/{id}`) include
+`context_length`, la capacità totale in token configurata per il backend
+caricato. È distinta da `max_completion_tokens`, il budget predefinito del
+server per una risposta. I client devono riservare spazio nel contesto sia al
+prompt sia ai token generati; non viene pubblicizzato il massimo teorico del GGUF.
+
 ## Percorso della richiesta
 
 1. `Network.framework` accetta e delimita la richiesta.

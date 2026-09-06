@@ -7,6 +7,11 @@ il checkpoint Vision-Exp e il suo encoder separato, poi allega le immagini.
 L'interfaccia aggiunge avvio guidato, ricerca delle chat e un composer più
 accessibile. Configurazione, verifiche e limiti: [DeepSeek Vision](docs/DEEPSEEK-VISION.it.md).
 
+**Mini Tool Bench** integra Terminal-Bench-Local (prima Terminal Bench Mini),
+con Core-19 e la suite storica Mini-20. Un pulsante prepara Podman e avvia i test
+usando il modello caricato, con log dal vivo e importazione degli esiti verificati:
+[configurazione e risultati](Sources/DwarfStar/Features/MiniToolBench/README.md).
+
 DwarfStar è un'applicazione nativa Swift / SwiftUI per eseguire modelli
 linguistici locali su Apple Silicon con un **motore di inferenza Metal in puro
 Swift**. **DeepSeek V4** è oggi il backend operativo: Flash e il profilo Pro Q2

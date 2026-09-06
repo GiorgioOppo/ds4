@@ -47,7 +47,6 @@ let package = Package(
         .executable(name: "DwarfStar", targets: ["DwarfStar"]),
         // Pure-Swift engine demo CLI — NO external links (no C engine).
         .executable(name: "DS4Demo", targets: ["DS4Demo"]),
-        .executable(name: "ds4-swe-local", targets: ["DS4SWEBenchLocal"]),
     ],
     targets: [
         // Portable formats, architecture inspection and backend-owned model
@@ -94,7 +93,7 @@ let package = Package(
                 "Assets.xcassets",
                 // Keep newly added feature docs warning-free even when SwiftPM
                 // reuses a cached evaluation of this dynamic manifest.
-                "Features/SWEBench/README.md",
+                "Features/MiniToolBench/README.md",
             ])
         ),
 
@@ -114,6 +113,5 @@ let package = Package(
             dependencies: ["DS4Core", "DS4Metal"],
             exclude: markdownFiles(in: "Sources/DS4Demo")
         ),
-        .executableTarget(name: "DS4SWEBenchLocal"),
     ]
 )
