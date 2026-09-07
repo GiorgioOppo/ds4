@@ -135,6 +135,11 @@ Run each binary with `--help` for its full options.
 the token history and live model state together, shows prefill progress, and
 uses the model's native tool format. DeepSeek and GLM have their own templates.
 
+Use `/hints on` for occasional, brief explanations of the programming choices
+behind the work, and `/hints off` to stop them. Changes take effect at the next
+conversation boundary without rebuilding the cached context. New and resumed
+sessions start with hints off.
+
 Sessions are stored in `~/.ds4/kvcache`:
 
 | Command | Action |

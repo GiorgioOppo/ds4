@@ -398,10 +398,12 @@ static void test_shell_terminal_controls(void) {
 static void test_markdown_literals(void) {
     const char *input[] = {"Use *.c files.", "The literal is \\*.", "An unmatched `tick",
                           "**bold** and *italic* and `code`.", "``a ` b``", "*unclosed",
-                          "* list item\n", "trailing \\", "**unclosed", "`a``", "\\`literal\\`"};
+                          "* list item\n", "trailing \\", "**unclosed", "`a``", "\\`literal\\`",
+                          "> **Hint:** Check `errno`.\n"};
     const char *expected[] = {"Use *.c files.", "The literal is *.", "An unmatched `tick",
                              "bold and italic and code.", "a ` b", "*unclosed",
-                             "* list item\n", "trailing \\", "**unclosed", "`a``", "`literal`"};
+                             "* list item\n", "trailing \\", "**unclosed", "`a``", "`literal`",
+                             "> Hint: Check errno.\n"};
     for (size_t i = 0; i < sizeof(input)/sizeof(input[0]); i++) {
         agent_tail_capture capture = {.cap = 16384};
         agent_token_renderer r = {.capture = &capture, .format_markdown = true};

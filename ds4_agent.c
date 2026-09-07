@@ -118,6 +118,18 @@ typedef struct {
 
 typedef struct agent_bash_job agent_bash_job;
 
+/* Runtime preference only; never part of saved session metadata. */
+typedef struct {
+    bool enabled;
+    bool instructed;
+    enum {
+        AGENT_HINTS_UNSET,
+        AGENT_HINTS_OFF,
+        AGENT_HINTS_ON,
+        AGENT_HINTS_UNKNOWN,
+    } applied;
+} agent_hints;
+
 typedef struct {
     ds4_engine *engine;
     agent_config *cfg;
@@ -165,6 +177,7 @@ typedef struct {
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
     bool datetime_context_injected;
+    agent_hints hints;
     int last_system_prompt_reminder_at;
     char more_path[PATH_MAX];
     int more_next_line;
@@ -588,6 +601,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/new") ||
            agent_slash_command_with_args(cmd, "/power") ||
            agent_slash_command_with_args(cmd, "/steer") ||
+           agent_slash_command_with_args(cmd, "/hints") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -1341,6 +1355,62 @@ static const char agent_glm_syntax_reminder[] =
     "<arg_value>$PARAMETER_VALUE</arg_value></tool_call>\n";
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
+
+static const char agent_hints_prompt[] =
+    "The user enabled programming hints. Occasionally explain a useful concept "
+    "behind the current work: a design choice, failure mechanism, trade-off, "
+    "or way to verify correctness. Base each hint on code or results you have "
+    "actually examined. Write one or two sentences as a normal Markdown "
+    "blockquote starting with > **Hint:**. Hints are prose, not tool calls. "
+    "Put them after the relevant discovery, including between tool calls. "
+    "Prefer no hint to routine narration, repetition, or generic advice. "
+    "Do not invent personal experience or a learner profile. Keep working "
+    "without waiting for an answer. Later system notes may enable or disable "
+    "hints; follow the latest setting.\n";
+
+static bool agent_parse_hints(const char *arg, bool *enabled) {
+    if (!strcmp(arg, "on")) *enabled = true;
+    else if (!strcmp(arg, "off")) *enabled = false;
+    else return false;
+    return true;
+}
+
+/* The full instructions are sent once per live context, not on each enable. */
+static const char *agent_hints_note(agent_hints *h) {
+    const char *note;
+    if (h->enabled && !h->instructed) {
+        note = agent_hints_prompt;
+        h->instructed = true;
+    } else if (h->applied != AGENT_HINTS_UNSET &&
+               h->applied != (h->enabled ? AGENT_HINTS_ON : AGENT_HINTS_OFF)) {
+        note = h->enabled ?
+            "The user enabled programming hints. Produce them from now on.\n" :
+            "Programming hints are disabled. Do not produce teaching asides; "
+            "continue the task normally.\n";
+    } else {
+        return NULL;
+    }
+    h->applied = h->enabled ? AGENT_HINTS_ON : AGENT_HINTS_OFF;
+    return note;
+}
+
+static void agent_hints_compacted(agent_hints *h) {
+    /* The retained tail may still contain an old on/off note. */
+    if (h->applied != AGENT_HINTS_UNSET) h->applied = AGENT_HINTS_UNKNOWN;
+    h->instructed = false;
+}
+
+static void agent_worker_append_hints_context(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    const char *note = agent_hints_note(&w->hints);
+    pthread_mutex_unlock(&w->mu);
+    if (!note) return;
+    ds4_chat_append_message(w->engine, &w->transcript, "system", note);
+    agent_trace_text(w, "hints-context", note, strlen(note));
+    pthread_mutex_lock(&w->mu);
+    w->session_dirty = true;
+    pthread_mutex_unlock(&w->mu);
+}
 
 static char *agent_build_system_prompt_reminder(ds4_engine *engine,
                                                 bool edit_upto) {
@@ -4986,6 +5056,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     w->status.gen_tps = 0.0;
     w->status.greedy_sampling = false;
     w->status.error[0] = '\0';
+    if (w->initialized) w->hints = (agent_hints){0};
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     w->datetime_context_injected = false;
@@ -6133,6 +6204,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         w->datetime_context_injected = true;
         pthread_mutex_lock(&w->mu);
+        w->hints = (agent_hints){.applied = AGENT_HINTS_UNKNOWN};
         w->user_activity = true;
         w->session_dirty = false;
         w->status.state = AGENT_WORKER_IDLE;
@@ -7558,7 +7630,68 @@ static void test_agent_steering_command(void) {
 
 static void test_agent_terminal_wrap_output_is_deferred(void);
 
+static void test_agent_hints_state(void) {
+    bool enabled = false;
+    AGENT_TEST_ASSERT(agent_parse_hints("on", &enabled) && enabled);
+    AGENT_TEST_ASSERT(agent_parse_hints("off", &enabled) && !enabled);
+    AGENT_TEST_ASSERT(!agent_parse_hints("", &enabled));
+    AGENT_TEST_ASSERT(!agent_parse_hints("toggle", &enabled));
+    AGENT_TEST_ASSERT(!agent_parse_hints("on off", &enabled));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/hints on"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/hintson"));
+
+    agent_hints h = {0};
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == NULL);
+    h.enabled = true;
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == agent_hints_prompt);
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == NULL);
+    h.enabled = false;
+    const char *note = agent_hints_note(&h);
+    AGENT_TEST_ASSERT(note && strstr(note, "disabled"));
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == NULL);
+    h.enabled = true;
+    note = agent_hints_note(&h);
+    AGENT_TEST_ASSERT(note && note != agent_hints_prompt);
+    AGENT_TEST_ASSERT(note && strstr(note, "enabled"));
+
+    agent_hints_compacted(&h);
+    AGENT_TEST_ASSERT(h.enabled && !h.instructed);
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == agent_hints_prompt);
+    h.enabled = false;
+    agent_hints_compacted(&h);
+    note = agent_hints_note(&h);
+    AGENT_TEST_ASSERT(note && strstr(note, "disabled"));
+    AGENT_TEST_ASSERT(!h.instructed);
+    agent_hints_compacted(&h);
+    note = agent_hints_note(&h);
+    AGENT_TEST_ASSERT(note && strstr(note, "disabled"));
+
+    /* A restored session must override old on notes without restoring a setting. */
+    h = (agent_hints){.applied = AGENT_HINTS_UNKNOWN};
+    note = agent_hints_note(&h);
+    AGENT_TEST_ASSERT(!h.enabled && !h.instructed);
+    AGENT_TEST_ASSERT(note && strstr(note, "disabled"));
+    h.enabled = true;
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == agent_hints_prompt);
+
+    /* Multiple changes before a safe point coalesce to the latest request. */
+    h = (agent_hints){0};
+    h.enabled = true;
+    h.enabled = false;
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == NULL);
+    agent_hints_compacted(&h);
+    AGENT_TEST_ASSERT(agent_hints_note(&h) == NULL);
+
+    char *dsml = agent_build_dsml_tools_prompt(false, false);
+    char *glm = agent_build_glm_tools_prompt(false, false);
+    AGENT_TEST_ASSERT(strstr(dsml, "programming hints") == NULL);
+    AGENT_TEST_ASSERT(strstr(glm, "programming hints") == NULL);
+    free(dsml);
+    free(glm);
+}
+
 static void ds4_agent_unit_tests_run(void) {
+    test_agent_hints_state();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_cache_rejects_impossible_lengths();
@@ -9366,6 +9499,9 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     }
     free(old_images);
     free(kept_images);
+    pthread_mutex_lock(&w->mu);
+    agent_hints_compacted(&w->hints);
+    pthread_mutex_unlock(&w->mu);
     agent_worker_note_system_prompt_seen(w);
     ds4_tokens_free(&old_transcript);
     ds4_tokens_free(&sys);
@@ -9552,6 +9688,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         return 1;
     }
     agent_worker_maybe_append_datetime_context(w);
+    agent_worker_append_hints_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
     if (!w->session_title) {
@@ -9591,6 +9728,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 1;
         }
         agent_worker_maybe_append_system_prompt_reminder(w);
+        agent_worker_append_hints_context(w);
         ds4_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
 
         const ds4_tokens *prompt_for_sync = &w->transcript;
@@ -11699,6 +11837,7 @@ static void runtime_help(void) {
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /hints on|off Enable or disable brief programming hints; starts off.");
     puts("  /steer [F]   Show or set FFN steering for subsequent tokens.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
@@ -12377,6 +12516,19 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         } else {
                             worker_request_power(&worker, power);
                         }
+                    }
+                } else if (agent_slash_command_with_args(cmd, "/hints")) {
+                    char *arg = cmd + strlen("/hints");
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    bool enabled;
+                    if (!agent_parse_hints(arg, &enabled)) {
+                        printf("usage: /hints on|off\n");
+                    } else {
+                        pthread_mutex_lock(&worker.mu);
+                        worker.hints.enabled = enabled;
+                        pthread_mutex_unlock(&worker.mu);
+                        printf("hints %s (applies at the next conversation boundary)\n",
+                               enabled ? "on" : "off");
                     }
                 } else if (!strncmp(cmd, "/steer", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
