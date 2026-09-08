@@ -220,6 +220,10 @@ typedef struct {
     bool md_bold;
     bool md_italic;
     bool md_inline_code;
+    bool md_hint;
+    bool md_line_started;
+    char md_hint_prefix[sizeof("> **Hint:**") - 1];
+    size_t md_hint_prefix_len;
     char md_inline[4096];
     size_t md_inline_len;
     bool md_escape;
@@ -2187,8 +2191,8 @@ static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
  * ============================================================================
  *
  * This renderer handles only the cheap markdown cues that make terminal output
- * readable: **bold**, *italic*, inline code, and fenced code blocks.  It is a
- * streaming parser with a bounded buffer for ambiguous inline spans.
+ * readable: **bold**, *italic*, inline code, hint asides, and fenced code blocks.
+ * It is a streaming parser with a bounded buffer for ambiguous inline spans.
  */
 
 static void agent_tail_capture_append(agent_tail_capture *t,
@@ -3131,7 +3135,21 @@ static void renderer_markdown_inline_flush(agent_token_renderer *r, bool format)
     renderer_reset_color(r);
 }
 
+static void renderer_hint_flush_prefix(agent_token_renderer *r) {
+    for (size_t i = 0; i < r->md_hint_prefix_len; i++)
+        renderer_write_char_raw(r, r->md_hint_prefix[i]);
+    r->md_hint_prefix_len = 0;
+}
+
+static void renderer_hint_end(agent_token_renderer *r) {
+    renderer_hint_flush_prefix(r);
+    if (r->md_hint) renderer_reset_color(r);
+    r->md_hint = false;
+    r->md_line_started = false;
+}
+
 static void renderer_markdown_emit_pending_literals(agent_token_renderer *r) {
+    renderer_hint_flush_prefix(r);
     renderer_markdown_inline_flush(r, false);
     if (r->md_escape) {
         renderer_write_char_raw(r, '\\');
@@ -3235,6 +3253,7 @@ static void renderer_markdown_feed(agent_token_renderer *r, char c) {
 }
 
 static void renderer_markdown_finish(agent_token_renderer *r) {
+    renderer_hint_flush_prefix(r);
     renderer_markdown_inline_flush(r, true);
     /* A closing code fence can be the final bytes of the assistant reply.  In
      * that case no following character arrives to force the pending backticks
@@ -3263,14 +3282,50 @@ static void renderer_markdown_finish(agent_token_renderer *r) {
     r->md_code_line = NULL;
     r->md_code_line_len = 0;
     r->md_code_line_cap = 0;
+    renderer_hint_end(r);
 }
 
 static void renderer_write_char(agent_token_renderer *r, char c) {
     if (!r->format_markdown || r->in_think) {
         renderer_markdown_emit_pending_literals(r);
+        renderer_hint_end(r);
         renderer_write_char_raw(r, c);
         return;
     }
+    /* Recognize only the advertised hint marker at a prose line boundary.
+     * Hold at most that short prefix; ordinary text still streams immediately.
+     * Explicit quote lines continue the aside. No width-dependent repainting. */
+    if (r->use_color && !r->md_line_started && !r->md_code_block &&
+        !r->md_fence_info && !r->md_inline_len && !r->md_escape &&
+        r->md_pending == AGENT_MD_PENDING_NONE) {
+        const char *prefix = r->md_hint ? "> " : "> **Hint:**";
+        if (c == prefix[r->md_hint_prefix_len]) {
+            r->md_hint_prefix[r->md_hint_prefix_len++] = c;
+            if (prefix[r->md_hint_prefix_len]) return;
+            bool continuation = r->md_hint;
+            r->md_hint_prefix_len = 0;
+            r->md_hint = true;
+            r->md_line_started = true;
+            renderer_reset_color(r);
+            const char rule[] = "\x1b[38;5;30m\xe2\x94\x82 \x1b[0m";
+            renderer_write(r, rule, sizeof(rule) - 1);
+            r->wrote_visible_output = true;
+            r->last_output_newline = false;
+            if (!continuation) {
+                const char label[] = "\x1b[1;97;48;5;23m Hint ";
+                renderer_write(r, label, sizeof(label) - 1);
+                renderer_reset_color(r);
+            }
+            return;
+        }
+        if (r->md_hint) renderer_reset_color(r);
+        r->md_hint = false;
+        size_t n = r->md_hint_prefix_len;
+        r->md_hint_prefix_len = 0;
+        for (size_t i = 0; i < n; i++)
+            renderer_markdown_feed(r, r->md_hint_prefix[i]);
+    }
+    r->md_line_started = c != '\n';
     renderer_markdown_feed(r, c);
 }
 
@@ -3291,11 +3346,13 @@ static void renderer_process(agent_token_renderer *r, const char *text, size_t l
         const char *cur = buf + i;
         size_t rem = total - i;
         if (bytes_has_prefix(cur, rem, think_open)) {
+            renderer_hint_end(r);
             r->in_think = true;
             i += strlen(think_open);
             continue;
         }
         if (bytes_has_prefix(cur, rem, think_close)) {
+            renderer_hint_end(r);
             r->in_think = false;
             renderer_reset_color(r);
             if (!r->last_output_newline) renderer_write(r, "\n", 1);
@@ -3336,6 +3393,7 @@ static void renderer_finish(agent_token_renderer *r) {
 
 static void renderer_color(agent_token_renderer *r, const char *seq) {
     renderer_markdown_emit_pending_literals(r);
+    renderer_hint_end(r);
     renderer_flush_utf8(r);
     bool reset = !seq || !seq[0] || !strcmp(seq, "\x1b[0m");
     if (r->use_color && seq && seq[0]) renderer_write(r, seq, strlen(seq));
@@ -3344,6 +3402,7 @@ static void renderer_color(agent_token_renderer *r, const char *seq) {
 
 static void renderer_plain(agent_token_renderer *r, const char *s, size_t n) {
     renderer_markdown_emit_pending_literals(r);
+    renderer_hint_end(r);
     renderer_flush_utf8(r);
     renderer_write(r, s, n);
     if (n) r->wrote_visible_output = true;
@@ -4122,6 +4181,7 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
         size_t rem = total - i;
         if (!sr->dsml_active && bytes_has_prefix(cur, rem, think_open)) {
             agent_stream_flush_start_tail(sr);
+            renderer_hint_end(sr->renderer);
             sr->post_think_gap = false;
             sr->in_think = true;
             sr->renderer->in_think = true;
@@ -4130,6 +4190,7 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
         }
         if (!sr->dsml_active && bytes_has_prefix(cur, rem, think_close)) {
             agent_stream_flush_start_tail(sr);
+            renderer_hint_end(sr->renderer);
             sr->in_think = false;
             sr->renderer->in_think = false;
             renderer_reset_color(sr->renderer);
