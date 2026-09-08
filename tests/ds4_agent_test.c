@@ -594,10 +594,58 @@ static void test_observation_error_is_not_context_exhaustion(void) {
     ds4_tokens_free(&worker.transcript);
 }
 
+static void test_compaction_boundaries(void) {
+    agent_dsml_parser parser = {.state = AGENT_DSML_SEARCH};
+    agent_stream_renderer stream = {.parser = &parser};
+    AGENT_TEST_ASSERT(!agent_stream_compaction_needs_lookahead(&stream));
+    stream.pending_len = 1;
+    AGENT_TEST_ASSERT(agent_stream_compaction_needs_lookahead(&stream));
+    stream.pending_len = 0;
+    stream.dsml_start_len = 1;
+    AGENT_TEST_ASSERT(agent_stream_compaction_needs_lookahead(&stream));
+    stream.dsml_active = true;
+    AGENT_TEST_ASSERT(!agent_stream_compaction_needs_lookahead(&stream));
+    stream.dsml_active = false;
+    parser.state = AGENT_DSML_PARAM_VALUE;
+    AGENT_TEST_ASSERT(!agent_stream_compaction_needs_lookahead(&stream));
+    int data[1000] = {0};
+    ds4_tokens tokens = {.v = data, .len = 1000};
+    AGENT_TEST_ASSERT(agent_compact_tail_boundary(&tokens, 1000, 100, 100, 42) == 900);
+    data[850] = 42;
+    AGENT_TEST_ASSERT(agent_compact_tail_boundary(&tokens, 1000, 100, 100, 42) == 850);
+    data[950] = 42;
+    AGENT_TEST_ASSERT(agent_compact_tail_boundary(&tokens, 1000, 100, 100, 42) == 950);
+    data[850] = data[950] = 0;
+    data[799] = 42;
+    AGENT_TEST_ASSERT(agent_compact_tail_boundary(&tokens, 1000, 100, 100, 42) == 900);
+    AGENT_TEST_ASSERT(agent_compact_tail_boundary(&tokens, 150, 100, 100, 42) == 100);
+    AGENT_TEST_ASSERT(agent_compact_tail_boundary(&tokens, 1000, 100, 100, -1) == 900);
+    AGENT_TEST_ASSERT(agent_compact_summary_budget(4096) == 512);
+    AGENT_TEST_ASSERT(agent_compact_summary_budget(100000) == 4096);
+    AGENT_TEST_ASSERT(agent_compact_summary_budget(1024) == 256);
+    ds4_vision_span spans[2] = {
+        {.token_start = 100, .embedding = {.token_count = 50}},
+        {.token_start = 200, .embedding = {.token_count = 30}},
+    };
+    for (int glm = 0; glm <= 1; glm++) {
+        for (int pos = 0; pos < 260; pos++) {
+            int expected = pos;
+            for (size_t i = 0; i < 2; i++) {
+                int start = (int)spans[i].token_start - glm;
+                int end = (int)(spans[i].token_start + spans[i].embedding.token_count) + glm;
+                if (pos > start && pos < end) expected = start;
+            }
+            AGENT_TEST_ASSERT(agent_compact_image_boundary(spans, 2, glm, pos) == expected);
+        }
+    }
+    AGENT_TEST_ASSERT(agent_compact_image_boundary(NULL, 0, false, 77) == 77);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
     if (argc == 3 && !strcmp(argv[1], "--terminal-fixtures")) test_output_dir = argv[2];
     ds4_agent_unit_tests_run();
+    test_compaction_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();
     test_streaming_file_tools();
