@@ -14,12 +14,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <mutex>
+#include "cuda/ds4_q4_prefill_reduce.h"
+#include "cuda/ds4_q4_dequant_layout.h"
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -66,6 +70,8 @@ typedef struct {
     uint8_t qs[CUDA_QK_K / 2];
 } cuda_block_q4_K;
 
+#include "cuda/ds4_q4_dequant_vec.cuh"
+
 typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
@@ -104,6 +110,28 @@ static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
+typedef struct ds4_gpu_q4_attn_q_b_f16_sidecar_desc {
+    uint64_t weight_offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint32_t weight_type;
+    uint32_t layer;
+} ds4_gpu_q4_attn_q_b_f16_sidecar_desc;
+
+static int g_cuda_is_gb10[DS4_MAX_GPUS];
+static int g_cuda_disable_q4_prefill_dequant_vec;
+static int g_cuda_test_q4_mmq_strict;
+static std::mutex g_q4_attn_q_b_f16_state_mutex;
+static std::mutex g_q4_attn_q_b_f16_build_mutex;
+static uint64_t g_q4_attn_q_b_f16_generation = 1u;
+static __half *g_q4_attn_q_b_transient_f16_scratch;
+static uint64_t g_q4_attn_q_b_transient_f16_scratch_bytes;
+static int g_q4_attn_q_b_transient_f16_scratch_device = -1;
+static int g_q4_attn_q_b_transient_f16_runtime_disabled;
+static std::mutex g_q4_attn_q_b_transient_f16_mutex;
+
+
 static int g_quality_mode;
 static int g_decode_fast_attention;
 static int g_decode_score_vec4;
@@ -1097,6 +1125,10 @@ extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
     return 0;
 }
 
+extern "C" void ds4_cuda_test_set_q4_mmq_strict(int required) {
+    g_cuda_test_q4_mmq_strict = required != 0;
+}
+
 static int cuda_use_mmq(void) {
     static int init = 0;
     static int use = 0;
@@ -1378,6 +1410,16 @@ static int cuda_env_flag_enabled(const char *name, int fallback) {
     return strcmp(env, "0") != 0;
 }
 
+static int cuda_q4_gb10_fast_path_enabled(
+        int logical_tier, const char *local_rollback_env) {
+    if (g_n_gpus != 1) return 0;
+    if (logical_tier < 0) logical_tier = 0;
+    if (logical_tier != 0 || !g_cuda_is_gb10[logical_tier]) return 0;
+    if (getenv("DS4_CUDA_NO_Q4_GB10_FAST") != NULL) return 0;
+    if (local_rollback_env && getenv(local_rollback_env) != NULL) return 0;
+    return cuda_use_mmq();
+}
+
 extern "C" int ds4_gpu_set_decode_fast_attention(int enabled) {
     const int old = g_decode_fast_attention;
     g_decode_fast_attention = enabled != 0;
@@ -1395,6 +1437,352 @@ static bool cuda_splitkv_decode_requested(void) {
     return g_decode_fast_attention ||
            cuda_env_flag_enabled("DS4_CUDA_SPLITKV_DECODE", 0);
 }
+
+enum {
+    CUDA_Q4_ATTN_Q_B_TYPE = 12u,
+    CUDA_Q4_ATTN_Q_B_IN_DIM = 1024u,
+    CUDA_Q4_ATTN_Q_B_OUT_DIM = 32768u,
+    CUDA_Q4_ATTN_Q_B_MAX_ENTRIES = 80u,
+};
+
+static uint32_t cuda_q4_attn_q_b_transient_f16_min_tokens(void) {
+    int present = 0;
+    return cuda_parse_u32_env_clamped(
+        "DS4_CUDA_Q4_ATTN_Q_B_TRANSIENT_F16_MIN_TOKENS",
+        4096u, 32u, UINT32_MAX, &present);
+}
+
+static int cuda_q4_attn_q_b_transient_f16_disabled(void) {
+    const char *value = getenv("DS4_CUDA_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16");
+    if (!value || !value[0]) return 0;
+    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 &&
+           strcasecmp(value, "no") != 0 && strcasecmp(value, "off") != 0;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_size(
+        uint32_t max_rows,
+        uint64_t *weight_bytes,
+        uint64_t *activation_offset,
+        uint64_t *scratch_bytes) {
+    const uint64_t wh_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM *
+        CUDA_Q4_ATTN_Q_B_OUT_DIM * sizeof(__half);
+    const uint64_t xh_off = (wh_bytes + 255u) & ~UINT64_C(255);
+    const uint64_t xh_row_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_IN_DIM * sizeof(__half);
+    if (max_rows == 0u ||
+        (uint64_t)max_rows > (UINT64_MAX - xh_off) / xh_row_bytes) {
+        return 0;
+    }
+    const uint64_t total = xh_off + (uint64_t)max_rows * xh_row_bytes;
+    if (total > SIZE_MAX) return 0;
+    if (weight_bytes) *weight_bytes = wh_bytes;
+    if (activation_offset) *activation_offset = xh_off;
+    if (scratch_bytes) *scratch_bytes = total;
+    return 1;
+}
+
+/* The automatic path is intentionally limited to physical device storage.
+ * cuda_model_range_ptr may also expose managed/HMM or mapped host memory; a
+ * per-layer dequantization from either source would fold migration/PCIe cost
+ * into prefill and could be much slower than the native Q4 kernel. */
+static int cuda_q4_attn_q_b_source_is_device_resident(
+        const void *ptr,
+        int expected_device) {
+    if (!ptr) return 0;
+    cudaPointerAttributes attr = {};
+    const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+#if CUDART_VERSION >= 10000
+    return attr.type == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#else
+    return attr.memoryType == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#endif
+}
+
+extern "C" int ds4_cuda_test_model_range_is_device_resident(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier) {
+    if (!model_map || model_size == 0u || bytes == 0u ||
+        offset > model_size || bytes > model_size - offset ||
+        g_n_gpus != 1 || logical_tier != 0 ||
+        model_map != g_model_host_base ||
+        model_size != g_model_registered_size ||
+        !g_model_device_owned || !g_model_device_base) {
+        return 0;
+    }
+
+    const char *resolved = g_model_device_base + offset;
+    return cuda_q4_attn_q_b_source_is_device_resident(
+        resolved, g_gpu[logical_tier].device_id);
+}
+
+/* Match the existing CUDA weight-cache safety floor without coupling this
+ * cache to the Q8-specific reserve environment variable.  The explicit
+ * future-session reserve supplied by ds4.c is added independently. */
+static uint64_t cuda_q4_attn_q_b_f16_reserve_bytes(uint64_t total_bytes) {
+    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
+        return 512ull * 1048576ull;
+    }
+    if (total_bytes >= 40ull * 1024ull * 1024ull * 1024ull) {
+        const uint64_t min_reserve = 768ull * 1048576ull;
+        const uint64_t pct_reserve = total_bytes / 100u;
+        return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+    }
+    const uint64_t min_reserve = 4096ull * 1048576ull;
+    const uint64_t pct_reserve = total_bytes / 20u;
+    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_release(void) {
+    std::lock_guard<std::mutex> lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    if (!g_q4_attn_q_b_transient_f16_scratch) {
+        g_q4_attn_q_b_transient_f16_scratch_bytes = 0;
+        g_q4_attn_q_b_transient_f16_scratch_device = -1;
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+        return 1;
+    }
+
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+    const int owner = g_q4_attn_q_b_transient_f16_scratch_device;
+    if (owner < 0 || cudaSetDevice(owner) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    if (cudaFree(g_q4_attn_q_b_transient_f16_scratch) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    g_q4_attn_q_b_transient_f16_scratch = NULL;
+    g_q4_attn_q_b_transient_f16_scratch_bytes = 0;
+    g_q4_attn_q_b_transient_f16_scratch_device = -1;
+    g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+    {
+        std::lock_guard<std::mutex> cache_lock(
+            g_q4_attn_q_b_f16_state_mutex);
+        if (++g_q4_attn_q_b_f16_generation == 0u) {
+            g_q4_attn_q_b_f16_generation = 1u;
+        }
+    }
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
+}
+
+static int cuda_q4_attn_q_b_transient_f16_scratch_ensure(
+        uint32_t max_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes) {
+    uint64_t scratch_bytes = 0;
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
+            max_rows, NULL, NULL, &scratch_bytes)) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    const int target_device = g_gpu[0].device_id;
+    if (g_q4_attn_q_b_transient_f16_scratch &&
+        g_q4_attn_q_b_transient_f16_scratch_device == target_device &&
+        g_q4_attn_q_b_transient_f16_scratch_bytes >= scratch_bytes) {
+        return 1;
+    }
+    /* A CUDA backend instance does not migrate its single-GPU arena between
+     * physical devices. Cleanup/reinit owns that transition; preserving the
+     * old allocation is safer than partially replacing it here. */
+    if (g_q4_attn_q_b_transient_f16_scratch &&
+        g_q4_attn_q_b_transient_f16_scratch_device != target_device) {
+        return 0;
+    }
+
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess ||
+        cudaSetDevice(target_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    const uint64_t effective_free = (uint64_t)free_bytes;
+    const uint64_t reserve =
+        cuda_q4_attn_q_b_f16_reserve_bytes((uint64_t)total_bytes);
+    uint64_t required_free = scratch_bytes;
+    if (required_free > UINT64_MAX - reserve) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    required_free += reserve;
+    if (required_free > UINT64_MAX - working_set_reserve_bytes) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    required_free += working_set_reserve_bytes;
+    if (required_free > effective_free) {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 attn_q_b transient F16 preflight skipped: "
+                    "need %.2f MiB scratch + %.2f GiB reserve + %.2f GiB "
+                    "future sessions, only %.2f GiB currently free\n",
+                    (double)scratch_bytes / 1048576.0,
+                    (double)reserve / 1073741824.0,
+                    (double)working_set_reserve_bytes / 1073741824.0,
+                    (double)effective_free / 1073741824.0);
+        }
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Allocate first so a failed grow cannot invalidate the capacity published
+     * by the current generation. The conservative admission above intentionally
+     * does not count the old arena as reclaimable. */
+    __half *scratch = NULL;
+    if (cudaMalloc((void **)&scratch, (size_t)scratch_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Any old arena can still be referenced by stream work queued by a previous
+     * command batch. Drain before replacing it; this synchronization happens in
+     * prompt-aware preflight, never in the timed layer loop. */
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFree(scratch);
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    if (g_q4_attn_q_b_transient_f16_scratch) {
+        if (cudaFree(g_q4_attn_q_b_transient_f16_scratch) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFree(scratch);
+            if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+            return 0;
+        }
+    }
+    g_q4_attn_q_b_transient_f16_scratch = scratch;
+    g_q4_attn_q_b_transient_f16_scratch_bytes = scratch_bytes;
+    g_q4_attn_q_b_transient_f16_scratch_device = target_device;
+    g_q4_attn_q_b_transient_f16_runtime_disabled = 0;
+    /* Session preflight caches the backend generation.  Capacity is part of
+     * readiness: after a grow, sessions prepared for a smaller prompt must
+     * revisit preflight before their next larger sync. */
+    {
+        std::lock_guard<std::mutex> cache_lock(
+            g_q4_attn_q_b_f16_state_mutex);
+        if (++g_q4_attn_q_b_f16_generation == 0u) {
+            g_q4_attn_q_b_f16_generation = 1u;
+        }
+    }
+    if (prepared_bytes) *prepared_bytes = scratch_bytes;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    fprintf(stderr,
+            "ds4: CUDA prepared reusable Q4 attn_q_b transient F16 scratch "
+            "(%.2f MiB, max batch %u tokens, output F32)\n",
+            (double)scratch_bytes / 1048576.0, max_rows);
+    return 1;
+}
+
+extern "C" uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void) {
+    std::lock_guard<std::mutex> lock(g_q4_attn_q_b_f16_state_mutex);
+    return g_q4_attn_q_b_f16_generation;
+}
+
+/* The public lifecycle API also owns the automatic transient arena. */
+extern "C" int ds4_gpu_release_q4_attn_q_b_f16_sidecars(void) {
+    std::lock_guard<std::mutex> build_lock(g_q4_attn_q_b_f16_build_mutex);
+    return cuda_q4_attn_q_b_transient_f16_scratch_release();
+}
+
+extern "C" int ds4_gpu_make_room_for_q4_attn_q_b_f16_session(void) {
+    return ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+}
+
+extern "C" int ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc *descs,
+        uint32_t count,
+        uint32_t max_prefill_rows,
+        uint64_t working_set_reserve_bytes,
+        uint64_t *prepared_bytes) {
+    if (prepared_bytes) *prepared_bytes = 0;
+    if (cuda_q4_attn_q_b_transient_f16_disabled() ||
+        max_prefill_rows < cuda_q4_attn_q_b_transient_f16_min_tokens() ||
+        g_ssd_streaming_mode || g_quality_mode || g_n_gpus != 1 ||
+        !g_cublas_ready || !g_gpu[0].cublas_ready || !g_gpu[0].cublas ||
+        g_decode_graph_capturing || !model_map || !descs || count == 0u ||
+        count > CUDA_Q4_ATTN_Q_B_MAX_ENTRIES) {
+        return 0;
+    }
+
+    const uint64_t expected_weight_bytes =
+        (uint64_t)CUDA_Q4_ATTN_Q_B_OUT_DIM *
+        (CUDA_Q4_ATTN_Q_B_IN_DIM / CUDA_QK_K) *
+        sizeof(cuda_block_q4_K);
+    for (uint32_t i = 0; i < count; i++) {
+        const ds4_gpu_q4_attn_q_b_f16_sidecar_desc &desc = descs[i];
+        if (desc.weight_type != CUDA_Q4_ATTN_Q_B_TYPE ||
+            desc.in_dim != CUDA_Q4_ATTN_Q_B_IN_DIM ||
+            desc.out_dim != CUDA_Q4_ATTN_Q_B_OUT_DIM ||
+            desc.weight_bytes != expected_weight_bytes ||
+            desc.weight_offset > model_size ||
+            desc.weight_bytes > model_size - desc.weight_offset) {
+            return 0;
+        }
+    }
+
+    /* Serialize capacity publication with lifecycle release. */
+    std::lock_guard<std::mutex> build_lock(g_q4_attn_q_b_f16_build_mutex);
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess ||
+        cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    int resident =
+        model_map == g_model_host_base &&
+        model_size == g_model_registered_size &&
+        g_model_device_owned && g_model_device_base;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!resident) break;
+        const char *source =
+            g_model_device_base + descs[i].weight_offset;
+        if (!cuda_q4_attn_q_b_source_is_device_resident(
+                source, g_gpu[0].device_id)) {
+            resident = 0;
+            break;
+        }
+    }
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    if (!resident ||
+        !cuda_q4_attn_q_b_transient_f16_scratch_ensure(
+            max_prefill_rows, working_set_reserve_bytes,
+            prepared_bytes)) {
+        return 0;
+    }
+    return 1;
+}
+
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
@@ -2580,6 +2968,10 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
+    ds4_mmq_set_gb10_optimizations(0);
+    memset(g_cuda_is_gb10, 0, sizeof(g_cuda_is_gb10));
+    g_cuda_disable_q4_prefill_dequant_vec =
+        getenv("DS4_CUDA_DISABLE_Q4_PREFILL_DEQUANT_VEC") != NULL;
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     cuda_xdev_env_refresh();
     cuda_decode_dispatch_env_refresh();
@@ -2603,6 +2995,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            g_cuda_is_gb10[i] = prop.major == 12 && prop.minor == 1 && prop.integrated;
             if (i == 0) g_device_is_spark =
                 prop.integrated && prop.major == 12 && prop.minor == 1;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
@@ -2769,6 +3162,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     }
 
     g_cublas_ready = 1;
+    ds4_mmq_set_gb10_optimizations(g_n_gpus == 1 && g_cuda_is_gb10[0]);
     return 1;
 }
 
@@ -2781,6 +3175,11 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    ds4_mmq_set_gb10_optimizations(0);
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
+        fprintf(stderr, "ds4: CUDA Q4 scratch cleanup synchronization failed\n");
+        return;
+    }
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
 
@@ -3709,6 +4108,7 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -3881,6 +4281,7 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
 
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
@@ -4615,6 +5016,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
+    (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
     g_quality_mode = quality ? 1 : 0;
     const cublasMath_t math_mode =
         (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
@@ -6590,13 +6992,21 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (rows > 8u) {
+        // Q-A and KV retain their per-thread products and exact reduction
+        // tree; only prefill replaces the nine shared stages with two fences.
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = rsqrtf(total / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -6660,13 +7070,19 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (rows > 8u) {
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = rsqrtf(total / (float)n + eps);
     if (which == 0u) {
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
             orow[i] = xr[i] * scale * w[i];
@@ -6718,6 +7134,7 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
     }
 }
 
+template<bool Q4_PREFILL_REDUCE>
 __global__ static void head_rms_norm_rope_tail_kernel(
         float *x,
         uint32_t n_tok,
@@ -6744,13 +7161,19 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         sum += v * v;
     }
     __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float total;
+    if (Q4_PREFILL_REDUCE) {
+        total = ds4_q4_prefill_reduce_256(sum, partial);
+    } else {
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = partial[0];
     }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const float scale = rsqrtf(total / (float)head_dim + eps);
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
         xr[i] *= scale;
@@ -15323,7 +15746,8 @@ extern "C" int ds4_gpu_matmul_q4_K_pair_decode_tensor(
     return ds4_mmq_q4_K_dense_pair_vec(
         w0, w1, (const float *)x->ptr,
         (float *)out0->ptr, (float *)out1->ptr,
-        (int)out_dim, (int)in_dim, cuda_decode_stream()) == 0;
+        (int)out_dim, (int)out_dim, /*N=*/1, (int)in_dim,
+        cuda_decode_stream()) == 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
@@ -16621,7 +17045,13 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
 extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    // Native Q4, Q8, SSD and quality prefill use the same F32 RMS tree as
+    // the resident Q4 epilogue. Decode and speculative widths retain theirs.
+    if (n_tok > 8u) {
+        head_rms_norm_rope_tail_kernel<true><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    } else {
+        head_rms_norm_rope_tail_kernel<false><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    }
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
@@ -19603,6 +20033,41 @@ __device__ static void dev_q4_K_get_scale_min(
     } else {
         *d_out = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
         *m_out = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u);
+    }
+}
+
+__global__ static void dequant_q4_K_to_f16_kernel(
+        __half *out,
+        const cuda_block_q4_K *w,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    const uint64_t chunk =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t chunks_per_row = in_dim / 16u;
+    const uint64_t total_chunks = out_dim * chunks_per_row;
+    if (chunk >= total_chunks) return;
+
+    // Both callers use packed rows with in_dim divisible by 256. A 16-value
+    // chunk stays within one scale group, so neither row division nor
+    // repeated scale/min unpack is needed in the value loop.
+    const cuda_block_q4_K *block = w + (chunk >> 4u);
+    const uint32_t group = (uint32_t)((chunk >> 1u) & 7u);
+    const uint32_t byte0 = (group >> 1u) * 32u +
+                           (uint32_t)(chunk & 1u) * 16u;
+    const float d = dev_f16_to_f32(block->d);
+    const float dmin = dev_f16_to_f32(block->dmin);
+    uint8_t scale_code, min_code;
+    dev_q4_K_get_scale_min(group, block->scales, &scale_code, &min_code);
+
+#pragma unroll
+    for (uint32_t k = 0; k < 16u; k++) {
+        const uint8_t packed = block->qs[byte0 + k];
+        const uint8_t q = (group & 1u) ? (packed >> 4u)
+                                       : (packed & 15u);
+        const float value =
+            (d * (float)scale_code) * (float)q -
+            dmin * (float)min_code;
+        out[chunk * 16u + k] = __float2half_rn(value);
     }
 }
 
@@ -32354,6 +32819,616 @@ extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
     return 0;
 }
 
+/* Dense Q4_K matvec fallback for the AProjQ4 attention projections. MMQ below
+ * handles prefill as a tiled matrix multiply so weights are reused across
+ * tokens; this bandwidth-oriented kernel remains useful for decode and for
+ * shapes MMQ cannot accept. */
+__global__ static void matmul_q4_K_dense_kernel(
+        float *out,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;   /* 32 rows per 256-thread block */
+    uint32_t tok = blockIdx.y;
+    uint32_t row = blockIdx.x * 32u + row_lane;
+    if (tok >= n_tok || row >= out_dim) return;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr =
+        (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+/* Two independently-sized Q4_K projections over one canonical Q8_K row.
+ * Each accumulator keeps the same block walk and quarter-warp reduction as
+ * matmul_q4_K_dense_kernel; interleaving the weight loads does not alter either
+ * output's arithmetic order. */
+__global__ static void matmul_q4_K_dense_pair_kernel(
+        float *out0,
+        float *out1,
+        const char *w0_base,
+        const char *w1_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out0_dim,
+        uint32_t out1_dim,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t tok = blockIdx.y;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (tok >= n_tok || (row >= out0_dim && row >= out1_dim)) return;
+
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr0 = row < out0_dim
+        ? (const cuda_block_q4_K *)(w0_base + (uint64_t)row * row_bytes)
+        : NULL;
+    const cuda_block_q4_K *wr1 = row < out1_dim
+        ? (const cuda_block_q4_K *)(w1_base + (uint64_t)row * row_bytes)
+        : NULL;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        if (wr0) acc0 += dev_dot_q4_K_q8_K_block(wr0 + b, xqb + b);
+        if (wr1) acc1 += dev_dot_q4_K_q8_K_block(wr1 + b, xqb + b);
+    }
+    acc0 = quarter_warp_sum_f32(acc0, lane);
+    acc1 = quarter_warp_sum_f32(acc1, lane);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[(uint64_t)tok * out0_dim + row] = acc0;
+        if (row < out1_dim) out1[(uint64_t)tok * out1_dim + row] = acc1;
+    }
+}
+
+/* Decode attention-output tail for AProjQ4:
+ *
+ *     block_out = input @ Wob(Q4_K)
+ *     out_hc    = HCPost(block_out, residual_hc, split)
+ *
+ * Keep the Q4_K dot-product and quarter-warp reduction identical to
+ * matmul_q4_K_dense_kernel.  The row-owning lane then materializes the
+ * diagnostic block output and immediately expands the same F32 value into
+ * the four HC streams.  This removes the standalone hc_expand launch without
+ * changing the Q4 accumulation order used by the non-MMQ fallback. */
+__global__ static void matmul_q4_K_hc_expand4_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *residual_hc,
+        const float *split,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out_dim,
+        uint32_t n_embd) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (row >= out_dim) return;
+
+    const cuda_block_q4_K *wr =
+        (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    const bool vector_aligned = (((uintptr_t)w_base & 15u) == 0u);
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        if (vector_aligned) {
+            dev_dot_q4_K_q8_K_block_vec(wr + b, xq + b, &acc);
+        } else {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        }
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+
+    if (lane == 0u) {
+        block_out[row] = acc;
+
+        const float *post = split + 4u;
+        const float *comb = split + 8u;
+#pragma unroll
+        for (uint32_t dst_hc = 0; dst_hc < 4u; dst_hc++) {
+            float hc_acc = acc * post[dst_hc];
+#pragma unroll
+            for (uint32_t src_hc = 0; src_hc < 4u; src_hc++) {
+                hc_acc += comb[dst_hc + src_hc * 4u] *
+                          residual_hc[(uint64_t)src_hc * n_embd + row];
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + row] = hc_acc;
+        }
+    }
+}
+
+static int cuda_matmul_q4_K_tensor(
+        ds4_gpu_tensor *out,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint64_t        in_dim,
+        uint64_t        out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t        n_tok) {
+    if (!out || !x || !model_map || n_tok == 0) return 0;
+    if (in_dim == 0 || (in_dim % CUDA_QK_K) != 0) return 0;
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (weight_offset > model_size || row_bytes == 0 ||
+        out_dim > UINT64_MAX / row_bytes) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "q4_K dense");
+    if (!wptr) return 0;
+    /* The scalar-token kernel below rereads every weight row for every token,
+     * making prefill scale almost linearly with batch length. MMQ tiles both
+     * axes and shares the Q4_K weights across activation columns, matching the
+     * fast Q8 prefill path while retaining native quantized arithmetic. */
+    if (in_dim <= INT_MAX && out_dim <= INT_MAX && n_tok <= INT_MAX &&
+        cuda_use_mmq()) {
+        /* MMVQ has lower setup cost for decode and speculative micro-batches;
+         * regular MMQ wins once enough token columns can share each weight
+         * tile. Both consume the GGUF Q4_K layout directly. */
+        const int rc = n_tok <= 8u
+            ? ds4_mmq_q4_K_dense_vec(
+                  wptr, (const float *)x->ptr, (float *)out->ptr,
+                  (int)out_dim, (int)n_tok, (int)in_dim,
+                  cuda_decode_stream())
+            : ds4_mmq_q4_K_dense(
+                  wptr, (const float *)x->ptr, (float *)out->ptr,
+                  (int)out_dim, (int)n_tok, (int)in_dim,
+                  cuda_decode_stream());
+        if (rc == 0) return 1;
+        fprintf(stderr,
+                "ds4: Q4_K MMQ returned %d "
+                "(in=%llu out=%llu n_tok=%llu)%s\n",
+                rc, (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok,
+                g_cuda_test_q4_mmq_strict
+                    ? "; strict benchmark mode rejects fallback"
+                    : "; falling back");
+        if (g_cuda_test_q4_mmq_strict) return 0;
+    }
+    if (g_cuda_test_q4_mmq_strict) {
+        fprintf(stderr,
+                "ds4: Q4_K strict benchmark mode found no MMQ dispatch "
+                "(in=%llu out=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                (unsigned long long)n_tok);
+        return 0;
+    }
+    void *tmp = cuda_tmp_alloc_on(logical_tier,
+                                  n_tok * blocks * sizeof(cuda_block_q8_K),
+                                  "q4_K dense prequant");
+    if (!tmp) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)tmp;
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+    q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+            xq, (const float *)x->ptr,
+            (uint32_t)in_dim, (uint32_t)n_tok);
+    if (!cuda_ok(cudaGetLastError(), "q4_K dense quantize launch")) return 0;
+    dim3 grid(((unsigned)out_dim + 31u) / 32u, (unsigned)n_tok, 1);
+    matmul_q4_K_dense_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr,
+            wptr,
+            xq,
+            row_bytes,
+            (uint32_t)blocks,
+            (uint32_t)out_dim,
+            (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(), "q4_K dense matmul launch");
+}
+
+static int cuda_matmul_q4_K_pair_tensor_impl(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out0 || !out1 || !x || !model_map || n_tok == 0u ||
+        n_tok > INT_MAX ||
+        in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
+        in_dim > INT_MAX || out0_dim == 0u || out1_dim == 0u ||
+        out0_dim > INT_MAX || out1_dim > INT_MAX) {
+        return 0;
+    }
+
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    if (blocks == 0u || blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out0_dim > UINT64_MAX / row_bytes ||
+        out1_dim > UINT64_MAX / row_bytes ||
+        weight0_offset > model_size || weight1_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight0_bytes = out0_dim * row_bytes;
+    const uint64_t weight1_bytes = out1_dim * row_bytes;
+    if (weight0_bytes > model_size - weight0_offset ||
+        weight1_bytes > model_size - weight1_offset ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out0_dim ||
+        n_tok * out0_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out1_dim ||
+        n_tok * out1_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+    const uint64_t out0_bytes = n_tok * out0_dim * sizeof(float);
+    const uint64_t out1_bytes = n_tok * out1_dim * sizeof(float);
+    if (x->bytes < x_bytes || out0->bytes < out0_bytes ||
+        out1->bytes < out1_bytes) {
+        return 0;
+    }
+    const uintptr_t out0_addr = (uintptr_t)out0->ptr;
+    const uintptr_t out1_addr = (uintptr_t)out1->ptr;
+    const bool outputs_overlap = out0_addr <= out1_addr
+        ? (uint64_t)(out1_addr - out0_addr) < out0_bytes
+        : (uint64_t)(out0_addr - out1_addr) < out1_bytes;
+    if (outputs_overlap) return 0;
+
+    const int logical_tier = ds4_tensor_device_idx(out0);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(out1) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const char *w0 = cuda_resolve_weight_ptr(
+        model_map, weight0_offset, weight0_bytes, logical_tier,
+        "q4_K dense pair0");
+    const char *w1 = cuda_resolve_weight_ptr(
+        model_map, weight1_offset, weight1_bytes, logical_tier,
+        "q4_K dense pair1");
+    if (!w0 || !w1) return 0;
+
+    const int gb10_canonical = cuda_q4_gb10_fast_path_enabled(
+        logical_tier, "DS4_CUDA_DISABLE_Q4_DENSE_PAIR");
+    if (cuda_use_mmq()) {
+        /* Share one canonical Q8_1 activation across both projections:
+         * MMVQ covers decode/speculative widths and token-tiled MMQ covers
+         * prefill.  On GB10 a rejected launch fails closed to ds4.c's
+         * independent projections; the Q8_K fallback below remains the
+         * established non-GB10 rollback. */
+        const int rc = n_tok <= 8u
+            ? ds4_mmq_q4_K_dense_pair_vec(
+                  w0, w1, (const float *)x->ptr,
+                  (float *)out0->ptr, (float *)out1->ptr,
+                  (int)out0_dim, (int)out1_dim,
+                  (int)n_tok, (int)in_dim, cuda_decode_stream())
+            : ds4_mmq_q4_K_dense_pair(
+                  w0, w1, (const float *)x->ptr,
+                  (float *)out0->ptr, (float *)out1->ptr,
+                  (int)out0_dim, (int)out1_dim,
+                  (int)n_tok, (int)in_dim, cuda_decode_stream());
+        if (rc == 0) return 1;
+        fprintf(stderr,
+                "ds4: Q4_K %s pair returned %d "
+                "(in=%llu out0=%llu out1=%llu n_tok=%llu)%s\n",
+                n_tok <= 8u ? "MMVQ" : "MMQ", rc,
+                (unsigned long long)in_dim,
+                (unsigned long long)out0_dim,
+                (unsigned long long)out1_dim,
+                (unsigned long long)n_tok,
+                rc == DS4_MMQ_NOT_APPLICABLE
+                    ? (g_cuda_test_q4_mmq_strict
+                           ? "; strict benchmark mode rejects fallback"
+                           : "; falling back")
+                    : "; attempted path failed closed");
+        if (rc != DS4_MMQ_NOT_APPLICABLE) return -1;
+        if (g_cuda_test_q4_mmq_strict) return -1;
+        if (gb10_canonical) return 0;
+    }
+    if (g_cuda_test_q4_mmq_strict) {
+        fprintf(stderr,
+                "ds4: Q4_K pair strict benchmark mode found no MMQ "
+                "dispatch (in=%llu out0=%llu out1=%llu n_tok=%llu)\n",
+                (unsigned long long)in_dim,
+                (unsigned long long)out0_dim,
+                (unsigned long long)out1_dim,
+                (unsigned long long)n_tok);
+        return -1;
+    }
+
+    /* The Q8_K pair is the established decode/microbatch rollback only.
+     * For prefill, preserve DS4_CUDA_MMQ=0 and MMQ rejection semantics by
+     * returning control to the caller's two independent dense projections. */
+    if (n_tok > 8u) return 0;
+
+    if (n_tok > UINT64_MAX / blocks ||
+        n_tok * blocks > UINT64_MAX / sizeof(cuda_block_q8_K)) {
+        return 0;
+    }
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, n_tok * blocks * sizeof(cuda_block_q8_K),
+        "q4_K dense pair prequant");
+    if (!xq) return 0;
+
+    const dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1u);
+    q8_K_quantize_kernel<<<qgrid, 256, 0, cuda_decode_stream()>>>(
+        xq, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
+    if (!cuda_ok(cudaGetLastError(), "q4_K dense pair quantize launch")) {
+        return -1;
+    }
+
+    const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    const dim3 grid(((unsigned)max_out + 31u) / 32u,
+                    (unsigned)n_tok, 1u);
+    matmul_q4_K_dense_pair_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+        (float *)out0->ptr,
+        (float *)out1->ptr,
+        w0,
+        w1,
+        xq,
+        row_bytes,
+        (uint32_t)blocks,
+        (uint32_t)out0_dim,
+        (uint32_t)out1_dim,
+        (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(), "q4_K dense pair matmul launch")
+        ? 1
+        : -1;
+}
+
+static int cuda_q4_K_hc_expand_canonical(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split) {
+    /* Reuse the exact ordinary Q4 dispatcher.  With MMQ enabled this is the
+     * canonical MMVQ/Q8_1 path (including sanitize); if MMVQ rejects the
+     * shape it retains the ordinary Q8_K materialized fallback. */
+    if (!cuda_matmul_q4_K_tensor(block_out, model_map, model_size,
+                                 weight_offset, in_dim, out_dim, x, 1u)) {
+        return 0;
+    }
+    /* Use the ordinary one-token HC launch and argument layout. */
+    const uint64_t n_elem = 4u * out_dim;
+    const float *base = (const float *)split->ptr;
+    hc_expand_kernel<<<(unsigned)((n_elem + 255u) / 256u),
+                       256, 0, cuda_decode_stream()>>>(
+        (float *)out_hc->ptr,
+        (const float *)block_out->ptr,
+        (const float *)block_out->ptr,
+        (const float *)block_out->ptr,
+        (const float *)residual_hc->ptr,
+        base + 4u,
+        base + 8u,
+        (uint32_t)out_dim, 4u, 1u, 4u, 16u, 0, 0);
+    return cuda_ok(cudaGetLastError(),
+                   "q4_K canonical MMVQ hc expand launch");
+}
+
+static int cuda_q4_K_hc_expand_q8k_launch(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        const char           *wptr,
+        cuda_block_q8_K      *xq,
+        uint64_t              row_bytes,
+        uint32_t              blocks,
+        uint32_t              out_dim,
+        uint32_t              n_embd) {
+    q8_K_quantize_kernel<<<blocks, 256, 0, cuda_decode_stream()>>>(
+        xq, (const float *)x->ptr, blocks * CUDA_QK_K, 1u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4_K Q8_K hc expand quantize launch")) {
+        return 0;
+    }
+
+    matmul_q4_K_hc_expand4_kernel<<<(out_dim + 31u) / 32u,
+                                      256, 0, cuda_decode_stream()>>>(
+        (float *)out_hc->ptr,
+        (float *)block_out->ptr,
+        (const float *)residual_hc->ptr,
+        (const float *)split->ptr,
+        wptr,
+        xq,
+        row_bytes,
+        blocks,
+        out_dim,
+        n_embd);
+    return cuda_ok(cudaGetLastError(), "q4_K Q8_K hc expand launch");
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_hc_expand_available(void) {
+    if (getenv("DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE") != NULL) return 0;
+    /* GB10 uses canonical MMVQ and HC; the non-MMQ path fuses Q8_K and HC. */
+    return cuda_q4_gb10_fast_path_enabled(g_current_logical_tier, NULL) ||
+           !cuda_use_mmq();
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc) {
+    if (!ds4_gpu_matmul_q4_K_hc_expand_available() ||
+        !out_hc || !block_out || !model_map || !x || !residual_hc || !split ||
+        in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
+        out_dim == 0u || out_dim != n_embd || (out_dim & 1u) != 0u ||
+        n_hc != 4u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    if (blocks == 0u || blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out_dim > UINT64_MAX / row_bytes || weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        out_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t x_bytes = in_dim * sizeof(float);
+    const uint64_t embd_bytes = out_dim * sizeof(float);
+    const uint64_t hc_bytes = 4u * embd_bytes;
+    const uint64_t split_bytes = 24u * sizeof(float);
+    if (x->bytes < x_bytes || block_out->bytes < embd_bytes ||
+        residual_hc->bytes < hc_bytes || split->bytes < split_bytes ||
+        out_hc->bytes < hc_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(out_hc);
+    if (ds4_tensor_device_idx(block_out) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier ||
+        ds4_tensor_device_idx(residual_hc) != logical_tier ||
+        ds4_tensor_device_idx(split) != logical_tier) {
+        return 0;
+    }
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "q4_K hc expand");
+    if (!wptr) return 0;
+
+    if (cuda_use_mmq()) {
+        return cuda_q4_K_hc_expand_canonical(
+            out_hc, block_out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, residual_hc, split);
+    }
+
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, blocks * sizeof(cuda_block_q8_K),
+        "q4_K hc expand prequant");
+    if (xq && cuda_q4_K_hc_expand_q8k_launch(
+                    out_hc, block_out, x, residual_hc, split,
+                    wptr, xq, row_bytes, (uint32_t)blocks,
+                    (uint32_t)out_dim, n_embd)) {
+        return 1;
+    }
+
+    /* Allocation/launch rejection of the fused fallback must not make
+     * decoding unavailable.  Re-materialize through the ordinary dispatcher
+     * and finish with the ordinary HC epilogue. */
+    return cuda_q4_K_hc_expand_canonical(
+        out_hc, block_out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, residual_hc, split);
+}
+
+__global__ static void matmul_q4_K_kslice_kernel(
+        float *out,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t full_row_bytes,
+        uint32_t block0,
+        uint32_t block_count,
+        uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row = blockIdx.x * 32u + row_lane;
+    if (row >= out_dim) return;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+        w_base + (uint64_t)row * full_row_bytes) + block0;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < block_count; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) out[row] = acc;
+}
+
+static int cuda_matmul_q4_K_kslice_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t x_elem_off) {
+    if (!out || !x || !model_map || full_in_dim == 0 || k_cnt == 0 ||
+        full_in_dim > UINT32_MAX || k_cnt > UINT32_MAX ||
+        out_dim > UINT32_MAX || out_dim > UINT64_MAX / sizeof(float) ||
+        (full_in_dim % CUDA_QK_K) != 0u ||
+        (k_off % CUDA_QK_K) != 0u || (k_cnt % CUDA_QK_K) != 0u ||
+        k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
+        x_elem_off > x->bytes / sizeof(float) ||
+        k_cnt > x->bytes / sizeof(float) - x_elem_off ||
+        out->bytes < out_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t full_blocks = full_in_dim / CUDA_QK_K;
+    const uint64_t slice_blocks = k_cnt / CUDA_QK_K;
+    if (full_blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) return 0;
+    const uint64_t row_bytes = full_blocks * sizeof(cuda_block_q4_K);
+    if (out_dim > UINT64_MAX / row_bytes || weight_offset > model_size) return 0;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier, "q4_K kslice");
+    if (!wptr) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc_on(
+        logical_tier, slice_blocks * sizeof(cuda_block_q8_K),
+        "q4_K kslice prequant");
+    if (!xq) return 0;
+    const float *xptr = (const float *)x->ptr + x_elem_off;
+    q8_K_quantize_kernel<<<(unsigned)slice_blocks, 256>>>(
+        xq, xptr, (uint32_t)k_cnt, 1u);
+    if (!cuda_ok(cudaGetLastError(), "q4_K kslice quantize launch")) return 0;
+    matmul_q4_K_kslice_kernel<<<((unsigned)out_dim + 31u) / 32u, 256>>>(
+        (float *)out->ptr, wptr, xq, row_bytes,
+        (uint32_t)(k_off / CUDA_QK_K), (uint32_t)slice_blocks,
+        (uint32_t)out_dim);
+    return cuda_ok(cudaGetLastError(), "q4_K kslice matmul launch");
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset,
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    /* Cross-CUDA pair dispatch predates the GB10 specialization.  Preserve it
+     * verbatim outside GB10; this switch remains its established rollback. */
+    if (getenv("DS4_CUDA_DISABLE_Q4_DENSE_PAIR") != NULL) return 0;
+    return cuda_matmul_q4_K_pair_tensor_impl(
+        out0, out1, model_map, model_size,
+        weight0_offset, weight1_offset,
+        in_dim, out0_dim, out1_dim, x, n_tok);
+}
+
 static int cuda_matmul_mmq_dense_quant(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -32448,8 +33523,10 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim,
                                          x, n_tok);
-    case 10u:  /* Q2_K */
     case 12u:  /* Q4_K */
+        return cuda_matmul_q4_K_tensor(out, model_map, model_size,
+                weight_offset, in_dim, out_dim, x, n_tok);
+    case 10u:  /* Q2_K */
     case 16u:  /* IQ2_XXS */
     case 39u:  /* MXFP4 */
         return cuda_matmul_mmq_dense_quant(
@@ -32920,6 +33997,7 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+    (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
@@ -33064,10 +34142,17 @@ extern "C" int ds4_gpu_matmul_quant_kslice_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
         uint64_t x_elem_off) {
-    if (weight_type != 8u) return 0;
-    return ds4_gpu_matmul_q8_0_kslice_tensor(
-            out, model_map, model_size, weight_offset,
-            full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    if (weight_type == 8u) {
+        return ds4_gpu_matmul_q8_0_kslice_tensor(
+                out, model_map, model_size, weight_offset,
+                full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    }
+    if (weight_type == 12u) {
+        return cuda_matmul_q4_K_kslice_tensor(
+                out, model_map, model_size, weight_offset,
+                full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    }
+    return 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
@@ -33087,18 +34172,197 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
 extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *q_half,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t weight_type,
         uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
         uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
         uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
-    (void)out; (void)q_half; (void)model_map; (void)model_size;
-    (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
-    (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot; (void)pos0;
-    (void)n_ctx_orig; (void)inverse; (void)freq_base; (void)freq_scale;
-    (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
-    (void)eps;
-    return 0;
+    (void)q_half;
+    /* Resident Q4 long prefill keeps one expanded matrix and an F32 output. */
+    if (weight_type != CUDA_Q4_ATTN_Q_B_TYPE || n_tok < 32u ||
+        cuda_q4_attn_q_b_transient_f16_disabled() ||
+        n_tok < cuda_q4_attn_q_b_transient_f16_min_tokens()) return 0;
+    if (g_ssd_streaming_mode || g_quality_mode || g_n_gpus != 1 ||
+        !g_cublas_ready ||
+        !g_gpu[0].cublas_ready || !g_gpu[0].cublas ||
+        g_decode_graph_capturing || !out || !x || !model_map ||
+        !out->ptr || !x->ptr || n_head == 0u ||
+        head_dim == 0u || in_dim != CUDA_Q4_ATTN_Q_B_IN_DIM ||
+        out_dim != CUDA_Q4_ATTN_Q_B_OUT_DIM ||
+        out_dim != (uint64_t)n_head * head_dim || n_rot > head_dim ||
+        (n_rot & 1u) != 0u ||
+        ds4_tensor_device_idx(out) != 0 ||
+        ds4_tensor_device_idx(x) != 0 ||
+        n_tok > (uint32_t)INT_MAX ||
+        (uint64_t)n_tok * in_dim > (uint64_t)UINT32_MAX * 256u ||
+        (uint64_t)n_tok * n_head > UINT32_MAX ||
+        pos0 > UINT32_MAX - (n_tok - 1u)) {
+        return 0;
+    }
+
+    const uint64_t x_bytes =
+        (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes =
+        (uint64_t)n_tok * out_dim * sizeof(float);
+    if (x->bytes < x_bytes || out->bytes < out_bytes) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (out_dim > UINT64_MAX / row_bytes || weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset) return 0;
+
+    uint64_t transient_weight_bytes = 0;
+    uint64_t xh_offset = 0;
+    uint64_t required_scratch_bytes = 0;
+    if (!cuda_q4_attn_q_b_transient_f16_scratch_size(
+            n_tok, &transient_weight_bytes, &xh_offset,
+            &required_scratch_bytes)) {
+        return 0;
+    }
+
+    /* Protect the shared weight/activation arena for the entire enqueue sequence.
+     * Stream ordering protects reuse after this function returns; host
+     * serialization protects the sequence itself from interleaving with
+     * another session. */
+    std::unique_lock<std::mutex> scratch_use_lock(
+        g_q4_attn_q_b_transient_f16_mutex);
+    if (!g_q4_attn_q_b_transient_f16_scratch ||
+        g_q4_attn_q_b_transient_f16_scratch_device != g_gpu[0].device_id ||
+        g_q4_attn_q_b_transient_f16_scratch_bytes <
+            required_scratch_bytes) {
+        return 0;
+    }
+    __half *const scratch =
+        g_q4_attn_q_b_transient_f16_scratch;
+    __half *const xh = reinterpret_cast<__half *>(
+        reinterpret_cast<char *>(scratch) + xh_offset);
+    const __half *const w_f16 = scratch;
+    if (g_q4_attn_q_b_transient_f16_runtime_disabled) return 0;
+
+    int previous_device = -1;
+    if (cudaGetDevice(&previous_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    const cudaStream_t stream = cuda_decode_stream();
+    const cublasHandle_t handle = cuda_cublas_for_tier(0);
+    cudaStream_t handle_stream = NULL;
+    if (cublasGetStream(handle, &handle_stream) != CUBLAS_STATUS_SUCCESS ||
+        handle_stream != stream) {
+        /* Never mutate the shared handle here.  A non-default stream means
+         * another subsystem owns its ordering; the native Q4 fallback is
+         * safer than racing the activation conversion. */
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    const uint64_t xh_count = (uint64_t)n_tok * in_dim;
+    const char *source =
+        model_map == g_model_host_base &&
+        model_size == g_model_registered_size &&
+        g_model_device_owned && g_model_device_base
+            ? g_model_device_base + weight_offset : NULL;
+    if (!cuda_q4_attn_q_b_source_is_device_resident(
+            source, g_gpu[0].device_id)) {
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+    const uint64_t chunks = transient_weight_bytes / (16u * sizeof(__half));
+    if (ds4_q4_dequant::select(
+            in_dim, out_dim, n_tok, (uintptr_t)source, (uintptr_t)scratch,
+            g_n_gpus == 1 && g_cuda_is_gb10[0], g_quality_mode,
+            g_ssd_streaming_mode, g_cuda_disable_q4_prefill_dequant_vec)) {
+        ds4_q4_dequant_f16_pair32_kernel<<<
+            (unsigned)((chunks / 2u + 255u) / 256u), 256, 0, stream>>>(
+                scratch, reinterpret_cast<const cuda_block_q4_K *>(source),
+                out_dim * blocks);
+    } else {
+        dequant_q4_K_to_f16_kernel<<<
+            (unsigned)((chunks + 255u) / 256u), 256, 0, stream>>>(
+                scratch,
+                reinterpret_cast<const cuda_block_q4_K *>(source),
+                in_dim, out_dim);
+    }
+    const cudaError_t dequant_err = cudaGetLastError();
+    if (dequant_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b transient dequantization failed: "
+                "%s\n",
+                cudaGetErrorString(dequant_err));
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* Prefill is deliberately excluded from decode-graph capture above, so
+     * dequantization, activation conversion, cuBLAS, and the epilogue all ride
+     * one stream.  Avoid retargeting the shared handle on this hot path. */
+    f32_to_f16_kernel<<<
+        (unsigned)((xh_count + 255u) / 256u), 256, 0, stream>>>(
+            xh, (const float *)x->ptr, xh_count);
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b activation conversion failed: %s\n",
+                cudaGetErrorString(launch_err));
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)out_dim, (int)n_tok, (int)in_dim,
+        &alpha,
+        w_f16, CUDA_R_16F, (int)in_dim,
+        xh, CUDA_R_16F, (int)in_dim,
+        &beta,
+        out->ptr, CUDA_R_32F, (int)out_dim,
+        CUDA_R_32F,
+        CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b F16 GEMM failed: status %d\n",
+                (int)status);
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return 0;
+    }
+
+    /* cuBLAS has accepted the first output writer.  From this point onward a
+     * native-Q4 replay is unsafe even when the specialization was optional. */
+    head_rms_norm_rope_tail_kernel<true><<<
+        n_tok * n_head, 256, 0, stream>>>(
+            (float *)out->ptr,
+            n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+            inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
+            attn_factor, beta_fast, beta_slow, eps);
+    launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q4 attn_q_b F16 RMS/RoPE epilogue failed: %s\n",
+                cudaGetErrorString(launch_err));
+        g_q4_attn_q_b_transient_f16_runtime_disabled = 1;
+        if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+        return -1;
+    }
+
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
+    return 1;
 }
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_range_tensor(
@@ -33146,22 +34410,220 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         uint64_t out_a_offset, uint64_t out_b_offset, uint32_t out_b_type,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups,
         uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
-    (void)out; (void)low; (void)group_tmp; (void)low_tmp;
-    (void)model_map; (void)model_size; (void)out_a_offset;
-    (void)out_b_offset; (void)out_b_type; (void)group_dim; (void)rank;
-    (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
-    return 0;
+    const int grouped_prefill_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_PREFILL", 0);
+    const int grouped_q81_require = cuda_env_flag_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81", 0);
+    const int any_grouped_require = grouped_prefill_require ||
+        grouped_q81_require;
+    if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
+        group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
+        n_tokens < 2u || group_dim > INT_MAX || rank > INT_MAX ||
+        out_dim > INT_MAX || n_tokens > INT_MAX || !cuda_use_mmq()) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (low_dim > INT_MAX || (group_dim % CUDA_QK_K) != 0u ||
+        (low_dim % CUDA_QK_K) != 0u) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const uint64_t row_a_bytes =
+        (group_dim / CUDA_QK_K) * sizeof(cuda_block_q4_K);
+    if (rank > UINT64_MAX / row_a_bytes ||
+        n_groups > UINT64_MAX / (rank * row_a_bytes)) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
+    if (out_a_offset > model_size ||
+        out_a_bytes > model_size - out_a_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
+        group_tmp->bytes < (uint64_t)n_tokens * group_dim * sizeof(float) ||
+        low_tmp->bytes < (uint64_t)n_tokens * rank * sizeof(float)) {
+        return any_grouped_require ? -1 : 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *out_a = cuda_resolve_weight_ptr(
+        model_map, out_a_offset, out_a_bytes, logical_tier, "q4 attn_out_a");
+    if (!out_a) {
+        return any_grouped_require ? -1 : 0;
+    }
+    /* The direct-strided eight-grid path preserves the canonical MMQ
+     * reduction tree and is the GB10 prefill default. Exact ENABLE=0 is a
+     * compatibility opt-out; the NO switch remains the rollback. */
+    const int grouped_prefill_enable = cuda_env_flag_enabled(
+        "DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_PREFILL", 1);
+    const int grouped_prefill_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL") != NULL;
+    const int grouped_q81_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81") != NULL;
+    const int grouped_prefill_selected = grouped_prefill_enable ||
+        grouped_prefill_require || grouped_q81_require;
+
+    const int grouped_gb10 =
+        n_tokens <= 8u && n_groups <= INT_MAX &&
+        ds4_tensor_device_idx(low) == logical_tier &&
+        ds4_tensor_device_idx(heads) == logical_tier &&
+        cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    const int grouped_prefill_gb10 =
+        n_tokens > 8u && n_groups <= INT_MAX &&
+        ds4_tensor_device_idx(low) == logical_tier &&
+        ds4_tensor_device_idx(heads) == logical_tier &&
+        !grouped_prefill_disable &&
+        cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A");
+    if (grouped_prefill_require && !grouped_prefill_gb10) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A prefill path "
+                "is not eligible\n");
+        return -1;
+    }
+    if (grouped_q81_require &&
+        (grouped_q81_disable || !grouped_prefill_gb10 ||
+         rank != 1024u || group_dim != 4096u || n_groups != 8u ||
+         n_tokens > (uint32_t)(INT32_MAX / (8*4096)))) {
+        fprintf(stderr,
+                "ds4: required CUDA Q4 grouped attention-A K4096/G8 "
+                "Q8_1 quantizer is not eligible\n");
+        return -1;
+    }
+    if (grouped_prefill_selected && grouped_prefill_gb10) {
+        const int rc = ds4_mmq_q4_K_grouped_dense(
+            out_a, (const float *)heads->ptr, (float *)low->ptr,
+            (int)rank, (int)n_tokens, (int)group_dim, (int)n_groups,
+            cuda_decode_stream());
+        if (rc != 0) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 grouped attention-A prefill returned %d; "
+                    "failing closed after dispatch\n", rc);
+            return -1;
+        }
+    } else if (grouped_gb10) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const int rc = ds4_mmq_q4_K_grouped_vec(
+                out_a,
+                (const float *)heads->ptr +
+                    (uint64_t)t * n_groups * group_dim,
+                (float *)low->ptr + (uint64_t)t * low_dim,
+                (int)rank, (int)group_dim, (int)n_groups,
+                cuda_decode_stream());
+            if (rc != 0) return -1;
+        }
+    } else {
+        /* Existing cross-CUDA path: pack one group at a time, run a
+         * token-batched MMQ, then scatter rank rows back to token-major low.
+         * Keep this byte-for-byte outside the new GB10 dispatch. */
+        for (uint32_t g = 0; g < n_groups; g++) {
+            cudaError_t ce = cudaMemcpy2DAsync(
+                group_tmp->ptr, group_dim * sizeof(float),
+                (const float *)heads->ptr + (uint64_t)g * group_dim,
+                (uint64_t)n_groups * group_dim * sizeof(float),
+                group_dim * sizeof(float), n_tokens,
+                cudaMemcpyDeviceToDevice, cuda_decode_stream());
+            if (!cuda_ok(ce, "q4 attention output heads pack")) return -1;
+            const int rc = ds4_mmq_q4_K_dense(
+                out_a + (uint64_t)g * rank * row_a_bytes,
+                (const float *)group_tmp->ptr, (float *)low_tmp->ptr,
+                (int)rank, (int)n_tokens, (int)group_dim,
+                cuda_decode_stream());
+            if (rc != 0) return -1;
+            ce = cudaMemcpy2DAsync(
+                (float *)low->ptr + (uint64_t)g * rank,
+                low_dim * sizeof(float), low_tmp->ptr, rank * sizeof(float),
+                rank * sizeof(float), n_tokens,
+                cudaMemcpyDeviceToDevice, cuda_decode_stream());
+            if (!cuda_ok(ce, "q4 attention output low unpack")) return -1;
+        }
+    }
+    int b_rc = 0;
+    if (out_b_type == 12u) {
+        b_rc = cuda_matmul_q4_K_tensor(out, model_map, model_size,
+                                       out_b_offset, low_dim, out_dim,
+                                       low, n_tokens);
+    } else if (out_b_type == 8u) {
+        b_rc = cuda_matmul_q8_0_tensor_labeled(
+            out, model_map, model_size, out_b_offset, low_dim, out_dim,
+            low, n_tokens, "q4 attn_output_b");
+    }
+    /* Attention-A has already been enqueued.  A B rejection or launch error
+     * can no longer request whole-operation fallback without replaying A, so
+     * preserve the tri-state compound-operation contract and fail closed. */
+    return b_rc > 0 ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t group0, uint32_t group_cnt,
-        const ds4_gpu_tensor *heads) {
-    (void)low; (void)model_map; (void)model_size; (void)out_a_offset;
-    (void)group_dim; (void)rank; (void)group0; (void)group_cnt;
-    (void)heads;
-    return 0;
+        const ds4_gpu_tensor *heads, int resident_decode) {
+    (void)resident_decode;
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        group_cnt == 0u || group0 > UINT32_MAX - group_cnt ||
+        group_dim > INT_MAX || rank > INT_MAX || group_cnt > INT_MAX ||
+        (group_dim % CUDA_QK_K) != 0u) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(low);
+    if (ds4_tensor_device_idx(heads) != logical_tier ||
+        !cuda_q4_gb10_fast_path_enabled(
+            logical_tier, "DS4_CUDA_NO_Q4_GROUPED_ATTN_A")) {
+        return 0;
+    }
+
+    const uint64_t blocks = group_dim / CUDA_QK_K;
+    if (blocks == 0u ||
+        blocks > UINT64_MAX / sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (rank > UINT64_MAX / row_bytes ||
+        group_dim > UINT64_MAX / group_cnt ||
+        rank > UINT64_MAX / group_cnt) {
+        return 0;
+    }
+    const uint64_t group_weight_bytes = rank * row_bytes;
+    if ((uint64_t)group0 > UINT64_MAX / group_weight_bytes ||
+        (uint64_t)group_cnt > UINT64_MAX / group_weight_bytes) {
+        return 0;
+    }
+    const uint64_t group_weight_offset =
+        (uint64_t)group0 * group_weight_bytes;
+    const uint64_t selected_weight_bytes =
+        (uint64_t)group_cnt * group_weight_bytes;
+    if (out_a_offset > model_size ||
+        group_weight_offset > model_size - out_a_offset) {
+        return 0;
+    }
+    const uint64_t selected_offset = out_a_offset + group_weight_offset;
+    if (selected_weight_bytes > model_size - selected_offset) return 0;
+
+    const uint64_t heads_elems = (uint64_t)group_cnt * group_dim;
+    const uint64_t low_elems = (uint64_t)group_cnt * rank;
+    if (heads_elems > UINT64_MAX / sizeof(float) ||
+        low_elems > UINT64_MAX / sizeof(float) ||
+        heads->bytes < heads_elems * sizeof(float) ||
+        low->bytes < low_elems * sizeof(float)) {
+        return 0;
+    }
+
+    const char *out_a = cuda_resolve_weight_ptr(
+        model_map, selected_offset, selected_weight_bytes, logical_tier,
+        "q4 grouped attn_out_a");
+    if (!out_a) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    const int rc = ds4_mmq_q4_K_grouped_vec(
+        out_a, (const float *)heads->ptr, (float *)low->ptr,
+        (int)rank, (int)group_dim, (int)group_cnt, stream);
+    if (rc != 0) {
+        /* NOT_APPLICABLE is pre-enqueue and cleanly retries the established
+         * per-group loop. A negative result may follow a launch and must
+         * propagate so the graph cannot replay work over a partial result. */
+        return rc < 0 ? -1 : 0;
+    }
+
+    return 1;
 }
 
 extern "C" int ds4_gpu_hc_expand_split_half_tensor(

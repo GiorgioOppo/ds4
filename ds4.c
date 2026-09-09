@@ -21634,7 +21634,8 @@ static bool metal_graph_attention_output_dense_quant_low(
         uint64_t                rank,
         uint32_t                group0,
         uint32_t                group_cnt,
-        const ds4_gpu_tensor *heads);
+        const ds4_gpu_tensor *heads,
+        bool                   resident_decode);
 static bool metal_graph_attention_output_dense_quant_tp(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -23698,6 +23699,9 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool qkv_proj_q8 =
         layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_kv->type == DS4_TENSOR_Q8_0;
+    const bool qkv_proj_q4 =
+        layer->attn_q_a->type == DS4_TENSOR_Q4_K &&
+        layer->attn_kv->type == DS4_TENSOR_Q4_K;
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     /* M1-M5 decode fusion: the q_a/kv Q8 pair and the four F16 compressor
      * projections all read the same normalized attention input and write
@@ -23841,6 +23845,27 @@ static bool metal_graph_encode_decode_layer_phase(
                 DS4_N_HEAD_DIM,
                 metal_graph_attn_norm(g),
                 1) != 0;
+    }
+    if (!resume_after_qa_kv_raw && ok && qkv_rms_fused && qkv_proj_q4 &&
+        g->cuda_qkv_pair &&
+        !qkv_pair_projected && !metal_graph_use_reference_qkv_pair_proj()) {
+        const int pair_rc = ds4_gpu_matmul_q4_K_pair_tensor(
+                metal_graph_qr(g),
+                metal_graph_kv_raw(g),
+                model->map,
+                model->size,
+                layer->attn_q_a->abs_offset,
+                layer->attn_kv->abs_offset,
+                DS4_N_EMBD,
+                q_rank,
+                DS4_N_HEAD_DIM,
+                metal_graph_attn_norm(g),
+                1);
+        if (pair_rc < 0) {
+            ok = false;
+        } else {
+            qkv_pair_projected = pair_rc > 0;
+        }
     }
     if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
         ok = metal_graph_matmul_dense_quant_tensor(metal_graph_qr(g),
@@ -24846,13 +24871,27 @@ static bool metal_graph_encode_decode_layer_phase(
         layer->attn_output_b->type == DS4_TENSOR_Q8_0;
     ds4_gpu_tensor *tp_attn_a = NULL;   /* rank partials consumed directly */
     ds4_gpu_tensor *tp_attn_b = NULL;   /* by the HC expand */
-    const bool fuse_attn_out_hc =
+    const bool fuse_attn_out_hc_q8 =
         !cuda_tp_attn &&
         g->tp_world < 2 &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         !metal_graph_directional_steering_attn_enabled(g) &&
         !metal_graph_use_reference_attn_out_hc();
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    const bool fuse_attn_out_hc_q4 =
+        !cuda_tp_attn &&
+        g->tp_world < 2 &&
+        layer->attn_output_a->type == DS4_TENSOR_Q4_K &&
+        layer->attn_output_b->type == DS4_TENSOR_Q4_K &&
+        !metal_graph_directional_steering_attn_enabled(g) &&
+        !metal_graph_use_reference_attn_out_hc() &&
+        ds4_gpu_matmul_q4_K_hc_expand_available() != 0;
+#else
+    const bool fuse_attn_out_hc_q4 = false;
+#endif
+    const bool fuse_attn_out_hc =
+        fuse_attn_out_hc_q8 || fuse_attn_out_hc_q4;
     const bool fuse_tp_attn_out_hc =
         cuda_tp_attn &&
         !metal_graph_use_reference_attn_out_hc() &&
@@ -25023,7 +25062,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     DS4_N_HC) != 0;
             if (ok) cuda_tp_attn_hc_fused = true;
         }
-    } else if (ok && fuse_attn_out_hc) {
+    } else if (ok && fuse_attn_out_hc_q8) {
         ok = ds4_gpu_attention_output_low_q8_tensor(metal_graph_attn_low(g),
                                                       model->map,
                                                       model->size,
@@ -25046,6 +25085,29 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         DS4_N_EMBD,
                                                         DS4_N_HC) != 0;
         }
+    } else if (ok && fuse_attn_out_hc_q4) {
+        ok = metal_graph_attention_output_dense_quant_low(
+                metal_graph_attn_low(g), g, model,
+                layer->attn_output_a,
+                group_dim, rank, 0, n_groups,
+                metal_graph_heads(g), true);
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+        if (ok) {
+            ok = ds4_gpu_matmul_q4_K_hc_expand_tensor(
+                    metal_graph_after_attn_hc(g),
+                    metal_graph_attn_out(g),
+                    model->map, model->size,
+                    layer->attn_output_b->abs_offset,
+                    (uint64_t)n_groups * rank,
+                    DS4_N_EMBD,
+                    metal_graph_attn_low(g),
+                    metal_graph_cur_hc(g),
+                    metal_graph_hc_split(g),
+                    DS4_N_EMBD, DS4_N_HC) != 0;
+        }
+#else
+        ok = false;
+#endif
     } else if (ok && g->tp_world == 2) {
         /* Group-sliced attention output: this rank computes its half of the
          * output groups and the matching k-window of the expand projection,
@@ -25079,7 +25141,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                           rank,
                                                           0,
                                                           n_groups,
-                                                          metal_graph_heads(g));
+                                                          metal_graph_heads(g),
+                                                          true);
         if (ok) ok = metal_graph_matmul_dense_quant_tensor(attn_out_dst,
                                                            model,
                                                            layer->attn_output_b,
@@ -27555,7 +27618,8 @@ static bool metal_graph_attention_output_dense_quant_low(
         uint64_t                rank,
         uint32_t                group0,
         uint32_t                group_cnt,
-        const ds4_gpu_tensor *heads) {
+        const ds4_gpu_tensor *heads,
+        bool                   resident_decode) {
     (void)g;
     if (!low || !model || !out_a || !heads ||
         group_dim == 0 || rank == 0 || group_cnt == 0) {
@@ -27571,16 +27635,23 @@ static bool metal_graph_attention_output_dense_quant_low(
                                                       group_cnt,
                                                       heads) != 0;
     }
+    /* Specialized Q4_K low projection where the backend has it.  Zero falls
+     * through to the generic per-group loop; a negative REQUIRE/error result
+     * fails closed after a backend may have submitted work. */
     if (out_a->type == DS4_TENSOR_Q4_K) {
-        return ds4_gpu_attention_output_low_q4_K_slice_tensor(low,
-                                                             model->map,
-                                                             model->size,
-                                                             out_a->abs_offset,
-                                                             group_dim,
-                                                             rank,
-                                                             group0,
-                                                             group_cnt,
-                                                             heads) != 0;
+        const int q4_slice_rc =
+            ds4_gpu_attention_output_low_q4_K_slice_tensor(low,
+                                                           model->map,
+                                                           model->size,
+                                                           out_a->abs_offset,
+                                                           group_dim,
+                                                           rank,
+                                                           group0,
+                                                           group_cnt,
+                                                           heads,
+                                                           resident_decode ? 1 : 0);
+        if (q4_slice_rc > 0) return true;
+        if (q4_slice_rc < 0) return false;
     }
     uint64_t row_bytes = 0;
     if (!metal_graph_dense_quant_row_bytes(out_a, group_dim, &row_bytes)) return false;
@@ -27652,7 +27723,8 @@ static bool metal_graph_attention_output_dense_quant_tp(
                                                      rank,
                                                      group0,
                                                      group_cnt,
-                                                     heads)) {
+                                                     heads,
+                                                     true)) {
         return false;
     }
     return metal_graph_matmul_dense_quant_kslice(out,
@@ -27699,24 +27771,25 @@ static bool metal_graph_attention_output_dense_quant_batch(
                                                         heads,
                                                         n_tokens) != 0;
     }
-    if (out_a->type == DS4_TENSOR_Q4_K && n_tokens >= 32u) {
-        if (ds4_gpu_attention_output_q4_K_batch_tensor(out,
-                                                       low,
-                                                       metal_graph_batch_group_tmp(g),
-                                                       metal_graph_batch_low_tmp(g),
-                                                       model->map,
-                                                       model->size,
-                                                       out_a->abs_offset,
-                                                       out_b->abs_offset,
-                                                       out_b->type,
-                                                       group_dim,
-                                                       rank,
-                                                       n_groups,
-                                                       out_dim,
-                                                       heads,
-                                                       n_tokens) != 0) {
-            return true;
-        }
+    if (out_a->type == DS4_TENSOR_Q4_K && n_tokens >= 2u) {
+        const int tiny_rc = ds4_gpu_attention_output_q4_K_batch_tensor(
+                out,
+                low,
+                metal_graph_batch_group_tmp(g),
+                metal_graph_batch_low_tmp(g),
+                model->map,
+                model->size,
+                out_a->abs_offset,
+                out_b->abs_offset,
+                out_b->type,
+                group_dim,
+                rank,
+                n_groups,
+                out_dim,
+                heads,
+                n_tokens);
+        if (tiny_rc > 0) return true;
+        if (tiny_rc < 0) return false;
     }
 
     const uint64_t heads_row_elems = (uint64_t)n_groups * group_dim;
@@ -27744,7 +27817,8 @@ static bool metal_graph_attention_output_dense_quant_batch(
                                                           rank,
                                                           0,
                                                           n_groups,
-                                                          heads_row);
+                                                          heads_row,
+                                                          false);
         if (ok) ok = metal_graph_matmul_dense_quant_tensor(out_row,
                                                            model,
                                                            out_b,
@@ -30217,23 +30291,42 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
-                                                      il,
-                                                      pos0,
-                                                      metal_graph_batch_qr(g),
-                                                      model,
-                                                      layer->attn_q_a,
-                                                      DS4_N_EMBD,
-                                                      q_rank,
-                                                      metal_graph_batch_attn_norm(g),
-                                                      n_tokens);
+    bool qkv_q4_pair_projected = false;
+    if (ok && qkv_rms_fused && g->cuda_qkv_pair &&
+        !metal_graph_use_reference_qkv_pair_proj() && n_tokens >= 2u &&
+        layer->attn_q_a->type == DS4_TENSOR_Q4_K &&
+        layer->attn_kv->type == DS4_TENSOR_Q4_K) {
+        const int pair_rc = ds4_gpu_matmul_q4_K_pair_tensor(
+            metal_graph_batch_qr(g), metal_graph_batch_kv_raw(g),
+            model->map, model->size,
+            layer->attn_q_a->abs_offset, layer->attn_kv->abs_offset,
+            DS4_N_EMBD, q_rank, DS4_N_HEAD_DIM,
+            metal_graph_batch_attn_norm(g), n_tokens);
+        if (pair_rc < 0) {
+            ok = false;
+        } else {
+            qkv_q4_pair_projected = pair_rc > 0;
+        }
+    }
+    if (ok && !qkv_q4_pair_projected) {
+        ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
+                                                 il,
+                                                 pos0,
+                                                 metal_graph_batch_qr(g),
+                                                 model,
+                                                 layer->attn_q_a,
+                                                 DS4_N_EMBD,
+                                                 q_rank,
+                                                 metal_graph_batch_attn_norm(g),
+                                                 n_tokens);
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_batch_qr(g),
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
+        if (ok && !qkv_q4_pair_projected) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
                                                           pos0,
                                                           metal_graph_batch_kv_raw(g),
@@ -30302,29 +30395,38 @@ static bool metal_graph_encode_layer_attention_batch(
         ok = false;
     }
     bool q_b_f16_out = false;
-    if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
-        q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
-                                                                     tp_q_half ? tp_q_half : g->batch_q_half,
-                                                                     model->map,
-                                                                     model->size,
-                                                                     layer->attn_q_b->abs_offset,
-                                                                     q_rank,
-                                                                     q_dim,
-                                                                     tp_qr_norm ? tp_qr_norm : metal_graph_batch_qr_norm(g),
-                                                                     tp_rows,
-                                                                     DS4_N_HEAD,
-                                                                     DS4_N_HEAD_DIM,
-                                                                     DS4_N_ROT,
-                                                                     pos0 + tp_row0,
-                                                                     compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                                     false,
-                                                                     freq_base,
-                                                                     freq_scale,
-                                                                     ext_factor,
-                                                                     attn_factor,
-                                                                     DS4_ROPE_YARN_BETA_FAST,
-                                                                     DS4_ROPE_YARN_BETA_SLOW,
-                                                                     DS4_RMS_EPS) != 0;
+    const bool q_b_f16_weight =
+        layer->attn_q_b->type == DS4_TENSOR_Q8_0 ||
+        (layer->attn_q_b->type == DS4_TENSOR_Q4_K &&
+         tp_rows >= 32u);
+    if (ok && !q_path_debug && q_b_f16_weight) {
+        const int q_b_f16_rc =
+            ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+                tp_q ? tp_q : metal_graph_batch_q(g),
+                tp_q_half ? tp_q_half : g->batch_q_half,
+                model->map,
+                model->size,
+                layer->attn_q_b->abs_offset,
+                layer->attn_q_b->type,
+                q_rank,
+                q_dim,
+                tp_qr_norm ? tp_qr_norm : metal_graph_batch_qr_norm(g),
+                tp_rows,
+                DS4_N_HEAD,
+                DS4_N_HEAD_DIM,
+                DS4_N_ROT,
+                pos0 + tp_row0,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                false,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW,
+                DS4_RMS_EPS);
+        if (q_b_f16_rc < 0) ok = false;
+        q_b_f16_out = q_b_f16_rc > 0;
     }
     if (q_b_f16_out) {
         DS4_METAL_PROFILE_Q_STAGE("q_b");
@@ -31728,8 +31830,28 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool attn_out_debug =
         metal_graph_debug_wants("attn_low", il, pos0) ||
         metal_graph_debug_wants("attn_out", il, pos0);
+    bool attn_out_hc_fused = false;
+#ifdef __APPLE__
+    if (ok && !attn_out_debug && !tp_row_split_attn &&
+        !metal_graph_directional_steering_attn_enabled(g) &&
+        layer->attn_output_a->type == DS4_TENSOR_Q4_K &&
+        layer->attn_output_b->type == DS4_TENSOR_Q4_K) {
+        const int fused_rc = ds4_gpu_attention_output_q4_K_batch_hc_tensor(
+            metal_graph_batch_attn_out(g), after_attn_hc_view,
+            metal_graph_batch_cur_hc(g), hc_split_view,
+            metal_graph_batch_attn_low(g),
+            metal_graph_batch_group_tmp(g), metal_graph_batch_low_tmp(g),
+            model->map, model->size,
+            layer->attn_output_a->abs_offset,
+            layer->attn_output_b->abs_offset, layer->attn_output_b->type,
+            group_dim, rank, n_groups, DS4_N_EMBD,
+            metal_graph_batch_heads(g), n_tokens, DS4_N_HC);
+        if (fused_rc < 0) ok = false;
+        attn_out_hc_fused = fused_rc > 0;
+    }
+#endif
     bool attn_out_f16 = false;
-    if (ok &&
+    if (ok && !attn_out_hc_fused &&
         !attn_out_debug &&
         !tp_row_split_attn &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
@@ -31748,7 +31870,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     metal_graph_batch_heads(g),
                                                                     n_tokens) != 0;
     }
-    if (!attn_out_f16) {
+    if (!attn_out_f16 && !attn_out_hc_fused) {
         if (ok) {
             ok = metal_graph_attention_output_dense_quant_batch(tp_attn_out ? tp_attn_out : metal_graph_batch_attn_out(g),
                                                                 metal_graph_batch_attn_low(g),
@@ -31795,7 +31917,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, metal_graph_batch_attn_out(g), il, n_tokens);
     }
-    if (ok && attn_out_f16) {
+    if (ok && attn_out_hc_fused) {
+        /* The output-B epilogue has already expanded the residual stream. */
+    } else if (ok && attn_out_f16) {
         ok = ds4_gpu_hc_expand_split_half_tensor(after_attn_hc_view,
                                                  g->batch_q_half,
                                                  metal_graph_batch_cur_hc(g),
@@ -37423,6 +37547,49 @@ static bool metal_graph_prefill_raw_swa(
                                            display_progress_ud);
 }
 
+static uint32_t metal_graph_prefill_chunk_rows_at(
+        const ds4_gpu_graph *g,
+        uint32_t range_start,
+        uint32_t pos0,
+        uint32_t remaining) {
+    if (!g || remaining == 0u || g->prefill_cap == 0u) return 0u;
+    uint32_t cap = g->prefill_cap;
+    if (range_start != 0u && cap > g->raw_cap) cap = g->raw_cap;
+    if (cap == 0u) return 0u;
+
+    if (range_start != 0u) {
+        const uint32_t mod = pos0 % g->prefill_cap;
+        if (mod != 0u) {
+            const uint32_t to_boundary = g->prefill_cap - mod;
+            if (to_boundary < cap) cap = to_boundary;
+        }
+    }
+    return remaining < cap ? remaining : cap;
+}
+
+/* Maximum batch width the chunk executor below can emit.  If the first chunk
+ * is smaller than cap it reaches an absolute prefill boundary, so the next
+ * chunk can use the full cap; if it is cap-sized, it is already the maximum. */
+static uint32_t metal_graph_prefill_max_chunk_rows(
+        const ds4_gpu_graph *g,
+        uint32_t start,
+        uint32_t n_tokens) {
+    if (g && g->deepseek4_vision_weights) {
+        uint32_t cap = g->prefill_cap;
+        if (start != 0u && cap > g->raw_cap) cap = g->raw_cap;
+        return n_tokens < cap ? n_tokens : cap;
+    }
+    const uint32_t first = metal_graph_prefill_chunk_rows_at(
+        g, start, start, n_tokens);
+    if (first == 0u || first >= n_tokens) return first;
+
+    uint32_t cap = g->prefill_cap;
+    if (start != 0u && cap > g->raw_cap) cap = g->raw_cap;
+    const uint32_t remaining = n_tokens - first;
+    const uint32_t later = remaining < cap ? remaining : cap;
+    return first > later ? first : later;
+}
+
 static uint32_t metal_graph_visual_prefill_chunk(
         const ds4_gpu_graph *g,
         const token_vec     *prompt,
@@ -39393,6 +39560,7 @@ struct ds4_engine {
      * caller that doesn't set the option observe the prior behavior). */
     int            placement_ctx_hint;
     int            placement_session_count_hint;
+    uint32_t       live_session_count;
     uint32_t       glm_session_count;
     uint64_t       glm_session_graph_bytes;
 };
@@ -54075,6 +54243,12 @@ static int generate_glm_metal_argmax(
     return 0;
 }
 
+static int ds4_prepare_q4_attn_q_b_sidecars(
+        const ds4_model *model,
+        const ds4_weights *weights,
+        uint32_t max_batch_rows,
+        uint64_t working_set_reserve_bytes);
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
@@ -54091,6 +54265,7 @@ static int generate_metal_graph_raw_swa(
         uint32_t            ssd_streaming_preload_experts,
         uint64_t            ssd_streaming_cache_bytes,
         uint64_t            ssd_streaming_prefill_headroom_bytes,
+        uint64_t            q4_sidecar_working_set_reserve_bytes,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
@@ -54170,8 +54345,37 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
+    /* Prepare reusable transient scratch for the real prompt width after
+     * graph allocation, before warmup and the measured prefill window. */
+    const uint32_t q4_sidecar_rows =
+        (uint32_t)prompt->len < prefill_cap ?
+            (uint32_t)prompt->len : prefill_cap;
+    if (ds4_prepare_q4_attn_q_b_sidecars(
+            model, weights, q4_sidecar_rows,
+            q4_sidecar_working_set_reserve_bytes) < 0) {
+        fprintf(stderr,
+                "ds4: required GPU Q4 attn_q_b F16 acceleration preflight "
+                "could not be completed\n");
+        metal_graph_free(&g);
+        return 1;
+    }
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
+
+    /* Match the session frontend's bounded first-submission warmup.  Without
+     * this call the legacy greedy frontend reaches the warmup from inside
+     * metal_graph_prefill_layer_major() and uses the whole prompt width.  The
+     * scratch result is overwritten by the real prefill, so warming thousands
+     * of rows is redundant work as well as making its timing incomparable to
+     * the session/DSpark frontend. */
+    const uint32_t warmup_rows = prefill_cap < 32u ? prefill_cap : 32u;
+    if (!metal_graph_warmup_prefill_kernels(&g,
+                                            model,
+                                            weights,
+                                            warmup_rows)) {
+        metal_graph_free(&g);
+        return 1;
+    }
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
@@ -54961,7 +55165,10 @@ struct ds4_session {
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
+    bool engine_session_counted;
 #ifndef DS4_NO_GPU
+    uint64_t q4_attn_q_b_f16_sidecars_generation;
+    uint32_t q4_attn_q_b_f16_prepared_rows;
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
@@ -59375,20 +59582,30 @@ int ds4_engine_generate_argmax(
             ds4_session_free(s);
             return rc;
         }
-        return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
-                                            n_predict, ctx_size, e->quality,
-                                            e->ssd_streaming,
-                                            e->ssd_streaming_cold,
-                                            e->ssd_streaming_preload_experts,
-                                            e->ssd_streaming_cache_bytes,
-                                            e->ssd_streaming_prefill_headroom_bytes,
-                                            e->power_percent,
-                                            e->prefill_chunk,
-                                            e->directional_steering_file,
-                                            e->directional_steering_attn_scale,
-                                            e->directional_steering_ffn_scale,
-                                            emit, done, emit_ud,
-                                            progress, progress_ud);
+        const int rc = generate_metal_graph_raw_swa(
+            model, vocab, weights, prompt, n_predict, ctx_size, e->quality,
+            e->ssd_streaming, e->ssd_streaming_cold,
+            e->ssd_streaming_preload_experts,
+            e->ssd_streaming_cache_bytes,
+            e->ssd_streaming_prefill_headroom_bytes,
+            ds4_engine_streaming_transient_guard_bytes(e),
+            e->power_percent,
+            e->prefill_chunk, e->directional_steering_file,
+            e->directional_steering_attn_scale,
+            e->directional_steering_ffn_scale, emit, done, emit_ud,
+            progress, progress_ud);
+        /* The legacy frontend owns a temporary graph rather than a session.
+         * Release transient scratch at this quiescent boundary when no
+         * session can still use it. */
+        if (__atomic_load_n(
+                &e->live_session_count, __ATOMIC_RELAXED) == 0u &&
+            !ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
+            fprintf(stderr,
+                    "ds4: WARNING: could not release %s Q4 "
+                    "attn_q_b F16 scratch after legacy generation\n",
+                    ds4_backend_name(e->backend));
+        }
+        return rc;
 #else
         fprintf(stderr, "ds4: %s generation requested but this build has no graph backend support\n",
                 ds4_backend_name(e->backend));
@@ -65409,6 +65626,12 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+#ifndef DS4_NO_GPU
+    /* Drain transient Q4 work before its source model mapping is unmapped. */
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
+        fprintf(stderr, "ds4: WARNING: could not release Q4 Q-B scratch at engine close\n");
+    }
+#endif
     if (e->mtp_model.map) model_close(&e->mtp_model);
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
@@ -65563,6 +65786,112 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+#ifndef DS4_NO_GPU
+static int ds4_prepare_q4_attn_q_b_sidecars(
+        const ds4_model *model,
+        const ds4_weights *weights,
+        uint32_t max_batch_rows,
+        uint64_t working_set_reserve_bytes) {
+    if (!model || !weights) return 0;
+    ds4_gpu_q4_attn_q_b_f16_sidecar_desc descs[DS4_MAX_LAYER];
+    uint32_t count = 0;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        const ds4_tensor *tensor = weights->layer[il].attn_q_b;
+        if (!tensor || tensor->type != DS4_TENSOR_Q4_K ||
+            tensor->ndim != 2u || tensor->dim[0] != DS4_N_LORA_Q ||
+            tensor->dim[1] != q_dim) {
+            continue;
+        }
+        descs[count++] = (ds4_gpu_q4_attn_q_b_f16_sidecar_desc) {
+            .weight_offset = tensor->abs_offset,
+            .weight_bytes = tensor->bytes,
+            .in_dim = tensor->dim[0],
+            .out_dim = tensor->dim[1],
+            .weight_type = tensor->type,
+            .layer = il,
+        };
+    }
+    if (count == 0u) return 1;
+
+    uint64_t prepared_bytes = 0;
+    return ds4_gpu_prepare_q4_attn_q_b_f16_sidecars(
+        model->map, model->size, descs, count, max_batch_rows,
+        working_set_reserve_bytes, &prepared_bytes);
+}
+
+static int ds4_session_prepare_q4_attn_q_b_sidecars(
+        ds4_session *s,
+        uint32_t max_batch_rows) {
+    if (!s || !s->engine ||
+        !ds4_backend_uses_graph(s->engine->backend) ||
+        ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        return 1;
+    }
+    const uint64_t cache_generation =
+        ds4_gpu_q4_attn_q_b_f16_cache_generation();
+    if (s->q4_attn_q_b_f16_sidecars_generation ==
+            cache_generation &&
+        max_batch_rows <= s->q4_attn_q_b_f16_prepared_rows) {
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+
+    uint64_t future_session_bytes = 0;
+    const uint32_t session_count = engine_placement_session_count(e);
+    const uint32_t live_sessions = __atomic_load_n(
+        &e->live_session_count, __ATOMIC_RELAXED);
+    uint32_t including_current = live_sessions;
+    /* Eager preparation runs before session registration, while the ordinary
+     * prompt-aware preflight runs after it.  Count the current session only
+     * in the former case instead of under-reserving one future graph. */
+    if (!s->engine_session_counted && including_current != UINT32_MAX) {
+        including_current++;
+    }
+    const uint32_t remaining =
+        session_count > including_current ?
+            session_count - including_current : 0u;
+    if (remaining != 0u) {
+        const ds4_context_memory memory =
+            ds4_context_memory_estimate_with_prefill_mode(
+                e->backend, s->ctx_size, e->prefill_chunk,
+                e->ssd_streaming);
+        future_session_bytes =
+            memory.total_bytes > UINT64_MAX / remaining
+                ? UINT64_MAX
+                : memory.total_bytes * remaining;
+    }
+
+    const uint64_t streaming_reserve_bytes =
+        ds4_engine_streaming_transient_guard_bytes(e);
+    const uint64_t working_set_reserve_bytes =
+        ds4_add_sat_u64(future_session_bytes, streaming_reserve_bytes);
+    const int rc = ds4_prepare_q4_attn_q_b_sidecars(
+        &e->model, &e->weights, max_batch_rows,
+        working_set_reserve_bytes);
+    if (rc < 0) {
+        fprintf(stderr,
+                "ds4: required %s Q4 attn_q_b F16 acceleration preflight "
+                "could not be completed\n",
+                ds4_backend_name(e->backend));
+        return 0;
+    }
+    if (rc > 0) {
+        s->q4_attn_q_b_f16_sidecars_generation =
+            ds4_gpu_q4_attn_q_b_f16_cache_generation();
+        s->q4_attn_q_b_f16_prepared_rows = max_batch_rows;
+    }
+    return 1;
+}
+#endif
+
+static void ds4_session_mark_engine_counted(ds4_session *s) {
+    if (!s || !s->engine || s->engine_session_counted) return;
+    __atomic_add_fetch(
+        &s->engine->live_session_count, 1u, __ATOMIC_RELAXED);
+    s->engine_session_counted = true;
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -65587,6 +65916,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ds4_session_free(s);
             return 1;
         }
+        ds4_session_mark_engine_counted(s);
         *out = s;
         return 0;
     }
@@ -65735,6 +66065,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ds4_session_free(s);
             return 1;
         }
+        ds4_session_mark_engine_counted(s);
         *out = s;
         return 0;
     }
@@ -65757,6 +66088,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         e->shared_prefill_workspace_ready
             ? &e->shared_prefill_workspace
             : NULL;
+    if (ds4_backend_uses_graph(e->backend) &&
+        __atomic_load_n(
+            &e->live_session_count, __ATOMIC_RELAXED) != 0u) {
+        /* The graph estimator intentionally omits several large prefill
+         * workspaces.  Evict conservatively before dynamic session growth;
+         * sessions created together at startup see an empty cache and pay
+         * nothing.  Cache generations make existing sessions re-prewarm. */
+        if (!ds4_gpu_make_room_for_q4_attn_q_b_f16_session()) {
+            fprintf(stderr,
+                    "ds4: could not make room for the %s session graph\n",
+                    ds4_backend_name(e->backend));
+            free(s);
+            return 1;
+        }
+    }
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
@@ -65850,6 +66196,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "\n");
         }
     }
+    /* Remote workers do not necessarily enter the local sync preflight before
+     * their first mirrored/layer-slice batch, so keep eager preparation for
+     * TP/distributed sessions.  Local sessions defer until the real prompt is
+     * known, avoiding a large allocation for decode-only sessions. */
+    if ((e->tp.active ||
+         e->distributed.role != DS4_DISTRIBUTED_NONE) &&
+        !ds4_session_prepare_q4_attn_q_b_sidecars(
+            s, s->prefill_cap)) {
+        if (__atomic_load_n(&e->live_session_count, __ATOMIC_RELAXED) == 0u) {
+            (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+        }
+        metal_graph_free(&s->graph);
+        free(s);
+        return 1;
+    }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     s->sample_probs =
         xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -65886,6 +66247,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr,
                     "ds4: failed to create distributed coordinator session: %s\n",
                     err[0] ? err : "unknown error");
+            if (__atomic_load_n(
+                    &e->live_session_count, __ATOMIC_RELAXED) == 0u) {
+                (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+            }
             metal_graph_free(&s->graph);
             free(s->logits);
             free(s->sample_probs);
@@ -65901,6 +66266,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         ds4_session_free(s);
         return 1;
     }
+    ds4_session_mark_engine_counted(s);
     *out = s;
     return 0;
 #endif
@@ -65908,6 +66274,31 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+#ifndef DS4_NO_GPU
+    bool release_gpu_q4_sidecars = false;
+#endif
+    if (s->engine && s->engine_session_counted) {
+        const uint32_t remaining_sessions = __atomic_sub_fetch(
+            &s->engine->live_session_count, 1u, __ATOMIC_RELAXED);
+#ifndef DS4_NO_GPU
+        release_gpu_q4_sidecars =
+            remaining_sessions == 0u &&
+            ds4_backend_uses_graph(s->engine->backend);
+#else
+        (void)remaining_sessions;
+#endif
+        s->engine_session_counted = false;
+    }
+#ifndef DS4_NO_GPU
+    else if (s->engine && ds4_backend_uses_graph(s->engine->backend) &&
+             __atomic_load_n(
+                 &s->engine->live_session_count, __ATOMIC_RELAXED) == 0u) {
+        /* An eager TP/distributed prewarm may have succeeded before session
+         * registration failed, so this uncounted session can still own the
+         * process-global sidecars. */
+        release_gpu_q4_sidecars = true;
+    }
+#endif
     if (s->glm_reserved_graph_bytes && s->engine) {
         s->engine->glm_session_graph_bytes -= s->glm_reserved_graph_bytes;
         s->engine->glm_session_count--;
@@ -65934,6 +66325,13 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
+        if (release_gpu_q4_sidecars &&
+            !ds4_gpu_release_q4_attn_q_b_f16_sidecars()) {
+            fprintf(stderr,
+                    "ds4: WARNING: could not release %s Q4 "
+                    "attn_q_b F16 scratch at session teardown\n",
+                    ds4_backend_name(s->engine->backend));
+        }
         if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
@@ -67287,6 +67685,70 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
     return true;
 }
 
+/* Prepare one-shot resources for the actual work the next sync will emit,
+ * without changing checkpoint/KV state.  Timed frontends may call this before
+ * starting their clock; ds4_session_sync() repeats it as an idempotent safety
+ * net for API users that do not. */
+int ds4_session_prepare_sync(ds4_session *s,
+                             const ds4_tokens *prompt,
+                             char *err,
+                             size_t errlen) {
+    if (!s || !prompt) {
+        if (err && errlen) snprintf(err, errlen, "missing session or prompt");
+        return 1;
+    }
+    if (prompt->len <= 0) {
+        if (err && errlen) snprintf(err, errlen, "empty prompt");
+        return 1;
+    }
+    if (prompt->len >= s->ctx_size) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "prompt length %d exceeds context %d "
+                     "(one token of generation room is required)",
+                     prompt->len, s->ctx_size);
+        }
+        return 1;
+    }
+
+#ifndef DS4_NO_GPU
+    if (!s->engine || !ds4_backend_uses_graph(s->engine->backend) ||
+        ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        return 0;
+    }
+
+    uint32_t start = 0u;
+    uint32_t rows = (uint32_t)prompt->len;
+    if (s->checkpoint_valid &&
+        ds4_session_vision_prefix_matches(
+            s, s->sync_images, s->sync_image_count) &&
+        prompt->len >= s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+        start = (uint32_t)s->checkpoint.len;
+        rows = (uint32_t)(prompt->len - s->checkpoint.len);
+        if (rows < metal_graph_resume_prefill_min_tokens()) return 0;
+    }
+    if (rows == 0u) return 0;
+
+    const uint32_t max_batch_rows = metal_graph_prefill_max_chunk_rows(
+        &s->graph, start, rows);
+    if (max_batch_rows == 0u) return 0;
+    if (!ds4_session_prepare_q4_attn_q_b_sidecars(
+            s, max_batch_rows)) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "required %s Q4 attn_q_b F16 acceleration preflight failed",
+                     ds4_backend_name(s->engine->backend));
+        }
+        return 1;
+    }
+#else
+    (void)err;
+    (void)errlen;
+#endif
+    return 0;
+}
+
 /* Under tensor parallelism the leader mirrors every public sync/eval to the
  * worker before doing the work itself, so both engines execute the same
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
@@ -67297,6 +67759,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
     }
+    if (ds4_session_prepare_sync(s, prompt, err, errlen) != 0) return 1;
 #ifndef DS4_NO_GPU
     ds4_session_dspark_scheduler_begin_request(s);
 #endif
@@ -70731,6 +71194,11 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     const uint32_t rows = (uint32_t)prefill_prompt->len - start;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const bool mirror = e->tp.active && e->tp.rank == 0;
+
+    if (ds4_session_prepare_sync(
+            prefill_session, prefill_prompt, err, errlen) != 0) {
+        return 1;
+    }
 
     if (mirror) {
         ds4_tp_batch_item *wire = ds4_sessions_tp_batch_items(items, count);

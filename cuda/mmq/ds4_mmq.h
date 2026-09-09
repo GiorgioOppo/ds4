@@ -872,13 +872,72 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// Optional dispatch rejection before enqueue; negative values are launch failures.
+#define DS4_MMQ_NOT_APPLICABLE 1
+
+int ds4_mmq_q4_K_dense_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_grouped_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_dense_pair(
+    const void  * W0_q4_K,
+    const void  * W1_q4_K,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_grouped_dense(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+void ds4_mmq_set_gb10_optimizations(int enabled);
+
+#if !defined(GGML_USE_HIP)
+size_t ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(int N);
+
+int ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+    const float * X_f32,
+    void        * q8_ds4,
+    size_t        q8_bytes,
+    int           N,
+    int           use_specialized,
+    cudaStream_t  stream);
+#endif
+
 int ds4_mmq_q4_K_dense_pair_vec(
     const void  * W0_q4_K,
     const void  * W1_q4_K,
     const float * X_f32,
     float       * out0_f32,
     float       * out1_f32,
-    int           M,
+    int           M0,
+    int           M1,
+    int           N,
     int           K,
     cudaStream_t  stream);
 
