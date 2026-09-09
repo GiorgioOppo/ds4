@@ -33,6 +33,8 @@
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
+/tests/test_cpu_q4_dense
+/tests/test_quantizer_indexer_q4
 /tests/test_sampling
 /tests/test_quality_api
 /tests/test_cuda_q8_scratch

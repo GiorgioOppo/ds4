@@ -1,5 +1,6 @@
 CC ?= cc
 UNAME_S := $(shell uname -s)
+.DEFAULT_GOAL := all
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
@@ -18,6 +19,7 @@ QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
+Q4_CPU_TEST_DEPS := ds4_image.c ds4_distributed.c ds4_tp.c ds4_ssd.c ds4_layer_pack.c
 DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
@@ -69,6 +71,22 @@ METAL_LDLIBS := $(LDLIBS)
 endif
 
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+
+.PHONY: test-cpu-q4 test-quantizer-indexer-q4
+tests/test_cpu_q4_dense: tests/test_cpu_q4_dense.c ds4.c ds4.h $(Q4_CPU_TEST_DEPS)
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -o $@ tests/test_cpu_q4_dense.c $(Q4_CPU_TEST_DEPS) $(LDLIBS)
+
+test-cpu-q4: tests/test_cpu_q4_dense q4k-dot-test
+	./tests/test_cpu_q4_dense
+
+gguf-tools/deepseek4-quantize: gguf-tools/deepseek4-quantize.c gguf-tools/quants.c gguf-tools/quants.h
+	$(MAKE) -C gguf-tools deepseek4-quantize
+
+tests/test_quantizer_indexer_q4: tests/test_quantizer_indexer_q4.c gguf-tools/quants.c gguf-tools/quants.h
+	$(CC) -O2 -Wall -Wextra -std=c99 -Igguf-tools -o $@ tests/test_quantizer_indexer_q4.c gguf-tools/quants.c $(LDLIBS)
+
+test-quantizer-indexer-q4: gguf-tools/deepseek4-quantize tests/test_quantizer_indexer_q4
+	./tests/test_quantizer_indexer_q4 ./gguf-tools/deepseek4-quantize
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
