@@ -17,13 +17,15 @@ Metal and ROCm value-aware booleans ignore surrounding whitespace and letter
 case: `0`, `false`, `no`, and `off` are false; an empty value or any other value
 is true. CUDA boolean spellings vary by control, as detailed in its table.
 
-The reference covers runtime controls added by this Q4 port. Existing upstream
-backend controls retain their upstream semantics.
+The reference covers runtime controls added by this Q4 port and its decode
+recovery. Existing upstream backend controls retain their upstream semantics.
 
 ## Metal
 
 | Variable | Default and interpretation | Purpose / implementation |
 | --- | --- | --- |
+| `DS4_METAL_DISABLE_Q8_MV_SINGLE_BARRIER` | presence rollback; any defined value disables the automatic four-SIMD-group Q8 matvec/pair variant | Restore the second barrier; quality, tensor-parallel, and other SIMD-group counts retain the reference kernels. [Source](../ds4_metal.m). |
+| `DS4_METAL_DISABLE_SSD_Q8_SINGLE_BARRIER` | presence rollback; any defined value disables the automatic SSD Q8 shared-expert variant | Restore the second barrier in the four/eight-SIMD-group gate/up SwiGLU producer. [Source](../ds4_metal.m). |
 | `DS4_METAL_DISABLE_PRE_M5_BATCH_ATTN_OUT_HC_FUSION` | presence rollback; unset enables the exact resident pre-M5 Q4_K output-B-to-HC4 tail when all shape and safety gates pass; any value including 0 disables | Restore the separate attention output-B materialization and HC expansion dispatches. [Source](../ds4_metal.m). |
 | `DS4_METAL_DISABLE_Q4_ATTN_OUT_A_DIRECT` | presence rollback; unset enables the automatic fixed-route path for eligible Apple M1-M4 long prefills; any defined value including 0 disables | Restore the generic route-map/work-list Q4 attention output-A path instead of the bit-identical fixed-route direct kernel. [Source](../ds4_metal.m). |
 | `DS4_METAL_DISABLE_Q4_ATTN_OUT_B_F16_RHS` | value-aware boolean; unset: off; empty/1/true/yes/on enables; 0/false/no/off disables | Disables resident pre-M5 Q4 attention output-B F16 RHS materialization and restores per-tile F32 staging. [Source](../ds4_metal.m). |
@@ -48,6 +50,8 @@ backend controls retain their upstream semantics.
 
 | Variable | Default and interpretation | Purpose / implementation |
 | --- | --- | --- |
+| `DS4_CUDA_NO_HC_SPLIT_NORM_SPLIT4096` | presence rollback; any defined value, including empty or 0, disables the automatic single-row width-4096 split | Restore the one-block fused HC weighted-sum/normalization kernel. The upstream `DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED` control also bypasses this candidate. [Source](../ds4_cuda.cu). |
+| `DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE` | presence rollback read at CUDA initialization; any defined value, including empty or 0, disables the warp maximum reduction; quality mode also uses the reference | Restore the shared-memory Q8_0 activation maximum in dense, grouped, and dual Q8_K/Q8_0 quantization. Quantization scales, rounding, and the Q8_K reduction remain unchanged. [Source](../cuda/ds4_q8_quantize.cuh). |
 | `DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable fused Q4 attention-output/HC expansion. [Source](../ds4_cuda.cu). |
 | `DS4_CUDA_DISABLE_Q4_ATTN_Q_B_TRANSIENT_F16` | value-aware rollback; unset/empty/0/false/no/off keeps the automatic transient path eligible; false/no/off are case-insensitive; whitespace is not trimmed; any other nonempty value disables it | Disable per-layer transient Q4_K attn_q_b-to-F16 scratch for physically device-resident single-GPU model images; otherwise eligible calls use native Q4. [Source](../ds4_cuda.cu). |
 | `DS4_CUDA_DISABLE_Q4_DENSE_PAIR` | presence kill switch; default unset (eligible path remains available); any defined value including 0 disables | Disable the Q4 dense pair CUDA Q4 optimization. [Source](../ds4_cuda.cu). |

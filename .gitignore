@@ -61,6 +61,7 @@ __pycache__/
 
 # Q4 test and benchmark build products
 /tests/test_metal_q4_hc
+/tests/test_metal_decode_defaults
 /tests/test_q4_epilogue_host
 /tests/test_q4_prefill_dequant_host
 /tests/test_cuda_q4_prefill_dequant

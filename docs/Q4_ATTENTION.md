@@ -31,14 +31,18 @@ explicit SSD-streaming configuration:
 ```sh
 ./ds4-server --metal \
   -m /path/to/DeepSeek-V4-Flash-AProjQ4.gguf \
-  --ssd-streaming --ssd-streaming-cache-experts 16 \
+  --ssd-streaming \
   --ctx 4096 --prefill-chunk 128 \
   --host 127.0.0.1 --port 8000
 ```
 
-Choose the expert-cache and context sizes for the available memory. The
-streaming path still needs memory for non-expert weights, activations, KV
-state, and backend workspace. See the [SSD memory guide](SSD_STREAMING.md).
+Omitting `--ssd-streaming-cache-experts` lets the runtime size the cache for
+the model, context, and available working-set budget. A plain number such as
+`16` requests only 16 expert slots across the model, not 16 GiB; this can
+increase SSD reads during decode. Use an explicit budget only when matching
+a benchmark configuration or tuning for the available memory. The streaming
+path still needs memory for non-expert weights, activations, KV state, and
+backend workspace. See the [SSD memory guide](SSD_STREAMING.md).
 The existing upstream DSpark and serving configurations retain their own
 backend restrictions.
 
@@ -97,6 +101,29 @@ Controls are listed in [Q4_CONTROLS.md](Q4_CONTROLS.md). Keep them unset for
 normal operation. Rollback and `REQUIRE` controls are useful for targeted
 parity tests; they are not prerequisites for Q4 model support.
 
+### Decode defaults retained from the development branch
+
+The original clean port omitted some automatic decode optimizations outside
+the Q4 matrix kernels. The follow-up restores these specific paths:
+
+- CUDA HC split/normalization at width 4096 and one row: sixteen blocks produce
+  the weighted sum, one block preserves the reference reduction order, and
+  sixteen blocks store normalized output. Scratch must be available before
+  submitting a writer; overlapping buffers retain the reference kernel.
+- CUDA Q8_0 activation quantization: a warp shuffle performs the same maximum
+  reduction without six block barriers. Quality mode and the rollback retain
+  the shared-memory implementation; the Q8_K part of dual quantization keeps
+  its original reduction and rounding.
+- Metal Q8 matvec and paired matvec with four SIMD groups: remove a redundant
+  barrier while retaining each kernel's reduction and output ownership.
+- Metal SSD shared-expert Q8 gate/up at four or eight SIMD groups: the same
+  barrier reduction applies to the fused SwiGLU producer.
+
+These are automatic decode paths, not new Q4 quantization formats. They also
+apply to compatible models whose attention remains Q8. A separate restored
+ROCm correctness fix assigns one writer to each raw-KV ring cell when a batch
+is larger than the ring; only its newest rows survive.
+
 ## Validation
 
 The host suite requires no model or GPU:
@@ -104,6 +131,8 @@ The host suite requires no model or GPU:
 ```sh
 make test-cpu-q4 test-quantizer-indexer-q4
 make test-q4-preflight-host
+make test-cuda-hc-split-norm-host test-cuda-q8-quantize-host \
+  test-rocm-raw-kv-store-host
 make test-q4-epilogue-host test-q4-prefill-dequant-host \
   test-q4-prefill-reduce-host test-cuda-q4-prefill-norm-host \
   test-cuda-q4-dequant-flat-host test-rocm-q4-dequant-flat-host \
@@ -120,12 +149,14 @@ guard regions, odd batch sizes, fallback shapes, and cache transitions:
 make test-metal-indexer-q4 test-metal-q4-prefill-pair \
   test-metal-q4-qb-token-pair test-metal-q4-attn-out-a-direct \
   test-metal-q4-qb-f16-cache test-metal-q4-hc
+make test-metal-decode-defaults
 ```
 
 On NVIDIA hardware, compile and run the native oracles:
 
 ```sh
 make test-mmq-parity-cuda test-cuda-q4-epilogue CUDA_ARCH=sm_121
+make test-cuda-hc-split-norm test-cuda-q8-quantize CUDA_ARCH=sm_121
 make test-cuda-q4-prefill-dequant test-cuda-q4-prefill-reduce \
   test-cuda-q4-prefill-norm CUDA_ARCH=sm_121
 ```
@@ -164,6 +195,33 @@ and timing options. Metal has `metal-q4-dense-pair-bench`,
 Kernel timings isolate a dispatch or projection. They cannot establish an
 end-to-end improvement or guarantee that Q4 prefill is faster than Q8.
 
+## Measuring decode recovery
+
+Compare the same Q4 GGUF, prompt, generated-token limit, sampling parameters,
+context, and cache budget. Changing the SSD expert cache is a separate
+experiment from changing kernels. Alternate the two binaries in A/B and B/A
+order and compare generated text as well as throughput.
+
+For the CUDA HC path, use the same binary with and without its rollback:
+
+```sh
+./ds4 --cuda --temp 0 --nothink -n 400 -c 131072 \
+  -m /path/to/model.gguf --prompt-file /path/to/prompt.txt
+DS4_CUDA_NO_HC_SPLIT_NORM_SPLIT4096=1 \
+  ./ds4 --cuda --temp 0 --nothink -n 400 -c 131072 \
+  -m /path/to/model.gguf --prompt-file /path/to/prompt.txt
+```
+
+Repeat in reversed order. This isolates the HC implementation; it does not
+measure Q4 versus Q8 or reproduce every optimization in the old branch.
+Test the Q8 activation reduction separately with
+`DS4_CUDA_DISABLE_Q8_QUANT_WARP_REDUCE=1`; set both rollbacks to compare the
+combined restored CUDA defaults with their reference implementations.
+The host HC fixture checks the extracted arithmetic and dispatch policy; its
+native CUDA mode checks actual kernels and captured graph replays. CUDA/HIP
+device validation and the reported DGX Spark throughput recovery require
+those devices and cannot be established by host simulations.
+
 ## Port provenance
 
 The clean history starts at upstream `6289c516273979173abbc062209a81dd3706b804`.
@@ -171,7 +229,8 @@ Q4 functionality was selected from
 `aprojq4-dense-attention` at `dff1543f33bdfb6d2e6023413cc3093fd093b8fa`, after
 the experimental Q4 kernel cleanup. The port retains the automatic Q4 paths
 and their required helpers, adapted to upstream's runtime and Metal queue.
-DSpark experiments, unrelated MoE/IQ2 changes, removed kernel candidates,
+The decode follow-up retains the narrowly scoped HC/Q8 defaults described
+above. DSpark experiments, other MoE/IQ2 changes, removed kernel candidates,
 compiled binaries, and historical benchmark reports are outside this port.
 
 The commits separate common CPU/model support, GPU implementations with

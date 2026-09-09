@@ -513,7 +513,7 @@ tests/test_ssd_cache: tests/test_ssd_cache.c ds4_ssd.c ds4_ssd.h
 test-ssd-cache: tests/test_ssd_cache
 	./tests/test_ssd_cache
 
-ds4_cuda.o: ds4_cuda.cu cuda/ds4_q4_dequant_layout.h cuda/ds4_q4_dequant_vec.cuh cuda/ds4_q4_prefill_reduce.h ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
+ds4_cuda.o: ds4_cuda.cu cuda/ds4_q4_dequant_layout.h cuda/ds4_q4_dequant_vec.cuh cuda/ds4_q4_prefill_reduce.h cuda/ds4_q8_quantize.cuh ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -798,6 +798,22 @@ clean:
 .PHONY: test-q4-preflight-host
 test-q4-preflight-host: tests/test_q4_preflight.py tests/kernel_source.py ds4.c ds4_gpu.h
 	python3 tests/test_q4_preflight.py
+
+.PHONY: test-cuda-hc-split-norm-host test-cuda-hc-split-norm test-cuda-q8-quantize-host test-cuda-q8-quantize test-rocm-raw-kv-store-host
+test-cuda-hc-split-norm-host: tests/test_cuda_hc_split_norm.py tests/kernel_source.py ds4_cuda.cu
+	python3 tests/test_cuda_hc_split_norm.py
+
+test-cuda-hc-split-norm: tests/test_cuda_hc_split_norm.py tests/kernel_source.py ds4_cuda.cu
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_hc_split_norm.py --cuda
+
+test-cuda-q8-quantize-host: tests/test_cuda_q8_quantize.py tests/test_cuda_q8_quantize.cpp tests/kernel_source.py ds4_cuda.cu cuda/ds4_q8_quantize.cuh
+	python3 tests/test_cuda_q8_quantize.py
+
+test-cuda-q8-quantize: tests/test_cuda_q8_quantize.py tests/test_cuda_q8_quantize.cpp ds4_cuda.cu cuda/ds4_q8_quantize.cuh
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_q8_quantize.py --cuda
+
+test-rocm-raw-kv-store-host: tests/test_rocm_raw_kv_store.py tests/kernel_source.py ds4_gpu.h rocm/ds4_rocm_fp8_kv.cuh rocm/ds4_rocm_attention_launch.cuh
+	python3 tests/test_rocm_raw_kv_store.py
 
 .PHONY: test-q4-epilogue-host test-cuda-q4-epilogue
 tests/test_q4_epilogue_host: tests/test_cuda_q4_epilogue.cpp cuda/mmq/ds4_q4_mmvq_epilogue.h
@@ -1138,6 +1154,13 @@ tests/test_metal_q4_hc: tests/test_metal_q4_hc.c ds4_gpu.h ds4_image.o ds4_metal
 test-metal-q4-hc: tests/test_metal_q4_hc
 	./tests/test_metal_q4_hc
 
+.PHONY: test-metal-decode-defaults
+tests/test_metal_decode_defaults: tests/test_metal_decode_defaults.m ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
+
+test-metal-decode-defaults: tests/test_metal_decode_defaults
+	./tests/test_metal_decode_defaults
+
 speed-bench/metal_q4_dense_pair_bench: speed-bench/metal_q4_dense_pair_bench.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 metal-q4-dense-pair-bench: speed-bench/metal_q4_dense_pair_bench
@@ -1222,7 +1245,7 @@ Q4_BUILD_PRODUCTS := tests/test_cpu_q4_dense tests/test_quantizer_indexer_q4 tes
 	tests/test_rocm_q4_wmma_load_host tests/test_rocm_q4_qb_epilogue_host tests/test_rocm_q4_qb_epilogue_host_fast \
 	tests/test_rocm_q4_qb_epilogue tests/test_rocm_q4_dense_pair tests/test_metal_q4_prefill_pair \
 	tests/test_metal_indexer_q4 tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_qb_f16_cache \
-	tests/test_metal_q4_qb_token_pair tests/test_metal_q4_hc speed-bench/metal_q4_dense_pair_bench \
+	tests/test_metal_q4_qb_token_pair tests/test_metal_q4_hc tests/test_metal_decode_defaults speed-bench/metal_q4_dense_pair_bench \
 	speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench \
 	cuda/mmq/test/test_mmq_parity tests/test_cuda_q4_epilogue speed-bench/rocm_q4_prefill_bench \
 	speed-bench/cuda_q4_prefill_bench

@@ -26,9 +26,9 @@
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <cstring>
 
 #if defined(__has_include)
@@ -2630,7 +2630,6 @@ extern "C" int ds4_mmq_mxfp4_moe_pair(
 
 #include "mmvq.cuh"
 #include "ds4_q4_mmvq_epilogue.h"
-#include <atomic>
 
 namespace {
 
