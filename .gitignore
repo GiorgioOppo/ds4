@@ -60,6 +60,7 @@ __pycache__/
 .DS_Store
 
 # Q4 test and benchmark build products
+/tests/test_ssd_cache
 /tests/test_metal_q4_hc
 /tests/test_metal_decode_defaults
 /tests/test_q4_epilogue_host

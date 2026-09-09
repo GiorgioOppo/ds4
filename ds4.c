@@ -4969,7 +4969,7 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
 }
 #endif
 
-static uint64_t ds4_streaming_manual_cache_safe_bytes(
+static uint64_t ds4_streaming_model_safe_bytes(
         ds4_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk,
@@ -4986,11 +4986,9 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
     if (recommended == 0) return 0;
 
     /*
-     * Explicit NGB budgets name only the routed expert cache. Keep that cache
-     * below the graph backend's working-set recommendation after accounting for
-     * the graph context/KV buffers. This is intentionally not an mlock-derived
-     * cap: crossing too close to the recommended working set makes short
-     * token-major prefill spend most of its time in VM/driver synchronization.
+     * Combined fixed-weight and routed-expert budget after graph context/KV
+     * buffers. Auto sizing and static pinning subtract non-routed weights
+     * themselves; retain their existing GiB rounding and minimum here.
      */
     uint64_t target = recommended > UINT64_MAX / 7ull ?
         UINT64_MAX : (recommended * 7ull) / 8ull;
@@ -61600,7 +61598,7 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
 #ifdef __APPLE__
     /* More cached experts help only if the fixed weights stay resident too.
      * Share the static-pinning budget, including the requested context. */
-    model_limit = ds4_streaming_manual_cache_safe_bytes(
+    model_limit = ds4_streaming_model_safe_bytes(
             e->backend, ctx_size > 0 ? ctx_size : 4096,
             e->prefill_chunk, true);
     /* GLM's larger fixed tensors and streaming windows need more margin. */
@@ -64170,12 +64168,44 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
-            ds4_streaming_manual_cache_safe_bytes(e->backend,
-                                                  opt->context_size,
-                                                  e->prefill_chunk,
-                                                  e->ssd_streaming);
-        if (safe_cache_bytes != 0 &&
+        uint64_t safe_cache_bytes = 0;
+        bool safe_cache_known = false;
+        if (e->backend == DS4_BACKEND_METAL) {
+#ifndef DS4_NO_GPU
+            uint64_t non_routed_bytes = 0;
+            if (!weights_streaming_non_routed_bytes(&e->weights,
+                                                    &non_routed_bytes)) {
+                fprintf(stderr,
+                        "ds4: Metal SSD streaming manual cache could not "
+                        "measure non-routed model weights\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            const ds4_context_memory ctx_mem =
+                ds4_context_memory_estimate_with_prefill_mode(
+                        e->backend, opt->context_size, e->prefill_chunk, true);
+            safe_cache_known = ds4_ssd_manual_cache_safe_bytes(
+                    ds4_gpu_recommended_working_set_size(), ctx_mem.total_bytes,
+                    non_routed_bytes, &safe_cache_bytes);
+#endif
+        } else {
+            /* Preserve the existing cap on other backends. */
+            safe_cache_bytes = ds4_streaming_model_safe_bytes(
+                    e->backend, opt->context_size, e->prefill_chunk, true);
+            safe_cache_known = safe_cache_bytes != 0;
+        }
+        if (safe_cache_known && safe_cache_bytes == 0) {
+            /* Zero otherwise means automatic sizing. Do not turn an exhausted
+             * explicit target into a fresh auto-cache allocation. */
+            fprintf(stderr,
+                    "ds4: Metal SSD streaming manual cache has no working-set "
+                    "budget after graph buffers and non-routed weights\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (safe_cache_known &&
             e->ssd_streaming_cache_bytes > safe_cache_bytes) {
             e->ssd_streaming_cache_bytes = safe_cache_bytes;
             fprintf(stderr,
@@ -64491,7 +64521,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             getenv("DS4_METAL_DISABLE_STREAMING_STATIC_LOCK") == NULL) {
             ds4_model_map_span_vec spans;
             uint64_t static_bytes = 0;
-            const uint64_t budget = ds4_streaming_manual_cache_safe_bytes(
+            const uint64_t budget = ds4_streaming_model_safe_bytes(
                     e->backend, opt->context_size, e->prefill_chunk, true);
             const uint64_t experts = ds4_add_sat_u64(
                     ds4_engine_dynamic_expert_cache_bytes(e),
