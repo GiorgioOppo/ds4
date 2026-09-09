@@ -195,6 +195,41 @@ and timing options. Metal has `metal-q4-dense-pair-bench`,
 Kernel timings isolate a dispatch or projection. They cannot establish an
 end-to-end improvement or guarantee that Q4 prefill is faster than Q8.
 
+### CUDA grouped output-A candidate
+
+An isolated benchmark evaluates the eight-token grouped kernel from
+[adamlawi/ds4 at b4922c9](https://github.com/adamlawi/ds4/blob/b4922c9614eaed560c4988739b03648652f5b09f/ds4_cuda.cu#L30189).
+It reuses each Q4 block across up to eight tokens and consumes the native
+head/output layout. Its Q8_K quantizer splits large token/group row counts
+across launches so `grid.y` never exceeds 65535. The inference backend does
+not include this candidate and no new runtime switch is introduced.
+
+```sh
+# Host layout, launch-boundary and production dot-helper checks.
+make test-cuda-q4-grouped-tok8-host
+
+# Native correctness checks, followed by balanced CUDA-event measurements.
+# Select the architecture of the GPU being tested.
+make bench-cuda-q4-grouped-tok8 CUDA_ARCH=sm_121 Q4_TOK8_TOKENS=512
+```
+
+`Q4_TOK8_DEVICE` selects the device (default 0). The native fixture checks
+token/row tails, a batch exceeding 65535 quantizer rows, guarded buffers and
+graph replays on a non-default stream. It compares against a scalar Q8_K
+reference and reports numerical differences from the grouped Q8_1 MMQ path.
+On GPUs other than GB10 it also measures the pack/MMQ/scatter sequence used
+by the current fallback. Timings include activation quantization and all
+projection work, with scratch allocation and warmup outside the samples.
+This is an eager comparison: the candidate owns preallocated scratch and
+MMQ uses its warmed pool. Inference configurations that register persistent
+MMQ scratch can have different overhead.
+
+Q8_K and Q8_1 activation quantization are different: diagnostic error metrics
+are not a model-quality acceptance test. Native CUDA compilation, timing and
+full-model quality measurements are required before changing inference
+dispatch. Host sanitizer checks do not establish those results. Generated
+translation units and executables are created in temporary directories.
+
 ## Measuring decode recovery
 
 Compare the same Q4 GGUF, prompt, generated-token limit, sampling parameters,

@@ -815,6 +815,23 @@ test-cuda-q8-quantize: tests/test_cuda_q8_quantize.py tests/test_cuda_q8_quantiz
 test-rocm-raw-kv-store-host: tests/test_rocm_raw_kv_store.py tests/kernel_source.py ds4_gpu.h rocm/ds4_rocm_fp8_kv.cuh rocm/ds4_rocm_attention_launch.cuh
 	python3 tests/test_rocm_raw_kv_store.py
 
+Q4_TOK8_DEPS := tests/test_cuda_q4_grouped_tok8.py tests/kernel_source.py \
+	speed-bench/cuda_q4_grouped_tok8_bench.cu cuda/ds4_q4_grouped_tok8_candidate.cuh ds4_cuda.cu
+Q4_TOK8_TOKENS ?= 512
+Q4_TOK8_DEVICE ?= 0
+.PHONY: test-cuda-q4-grouped-tok8-host test-cuda-q4-grouped-tok8 bench-cuda-q4-grouped-tok8
+test-cuda-q4-grouped-tok8-host: $(Q4_TOK8_DEPS)
+	python3 tests/test_cuda_q4_grouped_tok8.py
+
+test-cuda-q4-grouped-tok8: $(Q4_TOK8_DEPS) $(MMQ_OBJS)
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_q4_grouped_tok8.py \
+		--cuda --device $(Q4_TOK8_DEVICE) --link-objects "$(MMQ_OBJS)"
+
+bench-cuda-q4-grouped-tok8: $(Q4_TOK8_DEPS) $(MMQ_OBJS)
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_q4_grouped_tok8.py \
+		--cuda --device $(Q4_TOK8_DEVICE) --link-objects "$(MMQ_OBJS)" \
+		--bench --tokens $(Q4_TOK8_TOKENS)
+
 .PHONY: test-q4-epilogue-host test-cuda-q4-epilogue
 tests/test_q4_epilogue_host: tests/test_cuda_q4_epilogue.cpp cuda/mmq/ds4_q4_mmvq_epilogue.h
 	$(CXX) -O2 -Wall -Wextra -std=c++17 -o $@ $<
