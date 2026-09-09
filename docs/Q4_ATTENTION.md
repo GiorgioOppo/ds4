@@ -114,6 +114,18 @@ the Q4 matrix kernels. The follow-up restores these specific paths:
   reduction without six block barriers. Quality mode and the rollback retain
   the shared-memory implementation; the Q8_K part of dual quantization keeps
   its original reduction and rounding.
+- CUDA GB10 F16 compressor projections: restore the fused pair and state
+  store used in `d12f4480`/`ff749b84`. For K=4096, widths 256/1024 at ratio 4
+  and width 512 at ratio 128, an immutable transposed half2 cache coalesces
+  paired weight loads and retains the ordered 32-lane sum. Cache construction
+  happens outside capture; a cache miss during capture or an exhausted cache
+  uses the fused canonical-layout kernel. Quality and other GPU paths retain
+  the existing implementation. The cache is bounded to 1 GiB per loaded model
+  and released after graph invalidation at model teardown.
+- CUDA GB10 shared-expert Q8 down projection with HC expansion: restore the
+  aligned weight loads from the same historical snapshots. The activation
+  quantizer, accumulation and HC epilogue match the canonical Q8 path. This
+  uses existing model artifacts and adds no weight cache allocation.
 - Metal Q8 matvec and paired matvec with four SIMD groups: remove a redundant
   barrier while retaining each kernel's reduction and output ownership.
 - Metal SSD shared-expert Q8 gate/up at four or eight SIMD groups: the same
@@ -133,6 +145,7 @@ make test-cpu-q4 test-quantizer-indexer-q4
 make test-q4-preflight-host
 make test-cuda-hc-split-norm-host test-cuda-q8-quantize-host \
   test-rocm-raw-kv-store-host
+make test-cuda-f16-compressor-host test-cuda-q8-hc-aligned-host
 make test-q4-epilogue-host test-q4-prefill-dequant-host \
   test-q4-prefill-reduce-host test-cuda-q4-prefill-norm-host \
   test-cuda-q4-dequant-flat-host test-rocm-q4-dequant-flat-host \
@@ -157,6 +170,7 @@ On NVIDIA hardware, compile and run the native oracles:
 ```sh
 make test-mmq-parity-cuda test-cuda-q4-epilogue CUDA_ARCH=sm_121
 make test-cuda-hc-split-norm test-cuda-q8-quantize CUDA_ARCH=sm_121
+make test-cuda-f16-compressor test-cuda-q8-hc-aligned CUDA_ARCH=sm_121
 make test-cuda-q4-prefill-dequant test-cuda-q4-prefill-reduce \
   test-cuda-q4-prefill-norm CUDA_ARCH=sm_121
 ```
@@ -231,6 +245,32 @@ dispatch. Host sanitizer checks do not establish those results. Generated
 translation units and executables are created in temporary directories.
 
 ## Measuring decode recovery
+
+The F16 compressor and aligned Q8 HC restorations above recover two enabled
+paths absent from `670e6b9`; they are not a measured recovery of the reported
+GB10 +6.5%. The public `adamlawi/aprojq4-dense-attention` head `b4922c9` predates
+the bisected `d12f4480`/`ff749b84` snapshots. The latter are the sources for
+these restorations. The upstream aligned-Q8-pair scratch change at the
+`d12f4480` performance step was already present in `670e6b9`.
+
+On GB10, compare the same AProjQ4 file, fixed prompt, context and token limit
+against `670e6b9`, alternating executable order and checking generated output.
+Record startup/cache preparation separately. A same-binary rollback disables
+both restored paths with `DS4_CUDA_NO_F16_PAIR_COMPRESSOR_STORE=1` and
+`DS4_CUDA_NO_Q8_FUSED_ALIGNED=1`. Kernel timings are available with
+`make bench-cuda-f16-compressor CUDA_ARCH=sm_121`; these use prebuilt cached
+weights and report eight balanced rounds for separate, fused canonical and
+fused transposed kernels. They do not measure model throughput or cache setup.
+
+The F16 host oracle compares all four output/state arrays, untouched ring rows
+and guards for 72 input/position/type cases, including UINT32_MAX positions,
+under both contraction modes with ASan/UBSan. Native mode additionally checks
+three graph replays with fresh inputs; 106 host policy checks cover cache
+lifetime, aliases, capture and allocation/launch failures. The aligned Q8 HC
+oracle checks 40 kernel cases and 31 dispatch/fault cases in strict and fast
+builds, plus 8192 independent integer-dot comparisons. Native compilation,
+GPU correctness and performance of these two restorations remain unverified
+locally.
 
 Compare the same Q4 GGUF, prompt, generated-token limit, sampling parameters,
 context, and cache budget. Changing the SSD expert cache is a separate
