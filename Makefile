@@ -1270,6 +1270,32 @@ tests/test_metal_q4_qb_token_pair: tests/test_metal_q4_qb_token_pair.m ds4_gpu.h
 test-metal-q4-qb-token-pair: tests/test_metal_q4_qb_token_pair
 	./tests/test_metal_q4_qb_token_pair
 
+.PHONY: test-metal-q4-activation test-metal-q4-activation-runtime bench-metal-q4-activation
+tests/test_metal_q4_activation: tests/test_metal_q4_activation.m $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+test-metal-q4-activation: tests/test_metal_q4_activation
+	./tests/test_metal_q4_activation
+
+bench-metal-q4-activation: tests/test_metal_q4_activation
+	./tests/test_metal_q4_activation --bench
+
+tests/test_metal_q4_activation_runtime: tests/test_metal_q4_activation_runtime.m ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
+
+test-metal-q4-activation-runtime: tests/test_metal_q4_activation_runtime
+	env -u DS4_METAL_UNRETAINED_COMMAND_BUFFERS ./tests/test_metal_q4_activation_runtime
+	DS4_METAL_UNRETAINED_COMMAND_BUFFERS=1 ./tests/test_metal_q4_activation_runtime
+
+.PHONY: test-metal-moe-activation bench-metal-moe-activation
+METAL_MOE_ACTIVATION_DEPS := tests/test_metal_moe_activation.py tests/test_metal_moe_activation.m \
+	tests/kernel_source.py ds4_metal.m metal/moe.metal metal/cpy.metal
+test-metal-moe-activation: $(METAL_MOE_ACTIVATION_DEPS)
+	python3 tests/test_metal_moe_activation.py
+
+bench-metal-moe-activation: $(METAL_MOE_ACTIVATION_DEPS)
+	python3 tests/test_metal_moe_activation.py --bench
+
 .PHONY: test-metal-q4-hc
 tests/test_metal_q4_hc: tests/test_metal_q4_hc.c ds4_gpu.h ds4_image.o ds4_metal.o
 	$(CC) $(CFLAGS) -I. -o $@ $< ds4_image.o ds4_metal.o $(METAL_LDLIBS)
@@ -1392,6 +1418,7 @@ Q4_BUILD_PRODUCTS := tests/test_cpu_q4_dense tests/test_quantizer_indexer_q4 tes
 	tests/test_rocm_q4_qb_epilogue tests/test_rocm_q4_dense_pair tests/test_metal_q4_prefill_pair \
 	tests/test_metal_indexer_q4 tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_qb_f16_cache \
 	tests/test_metal_q4_qb_token_pair tests/test_metal_q4_hc tests/test_metal_decode_defaults tests/test_metal_f16_compressor \
+	tests/test_metal_q4_activation tests/test_metal_q4_activation_runtime \
 	speed-bench/metal_q4_dense_pair_bench \
 	speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench \
 	cuda/mmq/test/test_mmq_parity tests/test_cuda_q4_epilogue speed-bench/rocm_q4_prefill_bench \

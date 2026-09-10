@@ -8727,7 +8727,7 @@ kernel void kernel_mul_mm_id_addr(
 // each output keeps the exact MMA accumulation order of the separate GEMMs,
 // and the epilogue matches kernel_dsv4_moe_swiglu_weight_f16, so the fused
 // result is bit-identical to the unfused path.
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool CULL_TAIL_SIMDGROUPS = false>
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool CULL_TAIL_SIMDGROUPS = false, typename T1 = float, typename T1_2x4 = float2x4>
 kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -8804,7 +8804,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     const short iy = 8*(tiitg % NL1);
 
-    device const float * y = (device const float *)(src1
+    device const T1 * y = (device const T1 *)(src1
         + args.nb13*i13
         + args.nb12*i12
         + args.nb11*i11
@@ -8838,7 +8838,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
             const short ly_b = (tiitg/NL1)%8;
             const short ib_b = 4*sx_b + sy_b;
             *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
-                (half2x4)(*((device float2x4 *) y));
+                (half2x4)(*((device T1_2x4 *) y));
         }
 
         FOR_UNROLL (short i = 0; i < 16; i++) {
@@ -9160,6 +9160,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
 }
 
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mul_mm_id_pair_swiglu_f16_iq2;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, false, half, half2x4>) mul_mm_id_pair_swiglu_f16_rhs_iq2;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_id_pair_swiglu_f16_q4;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>) mul_mm_id_pair_swiglu_f16_mxfp4;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4, true>) mul_mm_id_pair_swiglu_f16_mxfp4_tail_cull;
@@ -9167,6 +9168,9 @@ typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4,
 
 // Host-visible fused routed pair matmuls for the DS4 expert quant formats.
 template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_iq2 kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+// Token-compact RHS: the preceding copy uses the same F32-to-half rounding
+// once per token. Keep routing, dequantization, MMA order and SwiGLU intact.
+template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_rhs")]] kernel mul_mm_id_pair_swiglu_f16_rhs_iq2 kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, false, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_q4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale>;

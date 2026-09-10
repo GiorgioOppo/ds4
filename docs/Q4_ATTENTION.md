@@ -521,6 +521,85 @@ median threshold alone is not a confidence interval or a numerical parity
 check. Native HIP compilation and the requested +8% remain unverified on
 the macOS development machine.
 
+### Metal activation preparation reuse
+
+The Metal port applies the same reuse principle to the existing SIMDgroup
+matrix paths on pre-M5 Apple GPUs. Q-B uses the existing
+`kernel_mul_mm_q4_K_f16_rhs`; the fused IQ2 gate/up kernel gains an F16 input
+specialization of the same template. Both keep weight decoding, F16 operand
+rounding, accumulation order and output arithmetic.
+
+| Path | Automatic selection | Reused preparation | Fixed queue scratch |
+| --- | --- | --- | --- |
+| Direct Q4 Q-B | K1024/M32768, N128–2048, resident, pre-M5, no quality/TP/concurrent encoder | One F32-to-F16 conversion instead of one per 64-row output band (512 bands for a full token tile) | 4 MiB |
+| Fused IQ2 gate/up + SwiGLU | IQ2/Q2 experts, K4096/M2048, E256/top-k 6, N512–2048, resident, pre-M5, TP1 | One token-compact F16 input shared by all selected experts and output-row tiles | 16 MiB |
+
+Metal's fused MoE pair consumes floating-point activations. The ROCm Q8
+record gather therefore has no direct counterpart here: the new input stays
+token-compact, and the original expert map selects its rows. Gate and up
+remain fused, and the down projection consumes the same F16 intermediate.
+Existing M5 MPP and packed-activation paths keep their selection, as do SSD,
+quality and small-batch paths. Existing Q-B weight sidecars are tried before
+the direct projection and retain their own activation preparation.
+
+The new buffers have fixed capacities, so later batches never replace a
+buffer still referenced by an unretained command buffer. The serial queue
+and tracked resource hazards order reuse; the copy encoder ends before the
+consumer starts. Cleanup drains submitted and unsubmitted work before
+releasing scratch. Allocation or pipeline failure before conversion can use
+the original path. Encoding failure after conversion propagates without
+replaying matrix computation. No new runtime environment controls are added.
+
+Native validation and preparation-inclusive microbenchmarks are available
+without loading a GGUF:
+
+```sh
+make test-metal-q4-activation test-metal-q4-activation-runtime
+make test-metal-moe-activation
+make bench-metal-q4-activation
+make bench-metal-moe-activation
+```
+
+The Q-B runtime fixture checks automatic selection against the explicit F32
+oracle, input/output guards, aliases, fallback cases, three consecutive GPU
+producers sharing one scratch buffer, and cleanup with an unsubmitted batch.
+It passes 36 cases in each of retained and unretained command-buffer modes
+on M1 Max. The standalone Q-B comparison also covers incomplete output/token
+tiles. Its benchmark selects the same boundary-check specialization and copy
+thread count as the runtime, includes conversion and encoder boundaries, and
+rotates eight synthetic weight matrices. The MoE fixture extracts the actual
+IQ2 decoder, map, copy and paired kernels, comparing complete F16 outputs in
+strict and fast Metal compilation modes. Its benchmark includes copy and
+paired compute but excludes the common map and down projection.
+
+Q-B timing with the exact runtime specializations was too variable to
+establish a stable percentage gain on the local M1 Max. The IQ2 case at
+128 tokens likewise showed no distinguishable gain, so its automatic reuse
+starts at 512 tokens. These limits are deliberate: fewer conversions alone
+do not prove faster matrix computation.
+
+Two isolated M1 Max benchmark runs passed all 81 MoE cases, including strict
+and fast parity checks and the production-shape timing cases. With
+K4096/M2048, 256 experts and top-k 6, 14 samples per arm in balanced ABBA
+order gave the following gate/up + SwiGLU throughput gains, including the
+activation copy:
+
+| Tokens | First run, means | Second run, means | Second run, medians |
+| --- | --- | --- | --- |
+| 128 (benchmark only) | +0.14% | +0.32% | +0.20% |
+| 512 | +1.81% | +1.82% | +1.88% |
+| 2048 | +2.61% | +3.34% | +3.44% |
+
+These synthetic resident-weight measurements use uniform routing. Actual
+expert distributions and the common map/down work can change the benefit.
+
+These checks validate local kernels and queue integration. Model-level
+prefill throughput, SSD runs and M2–M4 performance require separate
+measurements; a stage speedup does not establish an 8% end-to-end gain. Use
+the repeated CSV protocol above with `--metal` and `b09f8e3` as the baseline
+for this port. Keep chunk size in CSV filenames and compare frontier logits
+separately from timing.
+
 ### CUDA grouped output-A candidate
 
 An isolated benchmark evaluates the eight-token grouped kernel from
