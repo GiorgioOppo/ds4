@@ -155,6 +155,12 @@ the Q4 matrix kernels. The follow-up restores these specific paths:
   table. All 128 masks, floating-point operations, reductions, output stores
   and scratch requirements are unchanged. Selection is automatic at shader
   compilation; other Apple GPU generations retain their existing path.
+- CUDA raw IQ2_XXS routed experts: pass the seven-bit code directly to the
+  existing population-count helper, eliminating a redundant lookup of the
+  expanded sign byte. The grid-LUT decode and tile8 kernels also drop their
+  128-byte shared sign table and its initialization. Grid and activation
+  staging still require the existing barriers. Packed integer weights, DP4A
+  operations, FP scaling and dispatch remain unchanged.
 
 These are automatic decode paths, not new Q4 quantization formats. They also
 apply to compatible models whose attention remains Q8. A separate restored
@@ -180,6 +186,16 @@ needs longer measurements before treating it as a stable throughput gain.
 This 16-token prompt takes the SSD decode-style prefill path; it does not
 measure the 128-token Q4 matrix kernel. Larger Q4 matrix tiles were tested
 separately and excluded because they did not reliably improve that shape.
+
+The CUDA IQ2 port targets raw decode (including SSD streaming) and the
+prefill paths that call these helpers. Aligned-artifact decode, raw MMQ and
+D2R paths already reconstruct signs with population count. The aligned-SoA
+MMQ loader retains its existing `ksigns64` packed-mask table; that table
+replaces additional mask-expansion instructions and is a separate
+optimization. This port does not imply a speedup for the main MMQ prefill
+path. Native CUDA build validation and correctness/performance runs on
+NVIDIA hardware are still required; the M1 timings above do not establish
+a CUDA gain.
 
 ## Validation
 
