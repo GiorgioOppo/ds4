@@ -1225,6 +1225,11 @@ test-metal-decode-fusions: tests/test_metal_decode_fusions.py tests/test_metal_d
 		tests/kernel_source.py metal/dense.metal metal/dsv4_hc.metal
 	python3 tests/test_metal_decode_fusions.py
 
+.PHONY: test-metal-iq2-signs
+test-metal-iq2-signs: tests/test_metal_iq2_signs.py tests/test_metal_iq2_signs.m \
+		tests/kernel_source.py metal/moe.metal metal/dense.metal
+	python3 tests/test_metal_iq2_signs.py
+
 tests/test_metal_f16_compressor: tests/test_metal_f16_compressor.c ds4_gpu.h ds4_image.o ds4_metal.o
 	$(CC) $(CFLAGS) -I. -o $@ $< ds4_image.o ds4_metal.o $(METAL_LDLIBS)
 

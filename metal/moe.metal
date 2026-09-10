@@ -3310,8 +3310,17 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+#if DS4_METAL_IQ2_PAIR_POPCOUNT
+                // IQ2 stores seven signs; the eighth makes their parity even.
+                // M1 computes the same mask without a random shared LUT load.
+                const uint sign_bits_g = (aux32g >> (7*l)) & 127u;
+                const uint sign_bits_u = (aux32u >> (7*l)) & 127u;
+                const uint8_t signg = sign_bits_g | ((popcount(sign_bits_g) & 1u) << 7);
+                const uint8_t signu = sign_bits_u | ((popcount(sign_bits_u) & 1u) << 7);
+#else
                 const uint8_t signg = ssigns[(aux32g >> 7*l) & 127];
                 const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
+#endif
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8*l + j];
                     sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);

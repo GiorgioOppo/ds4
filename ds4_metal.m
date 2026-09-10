@@ -3042,6 +3042,12 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+static int ds4_gpu_device_is_m1_apple_silicon(void) {
+    return strncmp(g_metal_device_name, "Apple M1", 8) == 0 &&
+           (g_metal_device_name[8] == '\0' ||
+            g_metal_device_name[8] == ' ');
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -7131,6 +7137,12 @@ int ds4_gpu_init(void) {
         }
         MTLCompileOptions *options = [MTLCompileOptions new];
         NSMutableDictionary *macros = [NSMutableDictionary new];
+        /* On M1, integer parity avoids shared-memory sign lookups in the
+         * IQ2 paired matvec. Keep other GPU generations on their existing
+         * implementation; this specialization does not change FP arithmetic. */
+        if (ds4_gpu_device_is_m1_apple_silicon()) {
+            macros[@"DS4_METAL_IQ2_PAIR_POPCOUNT"] = @"1";
+        }
         if (g_metal4_tensor_api_enabled) {
             macros[@"DS4_METAL_HAS_TENSOR"] = @"1";
             fprintf(stderr, "ds4: Metal 4 tensor API enabled for Tensor kernels\n");
@@ -19935,12 +19947,6 @@ static const char *ds4_gpu_q4_mv_ext_name(uint32_t weight_type, int16_t r1ptg) {
         (void)prefix;
         return NULL;
     }
-}
-
-static int ds4_gpu_device_is_m1_apple_silicon(void) {
-    return strncmp(g_metal_device_name, "Apple M1", 8) == 0 &&
-           (g_metal_device_name[8] == '\0' ||
-            g_metal_device_name[8] == ' ');
 }
 
 static const char *ds4_gpu_q4_mm_name(

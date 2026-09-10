@@ -150,11 +150,36 @@ the Q4 matrix kernels. The follow-up restores these specific paths:
   directly, preserving the original reduction order and APE addition. This
   removes the device-memory barrier and projection reload from the previous
   fused epilogue. Existing device and shape gates remain in force.
+- Metal M1 IQ2_XXS paired matvec: compute the eighth sign bit with integer
+  population count instead of loading a random entry from the shared sign
+  table. All 128 masks, floating-point operations, reductions, output stores
+  and scratch requirements are unchanged. Selection is automatic at shader
+  compilation; other Apple GPU generations retain their existing path.
 
 These are automatic decode paths, not new Q4 quantization formats. They also
 apply to compatible models whose attention remains Q8. A separate restored
 ROCm correctness fix assigns one writer to each raw-KV ring cell when a batch
 is larger than the ring; only its newest rows survive.
+
+On M1 Max, the IQ2 sign change reduced median paired kernel latency by 5.0%
+with eight rotating weight sets (198 MiB), and 7.2% with one warm set
+(24.8 MiB). Each fast-math comparison used 24 alternating A/B samples of
+128 dispatches. The isolated kernel passed bitwise checks in strict and fast
+modes. These timings exclude CPU encoding and SSD reads; unstable
+single-dispatch cache-pressure measurements are excluded. They do not
+establish a 10% improvement in model throughput.
+
+An eight-run SSD-streaming comparison against `20e728e` on the same M1 Max
+(24 GPU cores, 32 GiB RAM) used A/B/B/A followed by B/A/A/B. With the
+IQ2XXS-w2Q2K-AProjQ4-SExpQ8-OutQ8 model, prompt `narrami la storia di roma`,
+`--ctx 4096 --prefill-chunk 128 --nothink --temp 0 -n 50` and the same
+automatic cache budget, mean generation was 4.84 versus 4.965 tokens/s
+(+2.6% observed). All eight runs generated identical output. Individual
+results varied from 4.62 to 5.32 tokens/s, so this small full-model difference
+needs longer measurements before treating it as a stable throughput gain.
+This 16-token prompt takes the SSD decode-style prefill path; it does not
+measure the 128-token Q4 matrix kernel. Larger Q4 matrix tiles were tested
+separately and excluded because they did not reliably improve that shape.
 
 ## Validation
 
@@ -184,6 +209,7 @@ make test-metal-indexer-q4 test-metal-q4-prefill-pair \
   test-metal-q4-qb-token-pair test-metal-q4-attn-out-a-direct \
   test-metal-q4-qb-f16-cache test-metal-q4-hc
 make test-metal-decode-defaults test-metal-decode-fusions test-metal-f16-compressor
+make test-metal-iq2-signs test-metal-ssd-experts
 # Larger activation allocations; each fixture runs separately.
 make test-metal-q4-prefill-long
 ```
@@ -195,6 +221,13 @@ positions, and Q8/HC SIMD-group variants. The F16 integration fixture checks
 command modes. Long-prefill fixtures compare direct output-A at 8191/8192
 tokens and fused output-B/HC at 8192 against the existing separate paths,
 including output guards and rejection beyond the dispatch limits.
+
+The IQ2 sign oracle checks all 128 sign codes on the CPU, then compiles the
+actual paired helper and ID, six-slot, address and masked-address wrappers
+with the popcount specialization disabled and enabled. It compares raw
+gate/up and SwiGLU outputs bitwise in strict and fast modes, including empty,
+partial and full masks, padded strides, nonzero offsets and guards. The SSD
+expert fixture separately exercises the production backend and cache eviction.
 
 On M1 Max (2026-09-10), a synthetic comparison against `080ac7d` measured
 the fused F16 kernels with fast math, warm weights, one warm-up pair and
