@@ -799,6 +799,19 @@ clean:
 test-q4-preflight-host: tests/test_q4_preflight.py tests/kernel_source.py ds4.c ds4_gpu.h
 	python3 tests/test_q4_preflight.py
 
+GPU_IQ2_SIGN_DEPS := tests/test_gpu_iq2_signs.py tests/test_gpu_iq2_signs.cpp \
+	tests/kernel_source.py ds4_iq2_tables_cuda.inc ds4_cuda.cu ds4_rocm.cu \
+	ds4_rocm.h rocm/ds4_rocm_moe.cuh
+.PHONY: test-gpu-iq2-signs-host test-cuda-iq2-signs test-rocm-iq2-signs
+test-gpu-iq2-signs-host: $(GPU_IQ2_SIGN_DEPS)
+	python3 tests/test_gpu_iq2_signs.py
+
+test-cuda-iq2-signs: $(GPU_IQ2_SIGN_DEPS)
+	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_gpu_iq2_signs.py --cuda
+
+test-rocm-iq2-signs: $(GPU_IQ2_SIGN_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_gpu_iq2_signs.py --rocm
+
 .PHONY: test-cuda-hc-split-norm-host test-cuda-hc-split-norm test-cuda-q8-quantize-host test-cuda-q8-quantize test-rocm-raw-kv-store-host
 test-cuda-hc-split-norm-host: tests/test_cuda_hc_split_norm.py tests/kernel_source.py ds4_cuda.cu
 	python3 tests/test_cuda_hc_split_norm.py

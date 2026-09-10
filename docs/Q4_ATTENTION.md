@@ -155,12 +155,13 @@ the Q4 matrix kernels. The follow-up restores these specific paths:
   table. All 128 masks, floating-point operations, reductions, output stores
   and scratch requirements are unchanged. Selection is automatic at shader
   compilation; other Apple GPU generations retain their existing path.
-- CUDA raw IQ2_XXS routed experts: pass the seven-bit code directly to the
-  existing population-count helper, eliminating a redundant lookup of the
-  expanded sign byte. The grid-LUT decode and tile8 kernels also drop their
-  128-byte shared sign table and its initialization. Grid and activation
-  staging still require the existing barriers. Packed integer weights, DP4A
-  operations, FP scaling and dispatch remain unchanged.
+- CUDA and ROCm raw IQ2_XXS routed experts: pass the seven-bit code directly
+  to the existing population-count helper, eliminating a redundant lookup
+  of the expanded sign byte. The grid-LUT decode and tile8 kernels also drop
+  their 128-byte shared/LDS sign table and its initialization. Grid and
+  activation staging still require the existing barriers. ROCm applies the
+  same simplification to direct IQ2 dequantization in the WMMA path. Packed
+  integer weights, DP4A operations, FP scaling and dispatch remain unchanged.
 
 These are automatic decode paths, not new Q4 quantization formats. They also
 apply to compatible models whose attention remains Q8. A separate restored
@@ -187,15 +188,15 @@ This 16-token prompt takes the SSD decode-style prefill path; it does not
 measure the 128-token Q4 matrix kernel. Larger Q4 matrix tiles were tested
 separately and excluded because they did not reliably improve that shape.
 
-The CUDA IQ2 port targets raw decode (including SSD streaming) and the
-prefill paths that call these helpers. Aligned-artifact decode, raw MMQ and
-D2R paths already reconstruct signs with population count. The aligned-SoA
-MMQ loader retains its existing `ksigns64` packed-mask table; that table
-replaces additional mask-expansion instructions and is a separate
-optimization. This port does not imply a speedup for the main MMQ prefill
-path. Native CUDA build validation and correctness/performance runs on
-NVIDIA hardware are still required; the M1 timings above do not establish
-a CUDA gain.
+The CUDA/ROCm IQ2 port targets raw decode (including CUDA SSD streaming) and
+the prefill paths that call these helpers. CUDA's aligned-artifact decode,
+raw MMQ and D2R paths already reconstruct signs with population count. The
+aligned-SoA MMQ loader retains its existing `ksigns64` packed-mask table;
+that table replaces additional mask-expansion instructions and is a separate
+optimization. Consequently this port does not imply a speedup for the main
+MMQ prefill path. The port still requires native CUDA/HIP build validation
+and correctness/performance runs on NVIDIA/AMD hardware; the M1 timing
+results above do not establish a gain on either backend.
 
 ## Validation
 
@@ -204,6 +205,7 @@ The host suite requires no model or GPU:
 ```sh
 make test-cpu-q4 test-quantizer-indexer-q4
 make test-q4-preflight-host
+make test-gpu-iq2-signs-host
 make test-cuda-hc-split-norm-host test-cuda-q8-quantize-host \
   test-rocm-raw-kv-store-host
 make test-cuda-f16-compressor-host test-cuda-q8-hc-aligned-host
@@ -245,6 +247,15 @@ gate/up and SwiGLU outputs bitwise in strict and fast modes, including empty,
 partial and full masks, padded strides, nonzero offsets and guards. The SSD
 expert fixture separately exercises the production backend and cache eviction.
 
+The CUDA/ROCm sign oracle extracts the current production helpers and checks
+every combination of 128 sign codes and 256 grid entries, signed DP4A inputs,
+complete 256-value blocks and batches of one to eight tokens. Its table-based
+reference preserves each helper's original floating-point order. Host mode
+uses ASan/UBSan in strict and fast builds; it models GPU intrinsics and does
+not validate GPU compilation or kernel scheduling. Native modes compile and
+run those same helpers on-device. They supplement the normal backend build
+and full-model tests; they do not exercise the whole routed-MoE dispatcher.
+
 On M1 Max (2026-09-10), a synthetic comparison against `080ac7d` measured
 the fused F16 kernels with fast math, warm weights, one warm-up pair and
 12 alternating old/new samples of 2048 dispatches each. Median GPU latency
@@ -259,6 +270,7 @@ On NVIDIA hardware, compile and run the native oracles:
 
 ```sh
 make test-mmq-parity-cuda test-cuda-q4-epilogue CUDA_ARCH=sm_121
+make test-cuda-iq2-signs CUDA_ARCH=sm_121
 make test-cuda-hc-split-norm test-cuda-q8-quantize CUDA_ARCH=sm_121
 make test-cuda-f16-compressor test-cuda-q8-hc-aligned CUDA_ARCH=sm_121
 make test-cuda-q4-prefill-dequant test-cuda-q4-prefill-reduce \
@@ -270,6 +282,7 @@ validation:
 
 ```sh
 make test-strix-rocm-q4-parity test-strix-rocm-q4-prefill
+make test-rocm-iq2-signs ROCM_ARCH=gfx1151
 make test-strix-rocm-q4-prefill-long
 make test-rocm-f16-compressor ROCM_ARCH=gfx1151
 make test-rocm-q4-prefill-dequant ROCM_ARCH=gfx1151
