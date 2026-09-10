@@ -342,6 +342,97 @@ and timing options. Metal has `metal-q4-dense-pair-bench`,
 Kernel timings isolate a dispatch or projection. They cannot establish an
 end-to-end improvement or guarantee that Q4 prefill is faster than Q8.
 
+### ROCm routing, Q2 staging and paired Q4 metadata
+
+The ROCm prefill kernels remove three sources of repeated work:
+
+- Stable expert routing uses one native wave per expert instead of one
+  thread. A ballot and exclusive population count compact consecutive pair
+  IDs in their original order. For 4096 tokens and six selected experts,
+  gfx1151 scans 768 wave windows instead of 24576 serial iterations per
+  expert. The algorithm still examines every pair for every expert; this is
+  parallelization, not a reduction in asymptotic complexity or total bytes.
+  The launch also supports wave64. Invalid IDs retain their previous handling.
+- The resident IQ2/Q2 hot-expert down projection stages 32 K values at once
+  on gfx1151 for batches of at least 128 tokens with F16 input/output. Two
+  consecutive K16 WMMA steps reuse that stage in the original accumulation
+  order. At K2048, inner block barriers fall from 256 to 128. After the final
+  K barrier, the output tile reuses the dead A stage, saving 4096 bytes of
+  scratch. Dynamic LDS falls from 9856 to 8832 bytes despite the larger K
+  stage, plus the existing 256-byte pair table in both cases. Occupancy and
+  elapsed time must still be checked on AMD hardware. Other dispatch cases
+  retain K16 staging.
+- Q4 DP4A and resident WMMA K64/K128 decode adjacent scale/minimum groups
+  together. Ten 16-bit metadata accesses replace twenty scalar byte accesses
+  per weight block in the source, with the same logical bytes and numerical
+  operands. The compiler may already combine some older accesses: this is
+  not a measured halving of load instructions or runtime. Activation
+  quantization, matrix tiles, precision and projection selection are unchanged.
+
+These changes add no runtime opt-in. The common MoE improvements can also
+benefit models with Q8 attention and the same IQ2/Q2 experts. Limited-cache
+SSD batches can return through separate streamed-expert kernels before
+stable routing and hotlist WMMA; do not attribute the MoE changes to that
+mode without confirming dispatch. The Q4 metadata helper also serves the
+DP4A paths used by streaming and small prefill chunks.
+
+The targeted validation and native microbenchmark commands are:
+
+```sh
+make test-rocm-q4-dot-host test-rocm-moe-prefill-host
+make test-rocm-moe-prefill ROCM_ARCH=gfx1151
+make bench-rocm-moe-prefill ROCM_ARCH=gfx1151
+make test-strix-rocm-q4-prefill-long
+make rocm-q4-prefill-bench ROCM_ARCH=gfx1151
+./speed-bench/rocm_q4_prefill_bench --tokens 128,512,1024,4096
+```
+
+The Q4 host oracle checks every combination of contributing metadata bytes
+and guarded packed/aligned DP4A outputs. The MoE host test executes extracted
+routing and A/B staging code with wave32/wave64 simulations and sanitizers;
+it does not emulate WMMA arithmetic or GPU synchronization. Native HIP
+compilation, guard checks and timing remain required. Generated MoE test
+sources and executables live in temporary directories.
+
+One extra Apple clang Q4 check combining fast-math and ASan/UBSan reproduces
+the same one-ULP scalar-oracle discrepancy on both the baseline and candidate
+(`0x5255e6a8` versus `0x5255e6a9`, trial 0, N1, lane 7). Strict sanitizer and
+ordinary strict/fast builds pass. Disabling FP contraction resolves this
+extra comparison on both revisions; the production arithmetic and oracle have
+not been relaxed to conceal it. This host compiler interaction is separate
+from native AMD numerical validation.
+
+For an end-to-end comparison, build separate baseline and candidate checkouts
+with `make strix-halo ROCM_ARCH=gfx1151`; the baseline before these changes is
+`a081850b5f8474f6ec5f68d429dc2746e547ef27`. Run the same AProjQ4 GGUF and prompt
+with each executable, keeping ROCm version, power settings and memory budget
+fixed. For example, from each checkout:
+
+```sh
+./ds4-bench --rocm -m /path/to/model-AProjQ4.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 --ctx-max 8192 --ctx-alloc 8193 \
+  --step-incr 2048 --gen-tokens 0 --prefill-chunk 128 \
+  --warm-weights --csv /tmp/baseline-resident-01.csv
+```
+
+Give every run its own CSV filename. Compare chunk 128 and chunk 2048
+separately. For the SSD comparison, replace `--warm-weights` with
+`--ssd-streaming --ssd-streaming-cache-experts 16GB`, or the tester's actual
+cache budget, identically for both revisions. Discard one warmup per variant
+and mode, then collect at least twelve runs in balanced ABBA/BAAB order.
+Disable profiling and use identical runtime controls. Validate frontier
+logits in separate runs with `--dump-frontier-logits-dir` pointing to an
+existing directory; timing runs should omit dumps.
+
+Each CSV frontier measures only its new suffix, here 2048 tokens. Aggregate
+throughput is `sum(prefill_tokens) / sum(prefill_tokens / prefill_tps)`, not
+the arithmetic mean of token rates. Report individual runs and spread,
+alongside candidate/baseline throughput. The requested +8% requires a ratio
+of at least 1.08 on the declared workload (about 7.41% less total time), with
+noise small enough to distinguish the gain. Host correctness tests and
+static work reductions do not establish that result.
+
 ### CUDA grouped output-A candidate
 
 An isolated benchmark evaluates the eight-token grouped kernel from

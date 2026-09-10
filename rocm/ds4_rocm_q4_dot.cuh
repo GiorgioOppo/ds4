@@ -5,6 +5,7 @@
 #define DS4_ROCM_Q4_DOT_CUH
 
 #include "ds4_rocm_q4_lds.cuh"
+#include "ds4_rocm_q4_scales.cuh"
 #include <type_traits>
 
 template<typename Q8Block>
@@ -38,9 +39,12 @@ rocm_dot_q4_K_q8_K_block8_reuse_weights(
     for (uint32_t jp = 0u; jp < 4u; jp++) {
         const uint32_t j0 = 2u * jp;
         const uint32_t j1 = j0 + 1u;
-        uint8_t sc0, m0, sc1, m1;
-        dev_q4_K_get_scale_min(j0, x->scales, &sc0, &m0);
-        dev_q4_K_get_scale_min(j1, x->scales, &sc1, &m1);
+        const ds4_rocm_q4_scales::pair metadata =
+            ds4_rocm_q4_scales::load_pair(x->scales, jp);
+        const uint8_t sc0 = static_cast<uint8_t>(metadata.scales);
+        const uint8_t sc1 = static_cast<uint8_t>(metadata.scales >> 8u);
+        const uint8_t m0 = static_cast<uint8_t>(metadata.minima);
+        const uint8_t m1 = static_cast<uint8_t>(metadata.minima >> 8u);
 
         int32_t qw[8];
         #pragma unroll

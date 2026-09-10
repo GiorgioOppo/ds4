@@ -1296,12 +1296,22 @@ __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
         uint32_t pair_count,
         uint32_t n_total_expert) {
     const uint32_t expert = (uint32_t)blockIdx.x;
-    if (expert >= n_total_expert || threadIdx.x != 0u) return;
+    // Launch 64 threads: exactly one native wave participates on wave32
+    // and wave64 devices. The second wave32 returns as a whole. A ballot
+    // compacts consecutive pairs, retaining the scalar scan's stable order.
+    const uint32_t width = warpSize;
+    const uint32_t lane = threadIdx.x;
+    if (expert >= n_total_expert || lane >= width) return;
     uint32_t pos = offsets[expert];
-    for (uint32_t pair = 0; pair < pair_count; pair++) {
-        int32_t expert_i = selected[pair];
+    for (uint64_t first = 0; first < pair_count; first += width) {
+        const uint64_t pair = first + lane;
+        int32_t expert_i = pair < pair_count ? selected[pair] : -1;
         if (expert_i < 0) expert_i = 0;
-        if ((uint32_t)expert_i == expert) sorted_pairs[pos++] = pair;
+        const bool match = pair < pair_count && (uint32_t)expert_i == expert;
+        const uint64_t mask = (uint64_t)__ballot_sync(FULL_WARP_MASK, match);
+        const uint64_t lower = (UINT64_C(1) << lane) - UINT64_C(1);
+        if (match) sorted_pairs[pos + (uint32_t)__popcll(mask & lower)] = (uint32_t)pair;
+        pos += (uint32_t)__popcll(mask);
     }
 }
 
@@ -3997,10 +4007,6 @@ __device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise_stage
         const uint32_t *raw_rows,
         uint32_t k0,
         uint32_t tid) {
-    const uint32_t g = (k0 & 255u) >> 4u;
-    const uint32_t within = g & 7u;
-    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
-    const uint32_t shift = (within >> 1u) * 2u;
     constexpr uint32_t KG = 4u;
     constexpr uint32_t RAW_DWORDS = 84u / sizeof(uint32_t);
     constexpr uint32_t UNITS_PER_TILE = (uint32_t)(BN * (BK / KG));
@@ -4010,6 +4016,12 @@ __device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise_stage
         const uint32_t nn = rem / (uint32_t)(BK / KG);
         const uint32_t kk0 = (rem - nn * (uint32_t)(BK / KG)) * KG;
         const uint32_t row = tile * (uint32_t)BN + nn;
+        // A staging tile may span multiple 16-value scale/min groups.
+        const uint32_t k = k0 + kk0;
+        const uint32_t g = (k & 255u) >> 4u;
+        const uint32_t within = g & 7u;
+        const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+        const uint32_t shift = (within >> 1u) * 2u;
         const unsigned char *blk =
                 reinterpret_cast<const unsigned char *>(raw_rows + row * RAW_DWORDS);
         const uint32_t dm_bits = *reinterpret_cast<const uint32_t *>(blk + 80u);
@@ -4017,7 +4029,7 @@ __device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise_stage
         const float dm = dev_f16_to_f32((uint16_t)(dm_bits >> 16u));
         const float s = (float)(blk[g] & 0x0fu);
         const float m = (float)(blk[g] >> 4u);
-        const uint32_t qbits = *reinterpret_cast<const uint32_t *>(blk + 16u + qbase + kk0);
+        const uint32_t qbits = *reinterpret_cast<const uint32_t *>(blk + 16u + qbase + (k & 15u));
         const uint32_t q0 = (qbits >> shift) & 3u;
         const uint32_t q1 = (qbits >> (8u + shift)) & 3u;
         const uint32_t q2 = (qbits >> (16u + shift)) & 3u;
@@ -5071,7 +5083,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
     }
 }
 
-template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false>
+template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false, int STAGE_K=BK>
 __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         float *down_out,
         half *down_out_h,
@@ -5089,14 +5101,22 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         uint64_t down_row_bytes,
         uint32_t n_expert,
         uint32_t n_tokens = 0u) {
-    extern __shared__ unsigned char raw_sh[];
+    static_assert(BK == 16 && (STAGE_K == 16 || STAGE_K == 32),
+                  "Q2 staging retains 16-wide WMMA arithmetic");
+    extern __shared__ __align__(16) unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
-    half *shB0 = shA + MTILES * BM * BK;
-    half *shB1 = shB0 + BK * BN;
+    half *shB0 = shA + MTILES * BM * STAGE_K;
+    half *shB1 = shB0 + STAGE_K * BN;
     constexpr uint32_t RAW_DWORDS = 84u / sizeof(uint32_t);
     constexpr uint32_t RAW_ROWS = 2u * BN;
-    uint32_t *shW = reinterpret_cast<uint32_t *>(shB1 + BK * BN);
-    float *shC = reinterpret_cast<float *>(shW + RAW_ROWS * RAW_DWORDS);
+    uint32_t *shW = reinterpret_cast<uint32_t *>(shB1 + STAGE_K * BN);
+    // All A/B/weight consumers finish at the final K-loop barrier. Reuse
+    // the K32 activation stage for the epilogue so the larger K stage needs
+    // less LDS than the original K16 layout.
+    static_assert(STAGE_K != 32 || MTILES * BM * STAGE_K * sizeof(half) >=
+                  MTILES * BM * BN * sizeof(float), "K32 A stage must hold C");
+    float *shC = STAGE_K == 32 ? reinterpret_cast<float *>(shA) :
+                               reinterpret_cast<float *>(shW + RAW_ROWS * RAW_DWORDS);
     const uint32_t hot_idx = (uint32_t)blockIdx.z;
     if (hot_idx >= hot_count) return;
     const uint32_t expert = hot_experts[hot_idx];
@@ -5143,26 +5163,26 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         }
         __syncthreads();
 
-        for (uint32_t krel = 0; krel < 256u && kb + krel < expert_mid_dim; krel += BK) {
+        for (uint32_t krel = 0; krel < 256u && kb + krel < expert_mid_dim; krel += STAGE_K) {
             const uint32_t k0 = kb + krel;
             if (MID_F16) {
-                for (uint32_t j = tid; j < MTILES * BM * (BK / 2); j += blockDim.x) {
-                    const uint32_t pair_row = j / (BK / 2);
-                    const uint32_t kk2 = j - pair_row * (BK / 2);
+                for (uint32_t j = tid; j < MTILES * BM * (STAGE_K / 2); j += blockDim.x) {
+                    const uint32_t pair_row = j / (STAGE_K / 2);
+                    const uint32_t kk2 = j - pair_row * (STAGE_K / 2);
                     const uint32_t pair = shPair[pair_row];
                     uint32_t v = 0u;
                     if (pair != UINT32_MAX) {
                         const uint64_t moff = (uint64_t)pair * expert_mid_dim + k0 + kk2 * 2u;
                         v = *reinterpret_cast<const uint32_t *>(mid_h + moff);
                     }
-                    *reinterpret_cast<uint32_t *>(shA + pair_row * BK + kk2 * 2u) = v;
+                    *reinterpret_cast<uint32_t *>(shA + pair_row * STAGE_K + kk2 * 2u) = v;
                 }
             } else {
-                for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
-                    const uint32_t mt = j / (BM * BK);
-                    const uint32_t rem = j - mt * BM * BK;
-                    const uint32_t mm = rem / BK;
-                    const uint32_t kk = rem - mm * BK;
+                for (uint32_t j = tid; j < MTILES * BM * STAGE_K; j += blockDim.x) {
+                    const uint32_t mt = j / (BM * STAGE_K);
+                    const uint32_t rem = j - mt * BM * STAGE_K;
+                    const uint32_t mm = rem / STAGE_K;
+                    const uint32_t kk = rem - mm * STAGE_K;
                     const uint32_t pair = shPair[mt * BM + mm];
                     if (pair != UINT32_MAX) {
                         shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
@@ -5171,15 +5191,20 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
                     }
                 }
             }
-            q2_K_dequant_pair_tile_half_rowwise_staged<BN, BK>(
+            q2_K_dequant_pair_tile_half_rowwise_staged<BN, STAGE_K>(
                     shB0, shB1, shW, krel, tid);
             __syncthreads();
             if (wave < MTILES) {
-                rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
-                rocwmma::load_matrix_sync(b0, shB0, BN);
-                rocwmma::load_matrix_sync(b1, shB1, BN);
-                rocwmma::mma_sync(acc0, a, b0, acc0);
-                rocwmma::mma_sync(acc1, a, b1, acc1);
+                // Reuse each published LDS stage for consecutive K16 MMAs.
+                // Both accumulators see exactly the original K order.
+#pragma unroll
+                for (uint32_t ki = 0; ki < STAGE_K; ki += BK) {
+                    rocwmma::load_matrix_sync(a, shA + wave * BM * STAGE_K + ki, STAGE_K);
+                    rocwmma::load_matrix_sync(b0, shB0 + ki, STAGE_K);
+                    rocwmma::load_matrix_sync(b1, shB1 + ki, STAGE_K);
+                    rocwmma::mma_sync(acc0, a, b0, acc0);
+                    rocwmma::mma_sync(acc1, a, b1, acc1);
+                }
             }
             __syncthreads();
         }

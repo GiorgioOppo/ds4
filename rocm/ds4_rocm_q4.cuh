@@ -7,11 +7,14 @@
 // single reusable scratch arena whose lifetime is protected by that ordering.
 
 #include "ds4_rocm_q4_lds.cuh"
+#include "ds4_rocm_q4_scales.cuh"
 #include "ds4_rocm_q4_wmma_load.cuh"
 #include <type_traits>
 
 static_assert(sizeof(cuda_block_q4_K) == 144u,
               "ROCm Q4_K block layout must match GGUF");
+static_assert(offsetof(cuda_block_q4_K, scales) == 4u,
+              "Q4_K paired metadata loads must retain their aligned offset");
 static_assert(sizeof(cuda_block_q8_K) == 292u,
               "ROCm Q8_K activation block layout must match the dot kernel");
 
@@ -585,13 +588,14 @@ rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel(
             /* Do not unroll the two nibbles: one pair of half16 weight
              * vectors must die before the next one is materialized.  This
              * caps VGPR pressure while preserving qgroup accumulation order. */
+            const ds4_rocm_q4_scales::pair metadata =
+                ds4_rocm_q4_scales::load_pair(block->scales, qpair);
 #pragma unroll 1
             for (uint32_t nibble = 0u; nibble < 2u; nibble++) {
-                const uint32_t qgroup = qpair * 2u + nibble;
-                uint8_t scale = 0u;
-                uint8_t minimum = 0u;
-                dev_q4_K_get_scale_min(
-                    qgroup, block->scales, &scale, &minimum);
+                const uint8_t scale = static_cast<uint8_t>(
+                    metadata.scales >> (nibble * 8u));
+                const uint8_t minimum = static_cast<uint8_t>(
+                    metadata.minima >> (nibble * 8u));
                 const float d = block_d * (float)scale;
                 const float dm = block_dm * (float)minimum;
                 const uint32_t shift = nibble * 4u;
@@ -794,13 +798,15 @@ rocm_matmul_q4_K_prefill_wmma_k128_p144_rowtile_strided_kernel(
                     block->qs + qpair * 32u + ROCM_Q4_WMMA_FRAGMENT,
                     sizeof(packed1));
 
+                const ds4_rocm_q4_scales::pair metadata =
+                    ds4_rocm_q4_scales::load_pair(block->scales, qpair);
+
 #pragma unroll 1
                 for (uint32_t nibble = 0u; nibble < 2u; nibble++) {
-                    const uint32_t qgroup = qpair * 2u + nibble;
-                    uint8_t scale = 0u;
-                    uint8_t minimum = 0u;
-                    dev_q4_K_get_scale_min(
-                        qgroup, block->scales, &scale, &minimum);
+                    const uint8_t scale = static_cast<uint8_t>(
+                        metadata.scales >> (nibble * 8u));
+                    const uint8_t minimum = static_cast<uint8_t>(
+                        metadata.minima >> (nibble * 8u));
                     const float d = block_d * (float)scale;
                     const float dm = block_dm * (float)minimum;
                     const uint32_t shift = nibble * 4u;

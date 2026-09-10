@@ -812,6 +812,18 @@ test-cuda-iq2-signs: $(GPU_IQ2_SIGN_DEPS)
 test-rocm-iq2-signs: $(GPU_IQ2_SIGN_DEPS)
 	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_gpu_iq2_signs.py --rocm
 
+ROCM_MOE_PREFILL_DEPS := tests/test_rocm_moe_prefill.py tests/test_rocm_moe_prefill.cpp \
+	tests/kernel_source.py rocm/ds4_rocm_moe.cuh rocm/ds4_rocm_moe_launch.cuh
+.PHONY: test-rocm-moe-prefill-host test-rocm-moe-prefill bench-rocm-moe-prefill
+test-rocm-moe-prefill-host: $(ROCM_MOE_PREFILL_DEPS)
+	python3 tests/test_rocm_moe_prefill.py
+
+test-rocm-moe-prefill: $(ROCM_MOE_PREFILL_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_moe_prefill.py --rocm
+
+bench-rocm-moe-prefill: $(ROCM_MOE_PREFILL_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_moe_prefill.py --rocm --bench
+
 .PHONY: test-cuda-hc-split-norm-host test-cuda-hc-split-norm test-cuda-q8-quantize-host test-cuda-q8-quantize test-rocm-raw-kv-store-host
 test-cuda-hc-split-norm-host: tests/test_cuda_hc_split_norm.py tests/kernel_source.py ds4_cuda.cu
 	python3 tests/test_cuda_hc_split_norm.py
@@ -971,7 +983,7 @@ test-rocm-q4-prefill-dispatch-host: tests/test_rocm_q4_prefill_dispatch.py tests
 	rocm/ds4_rocm_q4.cuh rocm/ds4_rocm_runtime.cuh
 	python3 tests/test_rocm_q4_prefill_dispatch.py
 
-ROCM_Q4_DOT_HEADERS = rocm/ds4_rocm_q4_dot.cuh rocm/ds4_rocm_q4_lds.cuh
+ROCM_Q4_DOT_HEADERS = rocm/ds4_rocm_q4_dot.cuh rocm/ds4_rocm_q4_lds.cuh rocm/ds4_rocm_q4_scales.cuh
 tests/test_rocm_q4_dot_host: tests/test_rocm_q4_dot_host.cpp $(ROCM_Q4_DOT_HEADERS)
 	$(CXX) -O2 -Wall -Wextra -std=c++17 -fno-fast-math -I. -o $@ $<
 

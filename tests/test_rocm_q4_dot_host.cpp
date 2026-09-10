@@ -24,21 +24,53 @@ static int32_t __dp4a(int32_t a,int32_t b,int32_t acc) {
 static uint32_t rng=0x486fabd9u;
 static uint32_t next() { rng^=rng<<13; rng^=rng>>17; rng^=rng<<5; return rng; }
 static void halfbits(uint16_t &u) { const _Float16 f=(_Float16)((int32_t)(next()%2049)-1024)/(_Float16)32;std::memcpy(&u,&f,2); }
-__device__ static void dev_q4_K_get_scale_min(
-        uint32_t j,
-        const uint8_t *scales,
-        uint8_t *d_out,
-        uint8_t *m_out) {
-    if (j < 4u) {
-        *d_out = scales[j] & 63u;
-        *m_out = scales[j + 4u] & 63u;
-    } else {
-        *d_out = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
-        *m_out = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u);
-    }
-}
-
 #include "rocm/ds4_rocm_q4_dot.cuh"
+
+static uint64_t test_scale_pairs() {
+  uint64_t cases = 0;
+  // The final metadata byte ends at the allocation boundary. An odd offset
+  // also verifies that the shared memcpy helper imposes no alignment promise
+  // beyond the aligned production Q4_K layout tested by test_blocks().
+  std::vector<uint8_t> storage(15u, 0xa5u);
+  uint8_t *const s = storage.data() + 3u;
+  for (uint32_t g = 0u; g < 8u; ++g) {
+    const uint32_t limit = g < 4u ? (1u << 16u) : (1u << 24u);
+    for (uint32_t packed = 0u; packed < limit; ++packed) {
+      const uint8_t a = static_cast<uint8_t>(packed);
+      const uint8_t b = static_cast<uint8_t>(packed >> 8u);
+      const uint8_t c = static_cast<uint8_t>(packed >> 16u);
+      uint32_t scale, minimum;
+      if (g < 4u) {
+        s[g] = a; s[g + 4u] = b;
+        s[g ^ 1u] = static_cast<uint8_t>(~a);
+        s[(g + 4u) ^ 1u] = static_cast<uint8_t>(~b);
+        scale = a & 63u;
+        minimum = b & 63u;
+      } else {
+        s[g - 4u] = a; s[g] = b; s[g + 4u] = c;
+        s[(g - 4u) ^ 1u] = static_cast<uint8_t>(~a);
+        s[g ^ 1u] = static_cast<uint8_t>(~b);
+        s[(g + 4u) ^ 1u] = static_cast<uint8_t>(~c);
+        scale = (c & 15u) | ((a >> 6u) << 4u);
+        minimum = (c >> 4u) | ((b >> 6u) << 4u);
+      }
+      const ds4_rocm_q4_scales::pair result =
+        ds4_rocm_q4_scales::load_pair(s, g / 2u);
+      const uint32_t shift = (g & 1u) * 8u;
+      if (((result.scales >> shift) & 255u) != scale ||
+          ((result.minima >> shift) & 255u) != minimum) {
+        std::fprintf(stderr, "FAIL paired Q4 metadata g=%u bytes=%06x\n", g, packed);
+        std::exit(1);
+      }
+      ++cases;
+    }
+  }
+  if (storage[0] != 0xa5u || storage[1] != 0xa5u || storage[2] != 0xa5u) {
+    std::fputs("FAIL Q4 metadata prefix canary\n", stderr);
+    std::exit(1);
+  }
+  return cases;
+}
 
 // Independently enumerate Q4 logical groups, nibble indices and Q8 elements.
 // Integer products/sums fit int32 even for the deliberately malformed int16
@@ -242,8 +274,12 @@ static unsigned test_row_tiles() {
 }
 
 int main() {
+  const uint64_t scale_pairs = test_scale_pairs();
   const unsigned blocks = test_blocks();
   const unsigned tiles = test_row_tiles();
+  std::printf("PASS paired Q4 metadata: %llu exhaustive group cases "
+              "(all contributing bytes, both pair positions, unaligned exact-end view).\n",
+              static_cast<unsigned long long>(scale_pairs));
   std::printf("PASS production dot packed/aligned: %u block cases, %u ROWS32/scalar K8192 cases "
               "(M63/64/65, N tails 1..8, offsets, group strides, output canaries).\n", blocks, tiles);
   std::puts("Host-only: HIP compilation, GPU shuffle/barrier parity and timing remain required.");
