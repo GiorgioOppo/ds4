@@ -25,6 +25,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
+#if defined(GGML_USE_HIP)
+#include "ds4_mmq_quant_reuse.cuh"
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -1873,6 +1876,18 @@ int ds4_mmq_moe_pair_impl(
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
+#if defined(GGML_USE_HIP)
+    // This scratch lives through the gather and both MMQs. Pool allocation
+    // and destruction use the stream selected above, just like gathered Y.
+    ggml_cuda_pool_alloc<char> token_q8_1_alloc;
+    const bool reuse_token_quant = ds4_mmq_quant_reuse::select(
+        type == GGML_TYPE_IQ2_XXS,
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151, direct_gateup_q8,
+        K, n_tokens, n_experts, n_expert_used);
+    static_assert(sizeof(block_q8_1_mmq) == ds4_mmq_quant_reuse::bytes_per_record,
+                  "token gather must copy the complete MMQ record");
+    static_assert(sizeof(uint4) == 16u, "MMQ gather vector size");
+#endif
     char *src1_q8_1 = direct_gateup_q8
         ? (char *)fused_down->input_q8_scratch
         : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
@@ -1920,7 +1935,34 @@ int ds4_mmq_moe_pair_impl(
                 type, /*ne00=*/K, s11_src, s12_src, s13_src,
                 /*ne0=*/ne10_padded, /*ne1=*/quant_rows, /*ne2=*/1, /*ne3=*/1,
                 stream);
-        } else {
+        }
+#if defined(GGML_USE_HIP)
+        else if (reuse_token_quant) {
+            char *token_q8_1 = token_q8_1_alloc.alloc(
+                ctx->pool(), ds4_mmq_quant_reuse::compact_bytes(ne10_padded, n_tokens));
+            // D4 writes all 144 bytes per record. This compact buffer is read
+            // only by the gather, so it needs no MMQ overread tail or memset.
+            quantize_mmq_q8_1_cuda(
+                X_f32, nullptr, token_q8_1, type,
+                K, s11_src, s12_src, s13_src,
+                ne10_padded, n_tokens, 1, 1, stream);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "%s: token MMQ activation quantize failed: %s\n",
+                        tag, cudaGetErrorString(err));
+                return -3;
+            }
+            const uint32_t vectors = uint32_t(ne_get_rows) *
+                                     ds4_mmq_quant_reuse::vectors_per_record;
+            const dim3 grid((vectors + ds4_mmq_quant_reuse::gather_threads - 1u) /
+                            ds4_mmq_quant_reuse::gather_threads,
+                            uint32_t(ne10_padded / ds4_mmq_quant_reuse::values_per_record));
+            ds4_mmq_gather_q8_1_records_kernel<<<
+                grid, ds4_mmq_quant_reuse::gather_threads, 0, stream>>>(
+                token_q8_1, ids_src1, src1_q8_1, uint32_t(n_tokens), uint32_t(ne_get_rows));
+        }
+#endif
+        else {
             quantize_mmq_q8_1_cuda(
                 X_f32, moe_yind ? nullptr : ids_src1, (void *)src1_q8_1,
                 type, /*ne00=*/K, s11_src, s12_src, s13_src,

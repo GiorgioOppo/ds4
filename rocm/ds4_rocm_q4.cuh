@@ -7,6 +7,7 @@
 // single reusable scratch arena whose lifetime is protected by that ordering.
 
 #include "ds4_rocm_q4_lds.cuh"
+#include "ds4_rocm_q4_activation.cuh"
 #include "ds4_rocm_q4_scales.cuh"
 #include "ds4_rocm_q4_wmma_load.cuh"
 #include <type_traits>
@@ -696,13 +697,14 @@ rocm_matmul_q4_K_prefill_wmma_k64_p80_rowtile_strided_kernel(
  * Keep this as a separate kernel and instantiate it only for the 256-row
  * geometry: its 18 KiB LDS tile is appropriate for q_b's 32768 output rows,
  * but could reduce occupancy on the smaller projections. */
-template <uint32_t ROW_TILE, uint32_t WAVES, uint32_t MIN_BLOCKS>
+template <uint32_t ROW_TILE, uint32_t WAVES, uint32_t MIN_BLOCKS,
+          typename Activation = float>
 __launch_bounds__(WAVES * 32u, MIN_BLOCKS)
 __global__ static void
 rocm_matmul_q4_K_prefill_wmma_k128_p144_rowtile_strided_kernel(
         float *out,
         const char *w_base,
-        const float *x,
+        const Activation *x,
         uint32_t n_tok,
         uint32_t n_groups,
         uint32_t in_dim,
@@ -740,6 +742,10 @@ rocm_matmul_q4_K_prefill_wmma_k128_p144_rowtile_strided_kernel(
     ds4_q4_float8_t acc3 = acc0;
     __shared__ __align__(32) _Float16
         lds_x[ROCM_Q4_WMMA_TOKEN_TILE * ROCM_Q4_WMMA_K128_LDS_PITCH];
+    static_assert(ROCM_Q4_WMMA_TOKEN_TILE == ds4_rocm_q4_activation::tokens &&
+                  ROCM_Q4_WMMA_K128_TILE == ds4_rocm_q4_activation::columns &&
+                  ROCM_Q4_WMMA_K128_LDS_PITCH == ds4_rocm_q4_activation::pitch,
+                  "F16 activation reuse must retain the K128 LDS layout");
 
     for (uint32_t block_index = 0u; block_index < q4_blocks;
          block_index++) {
@@ -755,30 +761,36 @@ rocm_matmul_q4_K_prefill_wmma_k128_p144_rowtile_strided_kernel(
              qpair_base += 2u) {
             const uint32_t group32_base =
                 block_index * 8u + qpair_base * 2u;
-            for (uint32_t j = tid * 4u;
-                 j < ROCM_Q4_WMMA_TOKEN_TILE * ROCM_Q4_WMMA_K128_TILE;
-                 j += blockDim.x * 4u) {
-                const uint32_t tok_local = j >> 7u;
-                const uint32_t kk = j & 127u;
-                const uint32_t tok = tok0 + tok_local;
-                half2 value01 = __floats2half2_rn(0.0f, 0.0f);
-                half2 value23 = value01;
-                if (tok < n_tok) {
-                    const float4 values =
-                        *reinterpret_cast<const float4 *>(
-                            x + (uint64_t)tok * x_token_stride +
-                            (uint64_t)group * x_group_stride +
-                            (uint64_t)group32_base *
-                                ROCM_Q4_WMMA_K_TILE +
-                            kk);
-                    value01 = __floats2half2_rn(values.x, values.y);
-                    value23 = __floats2half2_rn(values.z, values.w);
+            if constexpr (std::is_same<Activation, __half>::value) {
+                ds4_rocm_q4_activation::stage_thread(
+                    lds_x, x, n_tok, tok0,
+                    group32_base * ROCM_Q4_WMMA_K_TILE, tid, blockDim.x);
+            } else {
+                for (uint32_t j = tid * 4u;
+                     j < ROCM_Q4_WMMA_TOKEN_TILE * ROCM_Q4_WMMA_K128_TILE;
+                     j += blockDim.x * 4u) {
+                    const uint32_t tok_local = j >> 7u;
+                    const uint32_t kk = j & 127u;
+                    const uint32_t tok = tok0 + tok_local;
+                    half2 value01 = __floats2half2_rn(0.0f, 0.0f);
+                    half2 value23 = value01;
+                    if (tok < n_tok) {
+                        const float4 values =
+                            *reinterpret_cast<const float4 *>(
+                                x + (uint64_t)tok * x_token_stride +
+                                (uint64_t)group * x_group_stride +
+                                (uint64_t)group32_base *
+                                    ROCM_Q4_WMMA_K_TILE +
+                                kk);
+                        value01 = __floats2half2_rn(values.x, values.y);
+                        value23 = __floats2half2_rn(values.z, values.w);
+                    }
+                    _Float16 *const dst =
+                        lds_x +
+                        tok_local * ROCM_Q4_WMMA_K128_LDS_PITCH + kk;
+                    *reinterpret_cast<half2 *>(dst) = value01;
+                    *reinterpret_cast<half2 *>(dst + 2u) = value23;
                 }
-                _Float16 *const dst =
-                    lds_x +
-                    tok_local * ROCM_Q4_WMMA_K128_LDS_PITCH + kk;
-                *reinterpret_cast<half2 *>(dst) = value01;
-                *reinterpret_cast<half2 *>(dst + 2u) = value23;
             }
             __syncthreads();
 
@@ -1780,6 +1792,53 @@ static void rocm_q4_K_prefill_wmma_k128_enqueue(
             x_token_stride, x_group_stride, out_token_stride);
 }
 
+/* Conversion and consumer stay on the same default stream as the existing
+ * temporary arena. Once conversion is submitted, failures must not replay
+ * the F32 path; this helper returns -1 for every post-submit failure. */
+static int rocm_q4_K_prefill_wmma_k128_half_enqueue(
+        float *out, const char *w, const float *x, __half *xh, uint32_t n_tok) {
+    const uint64_t elements = uint64_t(n_tok) * ds4_rocm_q4_activation::inner;
+    f32_to_f16_kernel<<<(unsigned)((elements + 255u) / 256u), 256u>>>(
+        xh, x, elements);
+    if (!cuda_ok(cudaGetLastError(), "q4_K Q-B activation F16 conversion"))
+        return -1;
+    const dim3 grid(ds4_rocm_q4_activation::outputs / 256u,
+                    (n_tok + ROCM_Q4_WMMA_TOKEN_TILE - 1u) / ROCM_Q4_WMMA_TOKEN_TILE,
+                    1u);
+    rocm_matmul_q4_K_prefill_wmma_k128_p144_rowtile_strided_kernel<
+        256u, 16u, 1u, __half><<<grid, 512u>>>(
+            out, w, xh, n_tok, 1u, ds4_rocm_q4_activation::inner,
+            ds4_rocm_q4_activation::outputs, ds4_rocm_q4_activation::row_bytes,
+            ds4_rocm_q4_activation::inner, 0u, ds4_rocm_q4_activation::outputs);
+    return cuda_ok(cudaGetLastError(), "q4_K Q-B K128 reused F16 activation") ? 1 : -1;
+}
+
+// Called only after K128 has been selected. Reuse the existing dense-Q4
+// temporary arena and its lifecycle, reserving at most 4 MiB.
+static int rocm_q4_K_prefill_wmma_k128_half_try(
+        float *out, const char *w, const float *x, uint32_t n_tok,
+        uint32_t n_groups, uint32_t in_dim, uint32_t out_dim,
+        uint64_t row_bytes, uint64_t x_token_stride,
+        uint64_t x_group_stride, uint64_t out_token_stride) {
+    namespace activation = ds4_rocm_q4_activation;
+    if (!activation::scope(n_tok, n_groups, in_dim, out_dim, row_bytes,
+            x_token_stride, x_group_stride, out_token_stride, out, w, x,
+            true, !g_ssd_streaming_mode, g_quality_mode,
+            rocm_q4_qb_gfx1151_wave32_device())) return 0;
+    if (!activation::scratch_disjoint(g_cuda_tmp, g_cuda_tmp_bytes, out, w, x,
+            n_tok, g_rocm_q4_attn_q_b_transient_f16_scratch,
+            g_rocm_q4_attn_q_b_transient_f16_scratch_bytes)) return 0;
+
+    const uint64_t bytes = uint64_t(n_tok) * activation::inner * sizeof(__half);
+    __half *xh = reinterpret_cast<__half *>(
+        cuda_tmp_alloc(bytes, "q4_K Q-B reused F16 activation"));
+    if (!xh || (reinterpret_cast<uintptr_t>(xh) & 15u) != 0u ||
+        !activation::scratch_disjoint(xh, bytes, out, w, x, n_tok,
+            g_rocm_q4_attn_q_b_transient_f16_scratch,
+            g_rocm_q4_attn_q_b_transient_f16_scratch_bytes)) return 0;
+    return rocm_q4_K_prefill_wmma_k128_half_enqueue(out, w, x, xh, n_tok);
+}
+
 static uint32_t rocm_q4_K_prefill_wmma_row_tile(uint32_t out_dim) {
     const uint32_t shape_tile = out_dim >= 8192u
         ? 256u
@@ -1847,9 +1906,15 @@ static int rocm_q4_K_prefill_wmma_launch(
         getenv("DS4_ROCM_DISABLE_Q4_PREFILL_WMMA_K64_LOAD4") != NULL,
         use_k64, use_k128, row_tile, x, x_token_stride, x_group_stride);
     if (use_k128) {
-        rocm_q4_K_prefill_wmma_k128_enqueue(
+        const int reused = rocm_q4_K_prefill_wmma_k128_half_try(
             out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
             x_token_stride, x_group_stride, out_token_stride);
+        if (reused < 0) return 0;
+        if (reused == 0) {
+            rocm_q4_K_prefill_wmma_k128_enqueue(
+                out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
+                x_token_stride, x_group_stride, out_token_stride);
+        }
     } else if (use_k64) {
         rocm_q4_K_prefill_wmma_k64_enqueue(
             out, w, x, n_tok, n_groups, in_dim, out_dim, row_bytes,
@@ -2054,6 +2119,25 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_k128_enqueue(
         n_tok, n_groups, in_dim, out_dim, row_bytes,
         x_token_stride, x_group_stride, out_token_stride);
     return 1;
+}
+
+/* Enqueue-only candidate hook includes conversion in the timed interval.
+ * The caller owns an aligned, disjoint scratch allocation and device checks;
+ * it cannot silently benchmark the F32 fallback or omit conversion cost. */
+extern "C" int ds4_rocm_bench_q4_K_wmma_k128_half_enqueue(
+        void *out, const void *w, const void *x, void *scratch,
+        uint64_t scratch_bytes, uint32_t n_tok) {
+    namespace activation = ds4_rocm_q4_activation;
+    if (!activation::scope(n_tok, 1u, activation::inner, activation::outputs,
+            activation::row_bytes, activation::inner, 0u, activation::outputs,
+            out, w, x, true, true, false, true) || !scratch ||
+        (reinterpret_cast<uintptr_t>(scratch) & 15u) != 0u ||
+        scratch_bytes < uint64_t(n_tok) * activation::inner * sizeof(__half) ||
+        !activation::scratch_disjoint(scratch, scratch_bytes, out, w, x, n_tok,
+                                      nullptr, 0u)) return 0;
+    return rocm_q4_K_prefill_wmma_k128_half_enqueue(
+        reinterpret_cast<float *>(out), reinterpret_cast<const char *>(w),
+        reinterpret_cast<const float *>(x), reinterpret_cast<__half *>(scratch), n_tok);
 }
 
 enum {

@@ -546,7 +546,7 @@ ds4_rocm.o: ds4_rocm.cu cuda/ds4_q4_dequant_layout.h cuda/ds4_q4_dequant_vec.cuh
 cuda/mmq/ds4_ggml_stubs.rocm.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh cuda/mmq/vendors/hip.h ds4_rocm_memory.h ds4_linux_memory.h
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
-cuda/mmq/ds4_mmq.rocm.o: cuda/mmq/ds4_mmq.cu cuda/mmq/mmvq.cuh cuda/mmq/ds4_q4_mmvq_epilogue.h cuda/mmq/ds4_mmq.h cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh cuda/mmq/vendors/hip.h
+cuda/mmq/ds4_mmq.rocm.o: cuda/mmq/ds4_mmq.cu cuda/mmq/mmvq.cuh cuda/mmq/ds4_q4_mmvq_epilogue.h cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_quant_reuse.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh cuda/mmq/vendors/hip.h
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
 cuda/mmq/quantize.rocm.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/mmq.cuh cuda/mmq/vendors/hip.h
@@ -823,6 +823,45 @@ test-rocm-moe-prefill: $(ROCM_MOE_PREFILL_DEPS)
 
 bench-rocm-moe-prefill: $(ROCM_MOE_PREFILL_DEPS)
 	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_moe_prefill.py --rocm --bench
+
+ROCM_MMQ_QUANT_REUSE_DEPS := tests/test_rocm_mmq_quant_reuse.py tests/test_rocm_mmq_quant_reuse.cpp \
+	tests/kernel_source.py cuda/mmq/ds4_mmq_quant_reuse.cuh cuda/mmq/ds4_mmq.cu \
+	cuda/mmq/quantize.cu cuda/mmq/mmq.cuh cuda/mmq/vendors/hip.h
+.PHONY: test-rocm-mmq-quant-reuse-host test-rocm-mmq-quant-reuse bench-rocm-mmq-quant-reuse
+test-rocm-mmq-quant-reuse-host: $(ROCM_MMQ_QUANT_REUSE_DEPS)
+	python3 tests/test_rocm_mmq_quant_reuse.py
+
+test-rocm-mmq-quant-reuse: $(ROCM_MMQ_QUANT_REUSE_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_mmq_quant_reuse.py --rocm
+
+bench-rocm-mmq-quant-reuse: $(ROCM_MMQ_QUANT_REUSE_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_mmq_quant_reuse.py --rocm --bench
+
+ROCM_Q4_ACTIVATION_DEPS := tests/test_rocm_q4_activation.py tests/test_rocm_q4_activation.cpp \
+	tests/kernel_source.py rocm/ds4_rocm_common.cuh rocm/ds4_rocm_q4.cuh rocm/ds4_rocm_q4_activation.cuh \
+	rocm/ds4_rocm_q4_wmma_load.cuh rocm/ds4_rocm_q4_lds.cuh rocm/ds4_rocm_q4_scales.cuh
+.PHONY: test-rocm-q4-activation-host test-rocm-q4-activation bench-rocm-q4-activation
+test-rocm-q4-activation-host: $(ROCM_Q4_ACTIVATION_DEPS)
+	python3 tests/test_rocm_q4_activation.py
+
+test-rocm-q4-activation: $(ROCM_Q4_ACTIVATION_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_q4_activation.py --rocm
+
+bench-rocm-q4-activation: $(ROCM_Q4_ACTIVATION_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_q4_activation.py --rocm --bench
+
+ROCM_Q4_INT8_WMMA_DEPS := tests/test_rocm_q4_int8_wmma.py tests/test_rocm_q4_int8_wmma.cpp \
+	rocm/ds4_rocm_q4_dot.cuh rocm/ds4_rocm_q4_scales.cuh rocm/ds4_rocm_q4_lds.cuh
+.PHONY: test-rocm-q4-int8-wmma-host test-rocm-q4-int8-wmma
+test-rocm-q4-int8-wmma-host: $(ROCM_Q4_INT8_WMMA_DEPS)
+	python3 tests/test_rocm_q4_int8_wmma.py
+
+test-rocm-q4-int8-wmma: $(ROCM_Q4_INT8_WMMA_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_q4_int8_wmma.py --rocm
+
+.PHONY: test-prefill-compare
+test-prefill-compare: speed-bench/compare_prefill.py tests/test_compare_prefill.py
+	python3 tests/test_compare_prefill.py
 
 .PHONY: test-cuda-hc-split-norm-host test-cuda-hc-split-norm test-cuda-q8-quantize-host test-cuda-q8-quantize test-rocm-raw-kv-store-host
 test-cuda-hc-split-norm-host: tests/test_cuda_hc_split_norm.py tests/kernel_source.py ds4_cuda.cu

@@ -413,7 +413,7 @@ fixed. For example, from each checkout:
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 --ctx-max 8192 --ctx-alloc 8193 \
   --step-incr 2048 --gen-tokens 0 --prefill-chunk 128 \
-  --warm-weights --csv /tmp/baseline-resident-01.csv
+  --warm-weights --csv /tmp/baseline-chunk128-resident-01.csv
 ```
 
 Give every run its own CSV filename. Compare chunk 128 and chunk 2048
@@ -432,6 +432,94 @@ alongside candidate/baseline throughput. The requested +8% requires a ratio
 of at least 1.08 on the declared workload (about 7.41% less total time), with
 noise small enough to distinguish the gain. Host correctness tests and
 static work reductions do not establish that result.
+
+### ROCm activation preparation reuse
+
+The follow-up to `0fe51ea27a8e3520565cd470a61ac46630b72ad3` targets repeated
+computation on gfx1151. It spends additional temporary memory to reuse
+activation conversions and quantization:
+
+| Path | Previous preparation | Reused preparation | Extra live scratch |
+| --- | --- | --- | --- |
+| Q4 Q-B K1024, M32768, N256–2048, resident K128 WMMA | Each of 128 output-row tiles converts the same F32 activation values to F16 | Convert each activation once, then copy half8 vectors into the same K128 LDS layout | At most 4 MiB |
+| IQ2 paired gate/up K4096, E256, top-k 6, N128–2048 on gfx1151 | Quantize six expert assignments per token | Quantize each token once, then gather complete 144-byte MMQ records into the existing assignment layout | At most 9 MiB |
+
+Q-B keeps the original weight decoding, F16 rounding, WMMA accumulation and
+output epilogue. Its automatic selection requires tight strides and one
+group; quality mode and SSD streaming retain their existing paths. The
+existing dense temporary arena is checked for input/output aliases before
+growth can free its old allocation. Allocation failure can retain the
+original K128 path before conversion starts; a conversion or consumer launch
+failure is reported without replay. The long-batch Q-B weight sidecar has
+separate ownership and selection.
+
+For IQ2 gate/up, the original D4 quantizer produces the compact token buffer.
+The gather copies all four F32 scales and 128 quantized values, preserving
+the original expert maps, MMQ consumers and padding. Unwritten map entries
+still select quantized token zero. The compact pool allocation stays alive
+through gather and both matrix multiplications on the caller's stream.
+CUDA compilation and the direct gate/up Q8 path retain their previous code.
+This shared MoE change can also benefit a model with Q8 attention and the
+same IQ2 experts. It also applies to SSD calls that load the complete expert
+table for a layer; selected/compact expert-table calls retain their separate
+paths. Pool allocation failure retains the pool's existing fatal-error
+semantics, rather than switching algorithms after preparation has started.
+
+These are reductions in preparation work, not in the matrix multiplication
+operation count. At N2048, Q-B performs 2,097,152 F32-to-F16 element conversions
+instead of 268,435,456 across row tiles. The IQ2 path quantizes 2,048 source
+rows instead of 12,288 assignments. Each adds one kernel launch, and the
+gather still writes the full MMQ input. Neither ratio predicts end-to-end
+token throughput; extra launches and traffic may offset the savings.
+
+Run the host fixtures, then the actual HIP kernels on gfx1151:
+
+```sh
+make test-rocm-q4-activation-host test-rocm-mmq-quant-reuse-host
+make test-rocm-q4-activation test-rocm-mmq-quant-reuse ROCM_ARCH=gfx1151
+make bench-rocm-q4-activation bench-rocm-mmq-quant-reuse ROCM_ARCH=gfx1151
+```
+
+The Q-B native comparison includes conversion and K128 compute in candidate
+timings. The MMQ native comparison includes the original output memset and
+all quantize/gather launches, but excludes allocation, routing and MMQ
+compute. Both microbenchmarks require whole-model timing before claiming a
+prefill improvement. Host tests exercise the shared source with sanitizers;
+they cannot validate GPU synchronization, generated instructions or speed.
+
+A separate test-only Q4_K × Q8_K INT8 WMMA prototype preserves the eight
+Q8_K K-block partitions, per-block scale/minimum correction and final
+reduction tree. It uses a 16×16 tile, eight wave32 groups and 8 KiB of LDS.
+Its fragment layout follows the existing RDNA3 MMQ implementation and the
+[AMD WMMA description](https://gpuopen.com/learn/wmma_on_rdna3/). The source
+requires sixteen INT8 WMMA instructions per K256 segment of the 16×16 tile
+to keep eight independent 32-value scales per weight row. It is not selected
+by inference: registers, native parity and elapsed time must be checked before integration. The
+fixture's production-dot oracle is a numerical reference, not a substitute
+for benchmarking the complete existing TILE8 kernel.
+
+```sh
+make test-rocm-q4-int8-wmma-host
+make test-rocm-q4-int8-wmma ROCM_ARCH=gfx1151
+```
+
+Use the repeated end-to-end protocol above with `0fe51ea` as the baseline
+for this follow-up, testing chunk 128 and chunk 2048 separately. Only the
+MoE reuse applies at chunk 128. Compare collected pure-prefill CSVs with:
+
+```sh
+python3 speed-bench/compare_prefill.py \
+  --baseline /tmp/baseline-chunk128-resident-*.csv \
+  --candidate /tmp/candidate-chunk128-resident-*.csv --target-percent 8
+```
+
+The script checks matching frontiers, sums elapsed times within each run,
+and reports per-frontier and aggregate medians, min/max and observed gains.
+Use `--json` to include every run's rates. CSVs do not identify the model,
+GPU or runtime options; verify those match before comparison. Meeting the
+median threshold alone is not a confidence interval or a numerical parity
+check. Native HIP compilation and the requested +8% remain unverified on
+the macOS development machine.
 
 ### CUDA grouped output-A candidate
 
