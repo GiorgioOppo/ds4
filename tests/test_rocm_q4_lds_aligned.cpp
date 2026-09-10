@@ -206,7 +206,7 @@ void attention_case(const model &m) {
     std::puts("PASS attention A-WMMA/B-TILE8 N257: both intermediates bitwise, guards, dispatch");
 }
 void oracle(const model &m) {
-    for (uint32_t n : {256u,257u,511u,512u,1024u,2048u,4096u}) dense_case(m,n);
+    for (uint32_t n : {256u,257u,511u,512u,1024u,2048u,4096u,4097u,8192u}) dense_case(m,n);
     dense_case(m,257u,K,M,true,true);
     for (uint32_t n : {8u,255u}) dense_case(m,n,K,M,false);
     dense_case(m,256u,4096u,M,false); dense_case(m,256u,K,M-1u,false);
@@ -313,10 +313,10 @@ int main(int argc, char **argv) {
         bool bench = false; unsigned tokens = 0, samples = 8;
         for (int i = 1; i < argc; ++i) {
             if (!std::strcmp(argv[i],"--bench")) bench = true;
-            else if (!std::strcmp(argv[i],"--tokens") && i+1 < argc) tokens = number(argv[++i],256,4096);
+            else if (!std::strcmp(argv[i],"--tokens") && i+1 < argc) tokens = number(argv[++i],256,8192);
             else if (!std::strcmp(argv[i],"--samples") && i+1 < argc) samples = number(argv[++i],2,1000);
             else if (!std::strcmp(argv[i],"--help")) {
-                std::puts("usage: test_rocm_q4_lds_aligned [--bench [--tokens N (256..4096)] [--samples 8]]");
+                std::puts("usage: test_rocm_q4_lds_aligned [--bench [--tokens N (256..8192)] [--samples 8]]");
                 return 0;
             } else throw std::runtime_error("unknown/missing argument; use --help");
         }

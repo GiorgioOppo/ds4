@@ -144,7 +144,7 @@ void compare_arm(fixture &f, const std::vector<float> &ref,
 }
 void oracle() {
     unsigned cases = 0;
-    for (uint32_t n : {256u,257u,512u,2048u,4096u}) {
+    for (uint32_t n : {256u,257u,512u,2048u,4096u,4097u,8192u}) {
         params p; p.n = n;
         fixture f(p); const auto ref = reference(f);
         compare_arm(f,ref,nullptr,true);
@@ -286,10 +286,10 @@ int main(int argc, char **argv) {
         unsigned tokens = 4096, samples = 12;
         for (int i = 1; i < argc; ++i) {
             if (!std::strcmp(argv[i],"--bench")) bench = true;
-            else if (!std::strcmp(argv[i],"--tokens") && i+1 < argc) tokens = number(argv[++i],256,4096);
+            else if (!std::strcmp(argv[i],"--tokens") && i+1 < argc) tokens = number(argv[++i],256,8192);
             else if (!std::strcmp(argv[i],"--samples") && i+1 < argc) samples = number(argv[++i],2,1000);
             else if (!std::strcmp(argv[i],"--help")) {
-                std::puts("usage: test_rocm_q4_qb_epilogue [--bench --tokens 4096 --samples 12]"); return 0;
+                std::puts("usage: test_rocm_q4_qb_epilogue [--bench --tokens N (256..8192) --samples 12]"); return 0;
             } else throw std::runtime_error("unknown/missing argument; use --help");
         }
         if (!device()) {

@@ -42,7 +42,7 @@ DS4_Q4_LDS_INLINE bool aligned_scope(
         bool ssd, bool quality, bool gfx1151, bool disabled) {
     return !disabled && !ssd && !quality && gfx1151 && groups == 1u &&
            blocks == 32u && out_dim == 4096u &&
-           n_tok >= 256u && n_tok <= 4096u;
+           n_tok >= 256u && n_tok <= 8192u;
 }
 
 template<uint32_t ROWS>

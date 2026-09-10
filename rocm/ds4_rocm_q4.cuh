@@ -1401,9 +1401,9 @@ static int rocm_q4_K_grouped_attn_a_resident_default_scope(
 
 static int rocm_q4_K_prefill_tile8_scope(uint64_t n_tok) {
     /* Keep decode/speculative micro-batches on the latency-oriented legacy
-     * kernel.  4096 is DS4's largest supported prefill chunk and bounds the
-     * validated tiled-prefill surface. */
-    return n_tok > 8u && n_tok <= 4096u;
+     * kernel. The runtime also accepts 8192-token chunks. Each CTA still
+     * handles eight tokens; extending the grid needs no additional LDS. */
+    return n_tok > 8u && n_tok <= 8192u;
 }
 
 static int rocm_q4_K_prefill_tile8_requested(void) {
@@ -1419,9 +1419,24 @@ static int rocm_q4_K_prefill_tile8_required(void) {
 static int rocm_q4_K_q8_quantize_launch(
         cuda_block_q8_K *out, const float *x, uint32_t in_dim,
         uint32_t n_rows, const char *label) {
-    const dim3 grid(in_dim / CUDA_QK_K, n_rows, 1u);
-    rocm_q4_q8_K_quantize_kernel<<<grid, 256u>>>(out, x, in_dim, n_rows);
-    return cuda_ok(cudaGetLastError(), label);
+    if (!out || !x || in_dim == 0u ||
+        (in_dim % CUDA_QK_K) != 0u || n_rows == 0u) return 0;
+    const uint32_t blocks = in_dim / CUDA_QK_K;
+    /* Eight attention groups at N=8192 produce 65536 activation rows,
+     * exceeding HIP's portable grid-y limit. Preserve the existing launch
+     * below that limit and use aligned row slabs above it. Pass the original
+     * row count even to a short final slab: it selects the same maximum
+     * reduction as the unsplit batch. All slabs use the default stream. */
+    const uint32_t slab_rows = n_rows <= UINT16_MAX ? n_rows : 32768u;
+    for (uint64_t row0 = 0u; row0 < n_rows; row0 += slab_rows) {
+        const uint32_t remaining = (uint32_t)(n_rows - row0);
+        const uint32_t rows = remaining < slab_rows ? remaining : slab_rows;
+        const dim3 grid(blocks, rows, 1u);
+        rocm_q4_q8_K_quantize_kernel<<<grid, 256u>>>(
+                out + row0 * blocks, x + row0 * in_dim, in_dim, n_rows);
+        if (!cuda_ok(cudaGetLastError(), label)) return 0;
+    }
+    return 1;
 }
 
 enum {
@@ -1571,7 +1586,7 @@ static int rocm_q4_K_prefill_wmma_select(
     if (!requested) return ROCM_Q4_PREFILL_WMMA_FALLBACK;
 
     const int shape_ok =
-        n_tok >= 256u && n_tok <= 4096u &&
+        n_tok >= 256u && n_tok <= 8192u &&
         in_dim != 0u && (in_dim % CUDA_QK_K) == 0u &&
         out_dim != 0u && in_dim <= UINT32_MAX &&
         out_dim <= UINT32_MAX && n_tok <= UINT32_MAX;
@@ -2575,9 +2590,9 @@ static int rocm_q4_K_prefill_tile8_quant_launch(
         in_dim == 0u || out_dim == 0u || blocks == 0u ||
         (in_dim % CUDA_QK_K) != 0u ||
         !cuda_u64_mul_checked(n_tok, n_groups, &n_rows) ||
-        /* HIP keeps the portable grid-y limit at 65535.  Real AProjQ4 uses
-         * eight groups, so even the 4096-token ceiling remains in range. */
-        n_rows > UINT16_MAX ||
+        /* The quantizer slabs flattened [token,group] rows across launches;
+         * WMMA uses separate token/group grid axes. Both support 8192x8. */
+        n_rows > UINT32_MAX ||
         !cuda_u64_mul_checked(n_groups, blocks, &xq_token_stride) ||
         !cuda_u64_mul_checked(n_groups, in_dim, &x_token_stride) ||
         !cuda_u64_mul_checked(n_groups, out_dim, &out_token_stride)) {
@@ -2599,7 +2614,9 @@ static int rocm_q4_K_prefill_tile8_quant_launch(
     if (!rocm_q4_K_q8_quantize_launch(
             xq, x, in_dim, (uint32_t)n_rows,
             "q4_K prefill tile8 quantize launch")) {
-        return 0;
+        // A slab may already be queued. Report an execution failure, not
+        // an unavailable path that the caller could silently retry.
+        return -1;
     }
 
     const dim3 grid((unsigned)((out_dim - 1u) / 32u + 1u),

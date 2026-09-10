@@ -154,13 +154,13 @@ static uint32_t test_scope() {
     uint32_t cases = 0;
     for (uint32_t blocks : {4u, 8u, 31u, 32u, 33u, 64u})
     for (uint32_t out_dim : {0u, 512u, 4095u, 4096u, 4097u})
-    for (uint32_t nt : {0u, 1u, 8u, 255u, 256u, 257u, 4095u, 4096u, 4097u, 8192u})
+    for (uint32_t nt : {0u, 1u, 8u, 255u, 256u, 257u, 4095u, 4096u, 4097u, 8191u, 8192u, 8193u})
     for (uint32_t groups : {0u, 1u, 2u, 8u})
     for (uint32_t flags = 0; flags < 16u; ++flags) {
         const bool ssd = flags & 1u, quality = flags & 2u;
         const bool gfx1151 = flags & 4u, disabled = flags & 8u;
         const bool expected = blocks == 32u && out_dim == 4096u &&
-            nt >= 256u && nt <= 4096u && groups == 1u &&
+            nt >= 256u && nt <= 8192u && groups == 1u &&
             !ssd && !quality && gfx1151 && !disabled;
         require(lds::aligned_scope(blocks, out_dim, nt, groups,
                                   ssd, quality, gfx1151, disabled) == expected,

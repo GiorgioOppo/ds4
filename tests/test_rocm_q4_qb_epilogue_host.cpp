@@ -51,14 +51,14 @@ int main() {
     check(bits(ep::fold_columns(adversarial)) == bits(16777230.0f),
           "fast-math must not reassociate the register tree");
     size_t policies = 0;
-    for (uint32_t n : {0u,1u,8u,9u,255u,256u,257u,2048u,4096u,4097u,UINT32_MAX})
+    for (uint32_t n : {0u,1u,8u,9u,255u,256u,257u,2048u,4096u,4097u,8191u,8192u,8193u,UINT32_MAX})
     for (uint32_t h : {0u,1u,32u,64u,128u,UINT32_MAX})
     for (uint32_t d : {0u,256u,511u,512u,576u})
     for (uint32_t r : {0u,63u,64u,128u,513u})
     for (uint32_t flags = 0; flags < 16; ++flags) {
         const bool device = flags & 1, quality = flags & 2;
         const bool ssd = flags & 4, disabled = flags & 8;
-        const bool expected = n >= 256 && n <= 4096 && h == 64 &&
+        const bool expected = n >= 256 && n <= 8192 && h == 64 &&
             d == 512 && r == 64 && device && !quality && !ssd && !disabled;
         check(ep::select(n,h,d,r,device,quality,ssd,disabled) == expected, "admission");
         ++policies;

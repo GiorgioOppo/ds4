@@ -1582,6 +1582,154 @@ bool run_attention_prefill_case(const aligned_model &model,
     return ok;
 }
 
+// Compare a long batch against two already-supported batches over views of
+// the same input. In particular, eight groups at N=8192 exercise 65536 Q8_K
+// rows without issuing the 65536 separate projections of the rowwise oracle.
+// REQUIRE and the WMMA counter attest the selected path on both sides.
+bool run_prefill_long_chunk_case(const aligned_model &model, uint32_t n_tokens,
+                                 bool grouped, bool pair, bool wmma,
+                                 uint32_t out_b_type = kQ4Type) {
+    const char *kind = grouped ? (out_b_type == kQ8Type ?
+        "grouped Q4-A/Q8-B" : "grouped Q4-A/Q4-B") : pair ? "pair" : "dense";
+    if (wmma) {
+#if DS4_TEST_HAS_HIP_RUNTIME
+        hipDeviceProp_t properties{};
+        if (hipGetDeviceProperties(&properties, 0) != hipSuccess ||
+            properties.warpSize != 32 ||
+            std::strncmp(properties.gcnArchName, "gfx1151", 7u) != 0) {
+            std::fprintf(stderr, "long %s WMMA: SKIP (requires gfx1151 wave32)\n", kind);
+            return true;
+        }
+#else
+        std::fprintf(stderr, "long %s WMMA: SKIP (no HIP runtime)\n", kind);
+        return true;
+#endif
+    }
+    const uint32_t in_dim = grouped ? kAttnGroups * kAttnGroupDim : pair ? kTailK : kK;
+    const uint32_t out0_dim = grouped ? kAttnLowDim : pair ? kM0 : kM1;
+    const uint32_t out1_dim = grouped ? kAttnOutDim : pair ? kM1 : 0u;
+    // Cover a missing final token predicate and a row-tail predicate together.
+    const size_t guard0 = std::max(kOutputGuardFloats,
+        (size_t)(wmma ? 63u : 7u) * out0_dim + 255u);
+    const size_t guard1 = std::max(kOutputGuardFloats,
+        (size_t)(wmma ? 63u : 7u) * out1_dim + 255u);
+    const size_t count0 = (size_t)n_tokens * out0_dim;
+    const size_t count1 = (size_t)n_tokens * out1_dim;
+    const auto sentinel0 = sentinel_values(count0 + guard0);
+    const auto sentinel1 = sentinel_values(count1 + guard1);
+    std::vector<float> x;
+    fill_activation(&x, n_tokens, in_dim);
+    tensor_owner x_gpu(x.size() * sizeof(float));
+    tensor_owner reference0(sentinel0.size() * sizeof(float));
+    tensor_owner reference1(sentinel1.size() * sizeof(float));
+    tensor_owner candidate0(sentinel0.size() * sizeof(float));
+    tensor_owner candidate1(sentinel1.size() * sizeof(float));
+    if (!x_gpu.ptr || !reference0.ptr || !reference1.ptr ||
+        !candidate0.ptr || !candidate1.ptr || !write_tensor(x_gpu.ptr, x) ||
+        !write_tensor(reference0.ptr, sentinel0) ||
+        !write_tensor(reference1.ptr, sentinel1) ||
+        !write_tensor(candidate0.ptr, sentinel0) ||
+        !write_tensor(candidate1.ptr, sentinel1)) {
+        std::fprintf(stderr, "long %s N=%u: setup FAIL\n", kind, n_tokens);
+        return false;
+    }
+    // The grouped 8192-token fixture has a 1 GiB input; release its host copy
+    // before collecting outputs on systems with shared host/device memory.
+    std::vector<float>().swap(x);
+
+    env_snapshot tile_disable(kPrefillDisable);
+    env_snapshot tile_require(kPrefillRequire);
+    env_snapshot wmma_disable(kPrefillWmmaDisable);
+    env_snapshot wmma_require(kPrefillWmmaRequire);
+    (void)unsetenv(kPrefillDisable);
+    if (wmma) {
+        (void)unsetenv(kPrefillRequire);
+        (void)unsetenv(kPrefillWmmaDisable);
+        (void)setenv(kPrefillWmmaRequire, "1", 1);
+    } else {
+        (void)setenv(kPrefillRequire, "1", 1);
+        (void)setenv(kPrefillWmmaDisable, "1", 1);
+        (void)unsetenv(kPrefillWmmaRequire);
+    }
+    auto enqueue = [&](ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                       const ds4_gpu_tensor *input, uint32_t tokens,
+                       bool candidate) {
+        ds4_rocm_test_q4_prefill_wmma_reset();
+        int rc;
+        if (grouped) {
+            rc = ds4_gpu_attention_output_q4_K_batch_tensor(
+                out1, out0, nullptr, nullptr, model.data, model.size,
+                model.attn_a_offset,
+                out_b_type == kQ8Type ? model.attn_b_q8_offset : model.attn_b_offset,
+                out_b_type,
+                kAttnGroupDim, kAttnRank, kAttnGroups, kAttnOutDim,
+                input, tokens);
+        } else if (pair && candidate) {
+            rc = ds4_gpu_matmul_q4_K_pair_tensor(
+                out0, out1, model.data, model.size,
+                model.tail_k1024_offset, model.tail_k1024_pair_offset,
+                in_dim, out0_dim, out1_dim, input, tokens);
+        } else {
+            rc = ds4_gpu_matmul_quant_tensor(out0, model.data, model.size,
+                pair ? model.tail_k1024_offset : model.weight1_offset,
+                kQ4Type, in_dim, out0_dim, input, tokens);
+            if (rc > 0 && pair)
+                rc = ds4_gpu_matmul_quant_tensor(out1, model.data, model.size,
+                    model.tail_k1024_pair_offset, kQ4Type,
+                    in_dim, out1_dim, input, tokens);
+        }
+        const uint64_t calls = ds4_rocm_test_q4_prefill_wmma_get_calls();
+        if (rc <= 0 || calls != (wmma ? 1u : 0u)) {
+            std::fprintf(stderr,
+                "long %s %s N=%u candidate=%d: rc=%d WMMA=%llu FAIL\n",
+                kind, wmma ? "WMMA" : "TILE8", tokens, candidate ? 1 : 0,
+                rc, (unsigned long long)calls);
+            return false;
+        }
+        return true;
+    };
+    for (uint32_t base = 0; base < n_tokens; base += 4096u) {
+        const uint32_t tokens = std::min(4096u, n_tokens - base);
+        tensor_owner input(ds4_gpu_tensor_view(x_gpu.ptr,
+            (uint64_t)base * in_dim * sizeof(float),
+            (uint64_t)tokens * in_dim * sizeof(float)));
+        tensor_owner out0(ds4_gpu_tensor_view(reference0.ptr,
+            (uint64_t)base * out0_dim * sizeof(float),
+            (uint64_t)tokens * out0_dim * sizeof(float)));
+        tensor_owner out1(out1_dim ? ds4_gpu_tensor_view(reference1.ptr,
+            (uint64_t)base * out1_dim * sizeof(float),
+            (uint64_t)tokens * out1_dim * sizeof(float)) : nullptr);
+        if (!input.ptr || !out0.ptr || (out1_dim && !out1.ptr) ||
+            !enqueue(out0.ptr, out1.ptr, input.ptr, tokens, false)) return false;
+    }
+    if (grouped && out_b_type == kQ8Type) {
+        // Keep A's 4096+4096 numerical oracle, then replay Q8 B over those
+        // independently produced lows at the candidate's full shape. This
+        // avoids making bitwise equality depend on a BLAS batch heuristic.
+        if (ds4_gpu_matmul_q8_0_tensor(reference1.ptr, model.data, model.size,
+                model.attn_b_q8_offset, kAttnLowDim, kAttnOutDim,
+                reference0.ptr, n_tokens) <= 0) return false;
+    }
+    if (!enqueue(candidate0.ptr, candidate1.ptr, x_gpu.ptr, n_tokens, true))
+        return false;
+    auto compare = [&](ds4_gpu_tensor *reference, ds4_gpu_tensor *candidate,
+                       const std::vector<float> &sentinel, size_t count) {
+        std::vector<float> expected(sentinel.size()), got(sentinel.size());
+        return read_tensor(reference, &expected) && read_tensor(candidate, &got) &&
+            output_body_overwritten(got, sentinel, count, "long batch output body") &&
+            output_body_finite(got, count, "long batch finite output") &&
+            output_guard_unchanged(got, sentinel, count, "long batch tail canary") &&
+            output_guard_unchanged(expected, sentinel, count, "split batch tail canary") &&
+            bitwise_equal(got, expected, "long batch vs 4096-token reference and guards");
+    };
+    bool ok = compare(reference0.ptr, candidate0.ptr, sentinel0, count0);
+    if (out1_dim) ok = compare(reference1.ptr, candidate1.ptr, sentinel1, count1) && ok;
+    std::fprintf(stderr, "long %s %s N=%u vs 4096+%u: %s\n", kind,
+        wmma ? "WMMA" : "TILE8", n_tokens, n_tokens - 4096u,
+        ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool run_grouped_attention_decode_case(const aligned_model &model) {
     const uint64_t row_bytes =
         (kDecodeAttnGroupDim / kQkK) * sizeof(block_q4_K_test);
@@ -2889,12 +3037,15 @@ int main(int argc, char **argv) {
              attention_q8_30_ok && prefill_wmma_ok && prefill_load4_ok && output_wmma_ok &&
              gate_ok && ok;
         if (run_prefill_long) {
-            // A 64 MiB activation and a roughly 0.5 Gi-op projection stress
-            // arbitrary token-grid tails without the much slower CPU oracle.
-            const bool long_ok = run_prefill_parity_case(
-                model, 4096u, model.weight1_offset, kM1, false,
-                "prefill stress K=4096 M=33 n_tok=4096");
-            ok = long_ok && ok;
+            for (uint32_t tokens : {8191u, 8192u}) {
+                ok = run_prefill_long_chunk_case(model, tokens, false, false, false) && ok;
+                ok = run_prefill_long_chunk_case(model, tokens, false, true, false) && ok;
+                ok = run_prefill_long_chunk_case(model, tokens, true, false, false) && ok;
+                ok = run_prefill_long_chunk_case(model, tokens, false, false, true) && ok;
+                ok = run_prefill_long_chunk_case(model, tokens, true, false, true) && ok;
+            }
+            ok = run_prefill_long_chunk_case(model, 8192u, true, false, false, kQ8Type) && ok;
+            ok = run_prefill_long_chunk_case(model, 8192u, true, false, true, kQ8Type) && ok;
         }
     }
 

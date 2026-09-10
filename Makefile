@@ -825,6 +825,21 @@ test-cuda-f16-compressor: $(F16_COMPRESSOR_DEPS)
 bench-cuda-f16-compressor: $(F16_COMPRESSOR_DEPS)
 	NVCC="$(NVCC)" NVCCFLAGS="$(NVCCFLAGS)" python3 tests/test_cuda_f16_compressor.py --cuda --bench
 
+ROCM_F16_COMPRESSOR_DEPS := tests/test_rocm_f16_compressor.py tests/test_rocm_f16_compressor.cpp \
+	tests/kernel_source.py rocm/ds4_rocm_common.cuh rocm/ds4_rocm_matmul.cuh \
+	rocm/ds4_rocm_compressor.cuh rocm/ds4_rocm_q8.cuh rocm/ds4_rocm_norm_rope.cuh \
+	rocm/ds4_rocm_runtime.cuh
+.PHONY: test-rocm-f16-compressor-host test-rocm-f16-compressor bench-rocm-f16-compressor
+test-rocm-f16-compressor-host: $(ROCM_F16_COMPRESSOR_DEPS) tests/test_rocm_f16_compressor_policy.py
+	python3 tests/test_rocm_f16_compressor.py
+	python3 tests/test_rocm_f16_compressor_policy.py
+
+test-rocm-f16-compressor: $(ROCM_F16_COMPRESSOR_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_f16_compressor.py --rocm
+
+bench-rocm-f16-compressor: $(ROCM_F16_COMPRESSOR_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_f16_compressor.py --rocm --bench
+
 Q8_HC_ALIGNED_DEPS := tests/test_cuda_q8_hc_aligned.py tests/test_cuda_q8_hc_aligned.cpp \
 	tests/kernel_source.py ds4_cuda.cu cuda/ds4_q8_quantize.cuh
 .PHONY: test-cuda-q8-hc-aligned-host test-cuda-q8-hc-aligned
@@ -938,6 +953,11 @@ bench-cuda-q4-prefill-reduce:
 	$(MAKE) test-cuda-q4-prefill-reduce CUDA_Q4_PREFILL_REDUCE_TEST_ARGS=--bench
 
 .PHONY: test-rocm-q4-dot-host
+.PHONY: test-rocm-q4-prefill-dispatch-host
+test-rocm-q4-prefill-dispatch-host: tests/test_rocm_q4_prefill_dispatch.py tests/kernel_source.py \
+	rocm/ds4_rocm_q4.cuh rocm/ds4_rocm_runtime.cuh
+	python3 tests/test_rocm_q4_prefill_dispatch.py
+
 ROCM_Q4_DOT_HEADERS = rocm/ds4_rocm_q4_dot.cuh rocm/ds4_rocm_q4_lds.cuh
 tests/test_rocm_q4_dot_host: tests/test_rocm_q4_dot_host.cpp $(ROCM_Q4_DOT_HEADERS)
 	$(CXX) -O2 -Wall -Wextra -std=c++17 -fno-fast-math -I. -o $@ $<

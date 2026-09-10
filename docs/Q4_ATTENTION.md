@@ -126,6 +126,13 @@ the Q4 matrix kernels. The follow-up restores these specific paths:
   aligned weight loads from the same historical snapshots. The activation
   quantizer, accumulation and HC epilogue match the canonical Q8 path. This
   uses existing model artifacts and adds no weight cache allocation.
+- ROCm gfx1151 F16 compressor projections: fuse the existing shared-input
+  KV/gate pair with its state write for K=4096, widths 256/1024 at ratio 4 and
+  width 512 at ratio 128. The wave32 products and reduction remain unchanged;
+  the final FP32 values feed both projection outputs and ring state. No weight
+  cache or activation conversion is added. Quality mode, graph diagnostics
+  and other devices retain the previous path. Buffer and alias checks precede
+  the writer, and a launch failure cannot request a fallback replay.
 - Metal Q8 matvec and paired matvec with four SIMD groups: remove a redundant
   barrier while retaining each kernel's reduction and output ownership.
 - Metal SSD shared-expert Q8 gate/up at four or eight SIMD groups: the same
@@ -146,6 +153,7 @@ make test-q4-preflight-host
 make test-cuda-hc-split-norm-host test-cuda-q8-quantize-host \
   test-rocm-raw-kv-store-host
 make test-cuda-f16-compressor-host test-cuda-q8-hc-aligned-host
+make test-rocm-f16-compressor-host test-rocm-q4-prefill-dispatch-host
 make test-q4-epilogue-host test-q4-prefill-dequant-host \
   test-q4-prefill-reduce-host test-cuda-q4-prefill-norm-host \
   test-cuda-q4-dequant-flat-host test-rocm-q4-dequant-flat-host \
@@ -180,6 +188,8 @@ validation:
 
 ```sh
 make test-strix-rocm-q4-parity test-strix-rocm-q4-prefill
+make test-strix-rocm-q4-prefill-long
+make test-rocm-f16-compressor ROCM_ARCH=gfx1151
 make test-rocm-q4-prefill-dequant ROCM_ARCH=gfx1151
 ```
 
@@ -192,6 +202,34 @@ hardware. Full-model Q4/Q8 quality and throughput comparisons remain separate
 from these synthetic fixtures.
 
 ## Measuring prefill
+
+ROCm Q4 tiled paths accept up to 8192 tokens per call, matching explicitly
+requested large runtime chunks. Previously, the 4096-token TILE8/WMMA gates
+sent larger batches to the legacy path. Aligned output-B staging and the Q-B
+normalization/RoPE epilogue use the same extended limit. Their per-block
+geometry and shared-memory footprint are unchanged; total batch scratch grows
+with the token count. The transient F16 Q-B threshold remains 4096 tokens.
+
+An 8192-token attention batch has 65536 flattened token/group rows. The Q8_K
+producer splits these into two 32768-row launches to respect the portable
+HIP grid-y limit; the GEMM remains one tiled launch per projection. Smaller
+quantizer grids keep their previous dispatch. Every slab retains the original
+batch row count and reduction mode, including a short final slab. A submitted
+quantizer failure aborts the operation instead of replaying a fallback.
+
+The host dispatch oracle exercises the 65535/65536 boundary, offsets, shape
+selection and launch failures. The native long-prefill fixture compares large
+batches with bounded reference calls. Native gfx1151 compilation, numerical
+validation and model throughput still need to be measured; these changes do
+not establish a speedup or close the reported Q4/Q8 gap by themselves. Compare
+both revisions at each of `--prefill-chunk 4096` and `--prefill-chunk 8192`,
+using the same model and balanced run order. For component measurements:
+
+```sh
+make rocm-q4-prefill-bench ROCM_ARCH=gfx1151
+./speed-bench/rocm_q4_prefill_bench --tokens 4096,8192
+make bench-rocm-f16-compressor ROCM_ARCH=gfx1151
+```
 
 Use identical prompts, batch/chunk sizes, context, backend, expert-cache
 budget, and warmup for Q4 and Q8 runs. Record the GPU, exact commit, model

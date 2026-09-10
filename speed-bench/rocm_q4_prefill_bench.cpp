@@ -1698,7 +1698,7 @@ void usage(FILE *stream, const char *argv0) {
         "Resident ROCm Q4_K prefill kernel A/B (HIP event timing only).\n\n"
         "  --case all|lds|lds_vector|wmma_load4|dense|pair|qb|outb|output\n"
         "                              comparison to run (default: all)\n"
-        "  --tokens N[,N...]          token counts, each 9..4096\n"
+        "  --tokens N[,N...]          token counts, each 9..8192\n"
         "  --full                     use 9,16,17,31,32,33,128,256,257,512,4096\n"
         "  --sets N                   rotating resident weight sets (default: %u)\n"
         "  --samples N                samples/arm, multiple of 4 (default: %u)\n"
@@ -1756,7 +1756,7 @@ std::vector<uint32_t> parse_tokens(const char *text) {
         const std::string item(cursor,
                                comma ? static_cast<size_t>(comma - cursor)
                                      : std::strlen(cursor));
-        result.push_back(parse_u32(item.c_str(), "--tokens", 9u, 4096u));
+        result.push_back(parse_u32(item.c_str(), "--tokens", 9u, 8192u));
         if (!comma) break;
         cursor = comma + 1;
         if (!*cursor) {

@@ -16,7 +16,7 @@ enum { lanes = 32, values = 16, head_dim = 512, rotation = 64,
 
 DS4_QB_EP_INLINE bool shape(uint32_t tokens, uint32_t nh,
                             uint32_t dim, uint32_t rot) {
-    return tokens >= 256u && tokens <= 4096u && nh == heads &&
+    return tokens >= 256u && tokens <= 8192u && nh == heads &&
            dim == head_dim && rot == rotation;
 }
 
