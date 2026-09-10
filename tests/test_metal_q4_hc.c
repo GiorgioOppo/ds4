@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 /* Model-free bitwise oracle for Q4 output/HC fusion at its automatic shapes. */
 #include "ds4_gpu.h"
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,8 +37,21 @@ static void same(const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint64_t coun
     }
     free(y); free(x);
 }
-int main(void) {
-    enum { K = 8192, M = 4096, G = 8, R = 1024, HC = 4, N = 512, GUARD = 64 };
+static uint32_t parse_tokens(int argc, char **argv) {
+    if (argc == 1) return 512u;
+    check(argc == 3 && strcmp(argv[1], "--tokens") == 0,
+          "usage: test_metal_q4_hc [--tokens 512..8192 (multiple of 32)]");
+    errno = 0;
+    char *end = NULL;
+    const unsigned long n = strtoul(argv[2], &end, 10);
+    check(errno == 0 && end != argv[2] && *end == '\0' &&
+          n >= 512u && n <= 8192u && (n % 32u) == 0u,
+          "invalid token count");
+    return (uint32_t)n;
+}
+int main(int argc, char **argv) {
+    enum { K = 8192, M = 4096, G = 8, R = 1024, HC = 4, GUARD = 64 };
+    const uint32_t N = parse_tokens(argc, argv);
     const uint64_t a_bytes = (uint64_t)K * M / 256u * 144u;
     const uint64_t b_bytes = a_bytes;
     const uint64_t page = (uint64_t)getpagesize();
@@ -90,6 +104,17 @@ int main(void) {
     check(ds4_gpu_attention_output_q4_K_batch_hc_tensor(out, candidate, residual, split,
           low, group, tmp, model, model_bytes, 0, a_bytes, 12, M, R, G, M,
           heads, 33u, HC) == 0, "partial-token fallback");
+    check(ds4_gpu_attention_output_q4_K_batch_hc_tensor(out, candidate, residual, split,
+          low, group, tmp, model, model_bytes, 0, a_bytes, 12, M, R, G, M,
+          heads, 8193u, HC) == 0, "above-limit partial-token fallback");
+    check(setenv("DS4_METAL_REQUIRE_Q4_BATCH_ATTN_OUT_HC_FUSION", "1", 1) == 0,
+          "require fusion for upper-bound check");
+    check(ds4_gpu_attention_output_q4_K_batch_hc_tensor(out, candidate, residual, split,
+          low, group, tmp, model, model_bytes, 0, a_bytes, 12, M, R, G, M,
+          heads, 8224u, HC) == -1, "above-limit aligned-token refusal");
+    check(unsetenv("DS4_METAL_REQUIRE_Q4_BATCH_ATTN_OUT_HC_FUSION") == 0,
+          "clear fusion requirement");
+    same(baseline, candidate, (uint64_t)N * HC * M);
     ds4_gpu_tensor *decode_x = ds4_gpu_tensor_view(low, 0, K * 4u);
     ds4_gpu_tensor *decode_out = ds4_gpu_tensor_view(out, 0, M * 4u);
     ds4_gpu_tensor *decode_base = ds4_gpu_tensor_view(baseline, 0, HC * M * 4u);
@@ -107,6 +132,7 @@ int main(void) {
         candidate,guarded,baseline,out,tmp,group,low,split,residual,heads};
     for (size_t i = 0; i < sizeof(all)/sizeof(all[0]); ++i) ds4_gpu_tensor_free(all[i]);
     ds4_gpu_cleanup(); free(model);
-    puts("PASS: Q4 HC automatic prefill N512 and decode, bitwise outputs, guards, partial-token fallback");
+    printf("PASS: Q4 HC automatic prefill N%u and decode, bitwise outputs, guards, "
+           "partial-token fallback, upper-bound refusal\n", N);
     return 0;
 }

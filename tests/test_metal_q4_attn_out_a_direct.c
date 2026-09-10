@@ -7,6 +7,7 @@
 
 #include "ds4_gpu.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,9 +32,7 @@ enum {
     N_GROUPS = 8u,
     LOW_DIM = N_GROUPS * RANK,
     OUT_DIM = 64u,
-    ACTIVE_ROWS = 513u,
     REJECT_ROWS = 511u,
-    ALLOC_ROWS = ACTIVE_ROWS + 1u,
     GUARD_ELEMENTS = 64u,
 };
 
@@ -64,6 +63,18 @@ static void fail(const char *what) {
 }
 
 #define CHECK(expr, what) do { if (!(expr)) fail(what); } while (0)
+
+static uint32_t parse_rows(int argc, char **argv) {
+    if (argc == 1) return 513u;
+    CHECK(argc == 3 && strcmp(argv[1], "--tokens") == 0,
+          "usage: test_metal_q4_attn_out_a_direct [--tokens 512..8192]");
+    errno = 0;
+    char *end = NULL;
+    const unsigned long value = strtoul(argv[2], &end, 10);
+    CHECK(errno == 0 && end != argv[2] && *end == '\0' &&
+          value >= 512u && value <= 8192u, "invalid token count");
+    return (uint32_t)value;
+}
 
 static uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
@@ -145,8 +156,8 @@ static void fill_q8_matrix(void *raw, uint32_t in_dim,
     }
 }
 
-static void fill_heads(float *heads) {
-    for (uint32_t row = 0; row < ALLOC_ROWS; row++) {
+static void fill_heads(float *heads, uint32_t rows) {
+    for (uint32_t row = 0; row < rows; row++) {
         for (uint32_t i = 0; i < N_GROUPS * GROUP_DIM; i++) {
             const uint32_t key =
                 i * 41u + row * 271u + ((i >> 2u) ^ (row * 19u));
@@ -238,7 +249,9 @@ static void check_inputs_immutable(ds4_gpu_tensor *heads,
           "model weights were modified");
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const uint32_t active_rows = parse_rows(argc, argv);
+    const uint32_t alloc_rows = active_rows + 1u;
     const uint64_t page = (uint64_t)getpagesize();
     const uint64_t row_a_bytes =
         (GROUP_DIM / QK_K) * sizeof(block_q4_K);
@@ -250,17 +263,17 @@ int main(void) {
     const uint64_t model_bytes =
         align_up(out_b_offset + out_b_bytes, page);
     const uint64_t heads_payload_count =
-        (uint64_t)ALLOC_ROWS * N_GROUPS * GROUP_DIM;
-    const uint64_t low_payload_count = (uint64_t)ALLOC_ROWS * LOW_DIM;
-    const uint64_t out_payload_count = (uint64_t)ALLOC_ROWS * OUT_DIM;
+        (uint64_t)alloc_rows * N_GROUPS * GROUP_DIM;
+    const uint64_t low_payload_count = (uint64_t)alloc_rows * LOW_DIM;
+    const uint64_t out_payload_count = (uint64_t)alloc_rows * OUT_DIM;
     const uint64_t heads_storage_count =
         GUARD_ELEMENTS + heads_payload_count + GUARD_ELEMENTS;
     const uint64_t low_storage_count =
         GUARD_ELEMENTS + low_payload_count + GUARD_ELEMENTS;
     const uint64_t out_storage_count =
         GUARD_ELEMENTS + out_payload_count + GUARD_ELEMENTS;
-    const uint64_t active_low_count = (uint64_t)ACTIVE_ROWS * LOW_DIM;
-    const uint64_t active_out_count = (uint64_t)ACTIVE_ROWS * OUT_DIM;
+    const uint64_t active_low_count = (uint64_t)active_rows * LOW_DIM;
+    const uint64_t active_out_count = (uint64_t)active_rows * OUT_DIM;
     const uint64_t heads_payload_bytes =
         heads_payload_count * sizeof(float);
     const uint64_t heads_storage_bytes =
@@ -298,7 +311,7 @@ int main(void) {
     CHECK(heads_host && low_host && out_host && baseline_low && baseline_out,
           "host tensor allocation");
     poison(heads_host, heads_storage_count, 0x7fc00000u);
-    fill_heads(heads_host + GUARD_ELEMENTS);
+    fill_heads(heads_host + GUARD_ELEMENTS, alloc_rows);
     const uint64_t heads_hash =
         hash_bytes(heads_host, heads_storage_bytes);
 
@@ -340,7 +353,7 @@ int main(void) {
     CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
               out, low, NULL, NULL, model, model_bytes,
               0, out_b_offset, Q8_0_TYPE, GROUP_DIM, RANK,
-              N_GROUPS, OUT_DIM, heads, ACTIVE_ROWS) == -1,
+              N_GROUPS, OUT_DIM, heads, active_rows) == -1,
           "direct disable must win over REQUIRE");
     read_outputs(low_base, out_base, low_host, out_host,
                  low_storage_count, out_storage_count);
@@ -354,7 +367,7 @@ int main(void) {
     CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
               out, low, NULL, NULL, model, model_bytes,
               0, out_b_offset, Q8_0_TYPE, GROUP_DIM, RANK,
-              N_GROUPS, OUT_DIM, heads, ACTIVE_ROWS) == 1,
+              N_GROUPS, OUT_DIM, heads, active_rows) == 1,
           "routed baseline dispatch");
     read_outputs(low_base, out_base, low_host, out_host,
                  low_storage_count, out_storage_count);
@@ -408,7 +421,7 @@ int main(void) {
     CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
               out, low, NULL, NULL, model, model_bytes,
               0, out_b_offset, Q8_0_TYPE, GROUP_DIM, RANK,
-              N_GROUPS, OUT_DIM, heads, ACTIVE_ROWS) == 1,
+              N_GROUPS, OUT_DIM, heads, active_rows) == 1,
           "direct candidate dispatch");
     read_outputs(low_base, out_base, low_host, out_host,
                  low_storage_count, out_storage_count);
@@ -450,7 +463,7 @@ int main(void) {
     fprintf(stderr,
             "Metal Q4 output-A direct N=%u low=%llu/%llu out=%llu/%llu "
             "low_guard=%llu/%llu/%llu out_guard=%llu/%llu/%llu\n",
-            ACTIVE_ROWS,
+            active_rows,
             (unsigned long long)low_mismatch,
             (unsigned long long)active_low_count,
             (unsigned long long)out_mismatch,
@@ -502,6 +515,23 @@ int main(void) {
     CHECK(count_poison_mismatches(out_host, 0, out_storage_count,
                                   reject_out_poison) == 0,
           "N=511 REQUIRE modified out");
+    if (active_rows == 8192u) {
+        /* This allocation also fits 8193 complete rows. Therefore rejection
+         * proves the upper dispatch bound, rather than a buffer-size check. */
+        CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+                  out, low, NULL, NULL, model, model_bytes,
+                  0, out_b_offset, Q8_0_TYPE, GROUP_DIM, RANK,
+                  N_GROUPS, OUT_DIM, heads, 8193u) == -1,
+              "N=8193 REQUIRE must fail closed");
+        read_outputs(low_base, out_base, low_host, out_host,
+                     low_storage_count, out_storage_count);
+        CHECK(count_poison_mismatches(low_host, 0, low_storage_count,
+                                      reject_low_poison) == 0,
+              "N=8193 REQUIRE modified low");
+        CHECK(count_poison_mismatches(out_host, 0, out_storage_count,
+                                      reject_out_poison) == 0,
+              "N=8193 REQUIRE modified out");
+    }
     check_inputs_immutable(heads_base, heads_host, heads_storage_bytes,
                            heads_hash,
                            model, model_bytes, model_hash);
@@ -524,8 +554,10 @@ int main(void) {
     free(heads_host);
     free(model);
     fprintf(stderr,
-            "Metal Q4 output-A direct oracle PASS N=513 bitwise=1 "
-            "tail=1 immutable=1 reject_N511=1\n");
+            "Metal Q4 output-A direct oracle PASS N=%u bitwise=1 "
+            "tail=%u immutable=1 reject_N511=1 reject_N8193=%u\n",
+            active_rows, (active_rows % 32u) != 0u,
+            active_rows == 8192u);
     return 0;
 }
 

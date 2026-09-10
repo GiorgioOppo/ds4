@@ -1213,6 +1213,24 @@ tests/test_metal_q4_hc: tests/test_metal_q4_hc.c ds4_gpu.h ds4_image.o ds4_metal
 test-metal-q4-hc: tests/test_metal_q4_hc
 	./tests/test_metal_q4_hc
 
+.PHONY: test-metal-q4-prefill-long
+# Large synthetic fixtures run sequentially to bound peak GPU memory usage.
+test-metal-q4-prefill-long: tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_hc
+	./tests/test_metal_q4_attn_out_a_direct --tokens 8191
+	./tests/test_metal_q4_attn_out_a_direct --tokens 8192
+	./tests/test_metal_q4_hc --tokens 8192
+
+.PHONY: test-metal-decode-fusions test-metal-f16-compressor
+test-metal-decode-fusions: tests/test_metal_decode_fusions.py tests/test_metal_decode_fusions.m \
+		tests/kernel_source.py metal/dense.metal metal/dsv4_hc.metal
+	python3 tests/test_metal_decode_fusions.py
+
+tests/test_metal_f16_compressor: tests/test_metal_f16_compressor.c ds4_gpu.h ds4_image.o ds4_metal.o
+	$(CC) $(CFLAGS) -I. -o $@ $< ds4_image.o ds4_metal.o $(METAL_LDLIBS)
+
+test-metal-f16-compressor: tests/test_metal_f16_compressor
+	./tests/test_metal_f16_compressor
+
 .PHONY: test-metal-decode-defaults
 tests/test_metal_decode_defaults: tests/test_metal_decode_defaults.m ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
@@ -1304,7 +1322,8 @@ Q4_BUILD_PRODUCTS := tests/test_cpu_q4_dense tests/test_quantizer_indexer_q4 tes
 	tests/test_rocm_q4_wmma_load_host tests/test_rocm_q4_qb_epilogue_host tests/test_rocm_q4_qb_epilogue_host_fast \
 	tests/test_rocm_q4_qb_epilogue tests/test_rocm_q4_dense_pair tests/test_metal_q4_prefill_pair \
 	tests/test_metal_indexer_q4 tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_qb_f16_cache \
-	tests/test_metal_q4_qb_token_pair tests/test_metal_q4_hc tests/test_metal_decode_defaults speed-bench/metal_q4_dense_pair_bench \
+	tests/test_metal_q4_qb_token_pair tests/test_metal_q4_hc tests/test_metal_decode_defaults tests/test_metal_f16_compressor \
+	speed-bench/metal_q4_dense_pair_bench \
 	speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench \
 	cuda/mmq/test/test_mmq_parity tests/test_cuda_q4_epilogue speed-bench/rocm_q4_prefill_bench \
 	speed-bench/cuda_q4_prefill_bench

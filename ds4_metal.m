@@ -21771,6 +21771,9 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
             mv_dispatch.smem = 32u * 4u * sizeof(float);
         }
         mv_args.nr0 = mv_dispatch.nr0;
+        // Fused projection/state store reduces KV and score in separate
+        // planes so both partial sets need only one threadgroup barrier.
+        mv_dispatch.smem = 2u * 32u * (NSUInteger)mv_dispatch.nr0 * sizeof(float);
         ds4_gpu_dsv4_compressor_store_one_args store_args = {
             .width = width,
             .ratio = ratio,
@@ -21954,7 +21957,7 @@ int ds4_gpu_matmul_f16_quad_compressor_store_tensor(
         [enc setBuffer:state0scbuf offset:ds4_gpu_tensor_offset(state0_score) atIndex:15];
         [enc setBuffer:state1kvbuf offset:ds4_gpu_tensor_offset(state1_kv) atIndex:16];
         [enc setBuffer:state1scbuf offset:ds4_gpu_tensor_offset(state1_score) atIndex:17];
-        [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:2u * 32u * 2u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)width0 + (NSUInteger)width1 + 1u) / 2u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -28722,11 +28725,12 @@ static int ds4_gpu_attention_output_q4_K_batch_impl(
          * list before scattering back to the same token/group layout.  The
          * direct kernel removes only those indirections; its dequantization,
          * F16 staging, MMA order, and final stores are bit-identical.  Keep
-         * the default to the measured long-prefill range and leave Metal4 on
-         * its cooperative-tensor path. */
+         * the default to long prefills up to the runtime's 8192-token chunk
+         * limit. Scratch is tile-local (8 KiB), independent of token count;
+         * Metal4 retains its cooperative-tensor path. */
         const bool direct_low_eligible =
             !use_mpp_low &&
-            n_tokens >= 512u && n_tokens <= 4096u &&
+            n_tokens >= 512u && n_tokens <= 8192u &&
             group_dim == 4096u && rank == 1024u && n_groups == 8u &&
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             g_tp_split_world == 1 &&
@@ -28978,7 +28982,7 @@ int ds4_gpu_attention_output_q4_K_batch_hc_tensor(
         rank != 1024u || n_groups != 8u || out_dim != 4096u ||
         n_hc != 4u || n_tokens < 32u ||
         (n_tokens < 512u && !force) ||
-        n_tokens > 4096u || (n_tokens % 32u) != 0u) {
+        n_tokens > 8192u || (n_tokens % 32u) != 0u) {
         return require ? -1 : 0;
     }
 

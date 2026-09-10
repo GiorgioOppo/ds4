@@ -71,6 +71,13 @@ The Q4 CUDA output-TP split that assumes Q8_0 weights is rejected explicitly.
 This port does not claim every multi-GPU or tensor-parallel configuration is
 validated for AProjQ4.
 
+On eligible pre-M5 Metal devices, direct grouped Q4 output-A and fused Q4
+output-B/HC prefill accept up to 8192 tokens. Output-A handles partial tiles;
+output-B/HC requires a multiple of 32 tokens and remains resident-only.
+Their tile scratch is fixed-size, while activation storage grows with the
+batch. The separate Q-A/KV shared-input path retains its 256-token limit
+because it uses a fixed 2 MiB staging buffer. Metal4 dispatch is unchanged.
+
 ### Q-B F16 staging and memory
 
 The automatic path expands one layer's Q4_K Q-B weights into reusable F16
@@ -137,6 +144,12 @@ the Q4 matrix kernels. The follow-up restores these specific paths:
   barrier while retaining each kernel's reduction and output ownership.
 - Metal SSD shared-expert Q8 gate/up at four or eight SIMD groups: the same
   barrier reduction applies to the fused SwiGLU producer.
+- Metal fused F16 compressor pair/quad, including the compound Q8 QKV+quad
+  kernel: independent KV/gate partial-sum planes share one publication
+  barrier. The final FP32 values write both projections and ring state
+  directly, preserving the original reduction order and APE addition. This
+  removes the device-memory barrier and projection reload from the previous
+  fused epilogue. Existing device and shape gates remain in force.
 
 These are automatic decode paths, not new Q4 quantization formats. They also
 apply to compatible models whose attention remains Q8. A separate restored
@@ -170,8 +183,28 @@ guard regions, odd batch sizes, fallback shapes, and cache transitions:
 make test-metal-indexer-q4 test-metal-q4-prefill-pair \
   test-metal-q4-qb-token-pair test-metal-q4-attn-out-a-direct \
   test-metal-q4-qb-f16-cache test-metal-q4-hc
-make test-metal-decode-defaults
+make test-metal-decode-defaults test-metal-decode-fusions test-metal-f16-compressor
+# Larger activation allocations; each fixture runs separately.
+make test-metal-q4-prefill-long
 ```
+
+The decode fusion oracle checks 68 bitwise cases with strict math and again
+with fast math: F16 pair/quad and compound QKV+quad, both APE types, ring
+positions, and Q8/HC SIMD-group variants. The F16 integration fixture checks
+64 additional cases through the real backend APIs in eager and batched
+command modes. Long-prefill fixtures compare direct output-A at 8191/8192
+tokens and fused output-B/HC at 8192 against the existing separate paths,
+including output guards and rejection beyond the dispatch limits.
+
+On M1 Max (2026-09-10), a synthetic comparison against `080ac7d` measured
+the fused F16 kernels with fast math, warm weights, one warm-up pair and
+12 alternating old/new samples of 2048 dispatches each. Median GPU latency
+fell from 51.16 to 39.87 microseconds for the K=4096, width=512, ratio=128
+pair, and from 98.64 to 72.46 microseconds for the K=4096, widths=1024/256,
+ratio=4 quad. These are component timings, excluding model execution, CPU
+encoding and SSD reads. The standalone pair's existing automatic M3/M5 gate
+is unchanged; its M1 measurement directly invokes the shader. The quad
+integration fixture exercises the actual M1 backend dispatch.
 
 On NVIDIA hardware, compile and run the native oracles:
 
