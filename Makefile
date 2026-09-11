@@ -83,6 +83,30 @@ endif
 # the C/Metal/ROCm GPU API. Keep incremental builds coherent across backends.
 ds4.o ds4_cpu.o ds4_metal.o ds4_cuda.o ds4_rocm.o ds4_rocm_compat.o: ds4_gpu_phase.h
 ds4_cuda.o ds4_rocm.o: cuda/ds4_hc_norm_mix.cuh
+ds4_metal.o tests/test_metal_decode_defaults tests/test_metal_execution_phase \
+tests/test_metal_q4_activation_runtime: ds4_indexer_topk.h
+ds4_metal.o tests/test_metal_decode_defaults tests/test_metal_execution_phase \
+tests/test_metal_q4_activation_runtime tests/test_metal_indexer_topk: ds4_indexer_stream.h
+ds4_metal.o ds4_cuda.o ds4_rocm.o tests/test_metal_decode_defaults \
+tests/test_metal_execution_phase tests/test_metal_q4_activation_runtime \
+tests/test_metal_indexer_topk tests/test_metal_indexer_stream: ds4_indexer_plan.h
+
+.PHONY: test-indexer-plan test-metal-indexer-heads bench-metal-indexer-heads
+tests/test_indexer_plan: tests/test_indexer_plan.c ds4_indexer_plan.h ds4_gpu_phase.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -I. -o $@ $<
+
+test-indexer-plan: tests/test_indexer_plan
+	./tests/test_indexer_plan
+
+tests/test_metal_indexer_heads: tests/test_metal_indexer_heads.m tests/test_metal_indexer_topk.m ds4_metal.m ds4_gpu.h ds4_gpu_phase.h ds4_indexer_plan.h ds4_indexer_stream.h ds4_indexer_topk.h $(METAL_SRCS)
+	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
+
+test-metal-indexer-heads: tests/test_metal_indexer_heads
+	./tests/test_metal_indexer_heads
+
+bench-metal-indexer-heads: tests/test_metal_indexer_heads
+	./tests/test_metal_indexer_heads --bench
+
 .PHONY: test-gpu-execution-phase
 tests/test_gpu_execution_phase: tests/test_gpu_execution_phase.c ds4_gpu_phase.h $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CPU_CORE_OBJS) $(LDLIBS)
@@ -1346,6 +1370,32 @@ test-metal-q4-qb-token-pair: tests/test_metal_q4_qb_token_pair
 	./tests/test_metal_q4_qb_token_pair
 
 .PHONY: test-metal-q4-activation test-metal-q4-activation-runtime bench-metal-q4-activation
+.PHONY: test-metal-indexer-topk bench-metal-indexer-topk test-indexer-topk-host
+.PHONY: test-metal-indexer-stream bench-metal-indexer-stream test-indexer-stream-host
+tests/test_metal_indexer_stream: tests/test_metal_indexer_stream.m tests/test_metal_indexer_topk.m ds4_metal.m ds4_gpu.h ds4_gpu_phase.h ds4_indexer_stream.h ds4_indexer_topk.h $(METAL_SRCS)
+	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
+
+test-metal-indexer-stream: tests/test_metal_indexer_stream
+	./tests/test_metal_indexer_stream
+
+bench-metal-indexer-stream: tests/test_metal_indexer_stream
+	./tests/test_metal_indexer_stream --bench
+
+test-indexer-stream-host: tests/test_indexer_stream.py tests/test_indexer_stream.cpp tests/test_indexer_topk.py tests/kernel_source.py ds4_indexer_stream.h ds4_indexer_topk.h metal/indexer_stream.metal metal/argsort.metal
+	python3 tests/test_indexer_stream.py
+
+tests/test_metal_indexer_topk: tests/test_metal_indexer_topk.m ds4_metal.m ds4_gpu.h ds4_indexer_topk.h $(METAL_SRCS)
+	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
+
+test-metal-indexer-topk: tests/test_metal_indexer_topk
+	./tests/test_metal_indexer_topk
+
+bench-metal-indexer-topk: tests/test_metal_indexer_topk
+	./tests/test_metal_indexer_topk --bench
+
+test-indexer-topk-host: tests/test_indexer_topk.py tests/test_indexer_topk.cpp tests/kernel_source.py ds4_indexer_topk.h metal/argsort.metal
+	python3 tests/test_indexer_topk.py
+
 .PHONY: test-metal-execution-phase
 tests/test_metal_execution_phase: tests/test_metal_execution_phase.m tests/test_gpu_execution_phase.c ds4_metal.m ds4_gpu.h ds4_gpu_phase.h $(METAL_SRCS)
 	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
@@ -1503,7 +1553,7 @@ Q4_BUILD_PRODUCTS := tests/test_cpu_q4_dense tests/test_quantizer_indexer_q4 tes
 	tests/test_metal_q4_activation tests/test_metal_q4_activation_runtime \
 	tests/test_gpu_execution_phase tests/test_metal_execution_phase \
 	tests/test_gpu_hc_norm_mix_native \
-	tests/test_rocm_hc_prefill_native \
+	tests/test_metal_indexer_topk tests/test_metal_indexer_stream tests/test_rocm_hc_prefill_native \
 	speed-bench/metal_q4_dense_pair_bench \
 	speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench \
 	cuda/mmq/test/test_mmq_parity tests/test_cuda_q4_epilogue speed-bench/rocm_q4_prefill_bench \

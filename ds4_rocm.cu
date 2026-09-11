@@ -41,6 +41,7 @@
 
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "ds4_indexer_plan.h"
 
 static thread_local bool g_dspark_verify_mode;
 static thread_local ds4_gpu_execution_phase g_execution_phase = DS4_GPU_PHASE_AUTO;

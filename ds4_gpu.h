@@ -378,6 +378,11 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_INDEXER_TOPK_LEGACY = 1u << 7,
+    DS4_GPU_TEST_INDEXER_HEAD2 = 1u << 8,
+    DS4_GPU_TEST_INDEXER_HEAD4 = 1u << 9,
+    DS4_GPU_TEST_INDEXER_LEGACY_HEADS = 1u << 10,
+    DS4_GPU_TEST_INDEXER_HEAD1 = 1u << 12,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
