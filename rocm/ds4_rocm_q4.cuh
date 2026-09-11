@@ -921,6 +921,7 @@ rocm_matmul_q4_K_prefill_wmma_k128_p144_rowtile_strided_kernel(
     (void)out_token_stride;
 #endif
 }
+#include "ds4_rocm_q4_pipeline.cuh"
 #undef DS4_ROCM_Q4_GFX1151_WMMA_ROWTILE_DEVICE
 #endif
 
@@ -2139,6 +2140,35 @@ extern "C" int ds4_rocm_bench_q4_K_wmma_k128_half_enqueue(
     return rocm_q4_K_prefill_wmma_k128_half_enqueue(
         reinterpret_cast<float *>(out), reinterpret_cast<const char *>(w),
         reinterpret_cast<const float *>(x), reinterpret_cast<__half *>(scratch), n_tok);
+}
+
+/* Raw benchmark hook only. Candidate admission is explicit; it never replaces
+ * the default K128 entry or adds an environment-controlled production path. */
+extern "C" int ds4_rocm_bench_q4_K_wmma_k128_pipeline_enqueue(
+        void *out, const void *w, const void *x,
+        uint32_t n_tok, uint32_t n_groups, uint32_t in_dim, uint32_t out_dim,
+        uint64_t row_bytes, uint64_t x_token_stride,
+        uint64_t x_group_stride, uint64_t out_token_stride, bool rhs_f16) {
+    if (!ds4_rocm_q4_pipeline::admit(n_tok,n_groups,in_dim,out_dim,
+            row_bytes,x_token_stride,x_group_stride,out_token_stride,
+            out,w,x,rhs_f16,rocm_q4_qb_gfx1151_wave32_device())) return 0;
+    const dim3 grid((uint64_t(out_dim) + 255u) / 256u,
+                    (uint64_t(n_tok) + ROCM_Q4_WMMA_TOKEN_TILE - 1u) / ROCM_Q4_WMMA_TOKEN_TILE,
+                    n_groups);
+    if (rhs_f16) {
+        rocm_matmul_q4_K_prefill_wmma_k128_pipeline_rowtile_strided_kernel<
+            256u, 16u, 1u, __half><<<grid, 512u>>>(
+                static_cast<float *>(out), static_cast<const char *>(w),
+                static_cast<const __half *>(x), n_tok, n_groups, in_dim, out_dim,
+                row_bytes, x_token_stride, x_group_stride, out_token_stride);
+    } else {
+        rocm_matmul_q4_K_prefill_wmma_k128_pipeline_rowtile_strided_kernel<
+            256u, 16u, 1u, float><<<grid, 512u>>>(
+                static_cast<float *>(out), static_cast<const char *>(w),
+                static_cast<const float *>(x), n_tok, n_groups, in_dim, out_dim,
+                row_bytes, x_token_stride, x_group_stride, out_token_stride);
+    }
+    return cuda_ok(cudaGetLastError(), "Q4 K128 single-LDS pipeline benchmark") ? 1 : -1;
 }
 
 enum {

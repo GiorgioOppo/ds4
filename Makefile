@@ -949,6 +949,18 @@ test-rocm-q4-activation: $(ROCM_Q4_ACTIVATION_DEPS)
 bench-rocm-q4-activation: $(ROCM_Q4_ACTIVATION_DEPS)
 	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_q4_activation.py --rocm --bench
 
+ROCM_Q4_PIPELINE_DEPS := tests/test_rocm_q4_pipeline.py tests/test_rocm_q4_pipeline.cpp \
+	rocm/ds4_rocm_q4_pipeline.cuh rocm/ds4_rocm_norm_rope.cuh $(ROCM_Q4_ACTIVATION_DEPS)
+.PHONY: test-rocm-q4-pipeline-host test-rocm-q4-pipeline bench-rocm-q4-pipeline
+test-rocm-q4-pipeline-host: $(ROCM_Q4_PIPELINE_DEPS)
+	python3 tests/test_rocm_q4_pipeline.py
+
+test-rocm-q4-pipeline: $(ROCM_Q4_PIPELINE_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_q4_pipeline.py --rocm
+
+bench-rocm-q4-pipeline: $(ROCM_Q4_PIPELINE_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_q4_pipeline.py --rocm --bench
+
 ROCM_Q4_INT8_WMMA_DEPS := tests/test_rocm_q4_int8_wmma.py tests/test_rocm_q4_int8_wmma.cpp \
 	rocm/ds4_rocm_q4_dot.cuh rocm/ds4_rocm_q4_scales.cuh rocm/ds4_rocm_q4_lds.cuh
 .PHONY: test-rocm-q4-int8-wmma-host test-rocm-q4-int8-wmma
