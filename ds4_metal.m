@@ -26,6 +26,21 @@
 #include "ds4_gpu.h"
 #include "ds4_image.h"
 
+/* Dispatch policy belongs to the encoding thread, not to a command buffer.
+ * The graph scopes it around a logical forward pass; the selected pipelines
+ * are already recorded when asynchronous GPU execution starts. */
+static _Thread_local ds4_gpu_execution_phase g_execution_phase = DS4_GPU_PHASE_AUTO;
+
+ds4_gpu_execution_phase ds4_gpu_get_execution_phase(void) {
+    return g_execution_phase;
+}
+
+ds4_gpu_execution_phase ds4_gpu_exchange_execution_phase(ds4_gpu_execution_phase phase) {
+    const ds4_gpu_execution_phase previous = g_execution_phase;
+    g_execution_phase = phase;
+    return previous;
+}
+
 /*
  * Objective-C Metal glue for the C engine.
  *
@@ -20020,7 +20035,8 @@ static bool ds4_gpu_tensor_prefixes_overlap(
 
 static bool ds4_gpu_q4_qb_activation_reuse_eligible(
         uint32_t weight_type, uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
-    return weight_type == DS4_METAL_TENSOR_Q4_K &&
+    return ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) &&
+           weight_type == DS4_METAL_TENSOR_Q4_K &&
            in_dim == 1024u && out_dim == 32768u &&
            n_tok >= 128u && n_tok <= DS4_METAL_Q4_QB_RHS_MAX_TOKENS &&
            !g_ssd_streaming_mode && !g_quality_mode &&
@@ -20623,7 +20639,8 @@ static int ds4_gpu_try_q4_K_prefill_pair_f16_rhs(
     const bool exact_tokens =
         n_tok >= 32u && n_tok <= DS4_METAL_Q4_PAIR_M32_MAX_TOKENS &&
         (n_tok % 32u) == 0u;
-    if (!out0 || !out1 || !model_map || !x || !measured_shape || !exact_tokens ||
+    if (!ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) ||
+        !out0 || !out1 || !model_map || !x || !measured_shape || !exact_tokens ||
         !ds4_gpu_device_is_pre_m5_apple_silicon() ||
         g_batch_encoder_concurrent ||
         g_q4_scratch_slot < 0 || g_q4_scratch_slot >= DS4_Q4_SCRATCH_SLOTS ||
@@ -34310,7 +34327,8 @@ static bool ds4_gpu_iq2_activation_reuse_eligible(
         bool pair_swiglu, uint32_t gate_type, uint32_t down_type,
         uint32_t in_dim, uint32_t mid_dim, uint32_t experts,
         uint32_t top_k, uint32_t n_tok) {
-    return pair_swiglu && gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+    return ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) &&
+           pair_swiglu && gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
            down_type == DS4_METAL_TENSOR_Q2_K &&
            in_dim == 4096u && mid_dim == 2048u && experts == 256u && top_k == 6u &&
            n_tok >= 512u && n_tok <= 2048u &&
@@ -47695,6 +47713,7 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return -1;
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
@@ -47709,7 +47728,7 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
              MTLSizeMake(32, use_cluster2 ? 16 : 8, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "fused HC norm/mix")) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "fused HC norm/mix")) return -1;
     }
 
     return 1;

@@ -24,6 +24,7 @@
 #include <mutex>
 #include "cuda/ds4_q4_prefill_reduce.h"
 #include "cuda/ds4_q4_dequant_layout.h"
+#include "cuda/ds4_hc_norm_mix.cuh"
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -84,7 +85,21 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_gpu_mgpu.h"
+#include "ds4_gpu_phase.h"
 #include "ds4_iq2_tables_cuda.inc"
+
+static thread_local ds4_gpu_execution_phase g_execution_phase = DS4_GPU_PHASE_AUTO;
+
+extern "C" ds4_gpu_execution_phase ds4_gpu_get_execution_phase(void) {
+    return g_execution_phase;
+}
+
+extern "C" ds4_gpu_execution_phase ds4_gpu_exchange_execution_phase(
+        ds4_gpu_execution_phase phase) {
+    const ds4_gpu_execution_phase previous = g_execution_phase;
+    g_execution_phase = phase;
+    return previous;
+}
 
 typedef struct {
     ds4_gpu_attention_decode_row row[DS4_GPU_ATTENTION_DECODE_BATCH_MAX];
@@ -934,6 +949,8 @@ static_assert(sizeof(ds4_decode_graph_key) == 48u,
 
 struct cuda_decode_graph_entry {
     ds4_decode_graph_key key;
+    /* Phase participates in lookup without changing the public graph-key ABI. */
+    ds4_gpu_execution_phase phase;
     cudaGraphExec_t      exec;
     int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
     uint64_t             hits;
@@ -944,6 +961,7 @@ static cuda_decode_graph_entry
                    [CUDA_DECODE_GRAPH_VARIANTS];
 static cudaStream_t g_decode_graph_stream = NULL;
 static int g_decode_graph_capturing = 0;
+static ds4_gpu_execution_phase g_decode_graph_capture_phase = DS4_GPU_PHASE_AUTO;
 static uint64_t g_decode_graph_replays = 0;
 static uint64_t g_decode_graph_captures = 0;
 
@@ -1001,18 +1019,20 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
 }
 
 static cuda_decode_graph_entry *cuda_decode_graph_find(
-        const ds4_decode_graph_key *key) {
+        const ds4_decode_graph_key *key, ds4_gpu_execution_phase phase) {
     if (key->il >= CUDA_DECODE_GRAPH_LAYERS ||
         key->island >= CUDA_DECODE_GRAPH_ISLANDS) return NULL;
     cuda_decode_graph_entry *slot = NULL;
     for (uint32_t v = 0; v < CUDA_DECODE_GRAPH_VARIANTS; v++) {
         cuda_decode_graph_entry *e = &g_decode_graphs[key->il][key->island][v];
         if (e->state != 0 &&
+            e->phase == phase &&
             memcmp(&e->key, key, sizeof(*key)) == 0) return e;
         if (e->state == 0 && !slot) slot = e;
     }
     if (slot) {
         memcpy(&slot->key, key, sizeof(*key));
+        slot->phase = phase;
         slot->state = 0;   /* caller advances the state machine */
         return slot;
     }
@@ -1022,7 +1042,8 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
-    cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
+    const ds4_gpu_execution_phase phase = ds4_gpu_get_execution_phase();
+    cuda_decode_graph_entry *e = cuda_decode_graph_find(key, phase);
     if (!e || e->state == 3) return -1;
     if (e->state == 0) {
         /* Warm pass: run eagerly once so lazy allocators (tmp scratch,
@@ -1063,6 +1084,7 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
         return -1;
     }
     g_decode_graph_capturing = 1;
+    g_decode_graph_capture_phase = phase;
     return 0;
 }
 
@@ -1072,7 +1094,16 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
     cudaGraph_t graph = NULL;
     cudaError_t err = cudaStreamEndCapture(g_decode_graph_stream, &graph);
     (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
-    cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
+    cuda_decode_graph_entry *e = cuda_decode_graph_find(key, g_decode_graph_capture_phase);
+    /* A graph must retain the dispatch phase under which its nodes were
+     * selected. Discard an interrupted scope instead of caching mismatched
+     * preparation kernels; the caller can encode the island eagerly. */
+    if (ds4_gpu_get_execution_phase() != g_decode_graph_capture_phase) {
+        if (graph) (void)cudaGraphDestroy(graph);
+        if (e) cuda_decode_graph_entry_kill(e);
+        (void)cudaGetLastError();
+        return -1;
+    }
     if (err != cudaSuccess || graph == NULL) {
         fprintf(stderr, "ds4: decode graph capture failed (il=%u island=%u): %s\n",
                 key->il, key->island, cudaGetErrorString(err));
@@ -1257,7 +1288,7 @@ extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
     (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
     (void)cudaGetLastError();
     if (key) {
-        cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
+        cuda_decode_graph_entry *e = cuda_decode_graph_find(key, g_decode_graph_capture_phase);
         if (e) cuda_decode_graph_entry_kill(e);
     }
 }
@@ -16589,6 +16620,77 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_available(void) {
+    // Keep the existing one-token cuBLAS policy and single-device scratch
+    // ownership. Other matvec modes have different rounding/reduction trees.
+    if (!g_cublas_ready || g_quality_mode || g_n_gpus != 1 ||
+        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+        getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") != NULL ||
+        (getenv("DS4_CUDA_F16_SMALL_OUT") != NULL &&
+         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL &&
+         getenv("DS4_CUDA_NO_F16_SMALL_OUT") == NULL)) return 0;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device != g_gpu[0].device_id) return 0;
+    static thread_local int cached_device = -1;
+    static thread_local int supported = 0;
+    if (cached_device != device) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return 0;
+        supported = prop.major >= 7 && prop.maxThreadsPerBlock >= 256;
+        cached_device = device;
+    }
+    return supported;
+}
+
+extern "C" int ds4_gpu_hc_rms_norm_mix_f16_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t out_dim, float eps) {
+    using namespace ds4_hc_norm_mix;
+    if (!out || !x ||
+        !eligible(n, out_dim, ds4_gpu_get_execution_phase(), g_quality_mode,
+                  (uintptr_t)out->ptr, out->bytes, (uintptr_t)x->ptr, x->bytes,
+                  (uintptr_t)model_map, model_size, weight_offset) ||
+        !(eps > 0.0f && eps <= FLT_MAX) ||
+        ds4_tensor_device_idx(out) != 0 || ds4_tensor_device_idx(x) != 0 ||
+        !ds4_gpu_hc_rms_norm_mix_f16_available()) return 0;
+
+    // Captured graphs retain this pointer. Scratch growth invalidates them;
+    // never allocate or grow the common scratch while recording a graph.
+    if (g_decode_graph_capturing && (!g_cuda_tmp || g_cuda_tmp_bytes < half_bytes)) return 0;
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, 0, "HC norm/mix f16");
+    if (!range_valid((uintptr_t)wptr, weight_bytes) ||
+        ((uintptr_t)wptr & 1u) != 0u ||
+        overlaps((uintptr_t)out->ptr, out_bytes, (uintptr_t)wptr, weight_bytes)) return 0;
+    // Check the existing slab before an allocation could grow and free it.
+    if (g_cuda_tmp &&
+        (overlaps((uintptr_t)g_cuda_tmp, g_cuda_tmp_bytes, (uintptr_t)out->ptr, out_bytes) ||
+         overlaps((uintptr_t)g_cuda_tmp, g_cuda_tmp_bytes, (uintptr_t)x->ptr, x_bytes) ||
+         overlaps((uintptr_t)g_cuda_tmp, g_cuda_tmp_bytes, (uintptr_t)wptr, weight_bytes))) return 0;
+    __half *xh = (__half *)cuda_tmp_alloc_on(0, half_bytes, "HC norm/mix activations");
+    if (!range_valid((uintptr_t)xh, half_bytes) ||
+        overlaps((uintptr_t)xh, half_bytes, (uintptr_t)out->ptr, out_bytes) ||
+        overlaps((uintptr_t)xh, half_bytes, (uintptr_t)x->ptr, x_bytes) ||
+        overlaps((uintptr_t)xh, half_bytes, (uintptr_t)wptr, weight_bytes)) return 0;
+
+    // Baseline: RMS F32 -> conversion F16 -> cuBLAS. Reuse the established
+    // fused RMS/conversion kernel and exactly the same BLAS arguments/handle.
+    // This removes one launch and the 64 KiB normalized F32 materialization.
+    rms_norm_plain_f16_batch8_kernel<<<1u, 256u, 0, cuda_decode_stream()>>>(
+            xh, (const float *)x->ptr, n, 1u, eps);
+    if (!cuda_ok(cudaGetLastError(), "HC norm/mix activation launch")) return -1;
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+            cuda_cublas_for_tier(0), CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)out_dim, 1, (int)n, &alpha,
+            (const __half *)wptr, CUDA_R_16F, (int)n,
+            xh, CUDA_R_16F, (int)n, &beta,
+            out->ptr, CUDA_R_32F, (int)out_dim,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "HC norm/mix matmul") ? 1 : -1;
+}
+
 extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         ds4_gpu_tensor *out,
         const void *model_map,
@@ -16627,7 +16729,7 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
             xh, (const float *)x->ptr, (uint32_t)in_dim,
             (uint32_t)n_tok, norm_eps);
     if (!cuda_ok(cudaGetLastError(), "f16 rms-fold activation launch")) {
-        return 0;
+        return -1;
     }
 
     const float alpha = 1.0f;
@@ -16642,7 +16744,7 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         &beta,
         out->ptr, CUDA_R_32F, (int)out_dim,
         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-    return cublas_ok(st, "f16 rms-fold matmul");
+    return cublas_ok(st, "f16 rms-fold matmul") ? 1 : -1;
 }
 
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
@@ -24914,7 +25016,10 @@ static int routed_moe_launch(
                 rc = 1;
                 const uint64_t assignments =
                     (uint64_t)n_tokens * n_expert;
-                if (assignments >= 1024u) {
+                /* Batch size alone does not identify a prefill. Other phases
+                 * retain the general fused-SoA GEMM below. */
+                if (assignments >= 1024u &&
+                    ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase())) {
                     size_t input_q8_bytes = 0;
                     size_t down_q8_bytes = 0;
                     size_t work_bytes = 0;
@@ -34516,7 +34621,8 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float attn_factor, float beta_fast, float beta_slow, float eps) {
     (void)q_half;
     /* Resident Q4 long prefill keeps one expanded matrix and an F32 output. */
-    if (weight_type != CUDA_Q4_ATTN_Q_B_TYPE || n_tok < 32u ||
+    if (!ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) ||
+        weight_type != CUDA_Q4_ATTN_Q_B_TYPE || n_tok < 32u ||
         cuda_q4_attn_q_b_transient_f16_disabled() ||
         n_tok < cuda_q4_attn_q_b_transient_f16_min_tokens()) return 0;
     if (g_ssd_streaming_mode || g_quality_mode || g_n_gpus != 1 ||

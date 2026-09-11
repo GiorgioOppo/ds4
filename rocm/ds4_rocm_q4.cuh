@@ -1821,6 +1821,7 @@ static int rocm_q4_K_prefill_wmma_k128_half_try(
         uint64_t row_bytes, uint64_t x_token_stride,
         uint64_t x_group_stride, uint64_t out_token_stride) {
     namespace activation = ds4_rocm_q4_activation;
+    if (!ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase())) return 0;
     if (!activation::scope(n_tok, n_groups, in_dim, out_dim, row_bytes,
             x_token_stride, x_group_stride, out_token_stride, out, w, x,
             true, !g_ssd_streaming_mode, g_quality_mode,

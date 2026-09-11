@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "ds4_gpu_phase.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -1028,9 +1029,10 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* CUDA batch path: fold an input RMS normalization into the FP16 activation
- * conversion used by the following projection. Returns 0 without touching
- * out when the optimized path is unavailable. */
+/* CUDA/ROCm batch path: fold input RMS normalization into the FP16
+ * conversion used by the same projection. Returns 1 on success, 0 when
+ * declined before submission, and -1 on failure after submission may have
+ * begun. Only a zero result permits the caller to run its fallback. */
 int ds4_gpu_matmul_f16_rms_fold_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -3017,6 +3019,13 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   eps,
         float                   norm_eps);
 
+/* Single-row HC RMSNorm + F16 projection. Backends keep their established
+ * projection precision and reduction order; this need not be one kernel.
+ * Availability admits automatic graph dispatch; a benchmark may explicitly
+ * call a supported candidate whose automatic dispatch is disabled.
+ * The tensor operation returns
+ * 1 on success, 0 when declined before submission (caller may fall back),
+ * and -1 on failure after work may have been submitted (do not replay). */
 int ds4_gpu_hc_rms_norm_mix_f16_available(void);
 int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         ds4_gpu_tensor       *out,

@@ -202,6 +202,65 @@ static void qba_policy(qba_fixture *f) {
     qba_case(f,2049u,false,false,"large batch fallback");
 }
 
+static void qba_execution_phases(qba_fixture *f) {
+    const ds4_gpu_execution_phase phases[] = {
+        DS4_GPU_PHASE_AUTO, DS4_GPU_PHASE_PREFILL, DS4_GPU_PHASE_DECODE,
+        DS4_GPU_PHASE_VERIFY, DS4_GPU_PHASE_BATCH_DECODE, DS4_GPU_PHASE_MIXED,
+    };
+    qba_require(ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_AUTO,
+                "phase cases must start in legacy AUTO");
+    for (unsigned i = 0; i < sizeof(phases)/sizeof(phases[0]); ++i) {
+        DS4_GPU_PHASE_SCOPE(scope, phases[i]);
+        const bool prefill = phases[i] == DS4_GPU_PHASE_AUTO || phases[i] == DS4_GPU_PHASE_PREFILL;
+        // The token count and weights are identical in every phase. Selection
+        // must follow the explicit phase rather than inferring prefill from N.
+        qba_case(f,128u,(i&1u)!=0u,prefill,"same-N explicit phase");
+        qba_require(ds4_gpu_iq2_activation_reuse_eligible(true,
+                        DS4_METAL_TENSOR_IQ2_XXS, DS4_METAL_TENSOR_Q2_K,
+                        4096u,2048u,256u,6u,512u) == prefill,
+                    "IQ2 same-shape phase policy");
+        ++f->cases;
+        qba_require(ds4_gpu_get_execution_phase() == phases[i],
+                    "dispatch must preserve its caller phase");
+    }
+    qba_require(ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_AUTO,
+                "phase loop must restore AUTO");
+
+    // Encode every phase in one command buffer and restore the CPU phase
+    // before submission. This exercises dispatch selection at encoding time,
+    // including adjacent half-RHS and ordinary F32-RHS matmuls.
+    enum { TOKENS = 129, ARMS = 6 };
+    qba_tensor x = qba_alloc((NSUInteger)TOKENS*QBA_K*4u);
+    qba_tensor expected = qba_alloc((NSUInteger)TOKENS*QBA_M*4u);
+    qba_tensor actual[ARMS];
+    qba_fill(&x,831u);
+    const uint64_t xhash = qba_hash(ds4_gpu_tensor_contents(x.base), x.bytes + 2u*QBA_GUARD);
+    qba_require(qba_reference(f,&expected,&x,TOKENS),"phase batch reference");
+    for (unsigned i = 0; i < ARMS; ++i) actual[i] = qba_alloc(expected.bytes);
+    const uint64_t before = g_q4_qb_rhs_f16_launches;
+    qba_require(ds4_gpu_begin_commands(),"begin interleaved phase batch");
+    for (unsigned i = 0; i < ARMS; ++i) {
+        DS4_GPU_PHASE_SCOPE(scope, phases[i]);
+        qba_require(qba_automatic(f,&actual[i],&x,TOKENS),"phase batch dispatch");
+        const uint64_t allowed = i < 2u ? i+1u : 2u;
+        qba_require(g_q4_qb_rhs_f16_launches == before+allowed,
+                    "phase batch selected wrong pipeline");
+    }
+    qba_require(ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_AUTO,
+                "phase must restore before deferred GPU execution");
+    qba_require(ds4_gpu_end_commands(),"finish interleaved phase batch");
+    for (unsigned i = 0; i < ARMS; ++i) {
+        qba_equal(ds4_gpu_tensor_buffer(actual[i].base),
+                    ds4_gpu_tensor_buffer(expected.base), actual[i].bytes,
+                    "interleaved phase batch");
+        qba_free(&actual[i]);
+        ++f->cases;
+    }
+    qba_require(xhash == qba_hash(ds4_gpu_tensor_contents(x.base), x.bytes + 2u*QBA_GUARD),
+                "phase batch modified input");
+    qba_free(&expected); qba_free(&x);
+}
+
 static void qba_rejections(qba_fixture *f) {
     qba_tensor x = qba_alloc(128u*QBA_K*4u);
     qba_tensor out = qba_alloc(128u*QBA_M*4u);
@@ -329,6 +388,7 @@ int main(void) {
         for (unsigned i = 0; i < sizeof(tokens)/sizeof(tokens[0]); ++i)
             qba_case(&f,tokens[i],(i&1u)!=0u,true,"automatic Q-B");
         qba_policy(&f);
+        qba_execution_phases(&f);
         qba_rejections(&f);
         qba_batch(&f,false);
         qba_require(f.weight_hash == qba_hash(f.model,f.model_bytes),
@@ -339,7 +399,8 @@ int main(void) {
         free(f.model);
         printf("PASS: %u Metal Q4 activation runtime cases; automatic selection, "
                "bitwise outputs, guards, fixed 4 MiB scratch, fallbacks, alias "
-               "rejection, batch reuse and cleanup drain; unretained=%s\n",
+               "rejection, all six execution phases, mixed-phase batch, "
+               "batch reuse and cleanup drain; unretained=%s\n",
                f.cases,getenv("DS4_METAL_UNRETAINED_COMMAND_BUFFERS") ? "on" : "off");
     }
     return 0;

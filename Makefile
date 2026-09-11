@@ -78,6 +78,18 @@ endif
 	rocm
 
 .PHONY: test-cpu-q4 test-quantizer-indexer-q4
+
+# Shared dispatch policy is included directly by CUDA and transitively by
+# the C/Metal/ROCm GPU API. Keep incremental builds coherent across backends.
+ds4.o ds4_cpu.o ds4_metal.o ds4_cuda.o ds4_rocm.o ds4_rocm_compat.o: ds4_gpu_phase.h
+ds4_cuda.o ds4_rocm.o: cuda/ds4_hc_norm_mix.cuh
+.PHONY: test-gpu-execution-phase
+tests/test_gpu_execution_phase: tests/test_gpu_execution_phase.c ds4_gpu_phase.h $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< $(CPU_CORE_OBJS) $(LDLIBS)
+
+test-gpu-execution-phase: tests/test_gpu_execution_phase
+	./tests/test_gpu_execution_phase
+
 tests/test_cpu_q4_dense: tests/test_cpu_q4_dense.c ds4.c ds4.h $(Q4_CPU_TEST_DEPS)
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -o $@ tests/test_cpu_q4_dense.c $(Q4_CPU_TEST_DEPS) $(LDLIBS)
 
@@ -799,6 +811,68 @@ clean:
 test-q4-preflight-host: tests/test_q4_preflight.py tests/kernel_source.py ds4.c ds4_gpu.h
 	python3 tests/test_q4_preflight.py
 
+GPU_HC_NORM_MIX_DEPS := tests/test_gpu_hc_norm_mix.py tests/test_gpu_hc_norm_mix.cpp tests/kernel_source.py \
+	cuda/ds4_hc_norm_mix.cuh ds4_gpu_phase.h ds4_cuda.cu \
+	rocm/ds4_rocm_norm_rope.cuh rocm/ds4_rocm_common.cuh rocm/ds4_rocm_current_api_compat.cuh
+.PHONY: test-gpu-hc-norm-mix-host
+test-gpu-hc-norm-mix-host: $(GPU_HC_NORM_MIX_DEPS) tests/test_gpu_hc_norm_mix_graph.py ds4.c
+	python3 tests/test_gpu_hc_norm_mix.py
+	python3 tests/test_gpu_hc_norm_mix_graph.py
+
+tests/test_gpu_hc_norm_mix_native.o: tests/test_gpu_hc_norm_mix_native.cpp ds4_gpu.h ds4_gpu_phase.h
+	$(CXX) $(filter-out -std=c99 -ffast-math,$(CFLAGS)) -std=c++17 -I. -c -o $@ $<
+
+tests/test_gpu_hc_norm_mix_native: tests/test_gpu_hc_norm_mix_native.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CXX) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
+.PHONY: test-gpu-hc-norm-mix bench-gpu-hc-norm-mix test-rocm-hc-norm-mix bench-rocm-hc-norm-mix
+test-gpu-hc-norm-mix: tests/test_gpu_hc_norm_mix_native
+	./tests/test_gpu_hc_norm_mix_native
+
+bench-gpu-hc-norm-mix: tests/test_gpu_hc_norm_mix_native
+	./tests/test_gpu_hc_norm_mix_native --bench
+
+test-rocm-hc-norm-mix bench-rocm-hc-norm-mix:
+	$(MAKE) -B tests/test_gpu_hc_norm_mix_native \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
+		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
+		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+	./tests/test_gpu_hc_norm_mix_native $(if $(filter bench-rocm-hc-norm-mix,$@),--bench,)
+
+ROCM_HC_PREFILL_DEPS := tests/test_rocm_hc_prefill.py tests/test_rocm_hc_prefill.cpp tests/kernel_source.py \
+	rocm/ds4_rocm_rms_f16.cuh rocm/ds4_rocm_norm_rope.cuh rocm/ds4_rocm_common.cuh \
+	rocm/ds4_rocm_current_api_compat.cuh rocm/ds4_rocm_matmul.cuh rocm/ds4_rocm_hipblaslt.cuh \
+	cuda/ds4_hc_norm_mix.cuh ds4_gpu_phase.h ds4.c
+ds4_rocm.o: rocm/ds4_rocm_rms_f16.cuh
+.PHONY: test-rocm-hc-prefill-host test-rocm-hc-prefill-operands bench-rocm-hc-prefill-operands
+test-rocm-hc-prefill-host: $(ROCM_HC_PREFILL_DEPS)
+	python3 tests/test_rocm_hc_prefill.py
+
+test-rocm-hc-prefill-operands: $(ROCM_HC_PREFILL_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_hc_prefill.py --rocm
+
+bench-rocm-hc-prefill-operands: $(ROCM_HC_PREFILL_DEPS)
+	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_hc_prefill.py --rocm --bench
+
+tests/test_rocm_hc_prefill_native.o: tests/test_rocm_hc_prefill_native.cpp ds4_gpu.h ds4_gpu_phase.h
+	$(CXX) $(filter-out -std=c99 -ffast-math,$(CFLAGS)) -std=c++17 -I. -c -o $@ $<
+
+tests/test_rocm_hc_prefill_native: tests/test_rocm_hc_prefill_native.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-rocm-hc-prefill bench-rocm-hc-prefill
+test-rocm-hc-prefill bench-rocm-hc-prefill:
+	$(MAKE) -B tests/test_rocm_hc_prefill_native \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
+		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+	./tests/test_rocm_hc_prefill_native $(if $(filter bench-rocm-hc-prefill,$@),--bench,)
+
 GPU_IQ2_SIGN_DEPS := tests/test_gpu_iq2_signs.py tests/test_gpu_iq2_signs.cpp \
 	tests/kernel_source.py ds4_iq2_tables_cuda.inc ds4_cuda.cu ds4_rocm.cu \
 	ds4_rocm.h rocm/ds4_rocm_moe.cuh
@@ -838,6 +912,7 @@ bench-rocm-mmq-quant-reuse: $(ROCM_MMQ_QUANT_REUSE_DEPS)
 	HIPCC="$(HIPCC)" ROCM_CFLAGS="$(ROCM_CFLAGS)" python3 tests/test_rocm_mmq_quant_reuse.py --rocm --bench
 
 ROCM_Q4_ACTIVATION_DEPS := tests/test_rocm_q4_activation.py tests/test_rocm_q4_activation.cpp \
+	ds4_gpu_phase.h ds4_cuda.cu ds4_rocm.cu \
 	tests/kernel_source.py rocm/ds4_rocm_common.cuh rocm/ds4_rocm_q4.cuh rocm/ds4_rocm_q4_activation.cuh \
 	rocm/ds4_rocm_q4_wmma_load.cuh rocm/ds4_rocm_q4_lds.cuh rocm/ds4_rocm_q4_scales.cuh
 .PHONY: test-rocm-q4-activation-host test-rocm-q4-activation bench-rocm-q4-activation
@@ -1271,6 +1346,13 @@ test-metal-q4-qb-token-pair: tests/test_metal_q4_qb_token_pair
 	./tests/test_metal_q4_qb_token_pair
 
 .PHONY: test-metal-q4-activation test-metal-q4-activation-runtime bench-metal-q4-activation
+.PHONY: test-metal-execution-phase
+tests/test_metal_execution_phase: tests/test_metal_execution_phase.m tests/test_gpu_execution_phase.c ds4_metal.m ds4_gpu.h ds4_gpu_phase.h $(METAL_SRCS)
+	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
+
+test-metal-execution-phase: tests/test_metal_execution_phase
+	./tests/test_metal_execution_phase
+
 tests/test_metal_q4_activation: tests/test_metal_q4_activation.m $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
 
@@ -1280,7 +1362,7 @@ test-metal-q4-activation: tests/test_metal_q4_activation
 bench-metal-q4-activation: tests/test_metal_q4_activation
 	./tests/test_metal_q4_activation --bench
 
-tests/test_metal_q4_activation_runtime: tests/test_metal_q4_activation_runtime.m ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+tests/test_metal_q4_activation_runtime: tests/test_metal_q4_activation_runtime.m ds4_metal.m ds4_gpu.h ds4_gpu_phase.h $(METAL_SRCS)
 	$(CC) -O2 -fobjc-arc -fblocks -DDS4_USE_METAL -o $@ $< $(METAL_LDLIBS) -framework Accelerate
 
 test-metal-q4-activation-runtime: tests/test_metal_q4_activation_runtime
@@ -1419,6 +1501,9 @@ Q4_BUILD_PRODUCTS := tests/test_cpu_q4_dense tests/test_quantizer_indexer_q4 tes
 	tests/test_metal_indexer_q4 tests/test_metal_q4_attn_out_a_direct tests/test_metal_q4_qb_f16_cache \
 	tests/test_metal_q4_qb_token_pair tests/test_metal_q4_hc tests/test_metal_decode_defaults tests/test_metal_f16_compressor \
 	tests/test_metal_q4_activation tests/test_metal_q4_activation_runtime \
+	tests/test_gpu_execution_phase tests/test_metal_execution_phase \
+	tests/test_gpu_hc_norm_mix_native \
+	tests/test_rocm_hc_prefill_native \
 	speed-bench/metal_q4_dense_pair_bench \
 	speed-bench/metal_q4_prefill_pair_bench speed-bench/metal_q4_mm_tail_cull_bench speed-bench/metal_q4_attn_out_a_direct_bench \
 	cuda/mmq/test/test_mmq_parity tests/test_cuda_q4_epilogue speed-bench/rocm_q4_prefill_bench \

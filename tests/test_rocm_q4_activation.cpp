@@ -7,6 +7,7 @@
 #include <cstring>
 #include <type_traits>
 #include <vector>
+#include "ds4_gpu_phase.h"
 
 #ifdef TEST_NATIVE
 #include <hip/hip_runtime.h>
@@ -133,6 +134,7 @@ static size_t test_conversion_and_staging(){
 }
 
 static void reset(){
+    (void)ds4_gpu_exchange_execution_phase(DS4_GPU_PHASE_AUTO);
     allocated=freed=conversion_calls=half_calls=float_calls=k64_calls=k32_calls=0;
     requested=0;pending_error=fail_convert=fail_half=fail_allocate=0;
     g_ssd_streaming_mode=g_quality_mode=false;gfx1151=true;k64_control=k128_disable=-1;
@@ -155,6 +157,17 @@ static size_t test_dispatch(){
         const bool reused=n>=256&&n<=2048;
         check(allocated==reused&&conversion_calls==reused&&half_calls==reused&&float_calls==!reused,"bounded production selection");
         if(reused)check(requested==uint64_t(n)*1024*2&&requested<=activation::max_bytes,"at most four MiB");
+        ++cases;
+    }
+    for(auto phase:{DS4_GPU_PHASE_AUTO,DS4_GPU_PHASE_PREFILL,DS4_GPU_PHASE_DECODE,
+                    DS4_GPU_PHASE_VERIFY,DS4_GPU_PHASE_BATCH_DECODE,DS4_GPU_PHASE_MIXED}){
+        reset();
+        check(ds4_gpu_exchange_execution_phase(phase)==DS4_GPU_PHASE_AUTO,"phase setup");
+        check(launch()==1,"phase must retain a valid WMMA fallback");
+        const bool reused=phase==DS4_GPU_PHASE_AUTO||phase==DS4_GPU_PHASE_PREFILL;
+        check(allocated==reused&&conversion_calls==reused&&half_calls==reused&&float_calls==!reused,
+              "only AUTO/PREFILL prepare half RHS; other phases retain F32 K128");
+        check(ds4_gpu_get_execution_phase()==phase,"dispatch must not change caller phase");
         ++cases;
     }
     for(uint32_t which=0;which<12;++which){

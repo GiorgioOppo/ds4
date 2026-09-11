@@ -43,6 +43,18 @@
 #include "ds4_image.h"
 
 static thread_local bool g_dspark_verify_mode;
+static thread_local ds4_gpu_execution_phase g_execution_phase = DS4_GPU_PHASE_AUTO;
+
+extern "C" ds4_gpu_execution_phase ds4_gpu_get_execution_phase(void) {
+    return g_execution_phase;
+}
+
+extern "C" ds4_gpu_execution_phase ds4_gpu_exchange_execution_phase(
+        ds4_gpu_execution_phase phase) {
+    const ds4_gpu_execution_phase previous = g_execution_phase;
+    g_execution_phase = phase;
+    return previous;
+}
 
 extern "C" void ds4_gpu_set_dspark_verify_mode(bool enabled) {
     g_dspark_verify_mode = enabled;

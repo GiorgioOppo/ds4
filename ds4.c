@@ -45,6 +45,7 @@
 #include "ds4_distributed.h"
 #include "ds4_image.h"
 #include "ds4_tp.h"
+#include "ds4_gpu_phase.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
 #endif
@@ -116,6 +117,16 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#else
+static _Thread_local ds4_gpu_execution_phase g_cpu_execution_phase = DS4_GPU_PHASE_AUTO;
+ds4_gpu_execution_phase ds4_gpu_get_execution_phase(void) {
+    return g_cpu_execution_phase;
+}
+ds4_gpu_execution_phase ds4_gpu_exchange_execution_phase(ds4_gpu_execution_phase phase) {
+    const ds4_gpu_execution_phase previous = g_cpu_execution_phase;
+    g_cpu_execution_phase = phase;
+    return previous;
+}
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -19420,6 +19431,7 @@ enum { DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS = 1024 };
 enum { DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MAX_SEED_TOKENS = 8 };
 
 typedef struct rocm_graph_stream_layer_expert_load {
+    ds4_gpu_execution_phase   phase;
     pthread_t                 thread;
     bool                      active;
     bool                      ok;
@@ -19485,6 +19497,7 @@ static bool rocm_graph_stream_layer_expert_load_sync(
 static void *rocm_graph_stream_layer_expert_load_thread_main(void *arg) {
     rocm_graph_stream_layer_expert_load *job = arg;
     if (!job) return NULL;
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, job->phase);
     job->ok = rocm_graph_stream_layer_expert_load_sync(job->model,
                                                        job->layer,
                                                        job->il,
@@ -19516,6 +19529,7 @@ static bool rocm_graph_stream_layer_expert_load_start(
         uint64_t                             down_expert_bytes) {
     if (!job || job->active || !model || !layer) return false;
     memset(job, 0, sizeof(*job));
+    job->phase = ds4_gpu_get_execution_phase();
     job->model = model;
     job->layer = layer;
     job->il = il;
@@ -21157,6 +21171,16 @@ static bool metal_graph_use_reference_hc_decode(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_HC_FUSION", &cache);
 }
 
+static bool metal_graph_hc_norm_mix_decode_available(void) {
+    if (metal_graph_use_reference_hc_decode()) return false;
+#if defined(__APPLE__)
+    if (getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") != NULL ||
+        !(ds4_gpu_device_is_pre_m5_apple_silicon() ||
+          ds4_gpu_device_is_m5_apple_silicon())) return false;
+#endif
+    return ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
+}
+
 static bool metal_graph_use_reference_kv_decode(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_KV_FUSION", &cache);
@@ -21592,6 +21616,30 @@ static bool metal_graph_matmul_plain_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* An unavailable fast path may fall back only before it submits work.
+ * A negative result must stop the graph, including after a partial launch. */
+static bool metal_graph_hc_norm_mix_or_reference(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *normalized,
+        const ds4_gpu_tensor *x,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        bool                  try_fused) {
+    if (try_fused) {
+        const int fused = ds4_gpu_hc_rms_norm_mix_f16_tensor(
+                out, x, model->map, model->size, weight->abs_offset,
+                in_dim, out_dim, DS4_RMS_EPS);
+        if (fused != 0) return fused > 0;
+    }
+    if (!ds4_gpu_rms_norm_plain_tensor(normalized, x, in_dim, DS4_RMS_EPS)) {
+        return false;
+    }
+    return metal_graph_matmul_plain_tensor(
+            out, model, weight, in_dim, out_dim, normalized, 1);
+}
 static bool metal_graph_matmul_dense_quant_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -22702,6 +22750,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
 }
 
 typedef struct metal_graph_selected_async_load {
+    ds4_gpu_execution_phase   phase;
     bool                      active;
     bool                      ok;
     /* Selected ids remain usable for a synchronous retry if the service
@@ -22731,6 +22780,7 @@ static metal_graph_selected_async_load g_metal_graph_selected_async_load_job;
 
 static void metal_graph_selected_async_load_run(
         metal_graph_selected_async_load *job) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, job->phase);
     job->ok = false;
 
     if (!job->router_selected || !job->model || !job->layer ||
@@ -22856,6 +22906,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     if (!job || !router_selected || event_value == 0) return false;
     if (!metal_graph_selected_async_load_ensure_worker()) return false;
     memset(job, 0, sizeof(*job));
+    job->phase = ds4_gpu_get_execution_phase();
     job->router_selected = router_selected;
     job->model = model;
     job->layer = layer;
@@ -22918,6 +22969,7 @@ static bool metal_graph_selected_async_load_finish(
 
 #ifdef DS4_ROCM_BUILD
 typedef struct rocm_graph_batch_selected_async_load {
+    ds4_gpu_execution_phase   phase;
     bool                      active;
     bool                      ok;
     const ds4_gpu_tensor     *selected;
@@ -22946,6 +22998,7 @@ static rocm_graph_batch_selected_async_load
 
 static void rocm_graph_batch_selected_async_load_run(
         rocm_graph_batch_selected_async_load *job) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, job->phase);
     job->ok = false;
     if (!job->selected || !job->model || !job->layer || !job->selected_ids ||
         job->n_tokens <= 1 ||
@@ -23062,6 +23115,7 @@ static bool rocm_graph_batch_selected_async_load_start(
     const uint64_t n_ids = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
     if (n_ids > SIZE_MAX / sizeof(int32_t)) return false;
     memset(job, 0, sizeof(*job));
+    job->phase = ds4_gpu_get_execution_phase();
     job->selected_ids = xmalloc((size_t)n_ids * sizeof(job->selected_ids[0]));
     job->selected = selected;
     job->model = model;
@@ -23522,16 +23576,12 @@ static bool metal_graph_encode_decode_layer_phase(
         !resume_after_attn) {
     bool attn_hc_producer_pre_norm_fused = false;
     if (ok && !tp_ablate_hcpre) {
-        /* Fused norm+mix removes one decode dispatch per layer; the kernel
-         * reproduces both reduction trees bit-exactly (see dsv4_hc.metal). */
+        /* Backend-specific HC preparation preserves the existing projection
+         * arithmetic while avoiding a dispatch or normalized-row traffic. */
         const bool fuse_norm_mix =
             hc_dim == 16384u && mix_hc == 24u &&
             layer->hc_attn_fn->type == DS4_TENSOR_F16 &&
-            !metal_graph_use_reference_hc_decode() &&
-            getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
-            (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-             ds4_gpu_device_is_m5_apple_silicon()) &&
-            ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
+            metal_graph_hc_norm_mix_decode_available();
 #if defined(__APPLE__)
         const bool fuse_producer_pre_norm =
             fuse_norm_mix && fuse_hc_norm &&
@@ -23602,23 +23652,10 @@ static bool metal_graph_encode_decode_layer_phase(
         }
 #endif
         if (ok && !attn_hc_producer_pre_norm_fused) {
-            if (fuse_norm_mix) {
-                ok = ds4_gpu_hc_rms_norm_mix_f16_tensor(
-                        metal_graph_hc_mix(g), metal_graph_cur_hc(g),
-                        model->map, model->size,
-                        layer->hc_attn_fn->abs_offset,
-                        (uint32_t)hc_dim, (uint32_t)mix_hc,
-                        DS4_RMS_EPS) != 0;
-            } else {
-                ok = ds4_gpu_rms_norm_plain_tensor(
-                        metal_graph_flat_hc(g), metal_graph_cur_hc(g),
-                        (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-                if (ok) {
-                    ok = metal_graph_matmul_plain_tensor(
-                            metal_graph_hc_mix(g), model, layer->hc_attn_fn,
-                            hc_dim, mix_hc, metal_graph_flat_hc(g), 1);
-                }
-            }
+            ok = metal_graph_hc_norm_mix_or_reference(
+                    metal_graph_hc_mix(g), metal_graph_flat_hc(g),
+                    metal_graph_cur_hc(g), model, layer->hc_attn_fn,
+                    (uint32_t)hc_dim, (uint32_t)mix_hc, fuse_norm_mix);
         }
     }
     if (ok && fuse_hc_norm) {
@@ -25227,11 +25264,7 @@ static bool metal_graph_encode_decode_layer_phase(
         const bool fuse_norm_mix =
             hc_dim == 16384u && mix_hc == 24u &&
             layer->hc_ffn_fn->type == DS4_TENSOR_F16 &&
-            !metal_graph_use_reference_hc_decode() &&
-            getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
-            (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-             ds4_gpu_device_is_m5_apple_silicon()) &&
-            ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
+            metal_graph_hc_norm_mix_decode_available();
 #if defined(__APPLE__)
         const bool fuse_producer_pre_norm =
             fuse_norm_mix && fuse_hc_norm &&
@@ -25302,23 +25335,10 @@ static bool metal_graph_encode_decode_layer_phase(
         }
 #endif
         if (ok && !ffn_hc_producer_pre_norm_fused) {
-            if (fuse_norm_mix) {
-                ok = ds4_gpu_hc_rms_norm_mix_f16_tensor(
-                        metal_graph_hc_mix(g), metal_graph_after_attn_hc(g),
-                        model->map, model->size,
-                        layer->hc_ffn_fn->abs_offset,
-                        (uint32_t)hc_dim, (uint32_t)mix_hc,
-                        DS4_RMS_EPS) != 0;
-            } else {
-                ok = ds4_gpu_rms_norm_plain_tensor(
-                        metal_graph_flat_hc(g), metal_graph_after_attn_hc(g),
-                        (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-                if (ok) {
-                    ok = metal_graph_matmul_plain_tensor(
-                            metal_graph_hc_mix(g), model, layer->hc_ffn_fn,
-                            hc_dim, mix_hc, metal_graph_flat_hc(g), 1);
-                }
-            }
+            ok = metal_graph_hc_norm_mix_or_reference(
+                    metal_graph_hc_mix(g), metal_graph_flat_hc(g),
+                    metal_graph_after_attn_hc(g), model, layer->hc_ffn_fn,
+                    (uint32_t)hc_dim, (uint32_t)mix_hc, fuse_norm_mix);
         }
     }
     if (ok && fuse_hc_norm) {
@@ -29337,6 +29357,7 @@ static bool metal_graph_encode_token_raw_swa(
         uint32_t               pos,
         bool                   need_logits,
         bool                   allow_split_flush) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_DECODE));
     if (g->raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
@@ -29802,9 +29823,9 @@ static bool metal_graph_hc_rms_scale_project(
                n_tokens,
                DS4_RMS_EPS) != 0;
 #else
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-    if (weight->type == DS4_TENSOR_F16 &&
-        ds4_gpu_matmul_f16_rms_fold_tensor(
+#if !defined(DS4_NO_GPU)
+    if (weight->type == DS4_TENSOR_F16) {
+        const int folded = ds4_gpu_matmul_f16_rms_fold_tensor(
             out,
             model->map,
             model->size,
@@ -29813,8 +29834,9 @@ static bool metal_graph_hc_rms_scale_project(
             2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
             x,
             n_tokens,
-            DS4_RMS_EPS)) {
-        return true;
+            DS4_RMS_EPS);
+        // A failed producer/consumer must not be replayed through fallback.
+        if (folded != 0) return folded > 0;
     }
 #endif
     bool ok = ds4_gpu_rms_norm_plain_rows_tensor(
@@ -32669,6 +32691,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_DECODE));
     if (g->raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
@@ -32985,6 +33008,7 @@ static bool metal_graph_prefill_decode_streaming_range(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_PREFILL));
     if (!metal_graph_use_streaming_decode_prefill(g, weights, n_tokens)) return false;
     if (!prompt || start > (uint32_t)prompt->len ||
         n_tokens > (uint32_t)prompt->len - start) return false;
@@ -36536,6 +36560,7 @@ static bool metal_graph_prefill_pipeline_stage_major(
         bool                   show_progress,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_PREFILL));
     if (!g || !model || !weights || !prompt || !g->placement ||
         n_tokens == 0 || n_tokens > g->prefill_cap ||
         start > (uint32_t)prompt->len ||
@@ -36785,6 +36810,7 @@ static bool metal_graph_prefill_layer_major(
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_PREFILL));
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -37632,6 +37658,7 @@ static bool metal_graph_prefill_chunked_range(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_PREFILL));
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -38072,6 +38099,7 @@ static bool metal_graph_verify_suffix_tops(
         int                   *row_tops,
         float                 *row_logits,
         ds4_verify_suffix_timing *timing) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, DS4_GPU_PHASE_VERIFY);
     ds4_gpu_tp_keepalive_pause(1);
     const bool ok = metal_graph_verify_suffix_tops_impl(g, model, weights,
                                                         prompt, start,
@@ -38112,6 +38140,7 @@ static bool metal_graph_verify_decode2_exact(
         int                   *top1,
         float                 *logits0,
         float                 *logits1) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, DS4_GPU_PHASE_VERIFY);
     if (!g || !top0 || (!top1 && !logits1) || g->raw_cap == 0) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -48661,6 +48690,7 @@ static bool glm_graph_verify_rows(
         uint32_t           n,
         float             *output_hc,
         float             *logits_out) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, DS4_GPU_PHASE_VERIFY);
     if (!g || !model || !weights || !tokens || n == 0 || g->glm53 ||
         g->compact_cache_cap == 0 ||
         pos + n > g->compact_cache_cap ||
@@ -67100,6 +67130,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(
+            n_tokens == 1u && pos0 > 0u ? DS4_GPU_PHASE_DECODE : DS4_GPU_PHASE_PREFILL));
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -67785,6 +67817,7 @@ int ds4_session_prepare_sync(ds4_session *s,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_PREFILL));
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -67872,6 +67905,7 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_PREFILL));
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -67930,6 +67964,7 @@ int ds4_session_sync_multimodal(
 }
 
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_PREFILL));
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -69799,6 +69834,7 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_DECODE));
     if (!s) return 1;
     if (s->distributed) {
         if (!s->checkpoint_valid) {
@@ -69960,6 +69996,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  * the leader/worker lockstep survives every eval entry point. */
 static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_DECODE));
     if (!s || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "decode requires a synchronized checkpoint");
         return 1;
@@ -71415,6 +71452,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_BATCH_DECODE));
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
         return 1;
@@ -71494,6 +71532,7 @@ int ds4_sessions_eval_batch_with_prefill(
         const ds4_tokens *prefill_prompt,
         char *err,
         size_t errlen) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, DS4_GPU_PHASE_MIXED);
     if (!items || count <= 0 || !prefill_session || !prefill_prompt ||
         !prefill_session->engine) {
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
@@ -74584,6 +74623,7 @@ static bool metal_graph_encode_session_pipeline_batch(
         int count,
         const ds4_model *model,
         const ds4_weights *weights) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, ds4_gpu_execution_phase_or(DS4_GPU_PHASE_BATCH_DECODE));
     if (!items || count <= 0 || !model || !weights) return false;
     ds4_gpu_graph *first = &items[0].session->graph;
     if (!first->placement) return false;
@@ -74972,6 +75012,7 @@ static bool metal_graph_eval_mixed_prefill_decode(
         int decode_count,
         const ds4_model *model,
         const ds4_weights *weights) {
+    DS4_GPU_PHASE_SCOPE(execution_phase_scope, DS4_GPU_PHASE_MIXED);
     if (!metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prompt, start, prefill_rows,
                 decode_items, decode_count, weights)) {

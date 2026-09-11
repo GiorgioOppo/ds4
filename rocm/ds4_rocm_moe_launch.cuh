@@ -1200,13 +1200,18 @@ static int routed_moe_launch(
             }
         }
         const uint32_t iq2_gate_scalar_max = iq2_gate_hot_count != 0u ? iq2_gate_hot_threshold : 0u;
+        /* Phase gates materialized activation reuse, not the hot WMMA itself:
+         * other batches retain its existing F32-input/F32-mid variants. */
         const int use_iq2_hot_f16_mid =
+            ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) &&
             ((use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
               iq2_gate_hot_threshold == iq2_down_hot_threshold) ||
              use_rocm_mmq_gateup) &&
             (out_dim & 1u) == 0u && !g_quality_mode;
         half *iq2_hot_mid_h = use_iq2_hot_f16_mid ? (half *)gate->ptr : NULL;
-        const int use_iq2_x_f16 = use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
+        const int use_iq2_x_f16 =
+            ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) &&
+            use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
             up->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(half);
         half *iq2_x_h = use_iq2_x_f16 ? (half *)up->ptr : NULL;
         if (ok && use_iq2_x_f16) {

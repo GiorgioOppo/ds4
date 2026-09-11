@@ -19,11 +19,85 @@ from kernel_source import extract_function
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def phase_implementation(source):
+    declaration = re.search(r'^static thread_local ds4_gpu_execution_phase .*;$',
+                            source, re.M)
+    assert declaration, 'production TLS declaration missing'
+    return declaration[0] + '\n' + '\n'.join(extract_function(source, name) for name in (
+        'extern "C" ds4_gpu_execution_phase ds4_gpu_get_execution_phase(',
+        'extern "C" ds4_gpu_execution_phase ds4_gpu_exchange_execution_phase(',
+    ))
+
+
+def test_backend_phases(compiler, directory):
+    """Compile actual CUDA/ROCm TLS bodies without requiring either GPU SDK."""
+    for backend in ('cuda', 'rocm'):
+        source = (ROOT / f'ds4_{backend}.cu').read_text()
+        body = '#include "ds4_gpu_phase.h"\n#include <cassert>\n#include <thread>\n'
+        body += '#include <cstdint>\n#include <cstring>\n' + phase_implementation(source)
+        graph_test = ''
+        if backend == 'cuda':
+            body += '\nusing cudaGraphExec_t = void *;\n'
+            body += extract_function(source, 'struct ds4_decode_graph_key {') + ';\n'
+            body += extract_function(source, 'struct cuda_decode_graph_entry {') + ';\n'
+            for name in ('LAYERS', 'ISLANDS', 'VARIANTS'):
+                definition = re.search(r'^#define CUDA_DECODE_GRAPH_' + name + r'\s+\d+u$', source, re.M)
+                assert definition
+                body += definition[0] + '\n'
+            body += '''static cuda_decode_graph_entry
+                g_decode_graphs[CUDA_DECODE_GRAPH_LAYERS][CUDA_DECODE_GRAPH_ISLANDS]
+                               [CUDA_DECODE_GRAPH_VARIANTS];\n'''
+            body += extract_function(source, 'static cuda_decode_graph_entry *cuda_decode_graph_find(')
+            graph_test = '''
+                ds4_decode_graph_key key{};
+                auto *automatic = cuda_decode_graph_find(&key, DS4_GPU_PHASE_AUTO);
+                assert(automatic); automatic->state = 1;
+                auto *decode = cuda_decode_graph_find(&key, DS4_GPU_PHASE_DECODE);
+                assert(decode && decode != automatic); decode->state = 1;
+                assert(cuda_decode_graph_find(&key, DS4_GPU_PHASE_AUTO) == automatic);
+                assert(cuda_decode_graph_find(&key, DS4_GPU_PHASE_DECODE) == decode);
+                auto *prefill = cuda_decode_graph_find(&key, DS4_GPU_PHASE_PREFILL);
+                assert(prefill && prefill != decode); prefill->state = 1;
+                auto *verify = cuda_decode_graph_find(&key, DS4_GPU_PHASE_VERIFY);
+                assert(verify && verify != prefill); verify->state = 1;
+                assert(!cuda_decode_graph_find(&key, DS4_GPU_PHASE_BATCH_DECODE));
+                assert(!cuda_decode_graph_find(&key, DS4_GPU_PHASE_MIXED));
+            '''
+        body += '''
+            int main() {
+                assert(ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_AUTO);
+                for (int value = DS4_GPU_PHASE_AUTO; value <= DS4_GPU_PHASE_MIXED; ++value) {
+                    const auto phase = static_cast<ds4_gpu_execution_phase>(value);
+                    assert(ds4_gpu_exchange_execution_phase(phase) == DS4_GPU_PHASE_AUTO);
+                    assert(ds4_gpu_get_execution_phase() == phase);
+                    assert(ds4_gpu_execution_phase_allows_prefill(phase) ==
+                           (phase == DS4_GPU_PHASE_AUTO || phase == DS4_GPU_PHASE_PREFILL));
+                    std::thread worker([] {
+                        assert(ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_AUTO);
+                        assert(ds4_gpu_exchange_execution_phase(DS4_GPU_PHASE_VERIFY) == DS4_GPU_PHASE_AUTO);
+                        assert(ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_VERIFY);
+                    });
+                    worker.join();
+                    assert(ds4_gpu_get_execution_phase() == phase);
+                    assert(ds4_gpu_exchange_execution_phase(DS4_GPU_PHASE_AUTO) == phase);
+                }
+        ''' + graph_test + '\n}\n'
+        generated = directory / f'{backend}_phase.cpp'
+        generated.write_text(body)
+        binary = directory / f'{backend}_phase'
+        subprocess.run(compiler + ['-O2', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+            '-pthread', '-fsanitize=address,undefined', '-I', str(ROOT),
+            str(generated), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+        print(f'PASS actual {backend.upper()} TLS phase isolation' +
+              (' and phase-keyed graph lookup' if backend == 'cuda' else ''), flush=True)
+
+
 def build_source(native):
     q4 = (ROOT / 'rocm/ds4_rocm_q4.cuh').read_text()
     common = (ROOT / 'rocm/ds4_rocm_common.cuh').read_text()
     convert = extract_function(common, '__global__ static void f32_to_f16_kernel(')
-    definitions = [convert]
+    definitions = [phase_implementation((ROOT / 'ds4_rocm.cu').read_text()), convert]
     names = [
         'static int rocm_q4_K_prefill_wmma_load4_compatible(',
         'static void rocm_q4_K_prefill_wmma_k128_enqueue(',
@@ -91,6 +165,7 @@ def main():
             subprocess.run([str(binary), str(args.device)] + (['--bench'] if args.bench else []), check=True)
         else:
             compiler = shlex.split(os.environ.get('CXX', 'clang++'))
+            test_backend_phases(compiler, Path(tmp))
             for flags in (['-O2'], ['-O3', '-ffast-math', '-fno-finite-math-only']):
                 print('Q4 activation host ' + ' '.join(flags), flush=True)
                 subprocess.run(compiler + flags + ['-std=c++17', '-Wall', '-Wextra', '-Werror',

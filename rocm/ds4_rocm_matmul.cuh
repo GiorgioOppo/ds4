@@ -1,3 +1,5 @@
+#include "ds4_rocm_rms_f16.cuh"
+
 __global__ static void matmul_f16_tiny_batch_wave_kernel(
         float *out,
         const half *w,
@@ -979,6 +981,135 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand rows launch");
 }
 
+// Consume the already-converted RHS with the exact existing GEMM policy.
+// The ordinary API retains synchronous-library-rejection fallbacks; the fold
+// wrapper requests a hard stop after a GEMM submission reports failure.
+static int rocm_matmul_f16_prepared_tensor(
+        ds4_gpu_tensor *out, const __half *w, const __half *xh,
+        uint64_t in_dim, uint64_t out_dim, uint64_t n_tok,
+        bool stop_on_error = false) {
+#ifndef __HIP_PLATFORM_AMD__
+    (void)stop_on_error;
+#endif
+#ifdef __HIP_PLATFORM_AMD__
+    if ((n_tok == 2048u || n_tok == 4096u) &&
+        hipblaslt_prefill_solution_index((uint32_t)out_dim, (uint32_t)n_tok,
+                                        (uint32_t)in_dim) >= 0 &&
+        !g_glm_model && !g_quality_mode &&
+        g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+        ds4_rocm_is_gfx1151()) {
+        const int lt = hipblaslt_gemm_tn_f16_out_f32_prefill((float *)out->ptr, w, xh,
+                    (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim, stop_on_error);
+        if (lt != 0) return lt > 0;
+    }
+#endif
+    if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u &&
+        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_TINYM_WMMA")) {
+        matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w, xh);
+        return cuda_ok(cudaGetLastError(), "f16 tinym24 wmma launch");
+    }
+    if (in_dim == 4096u && n_tok == 2048u &&
+        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_SMALLM_WMMA")) {
+        if (out_dim == 64u || out_dim == 512u || out_dim == 1024u) {
+            const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
+            matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
+                    (float *)out->ptr, w, xh,
+                    (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
+            return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
+        }
+        if (out_dim == 256u) {
+            const dim3 grid((uint32_t)out_dim / 128u, (uint32_t)n_tok / 64u, 1u);
+            matmul_f16_smallm_wmma_kernel<128u, 64u><<<grid, 1024u>>>(
+                    (float *)out->ptr, w, xh,
+                    (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
+            return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
+        }
+    }
+    if (n_tok == 2048u && in_dim == 1024u && out_dim == 8192u &&
+        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_LARGEM_WMMA")) {
+        const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
+        matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
+                (float *)out->ptr, w, xh, (uint32_t)out_dim,
+                (uint32_t)n_tok, (uint32_t)in_dim);
+        return cuda_ok(cudaGetLastError(), "f16 largem wmma launch");
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+#ifdef __HIP_PLATFORM_AMD__
+    if ((n_tok == 4u ||
+         (g_dspark_verify_mode && n_tok <= 6u)) &&
+        g_rocblas_ready &&
+        g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_NONE &&
+        !__atomic_load_n(&g_rocblas_f16_solutions_disabled, __ATOMIC_RELAXED) &&
+        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
+        int32_t solution = 0;
+        if (in_dim == 4096u &&
+            (out_dim == 64u || out_dim == 256u ||
+             out_dim == 512u || out_dim == 1024u)) {
+            if (g_rocblas_f16_solution_set ==
+                DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -217;
+            if (g_rocblas_f16_solution_set ==
+                DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -50;
+        } else if (in_dim == 1024u && out_dim == 8192u) {
+            if (g_rocblas_f16_solution_set ==
+                DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -216;
+            if (g_rocblas_f16_solution_set ==
+                DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -49;
+        }
+        if (solution != 0) {
+            const rocblas_status rst = rocblas_gemm_ex(
+                    g_rocblas,
+                    rocblas_operation_transpose,
+                    rocblas_operation_none,
+                    (rocblas_int)out_dim,
+                    (rocblas_int)n_tok,
+                    (rocblas_int)in_dim,
+                    &alpha,
+                    w,
+                    rocblas_datatype_f16_r,
+                    (rocblas_int)in_dim,
+                    xh,
+                    rocblas_datatype_f16_r,
+                    (rocblas_int)in_dim,
+                    &beta,
+                    out->ptr,
+                    rocblas_datatype_f32_r,
+                    (rocblas_int)out_dim,
+                    out->ptr,
+                    rocblas_datatype_f32_r,
+                    (rocblas_int)out_dim,
+                    rocblas_datatype_f32_r,
+                    rocblas_gemm_algo_solution_index,
+                    solution,
+                    0u);
+            if (rst == rocblas_status_success) return 1;
+            __atomic_store_n(&g_rocblas_f16_solutions_disabled, 1, __ATOMIC_RELAXED);
+            if (stop_on_error) return 0;
+        }
+    }
+#endif
+    cublasStatus_t st = cublasGemmEx(g_cublas,
+                                     CUBLAS_OP_T,
+                                     CUBLAS_OP_N,
+                                     (int)out_dim,
+                                     (int)n_tok,
+                                     (int)in_dim,
+                                     &alpha,
+                                     w,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     xh,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     &beta,
+                                     out->ptr,
+                                     CUDA_R_32F,
+                                     (int)out_dim,
+                                     CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "f16 matmul");
+}
+
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map ||
         in_dim == 0u || out_dim == 0u || n_tok == 0u ||
@@ -1007,121 +1138,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
-#ifdef __HIP_PLATFORM_AMD__
-        if ((n_tok == 2048u || n_tok == 4096u) &&
-            hipblaslt_prefill_solution_index((uint32_t)out_dim, (uint32_t)n_tok,
-                                            (uint32_t)in_dim) >= 0 &&
-            !g_glm_model && !g_quality_mode &&
-            g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
-            ds4_rocm_is_gfx1151()) {
-            if (hipblaslt_gemm_tn_f16_out_f32_prefill((float *)out->ptr, w, xh,
-                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim)) return 1;
-        }
-#endif
-        if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u &&
-            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_TINYM_WMMA")) {
-            matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w, xh);
-            return cuda_ok(cudaGetLastError(), "f16 tinym24 wmma launch");
-        }
-        if (in_dim == 4096u && n_tok == 2048u &&
-            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_SMALLM_WMMA")) {
-            if (out_dim == 64u || out_dim == 512u || out_dim == 1024u) {
-                const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
-                matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
-                        (float *)out->ptr, w, xh,
-                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
-                return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
-            }
-            if (out_dim == 256u) {
-                const dim3 grid((uint32_t)out_dim / 128u, (uint32_t)n_tok / 64u, 1u);
-                matmul_f16_smallm_wmma_kernel<128u, 64u><<<grid, 1024u>>>(
-                        (float *)out->ptr, w, xh,
-                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
-                return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
-            }
-        }
-        if (n_tok == 2048u && in_dim == 1024u && out_dim == 8192u &&
-            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_LARGEM_WMMA")) {
-            const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
-            matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
-                    (float *)out->ptr, w, xh, (uint32_t)out_dim,
-                    (uint32_t)n_tok, (uint32_t)in_dim);
-            return cuda_ok(cudaGetLastError(), "f16 largem wmma launch");
-        }
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-#ifdef __HIP_PLATFORM_AMD__
-        if ((n_tok == 4u ||
-             (g_dspark_verify_mode && n_tok <= 6u)) &&
-            g_rocblas_ready &&
-            g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_NONE &&
-            !__atomic_load_n(&g_rocblas_f16_solutions_disabled, __ATOMIC_RELAXED) &&
-            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
-            int32_t solution = 0;
-            if (in_dim == 4096u &&
-                (out_dim == 64u || out_dim == 256u ||
-                 out_dim == 512u || out_dim == 1024u)) {
-                if (g_rocblas_f16_solution_set ==
-                    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -217;
-                if (g_rocblas_f16_solution_set ==
-                    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -50;
-            } else if (in_dim == 1024u && out_dim == 8192u) {
-                if (g_rocblas_f16_solution_set ==
-                    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -216;
-                if (g_rocblas_f16_solution_set ==
-                    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -49;
-            }
-            if (solution != 0) {
-                const rocblas_status rst = rocblas_gemm_ex(
-                        g_rocblas,
-                        rocblas_operation_transpose,
-                        rocblas_operation_none,
-                        (rocblas_int)out_dim,
-                        (rocblas_int)n_tok,
-                        (rocblas_int)in_dim,
-                        &alpha,
-                        w,
-                        rocblas_datatype_f16_r,
-                        (rocblas_int)in_dim,
-                        xh,
-                        rocblas_datatype_f16_r,
-                        (rocblas_int)in_dim,
-                        &beta,
-                        out->ptr,
-                        rocblas_datatype_f32_r,
-                        (rocblas_int)out_dim,
-                        out->ptr,
-                        rocblas_datatype_f32_r,
-                        (rocblas_int)out_dim,
-                        rocblas_datatype_f32_r,
-                        rocblas_gemm_algo_solution_index,
-                        solution,
-                        0u);
-                if (rst == rocblas_status_success) return 1;
-                __atomic_store_n(&g_rocblas_f16_solutions_disabled, 1, __ATOMIC_RELAXED);
-            }
-        }
-#endif
-        cublasStatus_t st = cublasGemmEx(g_cublas,
-                                         CUBLAS_OP_T,
-                                         CUBLAS_OP_N,
-                                         (int)out_dim,
-                                         (int)n_tok,
-                                         (int)in_dim,
-                                         &alpha,
-                                         w,
-                                         CUDA_R_16F,
-                                         (int)in_dim,
-                                         xh,
-                                         CUDA_R_16F,
-                                         (int)in_dim,
-                                         &beta,
-                                         out->ptr,
-                                         CUDA_R_32F,
-                                         (int)out_dim,
-                                         CUBLAS_COMPUTE_32F,
-                                         CUBLAS_GEMM_DEFAULT);
-        return cublas_ok(st, "f16 matmul");
+        return rocm_matmul_f16_prepared_tensor(out, w, xh, in_dim, out_dim, n_tok);
     }
     /* The 4096x256 F16 router projection is latency-bound and the ordered
      * 32-thread row kernel is at least as fast on gfx1151; keep shared-X for

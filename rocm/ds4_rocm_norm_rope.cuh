@@ -719,7 +719,8 @@ static int rocm_q4_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
         float                 beta_fast,
         float                 beta_slow,
         float                 eps) {
-    if ((uint64_t)n_tok <
+    if (!ds4_gpu_execution_phase_allows_prefill(ds4_gpu_get_execution_phase()) ||
+        (uint64_t)n_tok <
             rocm_q4_attn_q_b_transient_f16_min_tokens()) {
         return 0;
     }
