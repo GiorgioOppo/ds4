@@ -831,6 +831,31 @@ clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Q4 attention validation. See docs/Q4_ATTENTION.md for scope and hardware limits.
+GPU_INDEXER_PREPARED_DEPS := tests/test_gpu_indexer_prepared.py tests/test_gpu_indexer_prepared.cpp \
+	tests/kernel_source.py ds4_indexer_prepared.h ds4_indexer_prepared_launch.cuh \
+	ds4_indexer_plan.h ds4_gpu_phase.h cuda/ds4_indexer_prepare.cuh \
+	cuda/ds4_cuda_indexer_prepared.cuh rocm/ds4_rocm_indexer_prepared.cuh \
+	rocm/ds4_rocm_indexer_registers.cuh ds4_cuda.cu rocm/ds4_rocm_indexer.cuh
+ROCM_INDEXER_REGISTERS_DEPS := tests/test_rocm_indexer_registers.py \
+	tests/test_rocm_indexer_registers.cpp rocm/ds4_rocm_indexer_registers.cuh
+.PHONY: test-gpu-indexer-prepared-host test-cuda-indexer-prepared bench-cuda-indexer-prepared \
+	test-rocm-indexer-prepared bench-rocm-indexer-prepared \
+	test-rocm-indexer-registers-host test-rocm-indexer-registers
+test-gpu-indexer-prepared-host: $(GPU_INDEXER_PREPARED_DEPS)
+	python3 tests/test_gpu_indexer_prepared.py
+
+test-rocm-indexer-registers-host: $(ROCM_INDEXER_REGISTERS_DEPS)
+	python3 tests/test_rocm_indexer_registers.py
+
+test-cuda-indexer-prepared bench-cuda-indexer-prepared: $(GPU_INDEXER_PREPARED_DEPS)
+	NVCC="$(NVCC)" CUDA_ARCH="$(CUDA_ARCH)" python3 tests/test_gpu_indexer_prepared.py --cuda $(if $(filter bench-cuda-indexer-prepared,$@),--bench,)
+
+test-rocm-indexer-registers: $(ROCM_INDEXER_REGISTERS_DEPS)
+	HIPCC="$(HIPCC)" python3 tests/test_rocm_indexer_registers.py --rocm
+
+test-rocm-indexer-prepared bench-rocm-indexer-prepared: $(GPU_INDEXER_PREPARED_DEPS) $(ROCM_INDEXER_REGISTERS_DEPS)
+	HIPCC="$(HIPCC)" python3 tests/test_gpu_indexer_prepared.py --rocm $(if $(filter bench-rocm-indexer-prepared,$@),--bench,)
+
 .PHONY: test-q4-preflight-host
 test-q4-preflight-host: tests/test_q4_preflight.py tests/kernel_source.py ds4.c ds4_gpu.h
 	python3 tests/test_q4_preflight.py
