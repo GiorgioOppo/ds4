@@ -563,7 +563,7 @@ make bench-metal-moe-activation
 The Q-B runtime fixture checks automatic selection against the explicit F32
 oracle, input/output guards, aliases, fallback cases, three consecutive GPU
 producers sharing one scratch buffer, and cleanup with an unsubmitted batch.
-It passes 36 cases in each of retained and unretained command-buffer modes
+It passes 54 cases in each of retained and unretained command-buffer modes
 on M1 Max. The standalone Q-B comparison also covers incomplete output/token
 tiles. Its benchmark selects the same boundary-check specialization and copy
 thread count as the runtime, includes conversion and encoder boundaries, and
@@ -599,6 +599,504 @@ measurements; a stage speedup does not establish an 8% end-to-end gain. Use
 the repeated CSV protocol above with `--metal` and `b09f8e3` as the baseline
 for this port. Keep chunk size in CSV filenames and compare frontier logits
 separately from timing.
+
+### Explicit execution phases
+
+The executor identifies `PREFILL`, `DECODE`, `VERIFY`, `BATCH_DECODE`, and
+`MIXED` separately. Token count remains a matrix dimension: a batch of rows
+can contain independent decode requests, a speculative suffix, or prompt
+tokens. It is not a reliable substitute for the execution phase.
+
+`ds4_gpu_phase.h` exposes a thread-local phase with scoped restoration.
+Graph entry points set the phase before encoding; nested helpers inherit it,
+including single-token work used by SSD prefill. Worker jobs that encode GPU
+work carry the submitting phase. Returning early restores the caller's
+phase. Direct backend callers default to `AUTO`, which preserves the former
+shape-based selection. This dispatch context does not make the backend or
+its shared scratch safe for concurrent inference.
+
+Phase selection restricts prefill-specific preparation, while general
+matrix/vector kernels still use dimensions, device, quantization, and
+residency to choose a valid implementation:
+
+| Workload | Dispatch intent |
+| --- | --- |
+| Prefill | Amortize preparation and reuse across token/output tiles |
+| Single-token decode | Use existing low-latency vector and fused paths |
+| Speculative verification | Keep the speculative suffix distinct from a large prompt |
+| Batched decode | Preserve independent-session semantics despite multiple activation rows |
+| Mixed prefill/decode | Keep existing mixed-row handling and avoid prefill-only assumptions |
+
+In Metal this gates the Q4 Q-A/KV half-RHS pair, direct Q4 Q-B activation
+reuse, and IQ2 paired activation reuse described above. CUDA applies it to
+the expanded-F16 Q-B epilogue and the large-assignment fused-direct MoE path.
+ROCm applies it to transient F16 Q-B, K128 half-RHS preparation, and the IQ2
+hot-expert F16 input/intermediate reuse. Their general GEMM/WMMA fallbacks
+remain available. CUDA graph cache entries distinguish execution phases, so
+an otherwise matching shape cannot replay a graph captured under another
+phase. No runtime environment controls or weight-format changes are introduced.
+
+```sh
+make test-gpu-execution-phase
+make test-rocm-q4-activation-host
+make test-metal-execution-phase test-metal-q4-activation-runtime
+```
+
+The host tests exercise nested scopes, early exits and thread isolation,
+including the actual CUDA/ROCm TLS implementations and CUDA graph lookup.
+CPU and Metal scope tests pass; the CUDA/ROCm host suite also passes strict
+and fast ASan/UBSan checks (584 staging tiles and 39 dispatch/fault cases).
+The native Metal fixture compares the same Q-B shape under all six phase
+values against its F32-input oracle, including phase changes inside one
+command buffer before submission. All 54 runtime cases pass on M1 Max in
+both retained and unretained modes. Full engine compilation also passes;
+native CUDA/HIP execution remains unverified on the macOS development host.
+Dispatch separation alone is not a measured throughput improvement;
+compare prefill, ordinary decode and
+speculative verification separately with matching model, device and
+resident/SSD settings.
+
+These execution phases apply to the existing V4 checkpoint. They do not
+implement the causal encoder/decoder architecture of V4.1 or remove layers
+from the current model's forward pass.
+
+### HC decode preparation and ROCm Q4 lookahead
+
+These changes apply execution strategies to the existing V4 operators;
+they do not import V4.1 weights, change HC equations, or reduce Sinkhorn
+iterations. HC normalization and its narrow F16 projection keep each
+backend's established activation precision and accumulation order.
+
+For the single-row 16384-to-24 HC projection, CUDA combines RMSNorm and
+F32-to-F16 conversion in the existing normalization kernel, then uses the
+same cuBLAS call as the unfused path. This reduces three launches to two
+and avoids writing and reading a 64 KiB normalized F32 row. Both attention
+and FFN HC producers use the path on supported single-GPU devices (SM 7+
+with at least 256 threads per block), in `AUTO` or `DECODE`, when ordinary
+cuBLAS projection is selected and quality mode is off. Existing diagnostic
+matvec choices retain their reference path. Captured CUDA graphs require
+already allocated scratch; errors after submission stop the graph instead
+of attempting a fallback. Metal retains its existing fused HC kernel and
+uses the same explicit success/decline/failure contract.
+
+A separate gfx1151 ROCm candidate stores only the RMS scale (4 bytes), then
+applies it during the ordered F32-activation/F16-weight projection. It keeps
+two launches and fences the normalized F32 multiply before the weight
+product. Its tradeoff is explicit: removing the materialized row adds
+376832 FP32 multiplies because each of the 24 output rows normalizes its
+inputs. The native fixture can call this candidate directly; automatic
+graph admission remains disabled until native timing establishes a benefit.
+
+The Q4 prefill candidate in `rocm/ds4_rocm_q4_pipeline.cuh` retains the
+current K128/P144 WMMA geometry, Q4 unpacking, accumulation order, and one
+18 KiB LDS tile. Before computing a tile it requests one raw 16-byte vector
+per thread from the next tile. This anticipates 25% of the next F32 tile
+or 50% of the F16 tile, then converts and stages it after the reuse barrier.
+The rest of the next tile follows the usual load path. At K1024 the total
+number of activation loads and 15 barriers is unchanged. There is no second
+LDS tile and no second weight qpair kept alive.
+
+The Q4 candidate is exposed only to the benchmark, without a production
+environment switch. Four additional payload words per thread can still
+increase register pressure. Native ISA, register/spill counts, occupancy,
+parity and alternating baseline/candidate timing must establish whether
+the compiler actually overlaps the load with WMMA and whether it helps.
+Source order or host checks alone cannot establish GPU overlap or speedup.
+
+```sh
+make test-gpu-hc-norm-mix-host
+make test-rocm-q4-pipeline-host
+
+# CUDA: build/link the actual backend and time the complete HC operation.
+make bench-gpu-hc-norm-mix CUDA_ARCH=sm_121
+
+# ROCm: rebuild with the ROCm backend, then call the candidate explicitly.
+make bench-rocm-hc-norm-mix ROCM_ARCH=gfx1151
+make bench-rocm-q4-pipeline ROCM_ARCH=gfx1151
+```
+
+Host HC tests compare extracted production arithmetic and exercise buffer
+ranges, aliasing, phases, and graph fallback/error propagation. CUDA/HIP
+compilation, cuBLAS/device arithmetic and model throughput require native
+validation. Strict and explicit-FMA host arithmetic pass 64 cases each with
+ASan/UBSan. Both modes also pass 62 cases using the actual CUDA/ROCm wrappers,
+including allocation/producer/consumer faults and scratch/capture checks;
+the graph tests pass 56 admission/fallback cases for each platform branch.
+The public-API native fixture also passes 64 bitwise cases on Metal
+M1 Max. This validates the retained Metal implementation and API integration,
+not the CUDA/HIP machine code.
+
+The HC native benchmark reports 14 ABBA samples per arm, each with 64 calls,
+after warmup. Timings include CPU submission and synchronized GPU work;
+allocation and model upload are excluded. It requires bitwise agreement with
+the current backend's RMSNorm-plus-projection path, checks output guards and
+input immutability, and exits 77 when a candidate is unavailable. It uses
+synthetic resident F16 weights, not a GGUF or SSD streaming. No percentage
+throughput gain is claimed for either candidate.
+
+On CUDA with decode graphs supported, the fixture additionally checks two
+warm/capture/three-replay sequences with fresh inputs, separated by growth
+of the actual common scratch through the batched F16 API. This must retire
+the old graph before freeing its scratch and then permit recapture. Metal
+and ROCm explicitly skip this CUDA graph block. The CUDA replay test is
+provided but has not been executed on the macOS host.
+
+The Q4 native fixture compares all four baseline/candidate F32/F16 paths
+bitwise, including token and output-row tails. Its event timings include
+conversion in both F16 arms, use alternating order with 12 retained samples
+per arm, and report register, local-memory, LDS and occupancy queries.
+Synthetic Q-B timing shapes use K1024/M32768 with 128 through 2048 tokens.
+Allocation and upload are excluded. The host fixture checks raw lookahead,
+F16 bit transport, padded strides, guards and admission; source checks also
+require identical Q4 decoding, WMMA accumulation order and output stores.
+Both strict and fast host builds pass 5760 staging tiles each with ASan/UBSan,
+plus rejection checks for device, grid, alignment, stride, overflow and aliasing.
+Native HIP compilation and execution have not been performed on this Mac.
+
+### Indexer execution plan and grouped Metal heads
+
+`ds4_indexer_plan.h` records backend, execution phase, operand precision,
+required tensor prefixes and Metal launch geometry before encoding the score
+operation. It rejects invalid phases, zero dimensions, overflowing products
+and shapes/positions outside the conservative signed-32-bit indexer domain.
+Metal also checks device buffer/threadgroup limits and the loaded pipeline.
+CUDA and ROCm use the checked byte counts while retaining their native
+scorer dispatch and precision. Native launch geometry and hardware limits
+remain the responsibility of those backends. The planner performs no GPU
+allocation or synchronization and does not add state to captured graphs.
+
+The Metal SIMD-group scorer loads Q/K with `packed_float4`, converts to
+`half4` and stores vectors into threadgroup memory. Packed loads preserve
+the existing four-byte alignment requirement of F32 views. This reduces
+staging loop iterations and load/store instructions without changing the
+per-element half conversion. Variants group one, two or four independent
+heads of the existing eight-token by 32-key tile. Each head retains the same
+16 matrix multiply-accumulate steps over dimension 128. K fragments are loaded once
+per group; every weighted ReLU contribution still enters the score in
+ascending head order. For 64 heads, K fragment loads per SIMD group fall
+from 1024 to 512 or 256, while matrix arithmetic and Q conversion counts
+remain unchanged. Dynamic threadgroup storage grows from 11,264 bytes to
+14,336 or 20,480 bytes, at the same 128 threads per group.
+
+A barrier after each weighted head contribution is retained. Removing these
+barriers allowed Metal fast math to change score rounding by one ULP, even
+when source-level head order was unchanged. The retained boundary preserves
+the legacy recurrence; the two staging barriers are shared within each head
+group. Total barriers for 64 heads are 193 in the reference, 129 for two
+heads and 97 for four. Strict arithmetic alone is not the acceptance test:
+the native fixture compares scores and top-k IDs bitwise under the normal
+fast-math configuration as well.
+
+Automatic selection uses the two-head variant on **Apple M1 Max** for
+1,024 through 65,536 compressed rows and 128 through 512 tokens. These bounds
+cover the measured range; other devices and shapes retain the reference.
+Admission is limited to 64 heads of dimension 128, AUTO/PREFILL execution and
+the half-staged scorer. Test flags can compare all three variants through
+the same wrapper, with a legacy flag taking precedence over automatic
+selection. Quality mode retains the F32 scorer;
+NAX keeps its existing priority at 16 or more tokens, including its current
+quality-mode behavior. NAX already processes pairs of heads and is unchanged
+by this work. Other execution phases keep their existing scoring path.
+These changes apply to the indexer independently of whether dense projection
+weights are Q4 or Q8; no cross-layer KV or selection reuse is introduced.
+
+`make test-indexer-plan` runs 129,600 policy cases and 1,426,285 checks.
+Strict and fast ASan/UBSan builds pass, as do C11 and C++17 header checks.
+`make test-metal-indexer-heads` compares all three variants and the automatic
+selector through the public score and top-k APIs. Its 506 comparisons cover
+causal masks,
+partial tiles, ties, cancellation, half-rounding boundaries, production and
+signed/zero scales, guarded views and immutable inputs. Odd head counts,
+quality mode and non-prefill phases exercise fallback rather than grouped
+head tails. All 506 comparisons pass on M1 Max under normal fast math,
+unretained command buffers, and strict Metal math. Native CUDA/ROCm
+compilation and timing remain unverified here.
+
+`make bench-metal-indexer-heads` measures score-only and score-plus-top-k
+paths separately on identical inputs and preallocated buffers. It uses two
+warm ABBA blocks and 20 samples per arm, reports CPU-inclusive wall time and
+completed GPU time, and verifies scores and selected IDs before and after
+timing. Query/key production, model execution and SSD expert reads are not
+included, so these timings do not establish full-model prefill throughput.
+
+On Apple M1 Max (32 GiB), normal Metal fast math, K=512, 64 heads of
+width 128, ratio=4 and scale=1/sqrt(128*64), two-head vector staging measured:
+
+| Compressed rows | Tokens | Reference wall ms | Two-head wall ms | Throughput gain | GPU gain |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 128 | 1.656937 | 1.089750 | +52.0% | +52.8% |
+| 4,096 | 128 | 6.337938 | 4.097125 | +54.7% | +55.7% |
+| 16,384 | 128 | 24.392000 | 15.944125 | +53.0% | +53.2% |
+| 65,536 | 512 | 470.719000 | 334.072000 | +40.9% | +41.0% |
+
+These are **score-plus-top-k** medians, with identical masks, inputs and IDs.
+The position is `4*n_comp-n_tokens`, representing a current causal chunk
+near the end of a long cached context. Each command buffer repeats the full
+operation 8/8/4/1 times respectively; allocations occur before timing.
+Throughput gain is `reference_time/candidate_time-1`, not percentage latency
+reduction. The long-context samples have wider timing spread on this desktop;
+the result does not identify hardware occupancy or eliminate system noise.
+
+At 16,384 rows/128 tokens, vector staging with one head measured +43.6% wall
+throughput and four heads +38.7%, versus +53.0% with two. Grouping with scalar
+staging was slower across all six initial benchmark shapes; vectorized
+staging is essential to the measured gain. The matrix-operation count is
+unchanged. No percentage improvement in complete V4 inference or SSD
+streaming is claimed, and short prompts that bypass the indexer do not
+benefit from this dispatch.
+
+Examples for reproducing the production candidate and the one-head control:
+
+```sh
+./tests/test_metal_indexer_heads --bench 16384 128 2
+./tests/test_metal_indexer_heads --bench 16384 128 1
+```
+
+### Prepared CUDA/ROCm indexer operands and ROCm register scores
+
+These candidates optimize the existing V4 indexer computation without changing
+the model or sharing state between layers. They are available through the
+native fixtures; **production CUDA/ROCm dispatch is unchanged** pending device
+parity and timing. No runtime environment switch or converted-operand cache
+is introduced. Dense Q4 and Q8 models use the same indexer operation, so this
+work does not establish a relative Q4-versus-Q8 speedup.
+
+`cuda/ds4_indexer_prepare.cuh` converts contiguous Q[T,64,128] and K[C,128]
+from F32 to F16 in one grid-stride launch. Each scalar is rounded once per
+call with the same RNE conversion as the old tile loads; weights and scores
+remain F32. The prepared CUDA and ROCm reference consumers copy half2 packets
+into shared memory. All matrix operations, head order, scale and causal masks
+are retained. CUDA uses its original 32-token by 128-key tile with padded
+stride 136; ROCm uses its original 16-token by 128-key tile and shared score
+epilogue.
+
+Ignoring tails and wholly masked tiles, the previous conversion count is
+`T*H*D*ceil(C/128) + C*D*ceil(T/tile_T)`. Preparation reduces this to
+`T*H*D + C*D`, but adds a kernel launch and global writes/reads of the prepared
+operands. Scratch is `2*(T*H*D + C*D)` bytes at the admitted H=64/D=128,
+with K aligned to 256 bytes after Q. The matrix arithmetic count is unchanged.
+For C=4096/T=128 this is 3 MiB of scratch and 1,572,864 conversions, compared
+with 35,651,584 in the CUDA reference or 37,748,736 in ROCm. These are static
+counts, not measured throughput; small or heavily masked workloads can lose
+from the extra preparation.
+
+`rocm/ds4_rocm_indexer_registers.cuh` separately removes the per-head shared
+score store/reload. It accumulates weighted contributions in registers. A
+coordinate accumulator loaded through rocWMMA identifies the matrix element
+represented by each fragment register, avoiding a hardcoded private lane
+layout. Eight coordinates are packed into two uint32 values per lane. The
+diagnostic checks load, MMA and store consistency on the actual toolchain.
+The candidate is restricted to gfx1151/wave32 and must pass this diagnostic
+and complete score comparisons before admission. It accepts either original
+F32 operands or prepared F16 operands to isolate the two changes.
+
+| Scorer | Static shared bytes | Barriers per block, 64 heads |
+| --- | ---: | ---: |
+| CUDA reference / prepared | 43,520 | 129 |
+| ROCm reference / prepared | 45,056 | 193 |
+| ROCm register candidate | 37,888 | 130 |
+
+The register candidate removes 64 per-head barriers and adds one initial
+coordinate barrier. It also changes which rows each lane handles, potentially
+increasing weight loads and register pressure. Native resource/occupancy
+reports and timing are necessary to assess that tradeoff.
+
+`ds4_indexer_prepared_launch.cuh` provides the real prepare-plus-score
+pipeline used by the comparison fixture. Its checked plan declines decode,
+verification, mixed phases, quality mode, capture, native MXF4 priority,
+unsupported capabilities, invalid shapes, insufficient buffers and aliasing
+writers before GPU work. The caller owns scratch until stream completion;
+each invocation prepares fresh inputs. Producer launch failure suppresses
+the consumer; runtime errors return failure rather than taking a fallback
+after work may have been queued. Asynchronous errors are checked at stream
+completion. Capability fields must describe the current device; these
+candidates do not implement production device discovery or allocation.
+
+Host fixtures extract the actual preparation/staging code and launch wrapper,
+use an independent integer binary16 rounding oracle, and check buffer guards,
+tails, unchanged inputs, policy boundaries and injected launch errors under
+strict/fast ASan/UBSan. They do not emulate WMMA. The separate coordinate
+fixture exercises arbitrary register permutations on the host and offers a
+native load-to-MMA-to-store diagnostic.
+
+Both strict and fast host runs pass: 711 policy/buffer cases, 28 CUDA and
+30 HIP launch/fault cases, 90 preparation cases and 600 staging cases per
+build. The coordinate fixture passes 2,097,152 checks per build across 128
+arbitrary layouts. The planner header also compiles standalone as C11 and
+C++17. These results do not establish device MMA parity.
+
+```sh
+make test-gpu-indexer-prepared-host test-rocm-indexer-registers-host
+make test-cuda-indexer-prepared CUDA_ARCH=sm_121
+make bench-cuda-indexer-prepared CUDA_ARCH=sm_121
+make test-rocm-indexer-prepared
+make bench-rocm-indexer-prepared
+```
+
+Native fixtures compare score bits with the extracted current backend kernel
+in strict and production-fast modes (69 CUDA / 207 HIP comparisons each),
+including masked and partial tiles, half rounding boundaries, cancellation,
+signed/zero scales, guarded views and immutable inputs. The ROCm Make targets
+run the fragment diagnostic first, as does a direct `--rocm` runner invocation.
+Benchmarks use production-fast math and include preparation on **every**
+prepared candidate call, with allocations outside timing, warm ABBA order and
+20 samples per arm. They report raw GPU/wall samples, register usage, shared
+memory and estimated active blocks. The F32 register arm isolates removal of
+the shared score epilogue. These measurements exclude top-k, projections,
+expert execution and SSD reads, and cannot establish full-model t/s.
+
+CUDA/HIP compilation, native correctness and timing are unverified on the
+local Apple M1 Max machine, which has neither toolchain nor device. Automatic
+dispatch requires those results and a measured device/shape policy.
+
+### Compact Metal indexer top-k
+
+Metal keeps the existing bitonic leaf sort and compacts each subsequent
+merge to at most K candidates. Each parent needs only the best K entries
+from either child to produce its own best K. Discarding the suffix of a
+child therefore preserves the final selection, including the existing
+left-run preference for equal scores. The leaf network is unchanged:
+its tie order is not replaced with an ascending-index rule.
+
+Automatic selection uses the compact merge when an intermediate level can
+discard candidates. Single-pass sorts and shapes without intermediate
+compaction retain the existing path. This applies to the top-k operation
+for all execution phases and weight formats; it does not alter indexer
+scoring, Q4 decoding, attention masks, or the value of K. Tests can select
+the old merge through `DS4_GPU_TEST_INDEXER_TOPK_LEGACY`, without adding a
+production environment control.
+
+The score matrix is still materialized. A monolithic scoring/top-512 fusion
+would not discard anything from the current 32-column score tiles; making
+those tiles wide enough requires substantially more live state. The
+compact merge is an independent optimization that preserves the current
+matrix kernels and their arithmetic.
+
+```sh
+make test-indexer-topk-host
+make test-metal-indexer-topk
+make bench-metal-indexer-topk
+```
+
+The native fixture compares the complete API against the old merge and
+checks selection validity independently on the CPU. Masked `-INFINITY`,
+equal scores, signed zero, tails, multiple rows, tensor offsets and guards
+are included. Benchmarks compare the complete top-k operation; they do not
+measure score generation, full-model prefill, or SSD streaming.
+
+Validation on an Apple M1 Max (32 GiB) passes all 200 native cases, both
+with ordinary and unretained command buffers. The host fixture passes
+strict and fast builds with ASan/UBSan: each build checks 94,516 geometry
+cases, 1,022 merge trees and 17,775 kernel/stage/thread-grid combinations.
+The Metal engine also builds successfully. Native execution on other Apple
+GPU generations has not been measured for this change.
+
+The following warm measurements use K=512 and the production 1024-thread
+leaf. Each arm has 30 samples in ABBA order, preceded by four warm-up ABBA
+blocks. A sample repeats the complete top-k API 64 times for one token or
+eight times for 128 tokens. Times are medians per API call; throughput gain
+is `old_time / new_time - 1`.
+
+| Candidates per token | Tokens | Legacy wall ms | Compact wall ms | Wall throughput gain | GPU throughput gain |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 1 | 0.070109 | 0.066672 | +5.2% | +10.0% |
+| 4,096 | 128 | 0.822375 | 0.795188 | +3.4% | +4.7% |
+| 16,384 | 1 | 0.146758 | 0.113789 | +29.0% | +31.3% |
+| 16,384 | 128 | 3.401313 | 2.560500 | +32.8% | +32.7% |
+| 65,536 | 1 | 0.403531 | 0.159445 | +153.1% | +163.9% |
+| 65,536 | 128 | 13.051500 | 8.199250 | +59.2% | +60.1% |
+
+Shorter preliminary samples showed substantial scheduling noise, including
+changes in the sign of the small-shape wall-time difference. These warm
+synthetic timings are local measurements, not a full-model speedup claim.
+The benchmark prints every sample, its mean, median and range to expose
+that variability.
+
+For 16,384 candidates and K=512, intermediate merge writes fall from
+24,576 to 7,168 indices per token (70.8% fewer). The two scratch slabs
+require 48 KiB per token instead of 64 KiB. These figures exclude the
+unchanged score matrix, leaf writes and final K outputs; an already-grown
+scratch allocation is reused rather than shrunk.
+
+### ROCm HC prefill RMS-to-FP16 preparation
+
+The ROCm HC prefill projection now folds the existing plain RMS normalization
+into FP16 RHS preparation. Its reduction tree and normalized F32 rounding
+boundary match the standalone RMS kernel. Both the ordinary projection and
+the folded path use the same prepared-RHS consumer, including the existing
+hipBLASLt, WMMA and BLAS selection policies.
+
+Admission covers HC widths 16384 and 28672 with 24 outputs in AUTO/PREFILL,
+with more than one token. The 16384-wide path keeps its existing tiny-batch
+kernel for up to eight tokens. Quality mode, non-default BLAS streams and
+active HIP graph capture decline the optimization before submission. An
+error after submission returns -1; the graph runs its original fallback
+only for a zero return. CUDA's corresponding error returns follow the same
+contract.
+
+For width 16384, this removes one kernel launch and 128 KiB of intermediate
+F32 store/read traffic per token. It does not remove the projection's matrix
+multiplication, change the weights, or move RMS scaling after that projection.
+
+```sh
+make test-rocm-hc-prefill-host
+# AMD host: kernel operand parity and complete public-API parity/benchmarks.
+make test-rocm-hc-prefill-operands
+make test-rocm-hc-prefill
+make bench-rocm-hc-prefill
+```
+
+Host validation passes strict and explicit-FMA fast builds with ASan/UBSan.
+Each checks 62 admission cases, 38 wrapper cases, 18 hipBLASLt cases,
+102 actual graph-caller cases and 98 bitwise FP16 operand cases. The native
+fixture uses synthetic inputs and weights, tests the complete RMS/projection
+API, and needs no GGUF. Its C++ frontend compiles on this Mac; HIP compilation,
+AMD GPU execution and end-to-end throughput remain unverified here.
+
+### Streaming Metal scoring and selection candidate
+
+The measurements in this subsection predate vectorized grouped-head scoring.
+The streaming candidate remains confined to the test build.
+
+A test-only candidate scores aligned column ranges, sorts the original
+bitonic leaves into `(score, global_index)` pairs, and performs compact local
+and global merges. The leaf thread count is chosen from the full input and
+remains fixed for the final short chunk. Score arithmetic and the merge tree
+are unchanged. The paired candidates eliminate later gathers from a full
+score matrix, but use twice the bytes of index-only records and require more
+dispatches. The production graph retains the materialized score path.
+
+```sh
+make test-indexer-stream-host
+make test-metal-indexer-stream
+make bench-metal-indexer-stream
+```
+
+On M1 Max, 44 native parity cases and 13 rejection cases pass, with ordinary
+and unretained command buffers, including in-flight scratch growth. The host
+fixture passes strict/fast ASan/UBSan with 14,580 geometry checks, 180 trees
+with three rows each, and 750 pair merges. Tests compare actual shader source
+against the original leaf network and an independent complete merge.
+
+Warm full scoring plus selection timings below use 64 heads, width 128,
+K=512, 8192-column chunks, 30 samples per arm in ABBA order, and a fully
+visible prefix (`pos0=4*n_comp`). Times are wall-clock medians in ms, excluding
+allocations and model execution. The reference includes the compact Metal
+top-k optimization above.
+
+| Candidates | Tokens | Materialized | Streaming | Throughput gain |
+| ---: | ---: | ---: | ---: | ---: |
+| 16,384 | 128 | 30.8510 | 31.4990 | -2.06% |
+| 16,384 | 512 | 115.9400 | 114.8100 | +0.98% |
+| 65,536 | 128 | 114.3775 | 114.0430 | +0.29% |
+| 65,536 | 512 | 462.9895 | 463.3365 | -0.07% |
+
+These measurements do not establish a consistent speedup. The candidate
+wrapper, scratch and additional shader module therefore compile only in
+the native fixture via `DS4_METAL_INDEXER_STREAM_TESTING`; there is no new
+runtime option or automatic graph dispatch. A future compute optimization
+needs to address scoring itself, rather than infer a speedup from its lower
+scratch requirement.
 
 ### CUDA grouped output-A candidate
 
