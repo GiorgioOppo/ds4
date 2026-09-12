@@ -124,6 +124,8 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 
 #include "ds4_iq2_tables_cuda.inc"
 
+static int ds4_rocm_is_gfx1151(void);
+
 #include "rocm/ds4_rocm_runtime.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
@@ -170,6 +172,8 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "rocm/ds4_rocm_hc_output_launch.cuh"
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
+
+#include "rocm/ds4_rocm_v41.cuh"
 
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"

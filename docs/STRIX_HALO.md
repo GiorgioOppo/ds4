@@ -62,6 +62,18 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+## DeepSeek V4.1 Flash
+
+The ROCm 10.0 build supports calibrated V4.1 Flash Q2 text and vision on `gfx1151`. A single 128 GB system was tested with SSD streaming, including a 94 GiB expert/staging cache at 16K text context and in image/state checks. Engram tables remain disk-backed even when expert weights are resident. Cache admission depends on available memory, context size and concurrent sessions. Automatic sizing remains conservative; 94 GiB is a tested manual setting, not a universal maximum. The GPU GTT limit shares physical RAM with the OS and is not itself the usable cache budget.
+
+```sh
+make strix-halo ROCM_ARCH=gfx1151
+./download_model.sh ds41f-q2
+./ds4 --rocm -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming --ssd-streaming-cache-experts 94GB --ctx 8192
+```
+
+Use the matching V4.1 vision sidecar with `--vision FILE`. See [models and vision](MODELS.md#deepseek-v41-flash) for downloads and [qualification results](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151) for output quality, numerical drift and memory limitations. Resident text and vision inference were also tested on upcoming 192 GB hardware; performance results will be released soon.
+
 ## GLM 5.3 Flash
 
 The reference Q2 setup uses SSD streaming to leave room for its graph and KV

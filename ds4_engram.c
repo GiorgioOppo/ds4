@@ -13,6 +13,9 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#elif defined(__linux__) && defined(DS4_ROCM_BUILD)
+#include <pthread.h>
+#include <stdio.h>
 #endif
 
 bool ds4_engram_layout_valid(const ds4_engram_layout *l) {
@@ -218,6 +221,51 @@ static void read_batch_part(void *context, size_t part) {
     }
 }
 
+#if defined(__linux__) && defined(DS4_ROCM_BUILD) && !defined(__APPLE__)
+typedef struct {
+    engram_batch *batch;
+    size_t part;
+} engram_reader;
+
+static void *read_batch_thread(void *context) {
+    engram_reader *reader = context;
+    read_batch_part(reader->batch, reader->part);
+    return NULL;
+}
+
+static bool read_batch_pthreads(engram_batch *batch) {
+    pthread_t threads[ENGRAM_READERS - 1];
+    engram_reader readers[ENGRAM_READERS - 1];
+    size_t started = 0;
+    int create_error = 0;
+    batch->readers = ENGRAM_READERS;
+    /* The caller reads partition zero; bounded workers read the other fifteen.
+     * Partition boundaries and duplicate reuse match dispatch_apply_f exactly. */
+    for (size_t part = 1; part < batch->readers; part++) {
+        readers[started] = (engram_reader){batch, part};
+        create_error = pthread_create(&threads[started], NULL,
+                                      read_batch_thread, &readers[started]);
+        if (create_error) break;
+        started++;
+    }
+    if (!create_error) read_batch_part(batch, 0);
+    for (size_t i = 0; i < started; i++) {
+        const int error = pthread_join(threads[i], NULL);
+        if (error) {
+            /* Stack arguments, request rows and output cannot be released if a
+             * worker's termination is unproven. Do not return a live borrower. */
+            fprintf(stderr, "ds4: cannot join Engram reader safely (%d)\n", error);
+            abort();
+        }
+    }
+    if (create_error) {
+        errno = create_error;
+        return false;
+    }
+    return true;
+}
+#endif
+
 bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out) {
     if (!t || t->fd < 0 || (tokens && (!rows || !out || stride < DS4_ENGRAM_COLS)) ||
@@ -259,6 +307,10 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
             batch.readers = ENGRAM_READERS;
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
+        } else
+#elif defined(__linux__) && defined(DS4_ROCM_BUILD)
+        if (count >= 256) {
+            if (!read_batch_pthreads(&batch)) { ok = false; break; }
         } else
 #endif
         read_batch_part(&batch, 0);

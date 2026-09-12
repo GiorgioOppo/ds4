@@ -813,9 +813,18 @@ static int routed_moe_launch(
             mxfp4_path && use_expert_tiles && !use_mxfp4_tile32 && !use_mxfp4_ldsB &&
             !use_mxfp4_tile4 && n_tokens >= 8u &&
             getenv("DS4_ROCM_ENABLE_MXFP4_ROW64") != NULL;
+        /* V4.1 Q2 uses canonical IQ2 gate/up rows and Q2_K down rows.
+         * Keep other expert layouts on their existing admissions. */
+        const uint32_t v41_mmq_topology =
+            n_total_expert == 384u && n_expert == 6u &&
+            expert_in_dim == 5120u && expert_mid_dim == 2304u &&
+            out_dim == 5120u && n_tokens <= 2048u &&
+            gate_row_bytes == 1320u && gate_expert_bytes == 3041280u &&
+            down_row_bytes == 756u && down_expert_bytes == 3870720u &&
+            ds4_rocm_is_gfx1151();
         const uint32_t use_rocm_mmq_gateup =
             ok && iq2_path && n_tokens >= 128u && !g_quality_mode &&
-            n_total_expert <= 256u &&
+            (n_total_expert <= 256u || v41_mmq_topology) &&
             !batch_stream_selected && !batch_stream_split_selected &&
             !split_selected && !compact_selected && gate_w && up_w &&
             (stream_full_layer || full_table_cached) &&
@@ -1250,13 +1259,21 @@ static int routed_moe_launch(
                     logged_mmq_gateup = 1;
                     fprintf(stderr, "ds4: ROCm routed MoE using tuned MMQ IQ2 gate/up\n");
                 }
-            } else {
+            } else if (!v41_mmq_topology) {
                 (void)cudaGetLastError();
                 static int logged_mmq_fallback = 0;
                 if (!logged_mmq_fallback) {
                     logged_mmq_fallback = 1;
                     fprintf(stderr, "ds4: ROCm MMQ IQ2 gate/up returned %d; falling back\n", mmq_rc);
                 }
+            }
+            if (v41_mmq_topology && !mmq_gateup_done) {
+                /* This route skipped Q8_K x preparation. A legacy fallback
+                 * would consume unwritten xq or stale half mid storage. */
+                fprintf(stderr, "ds4: V4.1 MMQ gate/up or epilogue failed (%d)\n", mmq_rc);
+                if (!cuda_ok(cudaStreamSynchronize((cudaStream_t)0),
+                             "V4.1 MMQ failure drain")) abort();
+                return 0;
             }
         }
         int split_gateup_done = 0;

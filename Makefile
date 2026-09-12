@@ -268,7 +268,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -284,7 +284,7 @@ test-rocm:
 		test-session-state \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
 		ds4 ds4-server ds4-bench ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -557,6 +557,34 @@ tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-o
 test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
+ifeq ($(UNAME_S),Linux)
+.PHONY: test-deepseek41-memory
+test-deepseek41-memory: tests/test_deepseek41_memory.c ds4.c ds4.h ds4_gpu.h ds4_linux_memory.h
+	@set -eu; \
+	test_bin=$$(mktemp "$${TMPDIR:-/tmp}/ds4-memory.XXXXXX"); \
+	trap 'rm -f "$$test_bin"' EXIT; \
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -O0 -UNDEBUG -UDS4_NO_GPU -DDS4_ROCM_BUILD \
+		-Wno-unused-function -ffunction-sections -fdata-sections -I. \
+		tests/test_deepseek41_memory.c -Wl,--gc-sections $(LDLIBS) -o "$$test_bin"; \
+	"$$test_bin"
+
+# Exercise the real accelerator span builders on sparse GGUFs without a GPU
+# library, production object rebuild, or model allocation. Keep both branches.
+.PHONY: test-deepseek41-cache-spans
+test-deepseek41-cache-spans: tests/test_deepseek41_cache_spans.c ds4.c ds4.h ds4_gpu.h ds4_engram.h
+	@set -eu; \
+	test_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/ds4-cache-spans.XXXXXX"); \
+	trap 'rm -f "$$test_dir/generic" "$$test_dir/rocm"; rmdir "$$test_dir"' EXIT; \
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -O0 -UNDEBUG -UDS4_NO_GPU -UDS4_ROCM_BUILD \
+		-Wno-unused-function -ffunction-sections -fdata-sections -I. \
+		tests/test_deepseek41_cache_spans.c -Wl,--gc-sections $(LDLIBS) -o "$$test_dir/generic"; \
+	"$$test_dir/generic"; \
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -O0 -UNDEBUG -UDS4_NO_GPU -DDS4_ROCM_BUILD \
+		-Wno-unused-function -ffunction-sections -fdata-sections -I. \
+		tests/test_deepseek41_cache_spans.c -Wl,--gc-sections $(LDLIBS) -o "$$test_dir/rocm"; \
+	"$$test_dir/rocm"
+endif
+
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
@@ -599,7 +627,7 @@ cuda/mmq/quantize.rocm.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/co
 cuda/mmq/mmid.rocm.o: cuda/mmq/mmid.cu cuda/mmq/mmid.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/vendors/hip.h
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
-cuda/mmq/mmvq.rocm.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh cuda/mmq/vendors/hip.h
+cuda/mmq/mmvq.rocm.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh cuda/mmq/vendors/hip.h cuda/mmq/mmq.cuh
 	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
 
 cuda/mmq/d2r_stubs.rocm.o: cuda/mmq/test/d2r_stubs.cu cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/vendors/hip.h
@@ -607,6 +635,21 @@ cuda/mmq/d2r_stubs.rocm.o: cuda/mmq/test/d2r_stubs.cu cuda/mmq/ds4_mmq_d2r.cuh c
 
 tests/test_mxfp4_rocm.o: tests/test_mxfp4_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+# Compile the CPU references without fast-math; link the production GPU objects.
+# The executable name is recognized by the workload watcher on Halo hosts.
+tests/test_deepseek41_rocm.o: tests/test_deepseek41_rocm.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+ds4_image.rocm.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
+	$(CC) $(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -c -o $@ $<
+
+ds4-kernel-v41: tests/test_deepseek41_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-deepseek41-rocm
+test-deepseek41-rocm: ds4-kernel-v41
+	./ds4-kernel-v41
 
 tests/test_mxfp4_rocm: tests/test_mxfp4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
@@ -842,6 +885,7 @@ clean:
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
+	rm -f ds4-kernel-v41
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
 	rm -f tests/test_deepseek41_prefill

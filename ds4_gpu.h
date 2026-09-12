@@ -78,7 +78,7 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
 /* V4.1 activation/cache formats. Buffers are float-addressable but the
  * rounded values follow the released BF16/FP8/FP4 inference graph. */
 typedef enum {
@@ -172,10 +172,32 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint64_t weight_offset, uint32_t width,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* HC2048 F32 SGEMM: 1 enqueued, 0 unsupported, -1 failure.
+ * Never fall back after failure. Full heads scratch remains live on stream0;
+ * free the plan before graph tensors. Input is already RMS-normalized;
+ * output remains F32 for Sinkhorn. */
+typedef struct ds4_gpu_dsv41_hc_plan ds4_gpu_dsv41_hc_plan;
+int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
+                            ds4_gpu_tensor *out, const void *model_map,
+                            uint64_t model_size, uint64_t weight_offset,
+                            uint32_t rows, const ds4_gpu_tensor *input,
+                            ds4_gpu_tensor *full_heads_scratch);
+void ds4_gpu_dsv41_hc_plan_free(ds4_gpu_dsv41_hc_plan *plan);
+
+/* Preserve V4.1 activation formats while applying Q8 weights. */
+int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out,
+                                    const void *model_map, uint64_t model_size,
+                                    uint64_t weight_offset, uint32_t width,
+                                    uint32_t outputs, uint32_t rows,
+                                    const ds4_gpu_tensor *in);
+#endif
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);
+#endif
+#ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
@@ -288,6 +310,12 @@ int ds4_gpu_set_aux_model_map_range(const void *model_map,
                                     uint64_t map_size);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* V4.1 resident startup: exact new arenas on gfx1151, registered primary file only. */
+int ds4_gpu_cache_model_range_exact(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+/* Finish primary V4.1 startup uploads; later uploads recreate their staging pool. */
+int ds4_gpu_release_model_upload_staging(const void *model_map, uint64_t model_size);
+#endif
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
@@ -329,6 +357,11 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* Override the allocator reserve for a model with an explicit admission plan.
+ * set_ssd_streaming resets this to the ROCm default for each engine open. */
+void ds4_gpu_set_streaming_free_reserve(uint64_t bytes);
+#endif
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
@@ -404,9 +437,37 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
 #endif
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+typedef struct ds4_gpu_stream_expert_memory {
+    uint64_t dynamic_bytes, layer_bytes, selected_bytes, pinned_bytes;
+} ds4_gpu_stream_expert_memory;
+/* Call reserve/query/quiesce without a concurrent full-layer loader. Slab
+ * capacity includes free slots; it is not the current cached-entry count. */
+int ds4_gpu_stream_expert_cache_reserve_layers(
+        const ds4_gpu_stream_expert_table *even,
+        const ds4_gpu_stream_expert_table *odd);
+int ds4_gpu_stream_expert_cache_note_layer_consumed(
+        const ds4_gpu_stream_expert_table *table);
+int ds4_gpu_stream_expert_cache_quiesce(void);
+int ds4_gpu_stream_expert_cache_get_memory(ds4_gpu_stream_expert_memory *out);
 int ds4_gpu_stream_expert_cache_load_layer(
         const ds4_gpu_stream_expert_table *table);
+/* V4.1's single-owner sweep prepares on the graph thread after quiescing
+ * selected reads and joining its previous loader. All source copies finish
+ * before return; only this immutable descriptor crosses to the disk worker.
+ * Do not mutate/reuse a plan while its loader is running. */
+typedef struct ds4_gpu_dsv41_stream_layer_plan {
+    ds4_gpu_stream_expert_table table;
+    uint64_t generation;
+    uint64_t hits[6];
+} ds4_gpu_dsv41_stream_layer_plan;
+int ds4_gpu_dsv41_stream_prepare_layer(
+        const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_dsv41_stream_layer_plan *plan);
+int ds4_gpu_dsv41_stream_load_layer(
+        const ds4_gpu_dsv41_stream_layer_plan *plan);
+int ds4_gpu_dsv41_stream_cancel_layer(
+        const ds4_gpu_dsv41_stream_layer_plan *plan);
 int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor             *selected,
@@ -421,8 +482,9 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
-#ifdef __APPLE__
-/* Seed from mapped weights with blits appended to the active command buffer. */
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* Metal appends mapped-weight blits to its command buffer; ROCm copies from
+ * a matching full-layer slot and completes those D2D copies before return. */
 int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *expert_ids,

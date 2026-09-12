@@ -45,9 +45,7 @@ To build weights rather than download them, see [GGUF tools](../gguf-tools/READM
 
 ## DeepSeek V4.1 Flash
 
-V4.1 Flash text and vision inference work on Metal. It needs its own GGUF,
-tokenizer and inference graph; V4 Flash weights and DSpark
-support files are not interchangeable with it.
+V4.1 Flash text and vision inference work on Metal and ROCm on Strix Halo (`gfx1151`). ROCm Q2 text and vision qualification covers resident expert weights and SSD streaming; see the [Strix Halo setup](STRIX_HALO.md#deepseek-v41-flash). It needs its own GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files are not interchangeable with it.
 
 | Target | File size | Main weights |
 | --- | ---: | ---: |
@@ -90,8 +88,9 @@ Resident and TP inference also batch continued prefills automatically.
 
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
-increasing both context and slot count. DSpark, pipeline execution and
-non-Metal backends are not implemented for V4.1.
+increasing both context and slot count.
+
+DSpark, pipeline execution and CUDA are not implemented for V4.1. Distributed ROCm inference is not qualified.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
@@ -107,8 +106,9 @@ For images, download the matching encoder and add it to the same command:
   --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-Vision.gguf
 ```
 
-Vision works with SSD streaming, full residency and two-Mac TP. Pass the encoder
-on both TP ranks. Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
+On Metal, vision works with SSD streaming, full residency and two-Mac TP. ROCm vision is qualified with SSD streaming. Pass the encoder on both TP ranks.
+
+Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
 or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
 work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
 to build the GGUFs from safetensors.
@@ -170,7 +170,7 @@ Directional steering is supported for GLM 5.3, not GLM 5.2.
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,
 single-GPU CUDA, and ROCm. The encoder must match the model.
-V4.1 Flash is currently Metal-only; its setup is [above](#deepseek-v41-flash).
+V4.1 Flash also supports ROCm on Strix Halo; its setup is [above](#deepseek-v41-flash).
 
 ### DeepSeek Flash Vision Experimental
 
