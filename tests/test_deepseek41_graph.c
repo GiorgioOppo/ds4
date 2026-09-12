@@ -520,6 +520,120 @@ done:
     return rc;
 }
 
+static float attention_imatrix_value(unsigned source, uint32_t column) {
+    return ((float)(column % 17u) - 8) / 8 + (float)source;
+}
+
+static int check_attention_imatrix(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_imatrix_collector c = {.dataset_path = "bounded attention fixture", .chunks = 2};
+    ds4_weights weights = {0};
+    ds4_tensor tensors[5] = {0};
+    ds4_gpu_tensor *scratch = NULL, *overwrite = NULL;
+    FILE *file = NULL;
+    char path[] = "/private/tmp/ds41-attention-imatrix-XXXXXX";
+    int fd = -1, rc = 1;
+    const char *names[] = {"blk.0.attn_q_a.weight", "blk.0.attn_q_b.weight", "blk.0.attn_kv.weight",
+                           "blk.0.attn_output_a.weight", "blk.0.attn_output_b.weight"};
+    const unsigned source[] = {0, 1, 0, 2, 3};
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    g_ds4_shape.n_layer = 1;
+    const uint32_t widths[] = {DS4_N_EMBD, DS4_N_LORA_Q, DS4_N_HEAD * DS4_N_HEAD_DIM,
+                               DS4_N_OUT_GROUP * DS4_N_LORA_O};
+    REQUIRE(ds4_gpu_init());
+    c.attention_buf = malloc((size_t)widths[2] * sizeof(float));
+    scratch = ds4_gpu_tensor_alloc((uint64_t)widths[2] * sizeof(float));
+    overwrite = ds4_gpu_tensor_alloc((uint64_t)widths[2] * sizeof(float));
+    REQUIRE(c.attention_buf && scratch && overwrite);
+    REQUIRE(ds4_gpu_tensor_fill_f32(overwrite, 99.0f, widths[2]));
+    for (unsigned p = 0; p < 5; p++) {
+        c.attention_sum2[p] = calloc(imatrix_attention_width(p), sizeof(float));
+        REQUIRE(c.attention_sum2[p]);
+        tensors[p].name.ptr = names[p];
+        tensors[p].name.len = strlen(names[p]);
+    }
+    weights.layer[0].attn_q_a = &tensors[0];
+    weights.layer[0].attn_q_b = &tensors[1];
+    weights.layer[0].attn_kv = &tensors[2];
+    weights.layer[0].attn_output_a = &tensors[3];
+    weights.layer[0].attn_output_b = &tensors[4];
+    for (unsigned s = 0; s < 4; s++) {
+        c.attention_input[s] = ds4_gpu_tensor_alloc((uint64_t)widths[s] * sizeof(float));
+        REQUIRE(c.attention_input[s]);
+        float *input = ds4_gpu_tensor_contents(scratch);
+        REQUIRE(input);
+        for (uint32_t j = 0; j < widths[s]; j++) input[j] = attention_imatrix_value(s, j);
+        /* Match the graph's snapshot-before-reuse ordering within one command
+         * buffer. Collection happens only after the later overwrite drained. */
+        REQUIRE(ds4_gpu_begin_commands());
+        REQUIRE(ds4_gpu_tensor_copy(c.attention_input[s], 0, scratch, 0, (uint64_t)widths[s] * 4));
+        REQUIRE(ds4_gpu_tensor_copy(scratch, 0, overwrite, 0, (uint64_t)widths[s] * 4));
+        REQUIRE(ds4_gpu_end_commands());
+    }
+    REQUIRE(imatrix_collect_attention(&c, 0));
+    REQUIRE(imatrix_collect_attention(&c, 0));
+    for (unsigned p = 0; p < 5; p++) {
+        const uint32_t width = imatrix_attention_width(p), rows = p == 3 ? DS4_N_OUT_GROUP : 1;
+        REQUIRE(c.attention_count[p][0] == 2 * rows);
+        for (uint32_t j = 0; j < width; j++) {
+            float expected = 0;
+            for (unsigned repeat = 0; repeat < 2; repeat++) for (uint32_t row = 0; row < rows; row++) {
+                const float x = attention_imatrix_value(source[p], row * width + j);
+                expected += x * x;
+            }
+            REQUIRE(c.attention_sum2[p][j] == expected);
+        }
+    }
+    REQUIRE(!memcmp(c.attention_sum2[0], c.attention_sum2[2], DS4_N_EMBD * sizeof(float)));
+    fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    REQUIRE(close(fd) == 0);
+    fd = -1;
+    REQUIRE(imatrix_collector_save(&c, &weights, path));
+    file = fopen(path, "rb");
+    REQUIRE(file);
+    int32_t value;
+    REQUIRE(fread(&value, 4, 1, file) == 1 && value == 5);
+    for (unsigned p = 0; p < 5; p++) {
+        char name[128] = {0};
+        REQUIRE(fread(&value, 4, 1, file) == 1 && value > 0 && value < (int)sizeof(name));
+        REQUIRE(fread(name, 1, value, file) == (size_t)value && !strcmp(name, names[p]));
+        REQUIRE(fread(&value, 4, 1, file) == 1 && value == 1);
+        REQUIRE(fread(&value, 4, 1, file) == 1 && value == (int)imatrix_attention_width(p));
+        REQUIRE(fread(c.attention_buf, sizeof(float), value, file) == (size_t)value);
+        for (int32_t j = 0; j < value; j++)
+            REQUIRE(c.attention_buf[j] == c.attention_sum2[p][j] / c.attention_count[p][0]);
+    }
+    REQUIRE(fread(&value, 4, 1, file) == 1 && value == 2);
+    REQUIRE(fread(&value, 4, 1, file) == 1 && value == (int)strlen(c.dataset_path));
+    char dataset[128] = {0};
+    REQUIRE(fread(dataset, 1, value, file) == (size_t)value && !strcmp(dataset, c.dataset_path));
+    REQUIRE(fgetc(file) == EOF);
+    REQUIRE(!imatrix_collect_attention(&c, 1));
+    c.attention_count[0][0] = UINT32_MAX;
+    REQUIRE(!imatrix_collect_attention(&c, 0));
+    c.attention_count[0][0] = 2;
+    float *bad = ds4_gpu_tensor_contents(c.attention_input[0]);
+    const uint32_t nonfinite[] = {0x7f800000u, 0x7fc00001u, 0x7f7fffffu};
+    for (unsigned i = 0; i < 3; i++) {
+        memcpy(bad, &nonfinite[i], sizeof(float));
+        REQUIRE(!imatrix_collect_attention(&c, 0));
+    }
+    puts("V4.1 attention imatrix: input snapshots, five widths/names, pooled O_A counts, serialized means and finite checks PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    if (file) fclose(file);
+    if (fd >= 0) close(fd);
+    if (strstr(path, "XXXXXX") == NULL) unlink(path);
+    ds4_gpu_tensor_free(scratch);
+    ds4_gpu_tensor_free(overwrite);
+    imatrix_collector_free(&c);
+    ds4_gpu_cleanup();
+    g_ds4_shape = saved_shape;
+    return rc;
+}
+
 static int check_imatrix_inputs(void) {
     ds4_imatrix_collector c = {0};
     ds4_gpu_tensor *x = NULL, *mid = NULL, *selected = NULL;
@@ -2248,6 +2362,8 @@ done:
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--attention-identity"))
         return check_attention_identity();
+    if (argc == 2 && !strcmp(argv[1], "--attention-imatrix"))
+        return check_attention_imatrix();
     if (argc == 2 && !strcmp(argv[1], "--prefill-expert-stream"))
         return check_prefill_expert_stream();
     if (argc == 3 && !strcmp(argv[1], "--attention-index-bypass"))

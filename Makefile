@@ -212,6 +212,18 @@ tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4
 tests/test_deepseek41_graph: tests/test_deepseek41_graph.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
+# Non-finite calibration guards must survive the production optimizer flags.
+tests/test_deepseek41_imatrix_release.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
+	$(CC) $(CFLAGS) -O3 -ffast-math -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_deepseek41_imatrix_release: tests/test_deepseek41_imatrix_release.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(CFLAGS) -O3 -ffast-math -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-imatrix-release
+test-deepseek41-imatrix-release: tests/test_deepseek41_imatrix_release
+	./tests/test_deepseek41_imatrix_release --attention-imatrix
+	./tests/test_deepseek41_imatrix_release --attention-identity
+
 tests/test_deepseek41_q4_attention.o: tests/test_deepseek41_q4_attention.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
@@ -865,7 +877,7 @@ clean:
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_q8_bf16
 	rm -f tests/test_deepseek41_gguf
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_q4_attention
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_q4_attention tests/test_deepseek41_imatrix_release
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch

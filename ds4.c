@@ -35768,7 +35768,20 @@ typedef struct {
     uint64_t observed_routes;
     uint32_t chunks;
     const char *dataset_path;
+    /* V4.1 scalar calibration snapshots inputs before graph scratch is reused.
+     * Q_A and KV share the normalized input. O_A pools its eight group rows
+     * into one importance vector matching the GGUF tensor's column count. */
+    float *attention_sum2[5]; /* Q_A, Q_B, KV, O_A, O_B: [layer][column] */
+    uint32_t attention_count[5][DS4_MAX_LAYER];
+    ds4_gpu_tensor *attention_input[4]; /* norm, normalized QR, heads, BF16 low */
+    float *attention_buf;
 } ds4_imatrix_collector;
+
+static uint32_t imatrix_attention_width(unsigned projection) {
+    const uint32_t widths[] = {DS4_N_EMBD, DS4_N_LORA_Q, DS4_N_EMBD,
+        DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), DS4_N_OUT_GROUP * DS4_N_LORA_O};
+    return projection < 5 ? widths[projection] : 0;
+}
 
 struct ds4_glm_gpu_graph;
 static bool imatrix_collect_glm_one(
@@ -35789,6 +35802,19 @@ static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens
     c->routed_mid_f16_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
     c->selected_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
     c->sq_tmp = xmalloc((size_t)DS4_N_EMBD * sizeof(c->sq_tmp[0]));
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        for (unsigned i = 0; i < 5; i++)
+            c->attention_sum2[i] = xcalloc((size_t)DS4_N_LAYER * imatrix_attention_width(i), sizeof(float));
+        const uint32_t widths[] = {DS4_N_EMBD, DS4_N_LORA_Q,
+            DS4_N_HEAD * DS4_N_HEAD_DIM, DS4_N_OUT_GROUP * DS4_N_LORA_O};
+        uint32_t max_width = 0;
+        for (unsigned i = 0; i < 4; i++) {
+            c->attention_input[i] = ds4_gpu_tensor_alloc((uint64_t)widths[i] * sizeof(float));
+            if (!c->attention_input[i]) return false;
+            if (widths[i] > max_width) max_width = widths[i];
+        }
+        c->attention_buf = xmalloc((size_t)max_width * sizeof(float));
+    }
     return c->gate_up_sum2 && c->down_sum2 && c->ffn_norm_buf &&
            c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
 }
@@ -35802,6 +35828,9 @@ static void imatrix_collector_free(ds4_imatrix_collector *c) {
     free(c->routed_mid_f16_buf);
     free(c->selected_buf);
     free(c->sq_tmp);
+    for (unsigned i = 0; i < 5; i++) free(c->attention_sum2[i]);
+    for (unsigned i = 0; i < 4; i++) ds4_gpu_tensor_free(c->attention_input[i]);
+    free(c->attention_buf);
     memset(c, 0, sizeof(*c));
 }
 
@@ -35811,6 +35840,36 @@ static float *imatrix_gate_up_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_
 
 static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t expert) {
     return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
+}
+
+/* Called only after the calibration layer's GPU command buffer has drained. */
+static bool imatrix_collect_attention(ds4_imatrix_collector *c, uint32_t il) {
+    if (!c || !c->attention_sum2[0]) return true;
+    if (il >= DS4_N_LAYER || !c->attention_buf) return false;
+    const unsigned source[] = {0, 1, 0, 2, 3};
+    for (unsigned p = 0; p < 5; p++) {
+        const uint32_t width = imatrix_attention_width(p);
+        const uint32_t rows = p == 3 ? DS4_N_OUT_GROUP : 1;
+        if (c->attention_count[p][il] > UINT32_MAX - rows ||
+            !ds4_gpu_tensor_read(c->attention_input[source[p]], 0, c->attention_buf,
+                                (uint64_t)rows * width * sizeof(float))) return false;
+        float *sum = c->attention_sum2[p] + (size_t)il * width;
+        for (uint32_t row = 0; row < rows; row++) for (uint32_t col = 0; col < width; col++) {
+            uint32_t bits;
+            memcpy(&bits, c->attention_buf + (size_t)row * width + col, sizeof(bits));
+            /* Validate raw input before fast-math can assume finite arithmetic.
+             * A finite float squared fits double; reject float overflow before
+             * narrowing rather than checking a fast-math result for infinity. */
+            if ((bits & 0x7f800000u) == 0x7f800000u) return false;
+            float value;
+            memcpy(&value, &bits, sizeof(value));
+            const double next = (double)sum[col] + (double)value * value;
+            if (next > FLT_MAX) return false;
+            sum[col] = (float)next;
+        }
+        c->attention_count[p][il] += rows;
+    }
+    return true;
 }
 
 static bool imatrix_collect_tensor_batch(
@@ -35935,10 +35994,24 @@ static bool imatrix_collector_save(
     int32_t entries = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (weights->layer[il].ffn_gate_exps) entries += 3;
+        if (c->attention_sum2[0]) entries += 5;
     }
     imatrix_write_i32(fp, entries);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
+        if (c->attention_sum2[0]) {
+            const ds4_tensor *tensors[] = {layer->attn_q_a, layer->attn_q_b, layer->attn_kv,
+                layer->attn_output_a, layer->attn_output_b};
+            for (unsigned p = 0; p < 5; p++) {
+                const ds4_tensor *t = tensors[p];
+                if (!t) { fclose(fp); return false; }
+                char name[256];
+                snprintf(name, sizeof(name), "%.*s", (int)t->name.len, t->name.ptr);
+                const uint32_t width = imatrix_attention_width(p);
+                imatrix_write_entry(fp, name, c->attention_sum2[p] + (size_t)il * width,
+                    &c->attention_count[p][il], 1, width);
+            }
+        }
         if (!layer->ffn_gate_exps || !layer->ffn_up_exps ||
             !layer->ffn_down_exps) continue;
         char name[256];
@@ -39563,7 +39636,9 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
             l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
             4096, 1024, groups, g->heads);
-    return ok && ds41_bf16(g->low, groups * DS4_N_LORA_O);
+    return ok && ds41_bf16(g->low, groups * DS4_N_LORA_O) &&
+        (!g->imatrix || ds4_gpu_tensor_copy(g->imatrix->attention_input[3], 0,
+            g->low, 0, (uint64_t)groups * DS4_N_LORA_O * sizeof(float)));
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
@@ -39659,8 +39734,13 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
+    if (g->imatrix && (projected || g->tp_world != 1 ||
+        !ds4_gpu_tensor_copy(g->imatrix->attention_input[0], 0, g->norm, 0,
+                             (uint64_t)DS4_N_EMBD * sizeof(float)))) return false;
     if (!projected && (!ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) ||
         !ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) ||
+        (g->imatrix && !ds4_gpu_tensor_copy(g->imatrix->attention_input[1], 0, g->qr, 0,
+                                           (uint64_t)DS4_N_LORA_Q * sizeof(float))) ||
         !ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, head0 * 512u, heads * 512u) ||
         !ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) ||
         !ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) return false;
@@ -39687,6 +39767,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     } else if (!ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
                !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
+    if (g->imatrix && !ds4_gpu_tensor_copy(g->imatrix->attention_input[2], 0, g->heads, 0,
+                                          (uint64_t)heads * DS4_N_HEAD_DIM * sizeof(float))) return false;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
            ds41_bf16(g->block, DS4_N_EMBD);
@@ -40169,7 +40251,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
-                                               g->selected, false, il, 1);
+                                               g->selected, false, il, 1) &&
+                 imatrix_collect_attention(g->imatrix, il);
         if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
@@ -60445,9 +60528,9 @@ static int ds4_engine_collect_sequential_imatrix(
 #endif
 
     fprintf(stderr,
-            "ds4: collecting %s routed imatrix from %s "
+            "ds4: collecting %s routed%s imatrix from %s "
             "(layers=%u experts=%u ctx=%d)\n",
-            name, dataset_path, DS4_N_LAYER, DS4_N_EXPERT, ctx_size);
+            name, v41 ? " and attention" : "", dataset_path, DS4_N_LAYER, DS4_N_EXPERT, ctx_size);
 
     bool ok = true;
     int prompts_done = 0;
