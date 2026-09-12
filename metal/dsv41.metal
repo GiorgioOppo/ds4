@@ -59,6 +59,32 @@ kernel void kernel_dsv41_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+// Attention rounds the entire head before undoing RoPE on its tail. Keep
+// both BF16 boundaries, but avoid publishing the intermediate rounded head.
+kernel void kernel_dsv41_bf16_rope(
+        constant ds4_metal_args_dsv41_rope &args,
+        device float *x,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const ulong base = ((ulong)group.y * args.heads + group.x) * args.width;
+    const uint prefix = args.width - 64u;
+    for (uint vec = lane; vec < prefix / 4u; vec += 32u) {
+        const uint col = vec * 4u;
+        device uint4 *p = (device uint4 *)(x + base + col);
+        uint4 bits = *p;
+        const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+        bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+        *p = bits & 0xffff0000u;
+    }
+    const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = base + prefix + 2u * lane;
+    const float re = dsv41_bf16(x[i]), im = dsv41_bf16(x[i + 1u]);
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
+}
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,

@@ -152,6 +152,105 @@ static int check_bf16_linear(void) {
     return 1;
 }
 
+static int check_bf16_rope(void) {
+    const struct { uint32_t width, heads, rows, offset; } shapes[] = {
+        {64, 1, 1, 0}, {65, 2, 3, 0}, {128, 32, 5, 1}, {132, 2, 3, 4},
+        {512, 32, 1, 0}, {512, 32, 32, 0}, {512, 32, 128, 0},
+        {512, 32, 512, 0}, {512, 32, 2048, 0},
+        {512, 64, 1, 0}, {512, 64, 32, 0},
+        {512, 64, 128, 0}, {512, 64, 512, 0}, {512, 64, 2048, 0}
+    };
+    const uint32_t starts[] = {0, 126, 32766, 1046500};
+    const uint32_t edges[] = {
+        0, 0x80000000u, 1, 0x80000001u, 0x007fffffu, 0x807fffffu,
+        0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+        0x7fc10001u, 0xffc10001u, 0x3f808000u, 0xbf818000u,
+        0x3f7f8000u, 0xbf7e8000u
+    };
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(*shapes); shape++) {
+        const uint32_t width = shapes[shape].width, heads = shapes[shape].heads;
+        const uint32_t rows = shapes[shape].rows, offset = shapes[shape].offset;
+        const size_t count = (size_t)width * heads * rows, bytes = (count + 8) * 4;
+        ds4_gpu_tensor *storage[2] = {upload(NULL, bytes), upload(NULL, bytes)};
+        CHECK(storage[0] && storage[1]);
+        ds4_gpu_tensor *view[2];
+        uint32_t *bits[2];
+        for (unsigned mode = 0; mode < 2; mode++) {
+            view[mode] = ds4_gpu_tensor_view(storage[mode], offset * 4u, count * 4u);
+            bits[mode] = ds4_gpu_tensor_contents(storage[mode]);
+            CHECK(view[mode] && bits[mode]);
+        }
+        /* Include non-BF16 inputs and exact halfway values; every original
+         * FP32 value must round before entering either rotation product. */
+        for (unsigned compressed = 0; compressed < 2; compressed++) {
+            for (unsigned inverse = 0; inverse < 2; inverse++) {
+                for (size_t i = 0; i < count + 8; i++) bits[0][i] = 0x12345678u;
+                for (size_t i = 0; i < count; i++) {
+                    const float value = random_value();
+                    memcpy(bits[0] + offset + i, &value, 4);
+                    if (i % 17u == 0u) bits[0][offset + i] =
+                        (bits[0][offset + i] & 0xffff0000u) | 0x8000u;
+                }
+                for (size_t i = 0; i < sizeof(edges) / sizeof(*edges); i++) {
+                    if (i < width - 64u) bits[0][offset + i] = edges[i];
+                    bits[0][offset + width - 64u + i] = edges[i];
+                }
+                memcpy(bits[1], bits[0], bytes);
+                const uint32_t start = starts[compressed * 2u + inverse];
+                double elapsed[2][7] = {{0}};
+                const unsigned repeats = compressed && inverse ? 8u : 1u;
+                const unsigned calls = repeats > 1u ? (rows == 1u ? 128u : 8u) : 1u;
+                for (unsigned repeat = 0; repeat < repeats; repeat++) {
+                    for (unsigned j = 0; j < 2; j++) {
+                        const unsigned mode = j ^ (repeat & 1u);
+                        const double begin = monotonic_seconds();
+                        CHECK(ds4_gpu_begin_commands());
+                        for (unsigned call = 0; call < calls; call++) {
+                            if (mode) {
+                                CHECK(ds4_gpu_dsv41_bf16_rope(view[mode], width, heads,
+                                    rows, start, compressed, inverse));
+                            } else {
+                                CHECK(ds4_gpu_dsv41_quantize(view[mode], width * heads,
+                                    rows, DS4_V41_BF16));
+                                CHECK(ds4_gpu_dsv41_rope(view[mode], width, heads,
+                                    rows, start, compressed, inverse));
+                            }
+                        }
+                        CHECK(ds4_gpu_end_commands());
+                        if (repeat) elapsed[mode][repeat - 1u] =
+                            (monotonic_seconds() - begin) * (1000.0 / calls);
+                    }
+                    CHECK(!memcmp(bits[0], bits[1], bytes));
+                    for (size_t i = 0; i < offset; i++) CHECK(bits[1][i] == 0x12345678u);
+                    for (size_t i = offset + count; i < count + 8; i++)
+                        CHECK(bits[1][i] == 0x12345678u);
+                }
+                if (repeats > 1u) {
+                    for (unsigned mode = 0; mode < 2; mode++)
+                        for (unsigned i = 1; i < 7; i++)
+                            for (unsigned j = i; j && elapsed[mode][j] < elapsed[mode][j - 1u]; j--) {
+                                const double t = elapsed[mode][j];
+                                elapsed[mode][j] = elapsed[mode][j - 1u];
+                                elapsed[mode][j - 1u] = t;
+                            }
+                    fprintf(stderr,
+                        "V4.1 BF16+RoPE width=%u heads=%u rows=%u offset=%u: exact median %.4f -> %.4f ms\n",
+                        width, heads, rows, offset, elapsed[0][3], elapsed[1][3]);
+                }
+            }
+        }
+        CHECK(!ds4_gpu_dsv41_bf16_rope(view[1], width, heads, rows + 1, 0, true, true));
+        CHECK(!ds4_gpu_dsv41_bf16_rope(view[1], width, heads, rows, 1048576, true, true));
+        CHECK(!ds4_gpu_dsv41_bf16_rope(view[1], 63, heads, rows, 0, true, true));
+        CHECK(!ds4_gpu_dsv41_bf16_rope(view[1], width, 0, rows, 0, true, true));
+        for (unsigned mode = 0; mode < 2; mode++) {
+            ds4_gpu_tensor_free(view[mode]);
+            ds4_gpu_tensor_free(storage[mode]);
+        }
+    }
+    return 1;
+}
+
 static int check_hc_scaled(void) {
     enum { WIDTH = 20480, OUT = 24, ROWS = 8192 };
     const size_t weight_bytes = WIDTH * OUT * sizeof(_Float16);
@@ -951,6 +1050,11 @@ static int check_tp_attention(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--bf16-rope")) {
+        const int ok = ds4_gpu_init() && check_bf16_rope();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--tp-attention")) {
         const int ok = ds4_gpu_init() && check_tp_attention();
         ds4_gpu_cleanup();
@@ -992,7 +1096,8 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
     if (argc != 1) return 2;
-    int ok = ds4_gpu_init() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
+    int ok = ds4_gpu_init() && check_quantization() && check_engram() && check_rope_stride() &&
+             check_bf16_rope() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_index_projection() && check_causal_topk() && check_compact_carry() && check_attention_output() &&
              check_tp_attention();

@@ -105,6 +105,10 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
+/* Round the complete head to BF16 before RoPE, retaining the tail's second
+ * BF16 boundary. Equivalent to quantize(BF16) followed by dsv41_rope. */
+int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                           uint32_t rows, uint32_t start, bool compressed, bool inverse);
 /* Compressed pairs advance two absolute token positions per stored row. */
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,

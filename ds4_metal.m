@@ -47578,13 +47578,19 @@ static bool dsv41_tensor_has_floats(const ds4_gpu_tensor *tensor, uint64_t count
 /* Frequency rounding errors accumulate into phase errors at long contexts.
  * Preserve the reference's pow/reciprocal and YaRN operation order here. */
 #pragma float_control(precise, on, push)
-int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+static int ds4_gpu_dsv41_rope_impl(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
-                             bool compressed, bool inverse) {
+                             bool compressed, bool inverse, bool round_bf16) {
     if (width < 64 || !heads || !rows || rows > 1048576 || !stride ||
         (uint64_t)start + (uint64_t)(rows - 1u) * stride >= 1048576u ||
         (uint64_t)heads * rows > UINT64_MAX / width ||
         !dsv41_tensor_has_floats(x, (uint64_t)width * heads * rows)) return 0;
+    if (round_bf16 && ((width & 3u) || ds4_gpu_tensor_offset(x) % 16u)) {
+        if ((uint64_t)heads * rows > UINT32_MAX) return 0;
+        return ds4_gpu_dsv41_quantize(x, width, heads * rows, DS4_V41_BF16) &&
+            ds4_gpu_dsv41_rope_impl(x, width, heads, rows, start, stride,
+                                   compressed, inverse, false);
+    }
     if (!g_initialized && !ds4_gpu_init()) return 0;
     static float frequencies[2][32];
     static dispatch_once_t once;
@@ -47608,7 +47614,8 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
         }
     });
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope");
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(round_bf16 ?
+            "kernel_dsv41_bf16_rope" : "kernel_dsv41_rope");
         if (!pipeline) return 0;
         struct {
             uint32_t width, heads, rows, start, inverse, stride;
@@ -47629,6 +47636,19 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
     }
 }
 #pragma float_control(pop)
+
+int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                             uint32_t rows, uint32_t start, uint32_t stride,
+                             bool compressed, bool inverse) {
+    return ds4_gpu_dsv41_rope_impl(x, width, heads, rows, start, stride,
+                                  compressed, inverse, false);
+}
+
+int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                           uint32_t rows, uint32_t start, bool compressed, bool inverse) {
+    return ds4_gpu_dsv41_rope_impl(x, width, heads, rows, start, 1,
+                                  compressed, inverse, true);
+}
 
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse) {

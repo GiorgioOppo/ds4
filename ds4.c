@@ -39661,9 +39661,14 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+            heads, DS4_N_HEAD_DIM)) return false;
+    /* The fused pass benefits the full 64-head layout; retain the existing
+     * dispatch for TP's smaller head slice. */
+    if (g->tp_world == 1) {
+        if (!ds4_gpu_dsv41_bf16_rope(g->heads, DS4_N_HEAD_DIM, heads, 1,
+                                    pos, ratio != 0, true)) return false;
+    } else if (!ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+               !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -39685,6 +39690,20 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    /* Read the selected IDs before the shared expert so its GPU work can
+     * overlap missing-expert reads. The routed kernel consumes this existing
+     * cache reservation and waits for the weights before using them. TP owns
+     * expert slices with different offsets; keep its scheduling unchanged. */
+    if (g->streaming && !g->quality && !g->imatrix && g->tp_world == 1 &&
+        ds4_gpu_stream_expert_cache_configured_count() != 0 &&
+        l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
+        const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(
+            m, l, il, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD);
+        if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                &table, g->selected, DS4_N_EXPERT_USED)) return false;
+    }
     if ((!shared_owner || g->tp_rank == (il & 1u)) &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
@@ -40000,8 +40019,12 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             b->selected_comp, count, start, n_raw, g->prefill_cap + 128u, 0, n_comp,
             DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM);
     }
-    if (!ok || !ds4_gpu_dsv41_quantize(b->heads, heads * DS4_N_HEAD_DIM, count, DS4_V41_BF16) ||
-        !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, heads, count, start, ratio != 0, true))
+    if (!ok) return false;
+    if (g->tp_world == 1) {
+        if (!ds4_gpu_dsv41_bf16_rope(b->heads, DS4_N_HEAD_DIM, heads, count,
+                                    start, ratio != 0, true)) return false;
+    } else if (!ds4_gpu_dsv41_quantize(b->heads, heads * DS4_N_HEAD_DIM, count, DS4_V41_BF16) ||
+               !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, heads, count, start, ratio != 0, true))
         return false;
     const uint32_t kept = n_raw < 128u ? n_raw : 128u;
     const uint32_t slot = (start + count - kept) % 128u;
