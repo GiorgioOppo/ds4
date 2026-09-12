@@ -932,6 +932,7 @@ typedef struct {
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+static __strong id<MTLBuffer> g_stream_prefill_layer_views[3];
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
@@ -11511,6 +11512,7 @@ void ds4_gpu_cleanup(void) {
             g_stream_expert_cache_batch_seq = 0;
         }
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
+        (void)ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL);
         if (ds4_gpu_stream_expert_timing_summary_enabled() &&
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
@@ -12811,6 +12813,72 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
             ds4_gpu_gib(offset),
             ds4_gpu_gib(end));
     return nil;
+}
+
+int ds4_gpu_stream_prefill_bind_layer(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *down) {
+    @autoreleasepool {
+        if (g_batch_cb || [g_pending_cbs count] != 0) return 0;
+        const ds4_gpu_tensor *tensors[] = {gate, up, down};
+        uint64_t offsets[3] = {0}, bytes[3] = {0};
+        id<MTLBuffer> buffers[3] = {nil, nil, nil};
+        if (table) {
+            if (!g_ssd_streaming_mode || !table->model_map || !table->model_size ||
+                !table->n_total_expert || !table->gate_expert_bytes || !table->down_expert_bytes ||
+                table->gate_expert_bytes > UINT64_MAX / table->n_total_expert ||
+                table->down_expert_bytes > UINT64_MAX / table->n_total_expert) return 0;
+            offsets[0] = table->gate_offset;
+            offsets[1] = table->up_offset;
+            offsets[2] = table->down_offset;
+            bytes[0] = bytes[1] = table->gate_expert_bytes * table->n_total_expert;
+            bytes[2] = table->down_expert_bytes * table->n_total_expert;
+            for (unsigned j = 0; j < 3; j++) {
+                if (!tensors[j] || ds4_gpu_tensor_offset(tensors[j]) != 0 ||
+                    ds4_gpu_tensor_bytes(tensors[j]) < bytes[j] ||
+                    offsets[j] > table->model_size || bytes[j] > table->model_size - offsets[j]) return 0;
+                buffers[j] = ds4_gpu_tensor_buffer(tensors[j]);
+                if (!buffers[j]) return 0;
+            }
+        } else if (gate || up || down) return 0;
+        if (!table && !g_stream_prefill_layer_views[0] &&
+            !g_stream_prefill_layer_views[1] && !g_stream_prefill_layer_views[2]) return 1;
+
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            id<MTLBuffer> buffer = g_model_views[i].buffer;
+            if (buffer != g_stream_prefill_layer_views[0] &&
+                buffer != g_stream_prefill_layer_views[1] &&
+                buffer != g_stream_prefill_layer_views[2]) kept++;
+        }
+        if (table && kept > DS4_METAL_MAX_MODEL_VIEWS - 3u) return 0;
+        ds4_gpu_model_residency_clear();
+        uint32_t dst = 0;
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            id<MTLBuffer> buffer = g_model_views[i].buffer;
+            if (buffer != g_stream_prefill_layer_views[0] &&
+                buffer != g_stream_prefill_layer_views[1] &&
+                buffer != g_stream_prefill_layer_views[2]) g_model_views[dst++] = g_model_views[i];
+        }
+        for (uint32_t i = dst; i < g_model_view_count; i++) g_model_views[i] = (ds4_gpu_model_view){0};
+        g_model_view_count = dst;
+        for (unsigned j = 0; j < 3; j++) g_stream_prefill_layer_views[j] = nil;
+        /* Exact loaded tensors take precedence over page padding in mmap views.
+         * Keep auxiliary models and all static weights under their existing IDs. */
+        if (table) {
+            for (uint32_t i = dst; i > 0; i--) g_model_views[i + 2u] = g_model_views[i - 1u];
+            for (unsigned j = 0; j < 3; j++) {
+                g_stream_prefill_layer_views[j] = buffers[j];
+                g_model_views[j] = (ds4_gpu_model_view){buffers[j], table->model_map,
+                    table->model_size, offsets[j], bytes[j]};
+            }
+            g_model_view_count += 3u;
+        }
+        /* The exact-range fast path must not reuse an aggregate mapping key. */
+        g_model_map_ptr = NULL;
+        return 1;
+    }
 }
 
 typedef enum {
@@ -43547,6 +43615,23 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_down_half_lut_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT) != 0u);
+        /* Short V4.1 expert groups usually leave the second 16-row half
+         * empty. Skip only that half's MMA; all threads still stage data,
+         * synchronize and write valid outputs in the established order. */
+        const bool v41_mm_tail_supported = use_mm_id && request_mid_f16 &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            down_type == DS4_METAL_TENSOR_Q2_K && n_expert == 6 &&
+            g_tp_split_world == 1 && ds4_gpu_device_is_pre_m5_apple_silicon();
+        const bool v41_mm_tail_auto = v41_mm_tail_supported &&
+            n_total_expert == 384 && expert_in_dim == 5120 &&
+            expert_mid_dim == 2304 && out_dim == 5120 && n_tokens <= 1024 &&
+            (!g_ssd_streaming_mode || force_resident) &&
+            (g_test_flags & DS4_GPU_TEST_V41_MOE_REFERENCE) == 0u;
+        const bool use_v41_mm_pair_tail_cull = v41_mm_tail_supported &&
+            use_mm_id_pair_swiglu &&
+            (v41_mm_tail_auto || (g_test_flags & DS4_GPU_TEST_V41_PAIR_TAIL_CULL) != 0u);
+        const bool use_v41_mm_down_tail_cull = v41_mm_tail_supported &&
+            (v41_mm_tail_auto || (g_test_flags & DS4_GPU_TEST_V41_DOWN_TAIL_CULL) != 0u);
         if (use_mm_id) {
             gate_map_args =
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_total_expert, 1, n_expert, n_tokens);
@@ -43572,7 +43657,10 @@ int ds4_gpu_routed_moe_batch_tensor(
                     ds4_gpu_mul_mm_id_map0_name(n_expert));
             gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
             up_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
-            down_mm_pipeline = use_mxfp4_mm_id_down_half_lut ?
+            down_mm_pipeline = use_v41_mm_down_tail_cull ?
+                ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_mul_mm_id_q2_K_f16_tail_cull", false) :
+                use_mxfp4_mm_id_down_half_lut ?
                 ds4_gpu_get_mul_mm_id_pipeline(
                     use_mxfp4_mm_id_down_tail_simdgroup_cull ?
                         "kernel_mul_mm_id_mxfp4_f16_half_lut_tail_cull" :
@@ -43662,7 +43750,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                 (use_mxfp4_mm_id_pair_half_scale ?
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale" :
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16")) :
-                            "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                            (use_v41_mm_pair_tail_cull ?
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_tail_cull" :
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16"));
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {

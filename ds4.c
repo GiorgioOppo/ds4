@@ -39152,6 +39152,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
+    uint64_t streaming_prefill_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor **tp_out, **tp_in;
@@ -40479,6 +40480,168 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
     return g->prefill_cap;
 }
 
+typedef struct ds41_prefill_expert_slot ds41_prefill_expert_slot;
+typedef struct {
+    ds41_prefill_expert_slot *slot;
+    uint32_t index;
+} ds41_prefill_expert_worker;
+
+struct ds41_prefill_expert_slot {
+    ds4_gpu_tensor *tensor[3];
+    uint8_t *dst[3];
+    uint64_t bytes[3];
+    bool locked[3];
+    const ds4_model *model;
+    ds4_gpu_stream_expert_table table;
+    pthread_t threads[16];
+    ds41_prefill_expert_worker workers[16];
+    bool ok[16];
+    uint32_t n_threads, started;
+};
+
+static void *ds41_prefill_expert_read(void *arg) {
+    ds41_prefill_expert_worker *worker = arg;
+    ds41_prefill_expert_slot *slot = worker->slot;
+    const uint64_t offsets[] = {slot->table.gate_offset, slot->table.up_offset,
+                                slot->table.down_offset};
+    const uint64_t lengths[] = {
+        slot->table.gate_expert_bytes * slot->table.n_total_expert,
+        slot->table.gate_expert_bytes * slot->table.n_total_expert,
+        slot->table.down_expert_bytes * slot->table.n_total_expert};
+    for (unsigned j = 0; j < 3; j++) {
+        const uint64_t part = lengths[j] / slot->n_threads;
+        const uint64_t extra = lengths[j] % slot->n_threads;
+        const uint64_t index = worker->index;
+        uint64_t pos = part * index + (index < extra ? index : extra);
+        const uint64_t end = pos + part + (index < extra);
+        uint8_t *dst = slot->dst[j];
+        while (pos < end) {
+            const size_t bytes = end - pos < (UINT64_C(16) << 20) ?
+                (size_t)(end - pos) : (size_t)(UINT64_C(16) << 20);
+            ssize_t n;
+            do { n = pread(slot->model->fd, dst + pos, bytes, (off_t)(offsets[j] + pos)); }
+            while (n < 0 && errno == EINTR);
+            if (n <= 0) return NULL;
+            pos += (uint64_t)n;
+        }
+    }
+    slot->ok[worker->index] = true;
+    return NULL;
+}
+
+static bool ds41_prefill_expert_read_join(ds41_prefill_expert_slot *slot) {
+    bool ok = true;
+    for (uint32_t i = 0; i < slot->started; i++) {
+        if (pthread_join(slot->threads[i], NULL))
+            ds4_die("cannot join V4.1 expert reader before reusing its buffers");
+        ok = slot->ok[i] && ok;
+    }
+    slot->started = 0;
+    return ok;
+}
+
+static bool ds41_prefill_expert_buffers_free(ds41_prefill_expert_slot slots[2]) {
+    bool ok = true;
+    /* Cancellation waits for the one bounded layer read already in flight;
+     * it never abandons threads still writing into these buffers. */
+    for (unsigned i = 0; i < 2; i++)
+        if (!ds41_prefill_expert_read_join(&slots[i])) ok = false;
+    /* Neither disk readers nor queued kernels may retain writable storage
+     * when a cancelled sweep gives its two-layer reserve back to the host. */
+    if (!ds4_gpu_synchronize()) ok = false;
+    if (!ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL))
+        ds4_die("cannot detach V4.1 expert buffers safely");
+    for (unsigned i = 0; i < 2; i++) for (unsigned j = 0; j < 3; j++) {
+        if (slots[i].locked[j] &&
+            munlock(ds4_gpu_tensor_contents(slots[i].tensor[j]), (size_t)slots[i].bytes[j]))
+            ds4_die("cannot release V4.1 expert buffer pages safely");
+        ds4_gpu_tensor_free(slots[i].tensor[j]);
+    }
+    memset(slots, 0, sizeof(*slots) * 2u);
+    return ok;
+}
+
+/* The engine already reserves two complete expert layers. Explicit buffers
+ * spend that same budget, so pread fills the storage consumed by the GPU
+ * instead of warming mmap pages which the next read can evict again. */
+static bool ds41_prefill_expert_buffers_init(const ds41_gpu_graph *g,
+                                            const ds4_model *m, const ds4_weights *w,
+                                            ds41_prefill_expert_slot slots[2]) {
+    if (!g->streaming || g->tp_world != 1 || g->quality || g->imatrix ||
+        g->encoder_resident || !g->streaming_prefill_bytes || m->fd < 0 ||
+        !ds4_gpu_device_is_pre_m5_apple_silicon()) return false;
+    for (unsigned i = 0; i < 2; i++) for (unsigned j = 0; j < 3; j++)
+        if (slots[i].tensor[j]) return false;
+    const ds4_tensor *first[] = {w->layer[0].ffn_gate_exps, w->layer[0].ffn_up_exps,
+                                 w->layer[0].ffn_down_exps};
+    uint64_t bytes[3], total = 0;
+    const uint64_t page = (uint64_t)getpagesize();
+    for (unsigned j = 0; j < 3; j++) {
+        if (!first[j] || !first[j]->bytes || first[j]->bytes > SIZE_MAX - page) return false;
+        bytes[j] = align_up(first[j]->bytes, page);
+        if (bytes[j] > (UINT64_MAX - total) / 2u) return false;
+        total += bytes[j] * 2u;
+    }
+    if (total > g->streaming_prefill_bytes) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const ds4_tensor *t[] = {l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps};
+        for (unsigned j = 0; j < 3; j++) {
+            if (!t[j] || t[j]->type != first[j]->type || t[j]->bytes != first[j]->bytes ||
+                t[j]->abs_offset > m->size || t[j]->bytes > m->size - t[j]->abs_offset ||
+                t[j]->abs_offset > (uint64_t)LLONG_MAX ||
+                t[j]->bytes > (uint64_t)LLONG_MAX - t[j]->abs_offset) return false;
+        }
+    }
+    for (unsigned i = 0; i < 2; i++) for (unsigned j = 0; j < 3; j++) {
+        slots[i].bytes[j] = bytes[j];
+        slots[i].tensor[j] = ds4_gpu_tensor_alloc(bytes[j]);
+        if (!slots[i].tensor[j] ||
+            mlock(ds4_gpu_tensor_contents(slots[i].tensor[j]), (size_t)bytes[j])) {
+            (void)ds41_prefill_expert_buffers_free(slots);
+            fprintf(stderr, "ds4: V4.1 explicit expert buffers unavailable; using mmap prefill\n");
+            return false;
+        }
+        slots[i].locked[j] = true;
+    }
+    return true;
+}
+
+static bool ds41_prefill_expert_read_start(ds41_prefill_expert_slot *slot,
+                                          const ds4_model *m,
+                                          const ds4_layer_weights *l, uint32_t il) {
+    if (slot->started) return false;
+    slot->model = m;
+    slot->table = graph_stream_expert_table_make(m, l, il,
+        routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
+        routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+    const uint64_t offsets[] = {slot->table.gate_offset, slot->table.up_offset,
+                                slot->table.down_offset};
+    const uint64_t per_expert[] = {slot->table.gate_expert_bytes, slot->table.gate_expert_bytes,
+                                   slot->table.down_expert_bytes};
+    if (!slot->table.n_total_expert || m->fd < 0) return false;
+    for (unsigned j = 0; j < 3; j++) {
+        if (!per_expert[j] || per_expert[j] > UINT64_MAX / slot->table.n_total_expert) return false;
+        const uint64_t bytes = per_expert[j] * slot->table.n_total_expert;
+        if (!slot->tensor[j] || bytes > ds4_gpu_tensor_bytes(slot->tensor[j]) ||
+            offsets[j] > m->size || bytes > m->size - offsets[j] ||
+            offsets[j] > (uint64_t)LLONG_MAX || bytes > (uint64_t)LLONG_MAX - offsets[j]) return false;
+        slot->dst[j] = ds4_gpu_tensor_contents(slot->tensor[j]);
+        if (!slot->dst[j]) return false;
+    }
+    slot->n_threads = metal_graph_stream_prefill_layer_pagein_threads();
+    for (uint32_t i = 0; i < slot->n_threads; i++) {
+        slot->ok[i] = false;
+        slot->workers[i] = (ds41_prefill_expert_worker){slot, i};
+        if (pthread_create(&slot->threads[i], NULL, ds41_prefill_expert_read, &slot->workers[i])) {
+            (void)ds41_prefill_expert_read_join(slot);
+            return false;
+        }
+        slot->started++;
+    }
+    return true;
+}
+
 /* Process rows in causal order within each layer. Selection/candidate rows
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
@@ -40521,7 +40684,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PIPELINE");
     bool engram_prefetched = overlap_engram &&
         ds41_engram_prefetch_start(&engram_prefetch, g, 0, total_count);
-    bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
+    ds41_prefill_expert_slot expert_slots[2] = {0};
+    const bool explicit_experts = !wide && total_count >= 32u && total_count <= 1024u && batch_hc && batch_core &&
+        !encoder_only && !resume_encoder &&
+        ds41_prefill_expert_buffers_init(g, m, w, expert_slots);
+    bool ok = !g->streaming || (explicit_experts ? metal_graph_stream_map_decode_static_all(m, w) :
+                                                  metal_graph_stream_map_token(m, w));
+    if (ok && explicit_experts) {
+        fprintf(stderr, "ds4: V4.1 prefill reads experts into two explicit layer buffers\n");
+        ok = ds41_prefill_expert_read_start(&expert_slots[0], m, &w->layer[0], 0);
+    }
     metal_graph_stream_prepare_slot prepare = {0};
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
@@ -40539,7 +40711,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             ds41_engram_prefetch_start(&engram_prefetch, g, 1, total_count);
         const double t0 = profile ? now_sec() : 0;
         const uint32_t first_count = total_count < encoder_chunk ? total_count : encoder_chunk;
-        if (g->streaming) {
+        if (explicit_experts) {
+            ds41_prefill_expert_slot *slot = &expert_slots[il & 1u];
+            ok = ds41_prefill_expert_read_join(slot) &&
+                ds4_gpu_stream_prefill_bind_layer(&slot->table,
+                    slot->tensor[0], slot->tensor[1], slot->tensor[2]);
+            /* The previous layer and its cache seed have both drained before
+             * its slot becomes the destination of this next-layer read. */
+            if (ok && il + 1u < DS4_N_LAYER)
+                ok = ds41_prefill_expert_read_start(&expert_slots[(il + 1u) & 1u],
+                                                    m, &w->layer[il + 1u], il + 1u);
+        } else if (g->streaming) {
             if (!g->encoder_resident || il >= 20)
                 ok = metal_graph_stream_prepare_join_layer(NULL, m, w, il, first_count,
                         false, true, false, false, &prepare, 1);
@@ -40749,6 +40931,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
     if (!metal_graph_stream_prepare_join_all(&prepare, 1)) ok = false;
+    if (explicit_experts && !ds41_prefill_expert_buffers_free(expert_slots)) ok = false;
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (ok && !encoder_only) {
         ok = ds4_gpu_begin_commands() &&
@@ -67669,6 +67852,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
+        s->ds41_graph.streaming_prefill_bytes = e->ssd_streaming_prefill_headroom_bytes;
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;

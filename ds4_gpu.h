@@ -365,6 +365,9 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_V41_PAIR_TAIL_CULL = 1u << 7,
+    DS4_GPU_TEST_V41_DOWN_TAIL_CULL = 1u << 8,
+    DS4_GPU_TEST_V41_MOE_REFERENCE = 1u << 9,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
@@ -392,6 +395,14 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
+#ifdef __APPLE__
+/* Bind explicitly loaded full-layer weights at their original model offsets.
+ * All NULL detaches them. The caller must drain GPU work before either call. */
+int ds4_gpu_stream_prefill_bind_layer(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *down);
+#endif
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);

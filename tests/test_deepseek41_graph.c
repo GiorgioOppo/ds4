@@ -7,6 +7,177 @@
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); goto done; \
 } } while (0)
 
+static bool prefill_stream_moe(const ds4_model *model,
+                               const ds4_layer_weights *layer,
+                               ds4_gpu_tensor *t[8], float *output) {
+    const uint64_t gate_row = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(layer->ffn_down_exps);
+    bool half = false;
+    return ds4_gpu_routed_moe_batch_tensor(t[7], t[3], t[4], t[5], t[6],
+        model->map, model->size, layer->ffn_gate_exps->abs_offset,
+        layer->ffn_up_exps->abs_offset, layer->ffn_down_exps->abs_offset,
+        layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+        gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+        DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, t[1], t[2], DS4_N_EXPERT,
+        DS4_N_EXPERT_USED, 7.0f, t[0], 0, 32, &half, true) && half &&
+        ds4_gpu_tensor_read(t[7], 0, output, 32u * DS4_N_EMBD * sizeof(float));
+}
+
+static int check_prefill_expert_stream(void) {
+    enum { LAYERS = 3, EXPERTS = 8, WIDTH = 256, ROWS = 32, ROUTES = 6 };
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_model model = {.fd = -1};
+    ds4_weights weights = {0};
+    ds4_tensor tensors[LAYERS][3] = {0};
+    ds41_prefill_expert_slot slots[2] = {0};
+    ds41_gpu_graph graph = {.streaming = true, .tp_world = 1};
+    ds4_gpu_tensor *t[8] = {0}, *bad_view = NULL;
+    FILE *file = NULL;
+    void *map = NULL, *aux = NULL;
+    float *reference[LAYERS] = {0}, *actual = NULL;
+    int rc = 1;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t sizes[3] = {EXPERTS * WIDTH * sizeof(block_iq2_xxs),
+                               EXPERTS * WIDTH * sizeof(block_iq2_xxs),
+                               EXPERTS * WIDTH * sizeof(block_q2_K)};
+    const uint64_t output_bytes = ROWS * WIDTH * sizeof(float);
+    uint64_t end = page;
+    g_ds4_shape.n_layer = LAYERS;
+    g_ds4_shape.n_expert = EXPERTS;
+    g_ds4_shape.n_expert_used = ROUTES;
+    g_ds4_shape.n_embd = g_ds4_shape.n_ff_exp = WIDTH;
+    for (unsigned il = 0; il < LAYERS; il++) for (unsigned j = 0; j < 3; j++) {
+        ds4_tensor *w = &tensors[il][j];
+        *w = (ds4_tensor){.ndim = 3, .dim = {WIDTH, WIDTH, EXPERTS},
+            .type = j == 2 ? DS4_TENSOR_Q2_K : DS4_TENSOR_IQ2_XXS,
+            .abs_offset = end + 128, .bytes = sizes[j], .elements = EXPERTS * WIDTH * WIDTH};
+        end = align_up(w->abs_offset + w->bytes, page) + page;
+    }
+    REQUIRE(posix_memalign(&map, page, end) == 0);
+    REQUIRE(posix_memalign(&aux, page, page) == 0);
+    memset(map, 0, end); memset(aux, 0, page);
+    for (unsigned i = 0; i < 4; i++) {
+        ((float *)map)[i * 4 + i] = (float)(i + 1);
+        ((float *)aux)[i * 4 + i] = (float)(i + 5);
+    }
+    for (unsigned il = 0; il < LAYERS; il++) {
+        weights.layer[il].ffn_gate_exps = &tensors[il][0];
+        weights.layer[il].ffn_up_exps = &tensors[il][1];
+        weights.layer[il].ffn_down_exps = &tensors[il][2];
+        for (unsigned j = 0; j < 3; j++) {
+            uint8_t *data = (uint8_t *)map + tensors[il][j].abs_offset;
+            for (uint64_t b = 0; b < sizes[j]; b++) data[b] = (uint8_t)(b * 37 + il * 71 + j * 29);
+            if (j == 2) for (uint64_t b = 0; b < sizes[j] / sizeof(block_q2_K); b++) {
+                ((block_q2_K *)data)[b].d = 0x2000 + il * 0x100;
+                ((block_q2_K *)data)[b].dmin = 0x1800;
+            }
+            else for (uint64_t b = 0; b < sizes[j] / sizeof(block_iq2_xxs); b++)
+                ((block_iq2_xxs *)data)[b].d = 0x1400 + il * 0x100;
+        }
+    }
+    file = tmpfile();
+    REQUIRE(file && fwrite(map, 1, end, file) == end && fflush(file) == 0);
+    model.fd = fileno(file); model.map = map; model.size = model.file_size = end;
+    for (unsigned j = 0; j < 3; j++) graph.streaming_prefill_bytes += 2 * align_up(sizes[j], page);
+    ds4_gpu_model_residency_skip(1);
+    REQUIRE(ds4_gpu_init());
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(true);
+    REQUIRE(ds4_gpu_set_model_map(model.map, model.size));
+    REQUIRE(ds4_gpu_set_model_map_range(aux, page, 0, page, page));
+    graph.streaming_prefill_bytes--;
+    REQUIRE(!ds41_prefill_expert_buffers_init(&graph, &model, &weights, slots));
+    REQUIRE(!slots[0].tensor[0] && !slots[1].tensor[2]);
+    graph.streaming_prefill_bytes++;
+    REQUIRE(ds41_prefill_expert_buffers_init(&graph, &model, &weights, slots));
+    REQUIRE(setenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_THREADS", "7", 1) == 0);
+    for (unsigned il = 0; il < LAYERS; il++) {
+        ds41_prefill_expert_slot *slot = &slots[il & 1u];
+        REQUIRE(ds41_prefill_expert_read_start(slot, &model, &weights.layer[il], il));
+        REQUIRE(!ds41_prefill_expert_read_start(slot, &model, &weights.layer[il], il));
+        REQUIRE(ds41_prefill_expert_read_join(slot));
+        REQUIRE(ds41_prefill_expert_read_join(slot));
+        for (unsigned j = 0; j < 3; j++) REQUIRE(memcmp(ds4_gpu_tensor_contents(slot->tensor[j]),
+            model.map + tensors[il][j].abs_offset, sizes[j]) == 0);
+    }
+    /* Reread layers 0/1 into separate slots, then shadow the complete mmap
+     * reference with layer 1 bytes bound at layer 0 offsets. */
+    for (unsigned i = 0; i < 2; i++) {
+        REQUIRE(ds41_prefill_expert_read_start(&slots[i], &model, &weights.layer[i], i));
+        REQUIRE(ds41_prefill_expert_read_join(&slots[i]));
+    }
+    const uint64_t counts[] = {ROWS * WIDTH, ROWS * ROUTES, ROWS * ROUTES,
+        ROWS * ROUTES * WIDTH, ROWS * ROUTES * WIDTH, ROWS * ROUTES * WIDTH,
+        ROWS * ROUTES * WIDTH, ROWS * WIDTH};
+    for (unsigned i = 0; i < 8; i++) REQUIRE((t[i] = ds4_gpu_tensor_alloc(counts[i] * 4)) != NULL);
+    for (unsigned i = 0; i < LAYERS; i++) REQUIRE((reference[i] = malloc(output_bytes)) != NULL);
+    REQUIRE((actual = malloc(output_bytes)) != NULL);
+    float *x = ds4_gpu_tensor_contents(t[0]), *route_weights = ds4_gpu_tensor_contents(t[2]);
+    int32_t *selected = ds4_gpu_tensor_contents(t[1]);
+    REQUIRE(x && route_weights && selected);
+    for (unsigned i = 0; i < ROWS * WIDTH; i++) x[i] = ((int)(i % 31) - 15) / 64.0f;
+    for (unsigned i = 0; i < ROWS * ROUTES; i++) {
+        selected[i] = i % EXPERTS; route_weights[i] = 1.0f / ROUTES;
+    }
+    for (unsigned il = 0; il < LAYERS; il++) {
+        REQUIRE(prefill_stream_moe(&model, &weights.layer[il], t, reference[il]));
+        for (unsigned i = 0; i < ROWS * WIDTH; i++) REQUIRE(isfinite(reference[il][i]));
+    }
+    REQUIRE(memcmp(reference[0], reference[1], output_bytes) != 0);
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(&slots[0].table,
+        slots[1].tensor[0], slots[1].tensor[1], slots[1].tensor[2]));
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[1], actual, output_bytes) == 0);
+    ds4_gpu_stream_expert_table invalid = slots[0].table;
+    invalid.down_offset = model.size;
+    REQUIRE(!ds4_gpu_stream_prefill_bind_layer(&invalid,
+        slots[0].tensor[0], slots[0].tensor[1], slots[0].tensor[2]));
+    bad_view = ds4_gpu_tensor_view(slots[0].tensor[0], 4, sizes[0] - 4);
+    REQUIRE(bad_view && !ds4_gpu_stream_prefill_bind_layer(&slots[0].table,
+        bad_view, slots[0].tensor[1], slots[0].tensor[2]));
+    REQUIRE(ds4_gpu_begin_commands());
+    REQUIRE(!ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL));
+    REQUIRE(ds4_gpu_end_commands());
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[1], actual, output_bytes) == 0);
+    for (unsigned i = 0; i < 2; i++) {
+        const void *source = i ? aux : model.map;
+        REQUIRE(ds4_gpu_matmul_f32_tensor(t[7], source, i ? page : model.size, 0, 4, 4, t[0], 1));
+        REQUIRE(ds4_gpu_tensor_read(t[7], 0, actual, 4 * sizeof(float)));
+        for (unsigned j = 0; j < 4; j++) REQUIRE(actual[j] == x[j] * (float)(j + 1 + 4 * i));
+    }
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(&slots[0].table,
+        slots[0].tensor[0], slots[0].tensor[1], slots[0].tensor[2]));
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[0], actual, output_bytes) == 0);
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL));
+    REQUIRE(prefill_stream_moe(&model, &weights.layer[0], t, actual));
+    REQUIRE(memcmp(reference[0], actual, output_bytes) == 0);
+    /* EOF and cancellation cleanup join every worker before releasing slots. */
+    REQUIRE(ftruncate(model.fd, tensors[2][2].abs_offset + sizes[2] / 2) == 0);
+    REQUIRE(ds41_prefill_expert_read_start(&slots[0], &model, &weights.layer[2], 2));
+    REQUIRE(!ds41_prefill_expert_read_join(&slots[0]));
+    REQUIRE(!slots[0].started);
+    REQUIRE(ds41_prefill_expert_read_start(&slots[1], &model, &weights.layer[1], 1));
+    REQUIRE(ds41_prefill_expert_buffers_free(slots));
+    REQUIRE(!slots[0].tensor[0] && !slots[1].tensor[2] && !slots[0].started && !slots[1].started);
+    REQUIRE(ds41_prefill_expert_buffers_free(slots));
+    puts("V4.1 explicit expert reads, binding lifetime, fallback and cancellation cleanup: PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    if (slots[0].tensor[0] || slots[1].tensor[0]) (void)ds41_prefill_expert_buffers_free(slots);
+    ds4_gpu_tensor_free(bad_view);
+    for (unsigned i = 0; i < 8; i++) ds4_gpu_tensor_free(t[i]);
+    for (unsigned i = 0; i < LAYERS; i++) free(reference[i]);
+    ds4_gpu_cleanup();
+    if (file) fclose(file);
+    free(map); free(aux); free(actual);
+    unsetenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_THREADS");
+    g_ds4_shape = saved_shape;
+    return rc;
+}
+
 static int check_batch_admission(void) {
     int rc = 1;
     ds4_session *sessions = calloc(8, sizeof(*sessions));
@@ -1990,6 +2161,8 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-stream"))
+        return check_prefill_expert_stream();
     if (argc == 3 && !strcmp(argv[1], "--attention-index-bypass"))
         return check_attention_index_bypass(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))

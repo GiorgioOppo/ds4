@@ -323,6 +323,93 @@ done:
     return ok;
 }
 
+/* Exercise the existing 32-row tile at its occupied-row boundaries, then
+ * time the same arithmetic at V4.1 dimensions. No model inference is needed. */
+static int check_tail_case(const void *model, uint64_t bytes,
+                           uint64_t up_off, uint64_t down_off,
+                           uint32_t tokens, int skewed, int benchmark) {
+    const uint64_t pairs = (uint64_t)tokens * SELECTED;
+    const uint64_t xb = (uint64_t)tokens * INPUT * sizeof(float);
+    const uint64_t mb = pairs * MID * sizeof(float);
+    const uint64_t eb = pairs * OUTPUT * sizeof(float);
+    const uint64_t ob = (uint64_t)tokens * OUTPUT * sizeof(float);
+    const uint64_t ib = pairs * sizeof(int32_t);
+    const uint64_t sizes[] = {xb, ib, ib, mb, mb, mb, eb, ob};
+    ds4_gpu_tensor *t[8] = {0};
+    float *x = malloc(xb), *weights = malloc(ib);
+    int32_t *ids = malloc(ib);
+    void *reference[3] = {malloc(mb / 2), malloc(eb), malloc(ob)};
+    void *actual = malloc(mb > eb ? mb : eb);
+    int ok = x && weights && ids && actual && reference[0] && reference[1] && reference[2];
+    for (unsigned i = 0; i < 8 && ok; i++) ok = (t[i] = ds4_gpu_tensor_alloc(sizes[i])) != NULL;
+    if (!ok) goto done;
+    for (uint64_t i = 0; i < xb / sizeof(float); i++)
+        x[i] = ((int)(random_u32() % 101) - 50) / 256.0f;
+    for (uint32_t row = 0; row < tokens; row++) for (uint32_t s = 0; s < SELECTED; s++) {
+        /* Hot routes make the occupied tail exactly tokens % 32. Mixed
+         * routes cover short tiles, a hot expert, and unused experts. */
+        ids[(uint64_t)row * SELECTED + s] = !skewed ? (int32_t)s :
+            s == 0 ? 0 : 1 + (row * 7 + s * 19) % (EXPERTS - 17);
+        weights[(uint64_t)row * SELECTED + s] = (s + 1) / 21.0f;
+    }
+    ok = ds4_gpu_tensor_write(t[0], 0, x, xb) && ds4_gpu_tensor_write(t[1], 0, ids, ib) &&
+         ds4_gpu_tensor_write(t[2], 0, weights, ib);
+    const uint32_t flags[] = {0, DS4_GPU_TEST_V41_PAIR_TAIL_CULL,
+        DS4_GPU_TEST_V41_DOWN_TAIL_CULL,
+        DS4_GPU_TEST_V41_PAIR_TAIL_CULL | DS4_GPU_TEST_V41_DOWN_TAIL_CULL};
+    /* Warm every pipeline first; the two measured sweeps run in opposite
+     * orders so compilation and a one-way thermal trend do not pick a winner. */
+    const unsigned order[] = {0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3};
+    const unsigned explicit_runs = benchmark ? 12u : 4u;
+    double elapsed[4] = {0};
+    for (unsigned run = 0; run < explicit_runs + 2u && ok; run++) {
+        const bool automatic = run >= explicit_runs;
+        const unsigned variant = automatic ? 0u : order[run];
+        /* Also validate release dispatch against the forced reference, with
+         * both resident views and the streamed full-layer binding mode. */
+        ds4_gpu_set_ssd_streaming(run == explicit_runs + 1u);
+        ds4_gpu_test_set_flags(automatic ? 0u :
+            DS4_GPU_TEST_V41_MOE_REFERENCE | flags[variant]);
+        for (unsigned i = 5; i < 8 && ok; i++)
+            ok = ds4_gpu_tensor_fill_f32(t[i], NAN, sizes[i] / sizeof(float));
+        bool half_mid = false;
+        const double begin = now_seconds();
+        ok = ok && ds4_gpu_routed_moe_batch_tensor(t[7], t[3], t[4], t[5], t[6],
+            model, bytes, 0, up_off, down_off, 16, 10,
+            (uint64_t)MID * INPUT / 256 * sizeof(iq2_block), INPUT / 256 * sizeof(iq2_block),
+            (uint64_t)OUTPUT * MID / 256 * sizeof(q2_block), MID / 256 * sizeof(q2_block),
+            INPUT, MID, OUTPUT, t[1], t[2], EXPERTS, SELECTED, 7.0f,
+            t[0], 0, tokens, &half_mid, true) && half_mid;
+        const double ms = (now_seconds() - begin) * 1000;
+        if (run >= 4 && !automatic) elapsed[variant] += ms / 2;
+        for (unsigned i = 0; i < 3 && ok; i++) {
+            const uint64_t size = i == 0 ? mb / 2 : i == 1 ? eb : ob;
+            ok = ds4_gpu_tensor_read(t[i + 5], 0, actual, size);
+            for (uint64_t j = 0; j < size / (i ? sizeof(float) : sizeof(uint16_t)) && ok; j++)
+                ok = isfinite(i ? ((float *)actual)[j] : (float)((_Float16 *)actual)[j]);
+            if (!run) memcpy(reference[i], actual, size);
+            else if (ok && memcmp(reference[i], actual, size)) {
+                fprintf(stderr, "V4.1 tail mismatch rows=%u skewed=%d variant=%u tensor=%u\n",
+                    tokens, skewed, variant, i);
+                ok = 0;
+            }
+        }
+        if (automatic) fprintf(stderr, "V4.1 tail auto rows=%u ssd=%u: %s\n",
+            tokens, run == explicit_runs + 1u, ok ? "PASS" : "FAIL");
+    }
+    if (benchmark && ok) fprintf(stderr,
+        "V4.1 tail timing rows=%u skewed=%d base=%.3f pair=%.3f down=%.3f both=%.3f ms\n",
+        tokens, skewed, elapsed[0], elapsed[1], elapsed[2], elapsed[3]);
+done:
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_set_ssd_streaming(false);
+    for (unsigned i = 0; i < 8; i++) ds4_gpu_tensor_free(t[i]);
+    for (unsigned i = 0; i < 3; i++) free(reference[i]);
+    free(x); free(weights); free(ids); free(actual);
+    fprintf(stderr, "V4.1 tail exact rows=%u skewed=%d: %s\n", tokens, skewed, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--v41-q4-decode")) {
         if (!ds4_gpu_init()) return 1;
@@ -333,13 +420,15 @@ int main(int argc, char **argv) {
     const bool address = argc == 2 && !strcmp(argv[1], "--ssd-address");
     const bool v41_tp = argc == 2 && !strcmp(argv[1], "--v41-tp");
     const bool v41_decode = argc == 2 && !strcmp(argv[1], "--v41-decode");
-    const bool v41 = v41_tp || v41_decode || (argc == 2 && !strcmp(argv[1], "--v41"));
-    if (argc != 1 && !address && !v41) {
-        fprintf(stderr, "usage: %s [--ssd-address | --v41 | --v41-tp | --v41-decode | --v41-q4-decode]\n", argv[0]);
+    const bool tail = argc == 2 && !strcmp(argv[1], "--v41-tail-cull");
+    const bool tail_small = argc == 2 && !strcmp(argv[1], "--v41-tail-cull-small");
+    const bool v41 = v41_tp || v41_decode || tail || (argc == 2 && !strcmp(argv[1], "--v41"));
+    if (argc != 1 && !address && !v41 && !tail_small) {
+        fprintf(stderr, "usage: %s [--ssd-address | --v41 | --v41-tp | --v41-decode | --v41-q4-decode | --v41-tail-cull | --v41-tail-cull-small]\n", argv[0]);
         return 1;
     }
     if (v41) { INPUT = 5120; MID = 2304; OUTPUT = 5124; EXPERTS = 384; }
-    if (v41_decode) OUTPUT = 5120;
+    if (v41_decode || tail) OUTPUT = 5120;
     const uint64_t page = getpagesize();
     const uint64_t up_off = aligned((uint64_t)EXPERTS * MID * INPUT / 256 * sizeof(iq2_block), page);
     const uint64_t down_off = up_off * 2;
@@ -363,6 +452,23 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && ds4_gpu_set_model_map(model, model_size);
     ds4_gpu_set_quality(false);
     ds4_gpu_set_ssd_streaming(false);
+    if (tail || tail_small) {
+        if (!ds4_gpu_device_is_pre_m5_apple_silicon()) {
+            fprintf(stderr, "V4.1 tail oracle requires pre-M5 Apple Silicon\n");
+            ok = 0;
+        }
+        const uint32_t boundary[] = {32, 33, 34, 47, 48, 49, 63, 64, 65, 80, 81};
+        const uint32_t timing[] = {128, 437, 1024};
+        const uint32_t *rows = tail ? timing : boundary;
+        const unsigned n = tail ? sizeof(timing) / sizeof(*timing) : sizeof(boundary) / sizeof(*boundary);
+        for (unsigned i = 0; i < n && ok; i++) {
+            if (tail_small) ok = check_tail_case(model, model_size, up_off, down_off, rows[i], 0, 0);
+            if (ok) ok = check_tail_case(model, model_size, up_off, down_off, rows[i], 1, tail);
+        }
+        ds4_gpu_cleanup();
+        free(model);
+        return ok ? 0 : 1;
+    }
     if (v41_decode) {
         setenv("DS4_TP_NO_KEEPALIVE", "1", 1);
         for (int rank = -1; rank < 2 && ok; rank++) {
