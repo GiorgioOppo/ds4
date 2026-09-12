@@ -2936,3 +2936,6 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+// Reuse the same packed-Q4 tiles and accumulation order after narrowing the
+// complete activation once, instead of again for every 64 output rows.
+template [[host_name("kernel_mul_mm_q4_K_f16_rhs")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, half, half2x4>;

@@ -338,12 +338,13 @@ static int check_attention_layouts(const char *path) {
                 int status;
                 pid_t done;
                 do { done = waitpid(child, &status, 0); } while (done < 0 && errno == EINTR);
-                assert(done == child && WIFEXITED(status) && WEXITSTATUS(status) == 1);
+                const int expected = types[type] == DS4_TENSOR_Q4_K ? 0 : 1;
+                assert(done == child && WIFEXITED(status) && WEXITSTATUS(status) == expected);
             }
         }
     }
     model_close(&model);
-    puts("V4.1 Q8 attention admitted, unsupported Q4 output layouts rejected before GPU allocation: PASS");
+    puts("V4.1 Q8/Q4_K attention admitted, Q4_0 output layouts rejected before GPU allocation: PASS");
     return 0;
 }
 
@@ -433,6 +434,90 @@ static void note_progress(void *ud, const char *event, int current, int total) {
 static bool cancel_progress(void *ud) {
     session_progress *p = ud;
     return p->cancel_at > 0 && p->progress >= p->cancel_at;
+}
+
+static int check_attention_identity(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_engine *engine = calloc(1, sizeof(*engine));
+    ds4_session *session = calloc(1, sizeof(*session));
+    ds4_tensor tensors[40][5] = {0};
+    uint32_t tags[200];
+    FILE *file = NULL;
+    int rc = 1;
+    int tokens[] = {101, 102, 103};
+    float logit = 123.0f;
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    REQUIRE(engine && session);
+    for (unsigned il = 0; il < 40; il++) {
+        for (unsigned p = 0; p < 5; p++) tensors[il][p].type = DS4_TENSOR_Q8_0;
+        ds4_layer_weights *l = &engine->weights.layer[il];
+        l->attn_q_a = &tensors[il][0]; l->attn_q_b = &tensors[il][1];
+        l->attn_kv = &tensors[il][2]; l->attn_output_a = &tensors[il][3];
+        l->attn_output_b = &tensors[il][4];
+    }
+    REQUIRE(ds41_attention_type_id(&engine->weights) == 0x413431u);
+    REQUIRE(ds4_engine_model_id(engine) == (int)DS4_VARIANT_FLASH41);
+    for (unsigned il = 0; il < 40; il++) for (unsigned p = 0; p < 5; p++) {
+        tensors[il][p].type = DS4_TENSOR_Q4_K;
+        const uint32_t tag = ds41_attention_type_id(&engine->weights);
+        REQUIRE((tag & 0x80000080u) == 0x80000080u && tag != 0x413431u);
+        REQUIRE(ds4_engine_model_id(engine) > 0 && (ds4_engine_model_id(engine) & 0x80));
+        REQUIRE((uint32_t)ds4_engine_model_id(engine) == (tag & 0x7fffffffu));
+        for (unsigned j = 0; j < il * 5 + p; j++) REQUIRE(tags[j] != tag);
+        tags[il * 5 + p] = tag;
+        tensors[il][p].type = DS4_TENSOR_Q4_0;
+        REQUIRE(ds41_attention_type_id(&engine->weights) != tag);
+        tensors[il][p].type = DS4_TENSOR_Q8_0;
+    }
+    ds4_tensor *saved_projection = engine->weights.layer[39].attn_output_b;
+    engine->weights.layer[39].attn_output_b = NULL;
+    REQUIRE(ds41_attention_type_id(&engine->weights) != 0x413431u);
+    engine->weights.layer[39].attn_output_b = saved_projection;
+    g_ds4_shape.family = DS4_MODEL_FAMILY_DEEPSEEK4;
+    tensors[0][0].type = DS4_TENSOR_Q4_K;
+    REQUIRE(ds4_engine_model_id(engine) == (int)DS4_VARIANT_FLASH41);
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    session->engine = engine;
+    session->ds41_graph_ready = session->checkpoint_valid = true;
+    session->ds41_graph.ctx = 16;
+    session->ds41_graph.pos = 3;
+    session->ds41_graph.valid = true;
+    session->checkpoint.v = tokens;
+    session->checkpoint.len = session->checkpoint.cap = 3;
+    session->logits = &logit;
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
+        16, 1, 128, 128, 17, 3, 40, 512, 128, DS4_N_VOCAB, 0
+    };
+    /* Invalid token data proves compatible markers reach payload parsing,
+     * while incompatible markers reject before reading or touching GPU state. */
+    file = tmpfile();
+    REQUIRE(file);
+    const uint32_t invalid_token = UINT32_MAX;
+    REQUIRE(fwrite(&invalid_token, sizeof(invalid_token), 1, file) == 1);
+    const uint64_t remaining = ds41_payload_body_bytes(&session->ds41_graph, 3);
+    for (unsigned q4_model = 0; q4_model < 2; q4_model++) {
+        tensors[0][0].type = q4_model ? DS4_TENSOR_Q4_K : DS4_TENSOR_Q8_0;
+        const uint32_t matching = ds41_attention_type_id(&engine->weights);
+        h[12] = q4_model ? 0x413431u : tags[0];
+        char error[128] = {0};
+        rewind(file);
+        REQUIRE(ds41_load_payload(session, file, h, remaining, error, sizeof(error)) != 0);
+        REQUIRE(ftell(file) == 0 && strstr(error, "attention types") != NULL);
+        REQUIRE(session->checkpoint_valid && session->ds41_graph.valid && session->ds41_graph.pos == 3);
+        REQUIRE(session->checkpoint.v == tokens && session->checkpoint.len == 3 && logit == 123.0f);
+        h[12] = matching;
+        REQUIRE(ds41_load_payload(session, file, h, remaining, error, sizeof(error)) != 0);
+        REQUIRE(ftell(file) == 4 && strstr(error, "snapshot token") != NULL);
+        REQUIRE(session->checkpoint_valid && session->ds41_graph.valid && session->ds41_graph.pos == 3);
+    }
+    puts("V4.1 attention identity: 200 projection positions, quant types, legacy Q8 marker and pre-read snapshot refusal PASS");
+    rc = 0;
+done:
+    if (file) fclose(file);
+    free(session); free(engine);
+    g_ds4_shape = saved_shape;
+    return rc;
 }
 
 static int check_imatrix_inputs(void) {
@@ -2161,6 +2246,8 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--attention-identity"))
+        return check_attention_identity();
     if (argc == 2 && !strcmp(argv[1], "--prefill-expert-stream"))
         return check_prefill_expert_stream();
     if (argc == 3 && !strcmp(argv[1], "--attention-index-bypass"))

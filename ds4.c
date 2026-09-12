@@ -5454,10 +5454,17 @@ static void weights_validate_layout(
         tensor_expect_dense_quant_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
 
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-            /* The V4.1 grouped output kernels consume Q8 blocks directly. */
-            tensor_expect_layout(l->attn_output_a, DS4_TENSOR_Q8_0, 2,
+            /* Grouped output dispatch supports Q8_0 and Q4_K, including mixed
+             * pairs. Q4_0 has no V4.1 grouped-output implementation. */
+            const ds4_tensor *outputs[] = {l->attn_output_a, l->attn_output_b};
+            for (unsigned i = 0; i < 2; i++) {
+                if (outputs[i]->type != DS4_TENSOR_Q8_0 && outputs[i]->type != DS4_TENSOR_Q4_K)
+                    tensor_expect_layout(outputs[i], DS4_TENSOR_Q8_0, 2,
+                        outputs[i]->dim[0], outputs[i]->dim[1], 0);
+            }
+            tensor_expect_layout(l->attn_output_a, l->attn_output_a->type, 2,
                 DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-            tensor_expect_layout(l->attn_output_b, DS4_TENSOR_Q8_0, 2,
+            tensor_expect_layout(l->attn_output_b, l->attn_output_b->type, 2,
                 out_low_dim, DS4_N_EMBD, 0);
             if (ds41_kv_source(il)) {
                 tensor_expect_layout(l->attn_compressor_kv, DS4_TENSOR_F16, 2,
@@ -39549,10 +39556,14 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
-    return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
+    const bool ok = l->attn_output_a->type == DS4_TENSOR_Q4_K ?
+        ds4_gpu_attention_output_low_q4_K_slice_tensor(g->low, m->map, m->size,
+            l->attn_output_a->abs_offset, 4096, 1024, group0, groups, g->heads) :
+        tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
         ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
             l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
-            4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
+            4096, 1024, groups, g->heads);
+    return ok && ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
@@ -39834,11 +39845,17 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
-    return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
-        ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count) &&
+    if (!ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) ||
+        !ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count)) return false;
+    /* Attention heads are dead until the projections finish. Reuse their
+     * workspace for Q-B's half RHS, retaining V4.1's BF16 output boundary. */
+    const bool qb_ok = l->attn_q_b->type == DS4_TENSOR_Q4_K && g->tp_world == 1u ?
+        ds4_gpu_dsv41_q4_qb_rows(b->q, b->heads, m->map, m->size,
+            l->attn_q_b->abs_offset, b->qr, count) &&
+        ds4_gpu_dsv41_quantize(b->q, q_dim, count, DS4_V41_BF16) :
         ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
-                               g->tp_rank * q_dim, q_dim, count) &&
-        ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
+                               g->tp_rank * q_dim, q_dim, count);
+    return qb_ok && ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
         ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, count);
 }
 
@@ -40842,25 +40859,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ok = ds41_attention(&row, m, l, il, true);
                 }
                 DS41_STAGE("attention core/index");
-                if (ok && g->tp_world == 2) {
-                    ok = ds4_gpu_dsv41_attention_output_tp_batch(g->batch.block, g->batch.low,
+                if (ok) {
+                    ok = ds4_gpu_dsv41_attention_output_typed_batch(g->batch.block, g->batch.low,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
-                        g->batch.heads, count, g->tp_rank) &&
+                        l->attn_output_a->type, l->attn_output_b->type,
+                        g->batch.heads, count, g->tp_world, g->tp_rank) &&
                         ds41_sum_partial_batch(g, g->batch.block, il, count) &&
                         ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
-                } else if (ok && l->attn_output_b->type == DS4_TENSOR_Q8_0) {
-                    ok = ds4_gpu_dsv41_attention_output_batch(g->batch.block, g->batch.low,
-                        m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
-                        g->batch.heads, count) &&
-                        ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
-                } else if (ok) {
-                    for (uint32_t t = 0; ok && t < count; t++) {
-                        row.heads = g->rows_view[t].heads;
-                        row.low = g->rows_view[t].low;
-                        ok = ds41_attention_low(&row, m, l);
-                    }
-                    if (ok) ok = ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
-                                                   g->batch.low, count, true);
                 }
                 DS41_STAGE("attention output");
                 if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
@@ -59005,6 +59010,25 @@ static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
     return bytes;
 }
 
+/* A CoW Q4 conversion keeps file size and expert quantization unchanged.
+ * Cache and TP compatibility must also cover each attention projection type.
+ * Keep the established Q8 payload marker for existing checkpoints. */
+static uint32_t ds41_attention_type_id(const ds4_weights *weights) {
+    uint32_t hash = 2166136261u;
+    bool all_q8 = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        const ds4_tensor *projections[] = {l->attn_q_a, l->attn_q_b, l->attn_kv,
+            l->attn_output_a, l->attn_output_b};
+        for (unsigned p = 0; p < 5; p++) {
+            const uint32_t type = projections[p] ? projections[p]->type : UINT32_MAX;
+            hash = (hash ^ type) * 16777619u;
+            all_q8 = all_q8 && type == DS4_TENSOR_Q8_0;
+        }
+    }
+    return all_q8 ? 0x413431u : (hash & 0x7fffff7fu) | 0x80000080u;
+}
+
 static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
     if (!s->ds41_graph_ready || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
@@ -59014,7 +59038,8 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     }
     const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
-        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
+        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB,
+        ds41_attention_type_id(&s->engine->weights)
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
         if (payload_write_u32(fp, h[i], err, errlen)) return 1;
@@ -59039,8 +59064,9 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
         h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
         h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
-        h[12] != 0x413431u || remaining != ds41_payload_body_bytes(g, pos)) {
-        payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
+        h[12] != ds41_attention_type_id(&s->engine->weights) ||
+        remaining != ds41_payload_body_bytes(g, pos)) {
+        payload_set_err(err, errlen, "incompatible V4.1 snapshot attention types, dimensions or size");
         return 1;
     }
     ds4_tokens tokens = {0};
@@ -67013,6 +67039,14 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        const uint32_t attention = ds41_attention_type_id(&e->weights);
+        /* KV directories use the low byte, payloads validate the full tag.
+         * TP uses the full positive id even when GGUF sizes are identical. */
+        if (attention != 0x413431u) return (int)(attention & 0x7fffffffu);
+    }
+#endif
     (void)e;
     return (int)DS4_MODEL_VARIANT;
 }

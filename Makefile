@@ -212,6 +212,16 @@ tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4
 tests/test_deepseek41_graph: tests/test_deepseek41_graph.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_deepseek41_q4_attention.o: tests/test_deepseek41_q4_attention.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_deepseek41_q4_attention: tests/test_deepseek41_q4_attention.o $(CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-q4-attention
+test-deepseek41-q4-attention: tests/test_deepseek41_q4_attention
+	./tests/test_deepseek41_q4_attention
+
 tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -855,7 +865,7 @@ clean:
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_q8_bf16
 	rm -f tests/test_deepseek41_gguf
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_q4_attention
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch

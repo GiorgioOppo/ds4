@@ -101,6 +101,14 @@ int ds4_gpu_dsv41_q8_bf16_rows(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_rows);
+/* Q4_K Q-B (K1280, M32768), with raw F32 output. The caller supplies dead
+ * workspace of at least rows*1280*2 bytes for optional FP16 RHS reuse and owns
+ * the following BF16/RoPE boundary. Used tensor ranges must be disjoint and
+ * their offsets 16-byte aligned; ineligible batches use the native Q4 path. */
+int ds4_gpu_dsv41_q4_qb_rows(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *rhs_scratch,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const ds4_gpu_tensor *x, uint32_t n_rows);
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
@@ -114,6 +122,17 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank);
+/* V4.1 output projections, independently Q8_0 or Q4_K. Offsets address the
+ * complete matrices; heads/low contain only this rank's contiguous groups.
+ * Rounds low to BF16, then writes F32 output (a rank partial for world=2).
+ * The caller owns the final TP sum and output BF16 boundary. */
+int ds4_gpu_dsv41_attention_output_typed_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint32_t out_a_type, uint32_t out_b_type,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens,
+        uint32_t tp_world, uint32_t tp_rank);
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);

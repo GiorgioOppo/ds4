@@ -301,7 +301,8 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint64_t *out);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
- * Pro and later shapes must use nonzero ids. */
+ * Pro and later shapes must use nonzero ids. V4.1 with non-Q8 attention uses
+ * an opaque type-layout id; callers must not interpret it as a shape enum. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
