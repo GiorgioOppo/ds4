@@ -89,6 +89,18 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
+/* F32 weighted RMSNorm with the V4.1 BF16 output boundary. Activation views
+ * and weight offsets must be 16-byte aligned; in-place normalization is safe. */
+int ds4_gpu_dsv41_norm_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                           const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint32_t width, uint32_t rows,
+                           float eps);
+/* Decode/small-row Q8 projections with the scalar reduction and BF16 output.
+ * The output width must be even. Large prefill batches should retain GEMM. */
+int ds4_gpu_dsv41_q8_bf16_rows(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows);
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,

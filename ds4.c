@@ -39393,6 +39393,9 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
 
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+    if (round && weight->type == DS4_TENSOR_Q8_0 && !(weight->dim[1] & 1u))
+        return ds4_gpu_dsv41_q8_bf16_rows(out, m->map, m->size,
+            weight->abs_offset, weight->dim[0], weight->dim[1], in, 1);
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
@@ -39402,6 +39405,9 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
     bool ok;
+    /* The fused BF16 store benefits single rows; measured small-batch results
+     * are mixed, so keep their established dispatch and activation pass. */
+    if (count == 1) return ds41_matmul(out, m, weight, in, round);
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. The vocabulary head does not feed back into them. */
     if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && outputs != DS4_N_VOCAB &&
@@ -39501,9 +39507,8 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
-    return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
-        weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
-        ds41_bf16(out, (uint32_t)weight->dim[0]);
+    return ds4_gpu_dsv41_norm_rows(out, in, m->map, m->size,
+        weight->abs_offset, (uint32_t)weight->dim[0], 1, DS4_RMS_EPS);
 }
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
@@ -39742,7 +39747,8 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, g->engram_rows, true) ||
+        /* Engram rounds every key/value before use inside its add kernel. */
+        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, g->engram_rows, false) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
@@ -39769,9 +39775,8 @@ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                             const ds4_model *m, const ds4_tensor *weight, uint32_t count) {
-    return ds4_gpu_rms_norm_weight_rows_tensor(out, in, m->map, m->size,
-        weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS) &&
-        ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[0], count, DS4_V41_BF16);
+    return ds4_gpu_dsv41_norm_rows(out, in, m->map, m->size,
+        weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS);
 }
 
 static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
@@ -39798,7 +39803,7 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          uint32_t il, uint32_t count) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
+        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, false) ||
             !ds4_gpu_dsv41_engram_add(b->residual, b->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], g->image_count ? g->image_text_mask : NULL,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
@@ -39829,15 +39834,11 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
-        ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
-            l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
-        ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
+        ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count) &&
         ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
                                g->tp_rank * q_dim, q_dim, count) &&
         ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
-        ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
-            l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
-        ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16);
+        ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, count);
 }
 
 static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,

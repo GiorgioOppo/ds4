@@ -52,6 +52,7 @@
 /tests/test_rocm_memory
 /tests/test_deepseek4_vision_image
 /tests/test_deepseek41_metal
+/tests/test_deepseek41_q8_bf16
 /tests/test_deepseek41_gguf
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill

@@ -19527,7 +19527,7 @@ int ds4_gpu_matmul_q8_0_tensor(
     return ok;
 }
 
-int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+static int ds4_gpu_matmul_q8_0_decode_rows_exact_impl(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -19535,12 +19535,13 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
-        uint32_t              n_rows) {
+        uint32_t              n_rows,
+        bool                  bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !x || !model_map || n_rows == 0 ||
         n_rows > INT32_MAX || in_dim == 0 || out_dim == 0 ||
         (in_dim & 31u) != 0 || in_dim > UINT32_MAX ||
-        out_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX || (bf16 && (out_dim & 1u)) ||
         in_dim > UINT64_MAX / n_rows / sizeof(float) ||
         out_dim > UINT64_MAX / n_rows / sizeof(float) ||
         ds4_gpu_tensor_bytes(x) <
@@ -19581,9 +19582,15 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
 
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            bf16 ? "kernel_dsv41_mul_mv_q8_0_bf16" : dispatch.function_name,
+            dispatch.nsg);
         if (!pipeline) return 0;
+        if (bf16 && pipeline.maxTotalThreadsPerThreadgroup < 32u * (NSUInteger)dispatch.nsg) {
+            return ds4_gpu_matmul_q8_0_decode_rows_exact_impl(out, model_map, model_size,
+                weight_offset, in_dim, out_dim, x, n_rows, false) &&
+                ds4_gpu_dsv41_quantize(out, (uint32_t)out_dim, n_rows, DS4_V41_BF16);
+        }
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -19606,8 +19613,33 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         return ds4_gpu_finish_command_buffer(
-                cb, owned, "Q8_0 exact decode-row matvec");
+                cb, owned, bf16 ? "V4.1 Q8_0 BF16 decode-row matvec" :
+                                 "Q8_0 exact decode-row matvec");
     }
+}
+
+int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    return ds4_gpu_matmul_q8_0_decode_rows_exact_impl(out, model_map, model_size,
+        weight_offset, in_dim, out_dim, x, n_rows, false);
+}
+
+int ds4_gpu_dsv41_q8_bf16_rows(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    /* The matvec reads two weight rows per group before its guarded stores.
+     * V4.1 projections are even; reject tails instead of reading past weights.
+     * Leave distributed dispatch and its activation boundary unchanged. */
+    if (!out || !x || (out_dim & 1u) || in_dim > INT32_MAX || out_dim > INT32_MAX ||
+        (weight_offset & 1u) || (ds4_gpu_tensor_offset(x) & 3u) ||
+        (ds4_gpu_tensor_offset(out) & 3u)) return 0;
+    const bool fused = !ds4_gpu_tp_world_is_two();
+    return ds4_gpu_matmul_q8_0_decode_rows_exact_impl(out, model_map, model_size,
+        weight_offset, in_dim, out_dim, x, n_rows, fused) &&
+        (fused || ds4_gpu_dsv41_quantize(out, (uint32_t)out_dim, n_rows, DS4_V41_BF16));
 }
 
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
@@ -22153,7 +22185,7 @@ int ds4_gpu_rms_norm_weight_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
 }
 
-int ds4_gpu_rms_norm_weight_rows_tensor(
+static int ds4_gpu_rms_norm_weight_rows_impl(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         const void             *model_map,
@@ -22161,11 +22193,23 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint64_t                weight_offset,
         uint32_t                n,
         uint32_t                rows,
-        float                   eps) {
+        float                   eps,
+        bool                    round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (n == 0 || rows == 0 || (n & 3u) != 0) return 0;
 
     @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = round_bf16
+            ? ds4_gpu_get_pipeline("kernel_dsv41_rms_norm_mul_bf16_f32_4")
+            : g_rms_norm_pipeline;
+        if (!pipeline) return 0;
+        // Changing the reduction's thread count can change BF16 rounding.
+        // Keep the established reduction if a device limits the fused kernel.
+        if (round_bf16 && [pipeline maxTotalThreadsPerThreadgroup] < ds4_gpu_rms_norm_threads(n)) {
+            return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map,
+                       model_size, weight_offset, n, rows, eps) &&
+                   ds4_gpu_dsv41_quantize(out, n, rows, DS4_V41_BF16);
+        }
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         const uint64_t row_bytes = (uint64_t)n * sizeof(float);
@@ -22195,7 +22239,7 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:2];
@@ -22210,6 +22254,32 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_rms_norm_weight_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t rows, float eps) {
+    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size,
+                                            weight_offset, n, rows, eps, false);
+}
+
+int ds4_gpu_dsv41_norm_rows(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t width, uint32_t rows, float eps) {
+    // Shader dimensions are signed, and float4 accesses require aligned views.
+    // Bounding both dimensions also keeps width * rows * sizeof(float) in u64.
+    if (!out || !x || !width || !rows || (width & 3u) ||
+        width > INT32_MAX || rows > INT32_MAX || (weight_offset & 15u) ||
+        (ds4_gpu_tensor_offset(x) & 15u) || (ds4_gpu_tensor_offset(out) & 15u)) return 0;
+    if (ds4_gpu_tp_world_is_two()) {
+        return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map,
+                   model_size, weight_offset, width, rows, eps) &&
+               ds4_gpu_dsv41_quantize(out, width, rows, DS4_V41_BF16);
+    }
+    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size,
+                                            weight_offset, width, rows, eps, true);
 }
 
 int ds4_gpu_add_rms_norm_weight_tensor(

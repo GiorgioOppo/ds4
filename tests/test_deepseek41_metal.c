@@ -251,6 +251,198 @@ static int check_bf16_rope(void) {
     return 1;
 }
 
+/* Compare the fused epilogue against the original GPU reduction, including
+ * F32 inputs/weights that must not be rounded before the final multiply. */
+static int check_bf16_norm(void) {
+    const uint32_t widths[] = {128, 512, 1024, 1280, 5120};
+    const uint32_t row_counts[] = {1, 32, 128, 512, 2048};
+    const size_t guard = 4, weight_offset = 16;
+    const size_t page = (size_t)getpagesize();
+    const size_t weight_bytes = (weight_offset + 5120u * 4u + page - 1u) / page * page;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, page, weight_bytes));
+    memset(model, 0, weight_bytes);
+    float *weights = (float *)((char *)model + weight_offset);
+    CHECK(ds4_gpu_set_model_map(model, weight_bytes));
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t width = widths[wi];
+        for (size_t ri = 0; ri < sizeof(row_counts) / sizeof(*row_counts); ri++) {
+            const uint32_t rows = row_counts[ri];
+            const size_t count = (size_t)width * rows;
+            const size_t bytes = (count + 2u * guard) * sizeof(float);
+            uint32_t *source = malloc(bytes);
+            CHECK(source);
+            ds4_gpu_tensor *input_storage = upload(NULL, bytes);
+            ds4_gpu_tensor *storage[2] = {upload(NULL, bytes), upload(NULL, bytes)};
+            CHECK(input_storage && storage[0] && storage[1]);
+            ds4_gpu_tensor *input = ds4_gpu_tensor_view(input_storage, guard * 4u, count * 4u);
+            ds4_gpu_tensor *output[2];
+            uint32_t *bits[2];
+            uint32_t *input_bits = ds4_gpu_tensor_contents(input_storage);
+            CHECK(input && input_bits);
+            for (unsigned mode = 0; mode < 2; mode++) {
+                output[mode] = ds4_gpu_tensor_view(storage[mode], guard * 4u, count * 4u);
+                bits[mode] = ds4_gpu_tensor_contents(storage[mode]);
+                CHECK(output[mode] && bits[mode]);
+            }
+            for (unsigned pattern = 0; pattern < 4; pattern++) {
+                const float eps = pattern == 3u ? 0.0f : pattern == 2u ? 1e-20f : 1e-6f;
+                for (uint32_t i = 0; i < width; i++) {
+                    weights[i] = random_value();
+                    if (pattern == 3u) {
+                        const uint32_t tie = (0x3f008000u + ((i & 127u) << 16u)) |
+                                             ((i & 2u) << 30u);
+                        memcpy(weights + i, &tie, 4);
+                    }
+                }
+                for (size_t i = 0; i < count + 2u * guard; i++) source[i] = 0x12345678u;
+                for (size_t i = 0; i < count; i++) {
+                    float value = random_value();
+                    uint32_t value_bits;
+                    memcpy(&value_bits, &value, 4);
+                    if (pattern == 0u && i % 17u == 0u)
+                        value_bits = (value_bits & 0xffff0000u) | 0x8000u;
+                    if (pattern == 1u) value_bits = (uint32_t)(i & 1u) << 31u;
+                    if (pattern == 2u) {
+                        /* All inputs are finite. Include rows whose square sum
+                         * overflows, as well as underflow and mixed magnitudes. */
+                        const uint32_t finite[] = {
+                            0x7f7fffffu, 1u, 0x007fffffu, 0x00800000u,
+                            0x5d000001u, 0x20008000u, 0x3f818001u, 0x3e7f8000u
+                        };
+                        value_bits = finite[(i / width) % 8u] |
+                                     ((uint32_t)(i & 1u) << 31u);
+                        if ((i / width) % 8u == 7u && i % 13u == 0u)
+                            value_bits = 0x5d000001u;
+                    }
+                    if (pattern == 3u) value_bits = 0x3f800000u | ((uint32_t)(i & 1u) << 31u);
+                    source[guard + i] = value_bits;
+                }
+                for (unsigned in_place = 0; in_place < 2; in_place++) {
+                    memcpy(input_bits, source, bytes);
+                    for (unsigned mode = 0; mode < 2; mode++) memcpy(bits[mode], source, bytes);
+                    CHECK(ds4_gpu_begin_commands());
+                    CHECK(ds4_gpu_rms_norm_weight_rows_tensor(output[0],
+                        in_place ? output[0] : input, model, weight_bytes, weight_offset,
+                        width, rows, eps));
+                    CHECK(ds4_gpu_dsv41_quantize(output[0], width, rows, DS4_V41_BF16));
+                    CHECK(ds4_gpu_dsv41_norm_rows(output[1], in_place ? output[1] : input,
+                        model, weight_bytes, weight_offset, width, rows, eps));
+                    CHECK(ds4_gpu_end_commands());
+                    if (memcmp(bits[0], bits[1], bytes)) {
+                        for (size_t i = 0; i < count; i++) {
+                            if (bits[0][guard + i] != bits[1][guard + i]) {
+                                fprintf(stderr, "V4.1 BF16 RMSNorm width=%u rows=%u pattern=%u alias=%u index=%zu: %08x != %08x\n",
+                                    width, rows, pattern, in_place, i,
+                                    bits[1][guard + i], bits[0][guard + i]);
+                                return 0;
+                            }
+                        }
+                        CHECK(!memcmp(bits[0], bits[1], bytes));
+                    }
+                    CHECK(!memcmp(input_bits, source, bytes));
+                    for (size_t i = 0; i < guard; i++) {
+                        CHECK(bits[0][i] == 0x12345678u && bits[1][i] == 0x12345678u);
+                        CHECK(bits[0][guard + count + i] == 0x12345678u &&
+                              bits[1][guard + count + i] == 0x12345678u);
+                    }
+                }
+            }
+            if (wi == 0 && ri == 0) {
+                CHECK(!ds4_gpu_dsv41_norm_rows(NULL, input, model, weight_bytes,
+                    weight_offset, width, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], NULL, model, weight_bytes,
+                    weight_offset, width, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    weight_offset, 0, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    weight_offset, width - 1u, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    weight_offset, width, 0, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    weight_offset, width, rows + 1u, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    weight_offset, UINT32_MAX, UINT32_MAX, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    weight_offset, 0x80000000u, 0x80000000u, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model,
+                    weight_offset + width * 4u - 1u, weight_offset, width, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    UINT64_MAX, width, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], input, model, weight_bytes,
+                    weight_offset + 4u, width, rows, 1e-6f));
+                ds4_gpu_tensor *misaligned = ds4_gpu_tensor_view(input_storage,
+                    guard * 4u + 4u, count * 4u);
+                ds4_gpu_tensor *short_view = ds4_gpu_tensor_view(input_storage,
+                    guard * 4u, count * 4u - 4u);
+                CHECK(misaligned && short_view);
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], misaligned, model, weight_bytes,
+                    weight_offset, width, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(misaligned, input, model, weight_bytes,
+                    weight_offset, width, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(output[1], short_view, model, weight_bytes,
+                    weight_offset, width, rows, 1e-6f));
+                CHECK(!ds4_gpu_dsv41_norm_rows(short_view, input, model, weight_bytes,
+                    weight_offset, width, rows, 1e-6f));
+                ds4_gpu_tensor_free(short_view);
+                ds4_gpu_tensor_free(misaligned);
+            }
+            /* Fixed non-BF16 inputs avoid timing a chain of progressively
+             * renormalized activations. Alternate order and discard warmup. */
+            for (size_t i = 0; i < count; i++) {
+                const float value = random_value();
+                memcpy(input_bits + guard + i, &value, 4);
+            }
+            for (uint32_t i = 0; i < width; i++) weights[i] = 1.0f + random_value() / 8.0f;
+            double elapsed[2][7] = {{0}};
+            const unsigned calls = rows == 1u ? 128u : rows <= 32u ? 32u :
+                                   rows <= 128u ? 16u : rows <= 512u ? 8u : 4u;
+            for (unsigned repeat = 0; repeat < 8; repeat++) {
+                for (unsigned j = 0; j < 2; j++) {
+                    const unsigned mode = j ^ (repeat & 1u);
+                    const double begin = monotonic_seconds();
+                    CHECK(ds4_gpu_begin_commands());
+                    for (unsigned call = 0; call < calls; call++) {
+                        if (mode) {
+                            CHECK(ds4_gpu_dsv41_norm_rows(output[mode], input,
+                                model, weight_bytes, weight_offset, width, rows, 1e-6f));
+                        } else {
+                            CHECK(ds4_gpu_rms_norm_weight_rows_tensor(output[mode], input,
+                                model, weight_bytes, weight_offset, width, rows, 1e-6f));
+                            CHECK(ds4_gpu_dsv41_quantize(output[mode], width, rows, DS4_V41_BF16));
+                        }
+                    }
+                    CHECK(ds4_gpu_end_commands());
+                    if (repeat) elapsed[mode][repeat - 1u] =
+                        (monotonic_seconds() - begin) * (1000.0 / calls);
+                }
+                CHECK(!memcmp(bits[0], bits[1], bytes));
+            }
+            for (unsigned mode = 0; mode < 2; mode++)
+                for (unsigned i = 1; i < 7; i++)
+                    for (unsigned j = i; j && elapsed[mode][j] < elapsed[mode][j - 1u]; j--) {
+                        const double t = elapsed[mode][j];
+                        elapsed[mode][j] = elapsed[mode][j - 1u];
+                        elapsed[mode][j - 1u] = t;
+                    }
+            fprintf(stderr,
+                "V4.1 BF16 RMSNorm width=%u rows=%u: exact median %.4f -> %.4f ms\n",
+                width, rows, elapsed[0][3], elapsed[1][3]);
+            ds4_gpu_tensor_free(input);
+            ds4_gpu_tensor_free(input_storage);
+            for (unsigned mode = 0; mode < 2; mode++) {
+                ds4_gpu_tensor_free(output[mode]);
+                ds4_gpu_tensor_free(storage[mode]);
+            }
+            free(source);
+        }
+    }
+    ds4_gpu_cleanup();
+    free(model);
+    CHECK(ds4_gpu_init());
+    return 1;
+}
+
 static int check_hc_scaled(void) {
     enum { WIDTH = 20480, OUT = 24, ROWS = 8192 };
     const size_t weight_bytes = WIDTH * OUT * sizeof(_Float16);
@@ -357,6 +549,58 @@ static int check_engram(void) {
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(qwt);
     ds4_gpu_tensor_free(kwt); ds4_gpu_tensor_free(mt);
     free(x); free(actual); free(kv); free(qw); free(kw);
+    return 1;
+}
+
+static int check_engram_bf16_input(void) {
+    enum { D = 5120, ROWS = 5, N = ROWS * 4 * D, NK = ROWS * 5 * D };
+    float *x = malloc((N + 1u) * 4u), *kv = malloc(NK * 4u);
+    float *qw = malloc(4u * D * 4u), *kw = malloc(4u * D * 4u);
+    uint8_t mask[] = {0, 1, 0, 1, 0};
+    CHECK(x && kv && qw && kw);
+    for (size_t i = 0; i <= N; i++) x[i] = bf16(random_value());
+    for (size_t i = 0; i < NK; i++) {
+        kv[i] = random_value();
+        if (i % 17u == 0u) {
+            uint32_t bits;
+            memcpy(&bits, kv + i, 4);
+            bits = (bits & 0xffff0000u) | 0x8000u;
+            memcpy(kv + i, &bits, 4);
+        }
+    }
+    for (size_t i = 0; i < 4u * D; i++) { qw[i] = random_value(); kw[i] = random_value(); }
+    ds4_gpu_tensor *out[2] = {upload(NULL, (N + 1u) * 4u), upload(NULL, (N + 1u) * 4u)};
+    ds4_gpu_tensor *keys[2] = {upload(kv, NK * 4u), upload(kv, NK * 4u)};
+    ds4_gpu_tensor *qwt = upload(qw, 4u * D * 4u), *kwt = upload(kw, 4u * D * 4u);
+    ds4_gpu_tensor *mt = upload(mask, sizeof(mask));
+    CHECK(out[0] && out[1] && keys[0] && keys[1] && qwt && kwt && mt);
+    CHECK(ds4_gpu_dsv41_quantize(keys[0], 5u * D, ROWS, DS4_V41_BF16));
+    const uint32_t row_counts[] = {1, ROWS};
+    for (size_t ri = 0; ri < sizeof(row_counts) / sizeof(*row_counts); ri++) {
+        const uint32_t rows = row_counts[ri];
+        const size_t count = (size_t)rows * 4u * D;
+        for (unsigned masked = 0; masked < 2; masked++) {
+            for (unsigned mode = 0; mode < 2; mode++) {
+                CHECK(ds4_gpu_tensor_write(out[mode], 0, x, (N + 1u) * 4u));
+                CHECK(ds4_gpu_dsv41_engram_add(out[mode], keys[mode], qwt, kwt,
+                    masked ? mt : NULL, D, rows, 1e-20f));
+            }
+            const float *expected = ds4_gpu_tensor_contents(out[0]);
+            const float *actual = ds4_gpu_tensor_contents(out[1]);
+            CHECK(expected && actual && !memcmp(expected, actual, (N + 1u) * 4u));
+            CHECK(!memcmp(actual + count, x + count, (N + 1u - count) * 4u));
+            if (masked) for (uint32_t row = 0; row < rows; row++) {
+                if (!mask[row]) CHECK(!memcmp(actual + (size_t)row * 4u * D,
+                    x + (size_t)row * 4u * D, 4u * D * 4u));
+            }
+            fprintf(stderr, "V4.1 Engram raw/rounded F32 KV rows=%u masked=%u: exact\n", rows, masked);
+        }
+    }
+    for (unsigned mode = 0; mode < 2; mode++) {
+        ds4_gpu_tensor_free(out[mode]); ds4_gpu_tensor_free(keys[mode]);
+    }
+    ds4_gpu_tensor_free(qwt); ds4_gpu_tensor_free(kwt); ds4_gpu_tensor_free(mt);
+    free(x); free(kv); free(qw); free(kw);
     return 1;
 }
 
@@ -1050,6 +1294,16 @@ static int check_tp_attention(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--engram")) {
+        const int ok = ds4_gpu_init() && check_engram() && check_engram_bf16_input();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--bf16-norm")) {
+        const int ok = ds4_gpu_init() && check_bf16_norm();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--bf16-rope")) {
         const int ok = ds4_gpu_init() && check_bf16_rope();
         ds4_gpu_cleanup();
@@ -1096,8 +1350,8 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
     if (argc != 1) return 2;
-    int ok = ds4_gpu_init() && check_quantization() && check_engram() && check_rope_stride() &&
-             check_bf16_rope() && check_pool() &&
+    int ok = ds4_gpu_init() && check_quantization() && check_engram() && check_engram_bf16_input() && check_rope_stride() &&
+             check_bf16_rope() && check_bf16_norm() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_index_projection() && check_causal_topk() && check_compact_carry() && check_attention_output() &&
              check_tp_attention();
