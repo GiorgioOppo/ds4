@@ -1445,9 +1445,10 @@ static int check_attention_batches(const char *path, bool batch_index) {
                 REQUIRE(memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
                     ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes) == 0);
             }
-            REQUIRE(memcmp(ds4_gpu_tensor_contents(old->batch.selected_comp),
-                ds4_gpu_tensor_contents(fast->batch.selected_comp),
-                (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t)) == 0);
+            if (ratio && (start + count) / ratio >= DS4_N_INDEXER_TOP_K)
+                REQUIRE(memcmp(ds4_gpu_tensor_contents(old->batch.selected_comp),
+                    ds4_gpu_tensor_contents(fast->batch.selected_comp),
+                    (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t)) == 0);
             const float *expected = ds4_gpu_tensor_contents(old->batch.heads);
             const float *actual = ds4_gpu_tensor_contents(fast->batch.heads);
             double error = 0, norm = 0, worst = 0;
@@ -1470,6 +1471,143 @@ done:
     unsetenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_session_free(b); ds4_session_free(a); ds4_engine_close(engine);
+    return rc;
+}
+
+/* Compare the same attention kernels while the existing index diagnostic
+ * forces the old per-row selection work. No full routed layer is loaded. */
+static int check_attention_index_bypass(const char *path) {
+    enum { CONTEXT = 1100 };
+    ds4_model model = {.fd = -1};
+    ds4_weights weights = {0};
+    ds41_gpu_graph old = {.table = {{.fd = -1}, {.fd = -1}}};
+    ds41_gpu_graph fast = {.table = {{.fd = -1}, {.fd = -1}}};
+    ds4_model_map_span_vec mapped = {0};
+    uint64_t *offsets = NULL, *sizes = NULL;
+    const uint32_t layers[] = {0, 2, 3, 20, 24, 39};
+    const char *diagnostic = "DS4_METAL_DISABLE_V41_BATCH_INDEX";
+    int rc = 1;
+    model_open(&model, path, true, false);
+    config_validate_model(&model);
+    REQUIRE(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
+    weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
+    ds4_gpu_model_residency_skip(1);
+    REQUIRE(ds4_gpu_init());
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(12);
+    REQUIRE(ds4_gpu_set_model_fd(model.fd));
+    for (unsigned i = 0; i < sizeof(layers) / sizeof(*layers); i++) {
+        const ds4_layer_weights *l = &weights.layer[layers[i]];
+        model_map_span_vec_include_one(&mapped, l->attn_sinks);
+        if (ds41_kv_source(layers[i])) {
+            model_map_span_vec_include_one(&mapped, l->attn_compressor_kv);
+            model_map_span_vec_include_one(&mapped, l->attn_compressor_gate);
+            model_map_span_vec_include_one(&mapped, l->attn_compressor_norm);
+            model_map_span_vec_include_one(&mapped, l->indexer_attn_k);
+            model_map_span_vec_include_one(&mapped, l->indexer_k_norm);
+        }
+        if (ds41_index_source(layers[i])) {
+            model_map_span_vec_include_one(&mapped, l->indexer_attn_q_b);
+            model_map_span_vec_include_one(&mapped, l->indexer_proj);
+        }
+    }
+    offsets = malloc(mapped.len * sizeof(*offsets));
+    sizes = malloc(mapped.len * sizeof(*sizes));
+    REQUIRE(offsets && sizes);
+    for (uint32_t i = 0; i < mapped.len; i++) {
+        offsets[i] = mapped.v[i].off;
+        sizes[i] = mapped.v[i].end - mapped.v[i].off;
+    }
+    REQUIRE(ds4_gpu_set_model_map_spans(model.map, model.size, offsets, sizes,
+                                       mapped.len, mapped.max_tensor_bytes));
+    REQUIRE(ds41_graph_alloc(&old, &model, &weights, path, CONTEXT, true));
+    REQUIRE(ds41_graph_alloc(&fast, &model, &weights, path, CONTEXT, true));
+    const uint32_t ratios[] = {0, 2, 1};
+    for (unsigned scenario = 0; scenario < sizeof(ratios) / sizeof(*ratios); scenario++) {
+        const uint32_t ratio = ratios[scenario];
+        uint32_t start = ratio ? 500u * ratio : 127u;
+        const uint32_t counts[] = {ratio ? 11u * ratio - 1u : 1u, 1u,
+                                   ratio ? ratio : 2u, ratio ? 3u * ratio : 31u};
+        ds41_state_span sa[54], sb[54];
+        /* Include all owner caches and unfinished pairs, even those this
+         * scenario does not consume, to detect unwanted writes. */
+        const uint32_t spans = ds41_state_spans(&old, CONTEXT - 1u, sa);
+        REQUIRE(spans == ds41_state_spans(&fast, CONTEXT - 1u, sb));
+        for (uint32_t j = 0; j < spans; j++) {
+            REQUIRE(sa[j].bytes == sb[j].bytes);
+            float *x = ds4_gpu_tensor_contents(sa[j].tensor);
+            REQUIRE(x && ds4_gpu_tensor_contents(sb[j].tensor));
+            for (uint64_t k = 0; k < sa[j].bytes / sizeof(float); k++)
+                x[k] = (float)((int)((k * 13u + j * 7u) % 101u) - 50) / 128.0f;
+            memcpy(ds4_gpu_tensor_contents(sb[j].tensor), x, (size_t)sa[j].bytes);
+        }
+        memset(ds4_gpu_tensor_contents(old.batch.selected_comp), 0xff,
+               (size_t)ds4_gpu_tensor_bytes(old.batch.selected_comp));
+        memset(ds4_gpu_tensor_contents(fast.batch.selected_comp), 0xff,
+               (size_t)ds4_gpu_tensor_bytes(fast.batch.selected_comp));
+        memset(ds4_gpu_tensor_contents(old.batch.block_mask), 0,
+               (size_t)ds4_gpu_tensor_bytes(old.batch.block_mask));
+        memset(ds4_gpu_tensor_contents(fast.batch.block_mask), 0,
+               (size_t)ds4_gpu_tensor_bytes(fast.batch.block_mask));
+        for (unsigned stage = 0; stage < sizeof(counts) / sizeof(*counts); stage++) {
+            const uint32_t count = counts[stage];
+            REQUIRE(start + count < CONTEXT && count <= old.prefill_cap);
+            old.pos = fast.pos = start;
+            for (unsigned li = 0; li < sizeof(layers) / sizeof(*layers); li++) {
+                const uint32_t il = layers[li];
+                if (ds4_layer_compress_ratio(il) != ratio) continue;
+                ds4_gpu_tensor *inputs[] = {old.batch.norm, old.batch.qr, old.batch.q, old.batch.kv};
+                ds4_gpu_tensor *copies[] = {fast.batch.norm, fast.batch.qr, fast.batch.q, fast.batch.kv};
+                const uint32_t widths[] = {DS4_N_EMBD, DS4_N_LORA_Q,
+                                           DS4_N_HEAD * DS4_N_HEAD_DIM, DS4_N_HEAD_DIM};
+                for (unsigned j = 0; j < sizeof(inputs) / sizeof(*inputs); j++) {
+                    float *x = ds4_gpu_tensor_contents(inputs[j]);
+                    REQUIRE(x && ds4_gpu_tensor_contents(copies[j]));
+                    for (uint64_t k = 0; k < (uint64_t)count * widths[j]; k++)
+                        x[k] = (float)((int)((k * 17u + j * 11u + il * 3u + stage) % 97u) - 48) / 64.0f;
+                    memcpy(ds4_gpu_tensor_contents(copies[j]), x,
+                           (size_t)count * widths[j] * sizeof(float));
+                }
+                REQUIRE(setenv(diagnostic, "1", 1) == 0);
+                REQUIRE(ds4_gpu_begin_commands());
+                REQUIRE(ds41_attention_batch(&old, &model, &weights.layer[il], il, count));
+                REQUIRE(ds4_gpu_end_commands());
+                REQUIRE(unsetenv(diagnostic) == 0);
+                REQUIRE(ds4_gpu_begin_commands());
+                REQUIRE(ds41_attention_batch(&fast, &model, &weights.layer[il], il, count));
+                REQUIRE(ds4_gpu_end_commands());
+                for (uint32_t j = 0; j < spans; j++)
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
+                        ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes));
+                const uint64_t head_values = (uint64_t)count * DS4_N_HEAD * DS4_N_HEAD_DIM;
+                const float *a = ds4_gpu_tensor_contents(old.batch.heads);
+                const float *b = ds4_gpu_tensor_contents(fast.batch.heads);
+                for (uint64_t j = 0; j < head_values; j++) REQUIRE(isfinite(b[j]));
+                if (memcmp(a, b, (size_t)head_values * sizeof(float))) {
+                    fprintf(stderr, "V4.1 index bypass heads mismatch layer=%u start=%u count=%u\n",
+                            il, start, count);
+                    goto done;
+                }
+                if (ratio && (start + count) / ratio >= DS4_N_INDEXER_TOP_K)
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(old.batch.selected_comp),
+                        ds4_gpu_tensor_contents(fast.batch.selected_comp),
+                        (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t)));
+                fprintf(stderr, "V4.1 index bypass layer=%u start=%u count=%u: exact heads/KV\n",
+                        il, start, count);
+            }
+            start += count;
+        }
+    }
+    puts("V4.1 full-KV index bypass: exact heads/KV across raw, 511/512 compressed rows and indexed suffix PASS");
+    rc = 0;
+done:
+    unsetenv(diagnostic);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds41_graph_free(&fast); ds41_graph_free(&old);
+    ds4_gpu_cleanup();
+    free(sizes); free(offsets); free(mapped.v);
+    model_close(&model);
     return rc;
 }
 
@@ -1852,6 +1990,8 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--attention-index-bypass"))
+        return check_attention_index_bypass(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))
         return check_batch_admission();
     if (argc == 3 && !strcmp(argv[2], "--batch-head"))

@@ -39974,8 +39974,11 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     if (!ds4_gpu_tensor_copy(g->raw_prefill, previous * row_bytes, b->kv, 0, count * row_bytes))
         return false;
     ds41_gpu_graph row = *g;
-    const bool batch_index = ds41_index_source(il) &&
-        !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
+    /* The direct branch below scans every compressed row without reading
+     * selections or candidate masks. Keep publishing keys for later tokens. */
+    const bool batch_index_enabled = !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
+    const bool needs_selection = n_comp >= DS4_N_INDEXER_TOP_K || !batch_index_enabled;
+    const bool batch_index = ds41_index_source(il) && batch_index_enabled;
     const bool batch_publish = ratio == 2u && ds41_kv_source(il) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
@@ -39985,9 +39988,10 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         DS41_PREFILL_ROWS(DS41_SELECT_ROW)
 #undef DS41_SELECT_ROW
         if (!batch_publish && !ds41_attention_publish(&row, m, l, il)) return false;
-        if (!batch_index && !ds41_attention_select_published(&row, m, l, il)) return false;
+        if (needs_selection && !batch_index &&
+            !ds41_attention_select_published(&row, m, l, il)) return false;
     }
-    if (batch_index && !ds41_index_batch(g, m, l, il, count)) return false;
+    if (needs_selection && batch_index && !ds41_index_batch(g, m, l, il, count)) return false;
     bool ok;
     if (!n_comp) {
         /* Raw attention rounds probabilities per key block. Keep its existing
