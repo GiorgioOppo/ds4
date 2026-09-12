@@ -3,6 +3,7 @@
 
 #include <math.h>
 #include <mach/mach.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -209,6 +210,19 @@ static int check_seed_release(void *model, uint64_t bytes, uint64_t expert) {
     return 1;
 }
 
+typedef struct {
+    ds4_gpu_stream_expert_table table;
+    int32_t ids[6];
+    int ok;
+} ds41_cache_load_job;
+
+static void *ds41_cache_load_worker(void *arg) {
+    ds41_cache_load_job *job = arg;
+    ds4_gpu_stream_expert_cache_note_service_thread();
+    job->ok = ds4_gpu_stream_expert_cache_begin_selected_load(&job->table, job->ids, 6);
+    return NULL;
+}
+
 static int check_ds41_selected_load(void) {
     enum { INPUT = 512, MID = 768, EXPERTS = 384, SELECTED = 6, TURNS = 24 };
     const uint64_t gate_row = INPUT / 256 * sizeof(iq2_block);
@@ -216,6 +230,8 @@ static int check_ds41_selected_load(void) {
     const uint64_t gate_bytes = MID * gate_row, down_bytes = INPUT * down_row;
     const uint64_t up_offset = EXPERTS * gate_bytes, down_offset = 2 * up_offset;
     const uint64_t bytes = down_offset + EXPERTS * down_bytes;
+    const uint64_t page = getpagesize();
+    const uint64_t cache_slot_bytes = (2 * gate_bytes + down_bytes + page - 1) / page * page;
     FILE *file = tmpfile();
     if (!file) return 0;
     if (ftruncate(fileno(file), bytes)) { fclose(file); return 0; }
@@ -318,6 +334,67 @@ static int check_ds41_selected_load(void) {
                 ok = 0;
             }
         }
+    }
+    if (ok) {
+        ds41_cache_load_job job = {
+            .table = {.model_map = model, .model_size = bytes, .layer = 12,
+                .n_total_expert = EXPERTS, .gate_offset = 0,
+                .up_offset = up_offset, .down_offset = down_offset,
+                .gate_expert_bytes = gate_bytes, .down_expert_bytes = down_bytes},
+            .ids = {0, 1, 2, 3, 4, 5}, .ok = 1,
+        };
+        ds4_gpu_set_streaming_expert_cache_budget(12);
+        /* Ten of twelve slots stay GPU-owned. The worker can reserve two
+         * victims before its six-expert load must fail back to this thread. */
+        for (uint32_t layer = 10; layer < 12 && ok; layer++) {
+            ds4_gpu_stream_expert_table table = job.table;
+            table.layer = layer;
+            ok = ds4_gpu_stream_expert_cache_seed_experts(&table, job.ids, NULL, SELECTED);
+        }
+        ok = ok && ds4_gpu_stream_expert_cache_current_count() == 12 && ds4_gpu_begin_commands();
+        for (uint32_t layer = 10; layer < 12 && ok; layer++) {
+            const int32_t active_ids[SELECTED] = {0, 1, 2, 3,
+                layer == 10 ? 4 : 0, layer == 10 ? 5 : 1};
+            ok = ds4_gpu_tensor_write(it, 0, active_ids, sizeof(active_ids)) &&
+                 ds4_gpu_routed_moe_set_selected_override(active_ids, SELECTED) &&
+                 ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, down,
+                    model, bytes, 0, up_offset, down_offset, 16, 10,
+                    gate_bytes, gate_row, down_bytes, down_row, INPUT, MID, INPUT,
+                    it, wt, EXPERTS, SELECTED, 7.0f, xt, NULL, layer, false);
+        }
+        if (ok) {
+            pthread_t worker;
+            ok = pthread_create(&worker, NULL, ds41_cache_load_worker, &job) == 0;
+            if (ok) {
+                ok = pthread_join(worker, NULL) == 0 && !job.ok &&
+                     ds4_gpu_commands_active() &&
+                     ds4_gpu_stream_expert_cache_current_count() == 10 &&
+                     ds4_gpu_stream_expert_cache_allocated_bytes() == 12 * cache_slot_bytes;
+            }
+        }
+        if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = 0;
+        /* Recovered reservations must fit the same slabs. Compare the retry
+         * against a fresh synchronous SSD load with the identical selection. */
+        float retried[INPUT];
+        for (int fresh = 0; fresh < 2 && ok; fresh++) {
+            if (fresh) ds4_gpu_set_streaming_expert_cache_budget(12);
+            ok = ds4_gpu_stream_expert_cache_begin_selected_load(&job.table, job.ids, SELECTED) &&
+                 ds4_gpu_tensor_write(it, 0, job.ids, sizeof(job.ids)) &&
+                 ds4_gpu_routed_moe_set_selected_override(job.ids, SELECTED) &&
+                 ds4_gpu_begin_commands() &&
+                 ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, down,
+                    model, bytes, 0, up_offset, down_offset, 16, 10,
+                    gate_bytes, gate_row, down_bytes, down_row, INPUT, MID, INPUT,
+                    it, wt, EXPERTS, SELECTED, 7.0f, xt, NULL, job.table.layer, false);
+            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = 0;
+            ok = ok && ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)) &&
+                 ds4_gpu_stream_expert_cache_current_count() <= 12 &&
+                 ds4_gpu_stream_expert_cache_allocated_bytes() <= 12 * cache_slot_bytes;
+            if (!fresh) memcpy(retried, actual, sizeof(actual));
+            else if (memcmp(retried, actual, sizeof(actual))) ok = 0;
+        }
+        ds4_gpu_routed_moe_set_selected_override(NULL, 0);
+        fprintf(stderr, "Metal V4.1 SSD partial async reservation rollback: %s\n", ok ? "PASS" : "FAIL");
     }
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(id_source); ds4_gpu_tensor_free(it);
     ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);

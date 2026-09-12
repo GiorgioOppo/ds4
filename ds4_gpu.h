@@ -373,6 +373,10 @@ static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+#ifdef __APPLE__
+/* Allocated weight storage, including unused slab slots and pending loads. */
+uint64_t ds4_gpu_stream_expert_cache_allocated_bytes(void);
+#endif
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);

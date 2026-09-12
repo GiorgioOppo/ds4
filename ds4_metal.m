@@ -1027,7 +1027,9 @@ static double g_stream_expert_cache_mlock_ms;
 static int g_stream_expert_cache_mlock_warned;
 static uint64_t g_stream_expert_cache_slab_slot_bytes;
 static uint64_t g_stream_expert_cache_cb_seq;
-static uint64_t g_stream_expert_cache_done_seq;
+/* The load worker reads completion while a failed main-thread flush may
+ * drain pending commands. Other cache epochs stay on the encoding thread. */
+static _Atomic uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
 static uint64_t g_stream_expert_cache_owned_seq;
 static uint64_t g_stream_expert_cache_pending_max_seq;
@@ -15231,6 +15233,47 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     }
 }
 
+static NSMutableSet<id<MTLBuffer>> *ds4_gpu_stream_expert_cache_buffers(void) {
+    NSMutableSet<id<MTLBuffer>> *buffers = [NSMutableSet set];
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        if (g_stream_expert_cache_slabs[i]) {
+            [buffers addObject:g_stream_expert_cache_slabs[i]];
+        }
+    }
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            const ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid || e->slab_backed) continue;
+            if (e->gate_buffer) [buffers addObject:e->gate_buffer];
+            if (e->up_buffer) [buffers addObject:e->up_buffer];
+            if (e->down_buffer) [buffers addObject:e->down_buffer];
+        }
+    }
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
+        if (g_stream_expert_pending_load.gate_bufs[i]) {
+            [buffers addObject:g_stream_expert_pending_load.gate_bufs[i]];
+        }
+        if (g_stream_expert_pending_load.up_bufs[i]) {
+            [buffers addObject:g_stream_expert_pending_load.up_bufs[i]];
+        }
+        if (g_stream_expert_pending_load.down_bufs[i]) {
+            [buffers addObject:g_stream_expert_pending_load.down_bufs[i]];
+        }
+    }
+    return buffers;
+}
+
+uint64_t ds4_gpu_stream_expert_cache_allocated_bytes(void) {
+    @autoreleasepool {
+        uint64_t bytes = 0;
+        for (id<MTLBuffer> buffer in ds4_gpu_stream_expert_cache_buffers()) {
+            bytes += (uint64_t)[buffer length];
+        }
+        return bytes;
+    }
+}
+
 static int ds4_gpu_stream_expert_cache_is_protected(
         uint32_t expert,
         const int32_t *protect_ids,
@@ -15537,7 +15580,8 @@ retry:
     }
 
     if (victim_count == 0) {
-        if (skipped_inflight && !waited_inflight) {
+        if (skipped_inflight && !waited_inflight &&
+            !ds4_gpu_stream_expert_cache_on_service_thread()) {
             waited_inflight = 1;
             if (!ds4_gpu_stream_expert_cache_wait_inflight(
                     "streaming expert cache batch reuse")) {
@@ -15816,6 +15860,10 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         *down_inner = reuse.down_inner;
         return 1;
     }
+
+    /* A full cache needs a GPU-safe victim. Let the encoding thread wait and
+     * retry instead of allocating beyond the budget from the load worker. */
+    if (force_reuse && ds4_gpu_stream_expert_cache_on_service_thread()) return 0;
 
     if (ds4_gpu_stream_expert_combined_buffer_enabled()) {
         if (gate_expert_bytes > UINT64_MAX - gate_expert_bytes ||
@@ -16277,6 +16325,39 @@ static void ds4_gpu_stream_expert_pending_load_release_buffers(
         ds4_gpu_stream_expert_pending_load *p) {
     if (!p) return;
     for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
+        const ds4_gpu_stream_expert_cache_entry *entry = NULL;
+        if (i < p->n_loads && p->layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) {
+            const uint32_t slot = p->load_slots[i];
+            if (slot < p->n_selected && p->selected_ids[slot] >= 0 &&
+                p->selected_ids[slot] < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+                entry = &g_stream_expert_cache[p->layer][p->selected_ids[slot]];
+            }
+        }
+        const int installed = entry && entry->valid &&
+            entry->gate_buffer == p->gate_bufs[i] &&
+            entry->up_buffer == p->up_bufs[i] &&
+            entry->down_buffer == p->down_bufs[i] &&
+            entry->gate_inner == p->gate_inners[i] &&
+            entry->up_inner == p->up_inners[i] &&
+            entry->down_inner == p->down_inners[i];
+        if (!installed && p->gate_bufs[i]) {
+            /* Preparation can reserve some victims before a later miss
+             * fails. Return those uninstalled slots for the main-thread retry. */
+            uint32_t slot = 0;
+            if (ds4_gpu_stream_expert_slab_slot_for_buffer(
+                    p->gate_bufs[i], p->gate_inners[i], &slot)) {
+                ds4_gpu_stream_expert_slab_push_free_slot(slot);
+            } else {
+                ds4_gpu_stream_expert_unlock_explicit_buffer(p->gate_bufs[i]);
+                if (p->up_bufs[i] != p->gate_bufs[i]) {
+                    ds4_gpu_stream_expert_unlock_explicit_buffer(p->up_bufs[i]);
+                }
+                if (p->down_bufs[i] != p->gate_bufs[i] &&
+                    p->down_bufs[i] != p->up_bufs[i]) {
+                    ds4_gpu_stream_expert_unlock_explicit_buffer(p->down_bufs[i]);
+                }
+            }
+        }
         p->gate_bufs[i] = nil;
         p->up_bufs[i] = nil;
         p->down_bufs[i] = nil;
