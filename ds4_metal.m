@@ -37379,6 +37379,86 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
     return 1;
 }
 
+static int ds4_gpu_encode_v41_moe_partition(
+        id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mm_id_args *gate, const ds4_gpu_mul_mm_id_args *down,
+        id<MTLBuffer> work, NSUInteger stride) {
+    if (!cb || !pipeline || !gate || !down || !work || !g_moe_id_map_buffer ||
+        gate->ne02 <= 0 || gate->ne20 <= 0 || gate->ne21 <= 0 ||
+        gate->ne0 <= 0 || down->ne0 <= 0 || stride > UINT32_MAX || (stride & 15u)) return 0;
+    const uint64_t counts = (uint64_t)gate->ne02*sizeof(uint32_t);
+    const uint64_t ids = counts*(uint32_t)gate->ne21;
+    const uint64_t source_offset = (counts + ids + 7u) & ~UINT64_C(7);
+    const uint64_t cap = ((uint64_t)gate->ne20*gate->ne21 + 31u*gate->ne02 + 31u)/32u;
+    if (source_offset > g_moe_id_map_bytes ||
+        8u + cap*8u > g_moe_id_map_bytes - source_offset ||
+        stride < 8u + cap*8u || (uint64_t)stride*3u + 96u > work.length) return 0;
+    const uint32_t args[4] = {(uint32_t)stride,
+        ((uint32_t)gate->ne0 + 63u)/64u, ((uint32_t)down->ne0 + 63u)/64u, 0u};
+    if (cb == g_batch_cb) ds4_gpu_close_batch_encoder();
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(args) atIndex:0];
+    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:1];
+    [enc setBuffer:g_moe_id_map_buffer offset:(NSUInteger)source_offset atIndex:2];
+    [enc setBuffer:work offset:0 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    // The next dispatch reads arguments written by this kernel. Keep that
+    // producer/consumer boundary explicit even with a reused batch encoder.
+    if (cb == g_batch_cb) ds4_gpu_close_batch_encoder();
+    return 1;
+}
+
+static int ds4_gpu_encode_v41_moe_small_tiles(
+        id<MTLCommandBuffer> cb, id<MTLComputePipelineState> __strong pipelines[3], bool pair,
+        const ds4_gpu_mul_mm_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        id<MTLBuffer> gate, NSUInteger gate_offset,
+        id<MTLBuffer> up, NSUInteger up_offset,
+        id<MTLBuffer> rhs, NSUInteger rhs_offset,
+        id<MTLBuffer> dst, NSUInteger dst_offset,
+        id<MTLBuffer> weights, NSUInteger weights_offset,
+        id<MTLBuffer> work, NSUInteger stride) {
+    if (!cb || !pipelines || !args || !act || !gate || !up || !rhs || !dst || !weights ||
+        !work || !g_moe_id_map_buffer || (uint64_t)stride*3u + 96u > work.length) return 0;
+    const NSUInteger counts = (NSUInteger)args->ne02*sizeof(uint32_t);
+    const NSUInteger shared_pair[3] = {8704u, 9216u, 16384u};
+    const NSUInteger shared_down[3] = {4608u, 5120u, 8192u};
+    for (unsigned bucket = 0; bucket < 3; bucket++) {
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipelines[bucket]];
+        [enc setBytes:args length:sizeof(*args) atIndex:0];
+        if (pair || bucket < 2) {
+            [enc setBytes:act length:sizeof(*act) atIndex:1];
+            [enc setBuffer:gate offset:gate_offset atIndex:2];
+            [enc setBuffer:up offset:up_offset atIndex:3];
+            [enc setBuffer:rhs offset:rhs_offset atIndex:4];
+            [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:5];
+            [enc setBuffer:g_moe_id_map_buffer offset:counts atIndex:6];
+            [enc setBuffer:dst offset:dst_offset atIndex:7];
+            [enc setBuffer:weights offset:weights_offset atIndex:8];
+            [enc setBuffer:work offset:bucket*stride atIndex:9];
+        } else {
+            [enc setBuffer:gate offset:gate_offset atIndex:1];
+            [enc setBuffer:rhs offset:rhs_offset atIndex:2];
+            [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:3];
+            [enc setBuffer:g_moe_id_map_buffer offset:counts atIndex:4];
+            [enc setBuffer:dst offset:dst_offset atIndex:5];
+            [enc setBuffer:work offset:bucket*stride atIndex:6];
+        }
+        [enc setThreadgroupMemoryLength:pair ? shared_pair[bucket] : shared_down[bucket] atIndex:0];
+        [enc dispatchThreadgroupsWithIndirectBuffer:work
+            indirectBufferOffset:3u*stride + bucket*32u + (pair ? 0u : 16u)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+    }
+    return 1;
+}
+
 static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -47893,6 +47973,55 @@ int ds4_gpu_routed_moe_batch_tensor(
             }
         }
 
+        // These three pipelines consume disjoint GPU work lists. N8/N16 use
+        // smaller accumulator/staging layouts; occupied N32 tiles keep the
+        // established kernel. Resolve the entire plan before encoding.
+        id<MTLComputePipelineState> v41_small_pair[3] = {nil, nil, pair_swiglu_mm_pipeline};
+        id<MTLComputePipelineState> v41_small_down[3] = {nil, nil, down_mm_pipeline};
+        id<MTLComputePipelineState> v41_partition = nil;
+        id<MTLBuffer> v41_small_work = nil;
+        NSUInteger v41_small_stride = 0;
+        const bool force_v41_small_tiles = (g_test_flags & DS4_GPU_TEST_V41_MOE_SMALL_TILES) != 0u;
+        bool use_v41_small_tiles = v41_mm_tail_supported && use_mm_id_pair_swiglu &&
+            (v41_mm_tail_auto || force_v41_small_tiles) &&
+            expert_in_dim % 256u == 0u && expert_mid_dim % 256u == 0u && out_dim % 4u == 0u &&
+            !g_batch_encoder_concurrent && !use_packed_mpp && !use_iq2_pair_f16_rhs;
+        if (use_v41_small_tiles) {
+            v41_partition = ds4_gpu_get_pipeline("kernel_dsv41_moe_partition_work");
+            v41_small_pair[0] = ds4_gpu_get_pipeline("kernel_dsv41_moe_iq2_pair_n8");
+            v41_small_pair[1] = ds4_gpu_get_pipeline("kernel_dsv41_moe_iq2_pair_n16");
+            v41_small_down[0] = ds4_gpu_get_pipeline("kernel_dsv41_moe_q2_down_n8");
+            v41_small_down[1] = ds4_gpu_get_pipeline("kernel_dsv41_moe_q2_down_n16");
+            use_v41_small_tiles = v41_partition &&
+                v41_partition.maxTotalThreadsPerThreadgroup >= 128u;
+            const NSUInteger pair_shared[3] = {8704u, 9216u, 16384u};
+            const NSUInteger down_shared[3] = {4608u, 5120u, 8192u};
+            for (unsigned i = 0; i < 3 && use_v41_small_tiles; i++) {
+                id<MTLComputePipelineState> p = v41_small_pair[i], d = v41_small_down[i];
+                use_v41_small_tiles = p && d && p.threadExecutionWidth == 32u &&
+                    d.threadExecutionWidth == 32u && p.maxTotalThreadsPerThreadgroup >= 128u &&
+                    d.maxTotalThreadsPerThreadgroup >= 128u &&
+                    p.staticThreadgroupMemoryLength + pair_shared[i] <= g_device.maxThreadgroupMemoryLength &&
+                    d.staticThreadgroupMemoryLength + down_shared[i] <= g_device.maxThreadgroupMemoryLength;
+            }
+            if (use_v41_small_tiles) {
+                const uint64_t cap = ((uint64_t)n_tokens*n_expert + 31u*n_total_expert + 31u)/32u;
+                const uint64_t stride = (8u + cap*8u + 15u) & ~UINT64_C(15);
+                use_v41_small_tiles = stride <= UINT32_MAX && stride <= (NSUIntegerMax - 96u)/3u;
+                if (use_v41_small_tiles) {
+                    v41_small_stride = (NSUInteger)stride;
+                    // Batch-scoped retention also covers flushed/unretained
+                    // command buffers. At the admitted shape this is <14 KiB.
+                    v41_small_work = ds4_gpu_new_transient_buffer(
+                        3u*v41_small_stride + 96u, "ds4_v41_moe_small_work");
+                    use_v41_small_tiles = v41_small_work != nil;
+                }
+            }
+        }
+
+        // A diagnostic force must fail instead of silently testing fallback.
+        if (force_v41_small_tiles && !use_v41_small_tiles) return 0;
+
         const bool q4_batch_table_boundary =
             use_q4_batch_expert_table &&
             g_batch_cb != nil &&
@@ -48088,6 +48217,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                 &gate_mm_args,
                                                 selectedbuf,
                                                 ds4_gpu_tensor_offset(selected));
+            if (ok && use_v41_small_tiles)
+                ok = ds4_gpu_encode_v41_moe_partition(cb, v41_partition,
+                    &gate_mm_args, &down_mm_args, v41_small_work, v41_small_stride);
             if (ok && use_packed_mpp)
                 ok = ds4_gpu_encode_moe_packed_rhs(cb, &gate_mm_args,
                                                   xbuf, ds4_gpu_tensor_offset(x), false, packed_limit);
@@ -48118,7 +48250,13 @@ int ds4_gpu_routed_moe_batch_tensor(
                     .write_clamped = 0,
                     .clamp_value = clamp,
                 };
-                ok = ok && ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
+                if (ok && use_v41_small_tiles) {
+                    ok = ds4_gpu_encode_v41_moe_small_tiles(cb, v41_small_pair, true,
+                        &pair_mm_args, &act_args, gate_buf, (NSUInteger)gate_inner,
+                        up_buf, (NSUInteger)up_inner, pair_rhs, pair_rhs_offset,
+                        midbuf, ds4_gpu_tensor_offset(mid), weightsbuf,
+                        ds4_gpu_tensor_offset(weights), v41_small_work, v41_small_stride);
+                } else if (ok) ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
                                                                    pair_swiglu_mm_pipeline,
                                                                    use_mxfp4_mm_id_pair_swiglu_compact_tile,
                                                                    &pair_mm_args,
@@ -48446,6 +48584,13 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                      0,
                                                      down_smem,
                                                      use_tp_mxfp4_static_batch ? 1 : 2);
+            } else if (use_mm_id && use_v41_small_tiles) {
+                const ds4_gpu_dsv4_moe_swiglu_weight_args unused_act = {0};
+                ok = ds4_gpu_encode_v41_moe_small_tiles(cb, v41_small_down, false,
+                    &down_mm_args, &unused_act, down_buf, (NSUInteger)down_inner,
+                    down_buf, (NSUInteger)down_inner, midbuf, ds4_gpu_tensor_offset(mid),
+                    down_dst, down_dst_off, weightsbuf, ds4_gpu_tensor_offset(weights),
+                    v41_small_work, v41_small_stride);
             } else if (use_mm_id) {
                 if (use_packed_mpp)
                     ok = ds4_gpu_encode_moe_packed_rhs(cb, &down_mm_args,

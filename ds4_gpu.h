@@ -527,6 +527,7 @@ enum {
     DS4_GPU_TEST_V41_PAIR_TAIL_CULL = 1u << 13,
     DS4_GPU_TEST_V41_DOWN_TAIL_CULL = 1u << 14,
     DS4_GPU_TEST_V41_MOE_REFERENCE = 1u << 15,
+    DS4_GPU_TEST_V41_MOE_SMALL_TILES = 1u << 16,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
