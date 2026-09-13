@@ -285,6 +285,19 @@ tests/test_deepseek41_qb: tests/test_deepseek41_qb.o $(CORE_OBJS)
 test-deepseek41-qb: tests/test_deepseek41_qb
 	./tests/test_deepseek41_qb
 
+tests/test_deepseek41_outb.o: tests/test_deepseek41_outb.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_deepseek41_outb: tests/test_deepseek41_outb.o $(CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-outb bench-deepseek41-outb
+test-deepseek41-outb: tests/test_deepseek41_outb
+	./tests/test_deepseek41_outb
+
+bench-deepseek41-outb: tests/test_deepseek41_outb
+	./tests/test_deepseek41_outb --bench
+
 tests/test_deepseek41_masks.o: tests/test_deepseek41_masks.c ds4_gpu.h ds4_image.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
@@ -1006,7 +1019,7 @@ clean:
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_q8_bf16
 	rm -f tests/test_deepseek41_shared
-	rm -f tests/test_deepseek41_qb tests/test_deepseek41_masks
+	rm -f tests/test_deepseek41_qb tests/test_deepseek41_outb tests/test_deepseek41_masks
 	rm -f tests/test_deepseek41_publication
 	rm -f tests/test_deepseek41_candidates
 	rm -f tests/test_deepseek41_gather

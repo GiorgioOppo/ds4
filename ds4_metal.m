@@ -30883,8 +30883,8 @@ static int ds4_gpu_dsv41_output_projection_typed(
     return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 typed output-B K slice");
 }
 
-int ds4_gpu_dsv41_attention_output_typed_batch(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+static int ds4_gpu_dsv41_attention_output_typed_impl(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *workspace,
         const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t out_b_offset,
         uint32_t out_a_type, uint32_t out_b_type,
@@ -30918,6 +30918,61 @@ int ds4_gpu_dsv41_attention_output_typed_batch(
             (lb == hb && lo < ho + heads_bytes && ho < lo + low_bytes) ||
             (lb == ob && lo < oo + out_bytes && oo < lo + low_bytes)) return 0;
         if (!g_initialized && !ds4_gpu_init()) return 0;
+        /* Q is dead after attention. Expand output-B once in its available
+         * capacity, retaining the native K32 MMA order and the BF16 boundary
+         * between A and B. Small batches and insufficient views keep Q4 GEMM. */
+        const uint64_t rhs_bytes = (uint64_t)n_tokens * 8192u * sizeof(uint16_t);
+        const uint64_t expanded_bytes = UINT64_C(8192) * 5120u * sizeof(uint16_t);
+        const uint64_t workspace_bytes = rhs_bytes + expanded_bytes;
+        const bool eligible = workspace && out_b_type == DS4_METAL_TENSOR_Q4_K &&
+            tp_world == 1u && n_tokens >= 256u && n_tokens <= 2048u &&
+            !g_quality_mode && !g_batch_encoder_concurrent && g_tp_split_world <= 1 &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F32_F16_COPY") <= 0 &&
+            ds4_gpu_tensor_bytes(workspace) >= workspace_bytes;
+        id<MTLBuffer> scratch = eligible ? ds4_gpu_tensor_buffer(workspace) : nil;
+        const uint64_t scratch_offset = eligible ? ds4_gpu_tensor_offset(workspace) : 0;
+        id<MTLBuffer> b_weights = nil;
+        uint64_t b_inner = 0;
+        id<MTLComputePipelineState> dequant = nil, mm = nil;
+        const bool boundary = n_tokens % 32u != 0u;
+        if (eligible) {
+            if (!scratch || (scratch_offset & 15u) || scratch_offset > scratch.length ||
+                workspace_bytes > scratch.length - scratch_offset ||
+                ds4_gpu_tensor_prefixes_overlap(workspace, workspace_bytes, heads, heads_bytes) ||
+                ds4_gpu_tensor_prefixes_overlap(workspace, workspace_bytes, low, low_bytes) ||
+                ds4_gpu_tensor_prefixes_overlap(workspace, workspace_bytes, out, out_bytes)) return 0;
+            /* No-copy model wrappers may be distinct Metal objects over the
+             * same CPU pages. Check both matrices before encoding output-A. */
+            const uintptr_t model_addr = (uintptr_t)model_map;
+            const uintptr_t scratch_addr = (uintptr_t)scratch.contents;
+            const uint64_t offsets[] = {out_a_offset, out_b_offset};
+            const uint64_t sizes[] = {8192u * row_a_bytes, 5120u * row_b_bytes};
+            for (unsigned i = 0; i < 2; i++) {
+                if (offsets[i] > UINTPTR_MAX - model_addr ||
+                    sizes[i] > UINTPTR_MAX - model_addr - offsets[i]) return 0;
+                const uintptr_t first = model_addr + offsets[i], last = first + sizes[i];
+                if (scratch_addr && scratch_addr + scratch_offset < last &&
+                    first < scratch_addr + scratch_offset + workspace_bytes) return 0;
+            }
+            dequant = ds4_gpu_get_pipeline("kernel_dequantize_q4_K_f16");
+            mm = ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f16_f16_rhs", false, boundary);
+            const NSUInteger smem = boundary ? 8192u : 6144u;
+            if (!dequant || dequant.threadExecutionWidth != 32u ||
+                dequant.maxTotalThreadsPerThreadgroup < 64u || !mm ||
+                mm.threadExecutionWidth != 32u || mm.maxTotalThreadsPerThreadgroup < 128u ||
+                mm.staticThreadgroupMemoryLength + smem > g_device.maxThreadgroupMemoryLength ||
+                !g_cpy_contig_f32_f16_pipeline ||
+                !g_cpy_contig_f32_f16_pipeline.maxTotalThreadsPerThreadgroup) {
+                dequant = nil;
+                mm = nil;
+            } else {
+                b_weights = ds4_gpu_wrap_model_range(model_map, model_size,
+                    out_b_offset, 5120u * row_b_bytes, &b_inner);
+                if (!b_weights || (b_weights == scratch && b_inner < scratch_offset + workspace_bytes &&
+                    scratch_offset < b_inner + 5120u * row_b_bytes)) return 0;
+            }
+        }
         /* Keep the established Q8/Q8 schedule and arithmetic untouched. */
         if (out_a_type == DS4_METAL_TENSOR_Q8_0 && out_b_type == DS4_METAL_TENSOR_Q8_0)
             return tp_world == 1u ? ds4_gpu_dsv41_attention_output_batch(out, low,
@@ -30929,12 +30984,51 @@ int ds4_gpu_dsv41_attention_output_typed_batch(
         const uint32_t k_off = tp_rank * low_dim;
         bool ok = ds4_gpu_dsv41_output_low_typed(low, heads, model_map, model_size,
             out_a_offset + (uint64_t)k_off * row_a_bytes, out_a_type, groups, n_tokens) &&
-            ds4_gpu_dsv41_quantize(low, low_dim, n_tokens, DS4_V41_BF16) &&
-            ds4_gpu_dsv41_output_projection_typed(out, low, model_map, model_size,
+            ds4_gpu_dsv41_quantize(low, low_dim, n_tokens, DS4_V41_BF16);
+        if (ok && b_weights) {
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            ok = cb && !owned && ds4_gpu_encode_cpy_f32_f16_1d(cb, lb, (NSUInteger)lo,
+                scratch, (NSUInteger)scratch_offset, n_tokens * 8192u);
+            ds4_gpu_close_batch_encoder();
+            if (ok) ok = ds4_gpu_encode_q4_K_transient_f16(cb, dequant,
+                b_weights, (NSUInteger)b_inner, scratch,
+                (NSUInteger)(scratch_offset + rhs_bytes), 8192u, 5120u) != 0;
+            ds4_gpu_close_batch_encoder();
+            if (ok) ok = ds4_gpu_encode_f16_rhs_mm(cb, mm, scratch,
+                (NSUInteger)(scratch_offset + rhs_bytes), workspace, out,
+                8192u, 5120u, n_tokens, 8192u * sizeof(uint16_t), boundary) != 0;
+            /* FFN may now reuse Q through its existing graph aliases. */
+            ds4_gpu_close_batch_encoder();
+        } else if (ok) {
+            ok = ds4_gpu_dsv41_output_projection_typed(out, low, model_map, model_size,
                 out_b_offset, out_b_type, k_off, low_dim, n_tokens);
+        }
         if (!had_batch) ok = ds4_gpu_end_commands() != 0 && ok;
         return ok;
     }
+}
+
+int ds4_gpu_dsv41_attention_output_typed_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint32_t out_a_type, uint32_t out_b_type,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens,
+        uint32_t tp_world, uint32_t tp_rank) {
+    return ds4_gpu_dsv41_attention_output_typed_impl(out, low, NULL, model_map, model_size,
+        out_a_offset, out_b_offset, out_a_type, out_b_type, heads, n_tokens, tp_world, tp_rank);
+}
+
+int ds4_gpu_dsv41_attention_output_typed_workspace_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *workspace,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint32_t out_a_type, uint32_t out_b_type,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens,
+        uint32_t tp_world, uint32_t tp_rank) {
+    return ds4_gpu_dsv41_attention_output_typed_impl(out, low, workspace, model_map, model_size,
+        out_a_offset, out_b_offset, out_a_type, out_b_type, heads, n_tokens, tp_world, tp_rank);
 }
 
 int ds4_gpu_dsv41_q4_qb_rows(

@@ -41787,7 +41787,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
                 DS41_STAGE("attention core/index");
                 if (ok) {
-                    ok = ds4_gpu_dsv41_attention_output_typed_batch(g->batch.block, g->batch.low,
+                    /* Attention consumed Q; FFN will reuse its aliases only
+                     * after output-B has finished with this workspace. */
+                    ok = ds4_gpu_dsv41_attention_output_typed_workspace_batch(
+                        g->batch.block, g->batch.low, g->batch.q,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
                         l->attn_output_a->type, l->attn_output_b->type,
                         g->batch.heads, count, g->tp_world, g->tp_rank) &&

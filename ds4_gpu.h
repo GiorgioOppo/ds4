@@ -159,6 +159,16 @@ int ds4_gpu_dsv41_attention_output_typed_batch(
         uint32_t out_a_type, uint32_t out_b_type,
         const ds4_gpu_tensor *heads, uint32_t n_tokens,
         uint32_t tp_world, uint32_t tp_rank);
+/* Optional dead graph storage for transient output-B Q4->F16 expansion.
+ * Needs 80 MiB + n_tokens*8192*2 bytes; smaller views use the native path.
+ * Admitted storage must not overlap heads, low, output, or either matrix. */
+int ds4_gpu_dsv41_attention_output_typed_workspace_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *workspace,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint32_t out_a_type, uint32_t out_b_type,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens,
+        uint32_t tp_world, uint32_t tp_rank);
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
