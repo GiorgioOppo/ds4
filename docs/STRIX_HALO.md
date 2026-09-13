@@ -33,21 +33,13 @@ the container. Do not mix header versions as a general workaround.
 
 ## GPU-visible memory
 
-Check the memory pool reported by `rocminfo`. Some 128 GB configurations expose
-only about 62 GB to the GPU, which is insufficient for resident Flash Q2 plus
-runtime buffers. Firmware and kernel GTT/TTM settings control this limit.
-
-The native reference setup used these memory parameters:
+Check the GPU-visible memory pool reported by `rocminfo`. Some 128 GB systems expose only about 62 GiB to the GPU. The tested 128 GB Fedora Linux Strix Halo system, running a recent kernel and ROCm 10.0, used these boot parameters:
 
 ```text
-amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856
+amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856
 ```
 
-They are a system-specific starting point, not an allocation budget for
-DwarfStar. Preserve existing boot options and consult your kernel's settings
-before changing them. Keep RAM available for the OS even when the GPU can
-address most of it. Do not disable the IOMMU merely to copy another host's
-configuration; doing so changes device isolation.
+The GTT/TTM settings expose about 124 GiB to the GPU. An SSD expert-cache request such as `92GB` is fitted to that GPU-visible limit as well as available system RAM; a stock ~62 GiB pool can therefore yield a much smaller cache. `amd_iommu=off` was part of the tested setup, but is not required for GTT sizing and disables DMA isolation. Keep RAM available for the OS. See the [host configuration guide](https://strix-halo-toolboxes.com/#config) for Fedora, Ubuntu/Debian, and systemd-boot instructions.
 
 ## Build and run Flash
 
