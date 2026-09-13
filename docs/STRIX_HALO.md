@@ -72,7 +72,7 @@ make strix-halo ROCM_ARCH=gfx1151
 ./ds4 --rocm -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming --ssd-streaming-cache-experts 92GB --ctx 262144
 ```
 
-The larger-context configuration above allocated 262,144 tokens and completed a real 65,536-token text prompt plus 128 greedy outputs on the 128 GB SSD system. The same test passes in resident mode, with all 129,280 frontier logits and the printed continuation identical. This validates 256K allocation and 64K use; populated 256K inference and retrieval quality were not tested. The 94 GiB cache was refused at this larger allocation, while 92 GiB passed with at least 14.10 GiB RAM available. Other workloads and image inputs may need a smaller cache.
+The larger-context configuration above allocated 262,144 tokens and completed a real 65,536-token text prompt plus 128 greedy outputs on the 128 GB SSD system. The same test passes in resident mode, with all 129,280 frontier logits and the printed continuation identical. This validates 256K allocation and 64K use; populated 256K inference and retrieval quality were not tested. The tested 92 GiB cache leaves at least 14.10 GiB RAM available at this context allocation. Other workloads and image inputs may need a smaller cache.
 
 Use the matching V4.1 vision sidecar with `--vision FILE`. See [models and vision](MODELS.md#deepseek-v41-flash) for downloads and [qualification results](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151) for output quality, numerical drift and memory limitations. Resident text and vision inference were also tested on upcoming 192 GB hardware; performance results will be released soon.
 

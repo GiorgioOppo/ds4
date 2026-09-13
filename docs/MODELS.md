@@ -106,7 +106,7 @@ For images, download the matching encoder and add it to the same command:
   --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-Vision.gguf
 ```
 
-On Metal, vision works with SSD streaming, full residency and two-Mac TP. ROCm vision is qualified with SSD streaming. Pass the encoder on both TP ranks.
+On Metal, vision works with SSD streaming, full residency and two-Mac TP. ROCm vision is qualified with resident expert weights and SSD streaming. Pass the encoder on both TP ranks.
 
 Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
 or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
