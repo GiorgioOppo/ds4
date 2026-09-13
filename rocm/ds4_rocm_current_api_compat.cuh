@@ -124,6 +124,11 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_stream_selected_cache.loaded = 0;
     g_stream_batch_selected_cache.loaded = 0;
     g_stream_free_reserve_bytes = UINT64_C(16) << 30;
+    g_deepseek41_model = false;
+}
+
+extern "C" void ds4_gpu_set_deepseek41_model(bool enabled) {
+    g_deepseek41_model = enabled;
 }
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {

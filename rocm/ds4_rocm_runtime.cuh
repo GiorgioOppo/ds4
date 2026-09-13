@@ -33,6 +33,8 @@ static int g_rocblas_attention_b_solution_disabled;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
+/* Set from the engine family, after the preceding model caches are released. */
+static bool g_deepseek41_model;
 static int g_glm_model;
 
 enum {
@@ -717,6 +719,32 @@ static int cuda_stream_layer_expert_cache_wait(cuda_stream_layer_expert_cache &s
 }
 
 static int cuda_stream_layer_expert_cache_release(void) {
+    if (!g_deepseek41_model) {
+        bool any_active = false;
+        for (uint32_t i = 0; i < 2u; i++) {
+            if (g_stream_layer_expert_cache[i].base) {
+                any_active = true;
+                break;
+            }
+        }
+        if (any_active) {
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "streaming full-layer expert cache "
+                        "release sync failed: %s\n",
+                        cudaGetErrorString(sync_err));
+                (void)cudaGetLastError();
+            }
+        }
+        for (uint32_t i = 0; i < 2u; i++) {
+            cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
+            if (c.base) (void)cudaFree(c.base);
+            memset(&c, 0, sizeof(c));
+        }
+        return 1;
+    }
+
     bool any_active = false;
     for (uint32_t i = 0; i < 2u; i++) {
         if (g_stream_layer_expert_cache[i].base) any_active = true;
@@ -2624,6 +2652,28 @@ static int cuda_stream_layer_expert_cache_apply(
         const char **gate_w,
         const char **up_w,
         const char **down_w) {
+    if (!g_deepseek41_model) {
+        if (!g_ssd_streaming_mode || !gate_w || !up_w || !down_w) return 0;
+        for (uint32_t i = 0; i < 2u; i++) {
+            const cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
+            if (c.active &&
+                c.model_map == model_map &&
+                c.layer == layer &&
+                c.n_total_expert == n_total_expert &&
+                c.gate_offset == gate_offset &&
+                c.up_offset == up_offset &&
+                c.down_offset == down_offset &&
+                c.gate_expert_bytes == gate_expert_bytes &&
+                c.down_expert_bytes == down_expert_bytes &&
+                c.gate && c.up && c.down) {
+                *gate_w = c.gate;
+                *up_w = c.up;
+                *down_w = c.down;
+                return 1;
+            }
+        }
+        return 0;
+    }
     if (!g_ssd_streaming_mode || !gate_w || !up_w || !down_w) return 0;
     /* The caller joins this layer's loader. Never inspect the descriptor in
      * the other parity slot, which the next-layer loader may be publishing. */
@@ -2918,20 +2968,25 @@ static int cuda_stream_layer_expert_cache_load(
 
     cuda_stream_layer_expert_cache &slot =
         g_stream_layer_expert_cache[layer & 1u];
-    if (slot.reserved &&
+    if (g_deepseek41_model && slot.reserved &&
         (slot.model_map != model_map || slot.model_size != model_size ||
          slot.n_total_expert != n_total_expert ||
          slot.gate_expert_bytes != gate_expert_bytes ||
          slot.down_expert_bytes != down_expert_bytes ||
          slot.capacity < total_bytes || !slot.base)) return 0;
-    if (!cuda_stream_layer_expert_cache_wait(slot)) return 0;
+    if (g_deepseek41_model && !cuda_stream_layer_expert_cache_wait(slot)) return 0;
     slot.active = 0;
     slot.reuse_plan.generation = 0;
     if (slot.capacity < total_bytes) {
         if (slot.base) {
-            if (!cuda_ok(cudaFree(slot.base), "streaming full-layer growth")) return 0;
-            slot.base = NULL;
-            slot.capacity = 0;
+            if (g_deepseek41_model) {
+                if (!cuda_ok(cudaFree(slot.base), "streaming full-layer growth")) return 0;
+                slot.base = NULL;
+                slot.capacity = 0;
+            } else {
+                (void)cudaFree(slot.base);
+                memset(&slot, 0, sizeof(slot));
+            }
         }
         if (cuda_stream_cache_stats_on() &&
             !g_stream_resident_experts.empty()) {
@@ -2961,9 +3016,9 @@ static int cuda_stream_layer_expert_cache_load(
 
     const uint64_t read_chunk = 32ull * 1048576ull;
     const uint64_t gate_chunks =
-        (gate_bytes - 1u) / read_chunk + 1u;
+        (gate_bytes + read_chunk - 1u) / read_chunk;
     const uint64_t down_chunks =
-        (down_bytes - 1u) / read_chunk + 1u;
+        (down_bytes + read_chunk - 1u) / read_chunk;
     const uint64_t read_job_count64 = gate_chunks * 2u + down_chunks;
     if (read_job_count64 == 0 ||
         read_job_count64 > DS4_ROCM_STREAM_READ_MAX_JOBS ||
@@ -6064,7 +6119,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what, bool exact
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
-    if (bytes > UINT64_MAX - (align - 1u)) return NULL;
+    if (g_deepseek41_model && bytes > UINT64_MAX - (align - 1u)) return NULL;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
 
     for (cuda_model_arena &a : g_model_arenas) {
@@ -6079,9 +6134,9 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what, bool exact
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    /* Static SSD spans and explicitly requested resident startup spans use
-     * exact capacity; other callers retain the existing pooled policy. */
-    const uint64_t chunk = (g_ssd_streaming_mode || exact_arena) ? aligned : ds4_rocm_model_arena_bytes(aligned);
+    /* V4.1 startup uses exact capacity; preserve legacy pooling for other models.
+     * A follow-up may consolidate these policies after cross-model memory validation. */
+    const uint64_t chunk = ((g_deepseek41_model && g_ssd_streaming_mode) || exact_arena) ? aligned : ds4_rocm_model_arena_bytes(aligned);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -6881,7 +6936,7 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
  * pointers or change the allocation policy of later runtime callers. */
 extern "C" int ds4_gpu_cache_model_range_exact(const void *model_map, uint64_t model_size,
         uint64_t offset, uint64_t bytes, const char *label) {
-    if (!model_map || g_ssd_streaming_mode || model_map != g_model_host_base ||
+    if (!g_deepseek41_model || !model_map || g_ssd_streaming_mode || model_map != g_model_host_base ||
         model_size != g_model_registered_size || g_model_fd < 0 ||
         g_model_fd_host_base != model_map || offset > model_size ||
         bytes > model_size - offset || offset > g_model_file_size ||

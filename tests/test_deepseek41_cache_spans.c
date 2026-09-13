@@ -63,6 +63,22 @@ static void check_mapping(const char *path, bool shared, uint64_t first, uint64_
     assert(m.size == first && m.file_size == file_size);
     check_unmapped(&m);
     uint64_t prepared = UINT64_MAX;
+#ifndef DS4_ROCM_BUILD
+    /* CUDA keeps its original rejection of disk-only V4.1 descriptors. The
+     * ordinary mapped-tensor path must still work without the ROCm exemption. */
+    assert(!accelerator_prepare_model_tensor_spans(&m, NULL, NULL, 0, &prepared));
+    assert(!accelerator_cache_q8_tensors(&m, NULL, NULL, 0));
+    assert(cache_calls == 0);
+    const uint64_t tensor_count = m.n_tensors;
+    m.n_tensors = 1;
+    assert(accelerator_prepare_model_tensor_spans(&m, NULL, NULL, 0, &prepared));
+    assert(cache_calls == 1 && cache_bytes == 64 && prepared == 64);
+    assert(accelerator_cache_q8_tensors(&m, NULL, NULL, 0));
+    m.n_tensors = tensor_count;
+    model_close(&m);
+    expected_model = NULL;
+    return;
+#endif
     /* Before the fix this returned false with zero cache calls: the Engram
      * descriptors were incorrectly checked against the shorter weight map. */
     assert(accelerator_prepare_model_tensor_spans(&m, NULL, NULL, 0, &prepared));

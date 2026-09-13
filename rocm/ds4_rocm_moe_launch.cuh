@@ -816,7 +816,7 @@ static int routed_moe_launch(
         /* V4.1 Q2 uses canonical IQ2 gate/up rows and Q2_K down rows.
          * Keep other expert layouts on their existing admissions. */
         const uint32_t v41_mmq_topology =
-            n_total_expert == 384u && n_expert == 6u &&
+            g_deepseek41_model && n_total_expert == 384u && n_expert == 6u &&
             expert_in_dim == 5120u && expert_mid_dim == 2304u &&
             out_dim == 5120u && n_tokens <= 2048u &&
             gate_row_bytes == 1320u && gate_expert_bytes == 3041280u &&

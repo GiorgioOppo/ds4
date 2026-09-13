@@ -358,6 +358,8 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 #if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* Called after set_ssd_streaming has released the preceding model caches. */
+void ds4_gpu_set_deepseek41_model(bool enabled);
 /* Override the allocator reserve for a model with an explicit admission plan.
  * set_ssd_streaming resets this to the ROCm default for each engine open. */
 void ds4_gpu_set_streaming_free_reserve(uint64_t bytes);
