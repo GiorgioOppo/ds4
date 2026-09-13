@@ -40850,7 +40850,9 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_index_enabled = !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
     const bool needs_selection = n_comp >= DS4_N_INDEXER_TOP_K || !batch_index_enabled;
     const bool batch_index = ds41_index_source(il) && batch_index_enabled;
-    const bool batch_publish = ratio == 2u && ds41_kv_source(il) &&
+    /* Both compressor ratios use scalar-order row projections. Publishing
+     * layer 20 in one batch therefore preserves keys across suffix replay. */
+    const bool batch_publish = ds41_kv_source(il) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
     for (uint32_t t = 0; (!batch_index || !batch_publish) && t < count; t++) {
@@ -41646,18 +41648,22 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 if (!selection) ok = false;
                 else memset(selection, 0xff, (size_t)count * DS4_N_INDEXER_TOP_K * sizeof(int32_t));
             }
-            if (ok) ok = ds4_gpu_begin_commands() != 0;
-            if (!il) {
-                const float initial_pre[] = {1, 0, 0, 0};
-                for (uint32_t t = 0; ok && t < count; t++) {
-                    ok = ds4_gpu_tensor_write(g->rows_view[t].pre, 0, initial_pre, sizeof(initial_pre)) &&
-                        ds41_embed(g, m, w, g->rows_view[t].residual, g->rows_view[t].x,
-                                    tokens[off + t], start + t);
+            /* Later narrow layers already have their activations in place.
+             * Avoid submitting and waiting on an empty command buffer. */
+            if (!il || wide) {
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (!il) {
+                    const float initial_pre[] = {1, 0, 0, 0};
+                    for (uint32_t t = 0; ok && t < count; t++) {
+                        ok = ds4_gpu_tensor_write(g->rows_view[t].pre, 0, initial_pre, sizeof(initial_pre)) &&
+                            ds41_embed(g, m, w, g->rows_view[t].residual, g->rows_view[t].x,
+                                        tokens[off + t], start + t);
+                    }
+                } else if (ok) {
+                    ok = ds41_carry_copy(g, off, count, false);
                 }
-            } else if (wide) {
-                if (ok) ok = ds41_carry_copy(g, off, count, false);
+                if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             }
-            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             const double t_ready = profile ? now_sec() : 0;
             if (ok && ds41_engram_layer(il)) {
                 const uint32_t engram = il == 1 ? 0 : 1;
