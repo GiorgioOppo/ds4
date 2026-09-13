@@ -13,6 +13,81 @@ static inline float dsv41_bf16(float x) {
     return as_type<float>(bits & 0xffff0000u);
 }
 
+struct ds4_metal_args_dsv41_swiglu {
+    uint count;
+    float limit;
+};
+
+kernel void kernel_dsv41_swiglu_bf16(
+        constant ds4_metal_args_dsv41_swiglu &args,
+        device float *out,
+        device const float *gate,
+        device const float *up,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.count) return;
+    float x0 = dsv41_bf16(gate[i]);
+    float x1 = dsv41_bf16(up[i]);
+    if (args.limit > 1.0e-6f) {
+        x0 = min(x0, args.limit);
+        x1 = clamp(x1, -args.limit, args.limit);
+    }
+    const float silu = x0 / (1.0f + exp(-x0));
+    out[i] = dsv41_bf16(silu * x1 * 1.0f);
+}
+
+struct ds4_metal_args_dsv41_hc {
+    uint rows;
+    uint mode;
+};
+
+// Keep expand4's multiplication and four additions in the same order. The
+// BF16 block boundary precedes expansion; rounding only the final HC output
+// would change the released graph even if its storage stayed BF16.
+kernel void kernel_dsv41_hc_expand_bf16(
+        constant ds4_metal_args_dsv41_hc &args,
+        device float *out,
+        device const float *block,
+        device const float *add,
+        device const float *residual,
+        device const float *split,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.rows * 5120u) return;
+    const uint d = i % 5120u, t = i / 5120u;
+    float b = block[i];
+    if (args.mode) b += add[i];
+    b = dsv41_bf16(b);
+    const ulong base = (ulong)t * 20480u + d;
+    const float r0 = residual[base];
+    const float r1 = residual[base + 5120u];
+    const float r2 = residual[base + 10240u];
+    const float r3 = residual[base + 15360u];
+    device const float *post = split + (ulong)t * 24u + 4u;
+    device const float *comb = post + 4u;
+    for (uint h = 0; h < 4u; h++) {
+        float acc = b * post[h];
+        acc += comb[h] * r0;
+        acc += comb[h + 4u] * r1;
+        acc += comb[h + 8u] * r2;
+        acc += comb[h + 12u] * r3;
+        out[base + h * 5120u] = dsv41_bf16(acc);
+    }
+}
+
+kernel void kernel_dsv41_hc_sum_bf16(
+        constant ds4_metal_args_dsv41_hc &args,
+        device float *out,
+        device const float *residual,
+        device const float *weights,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.rows * 5120u) return;
+    const uint d = i % 5120u, t = i / 5120u;
+    const ulong base = (ulong)t * 20480u + d;
+    device const float *w = weights + (ulong)t * (args.mode ? 24u : 4u);
+    float acc = 0.0f;
+    for (uint h = 0; h < 4u; h++) acc += residual[base + h * 5120u] * w[h];
+    out[i] = dsv41_bf16(acc);
+}
+
 static inline float dsv41_pow2_ceil(float x) {
     const uint bits = as_type<uint>(x);
     return as_type<float>((bits & 0x7f800000u) +

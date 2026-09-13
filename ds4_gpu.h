@@ -110,6 +110,22 @@ int ds4_gpu_dsv41_shared_swiglu(
         uint64_t gate_offset, uint64_t up_offset,
         uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, float clamp);
+/* V4.1 elementwise epilogues, single-device non-quality execution. Inputs
+ * and output must have disjoint used ranges and 16-byte aligned offsets.
+ * SwiGLU has width 2304 and rounds gate/up before clamping, then its output.
+ * HC has width 5120 and four streams; expand rounds block[+add] before the
+ * existing ordered sums, then each output. Sum rounds the four-stream sum;
+ * split selects a 24-float weight row instead of a packed four-float row. */
+int ds4_gpu_dsv41_swiglu_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+        uint32_t rows, float clamp);
+int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *block, const ds4_gpu_tensor *add,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t rows);
+int ds4_gpu_dsv41_hc_sum_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *weights,
+        uint32_t rows, bool split);
 /* Q4_K Q-B (K1280, M32768), with raw F32 output. Dead workspace must hold
  * rows*1280*2 bytes; an additional 80 MiB permits transient FP16 weights for
  * larger prefill batches. The caller owns the following BF16/RoPE boundary.

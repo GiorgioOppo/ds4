@@ -111,3 +111,4 @@ __pycache__/
 /tests/test_cuda_q4_epilogue
 /speed-bench/rocm_q4_prefill_bench
 /speed-bench/cuda_q4_prefill_bench
+tests/test_deepseek41_epilogues

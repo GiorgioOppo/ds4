@@ -52062,6 +52062,81 @@ int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
     }
 }
 
+static int dsv41_epilogue_dispatch(const char *name, const void *args, NSUInteger args_bytes,
+        ds4_gpu_tensor *out, uint64_t out_floats,
+        const ds4_gpu_tensor *const *inputs, const uint64_t *input_floats,
+        uint32_t n_inputs, uint32_t n_threads) {
+    if (!n_threads || !dsv41_tensor_has_floats(out, out_floats) ||
+        (ds4_gpu_tensor_offset(out) & 15u)) return 0;
+    for (uint32_t i = 0; i < n_inputs; i++) {
+        if (!dsv41_tensor_has_floats(inputs[i], input_floats[i]) ||
+            (ds4_gpu_tensor_offset(inputs[i]) & 15u) ||
+            ds4_gpu_tensor_prefixes_overlap(out, out_floats * sizeof(float),
+                inputs[i], input_floats[i] * sizeof(float))) return 0;
+    }
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_quality_mode || g_tp_split_world > 1 || g_batch_encoder_concurrent) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
+        if (!pipeline || !ds4_gpu_tensor_buffer(out)) return 0;
+        const NSUInteger nth = MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup);
+        if (!nth) return 0;
+        for (uint32_t i = 0; i < n_inputs; i++)
+            if (!ds4_gpu_tensor_buffer(inputs[i])) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:args length:args_bytes atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:1];
+        for (uint32_t i = 0; i < n_inputs; i++)
+            [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
+                    offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 2u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_threads + nth - 1u) / nth, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 BF16 epilogue");
+    }
+}
+
+int ds4_gpu_dsv41_swiglu_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+        uint32_t rows, float clamp) {
+    const uint64_t n = (uint64_t)rows * 2304u;
+    if (!rows || n > UINT32_MAX || !isfinite(clamp) || clamp < 0.0f) return 0;
+    const struct { uint32_t count; float limit; } args = {(uint32_t)n, clamp};
+    const ds4_gpu_tensor *inputs[] = {gate, up};
+    const uint64_t counts[] = {n, n};
+    return dsv41_epilogue_dispatch("kernel_dsv41_swiglu_bf16", &args, sizeof(args),
+        out, n, inputs, counts, 2, (uint32_t)n);
+}
+
+int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *block, const ds4_gpu_tensor *add,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t rows) {
+    const uint64_t n = (uint64_t)rows * 5120u;
+    if (!rows || n > UINT32_MAX) return 0;
+    const uint32_t args[] = {rows, add != NULL};
+    const ds4_gpu_tensor *inputs[] = {block, add ? add : block, residual, split};
+    const uint64_t counts[] = {n, n, n * 4u, (uint64_t)rows * 24u};
+    return dsv41_epilogue_dispatch("kernel_dsv41_hc_expand_bf16", args, sizeof(args),
+        out, n * 4u, inputs, counts, 4, (uint32_t)n);
+}
+
+int ds4_gpu_dsv41_hc_sum_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *weights,
+        uint32_t rows, bool split) {
+    const uint64_t n = (uint64_t)rows * 5120u;
+    if (!rows || n > UINT32_MAX) return 0;
+    const uint32_t args[] = {rows, split};
+    const ds4_gpu_tensor *inputs[] = {residual, weights};
+    const uint64_t counts[] = {n * 4u, (uint64_t)rows * (split ? 24u : 4u)};
+    return dsv41_epilogue_dispatch("kernel_dsv41_hc_sum_bf16", args, sizeof(args),
+        out, n, inputs, counts, 2, (uint32_t)n);
+}
+
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,
                            const ds4_gpu_tensor *q_weight,
