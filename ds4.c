@@ -34,6 +34,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
+#include <sys/param.h>
 #include <sys/sysctl.h>
 #endif
 #include <stdarg.h>
@@ -41385,13 +41386,39 @@ struct ds41_prefill_expert_slot {
     uint8_t *dst[3];
     uint64_t bytes[3];
     bool locked[3];
-    const ds4_model *model;
+    int read_fd;
+    bool owns_read_fd;
     ds4_gpu_stream_expert_table table;
     pthread_t threads[16];
     ds41_prefill_expert_worker workers[16];
     bool ok[16];
     uint32_t n_threads, started;
 };
+
+/* A separate open keeps prefill's uncached reads from changing the model fd
+ * used by decode. A dup would share that setting. If the path is unavailable
+ * or now names another file, the original cached reader remains valid. */
+static int ds41_prefill_expert_open_nocache_fd(int source_fd) {
+#if defined(__APPLE__) && defined(F_GETPATH) && defined(F_NOCACHE)
+    char path[MAXPATHLEN];
+    struct stat source, opened;
+    if (source_fd < 0 || fstat(source_fd, &source) != 0 || !S_ISREG(source.st_mode) ||
+        fcntl(source_fd, F_GETPATH, path) != 0) return -1;
+    int fd;
+    do { fd = open(path, O_RDONLY | O_CLOEXEC); } while (fd < 0 && errno == EINTR);
+    if (fd < 0) return -1;
+    if (fstat(fd, &opened) != 0 || source.st_dev != opened.st_dev ||
+        source.st_ino != opened.st_ino || source.st_size != opened.st_size ||
+        fcntl(fd, F_NOCACHE, 1) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+#else
+    (void)source_fd;
+    return -1;
+#endif
+}
 
 static void *ds41_prefill_expert_read(void *arg) {
     ds41_prefill_expert_worker *worker = arg;
@@ -41413,7 +41440,7 @@ static void *ds41_prefill_expert_read(void *arg) {
             const size_t bytes = end - pos < (UINT64_C(16) << 20) ?
                 (size_t)(end - pos) : (size_t)(UINT64_C(16) << 20);
             ssize_t n;
-            do { n = pread(slot->model->fd, dst + pos, bytes, (off_t)(offsets[j] + pos)); }
+            do { n = pread(slot->read_fd, dst + pos, bytes, (off_t)(offsets[j] + pos)); }
             while (n < 0 && errno == EINTR);
             if (n <= 0) return NULL;
             pos += (uint64_t)n;
@@ -41431,6 +41458,11 @@ static bool ds41_prefill_expert_read_join(ds41_prefill_expert_slot *slot) {
         ok = slot->ok[i] && ok;
     }
     slot->started = 0;
+    if (slot->owns_read_fd) {
+        if (close(slot->read_fd) != 0) ok = false;
+        slot->owns_read_fd = false;
+        slot->read_fd = -1;
+    }
     return ok;
 }
 
@@ -41442,13 +41474,16 @@ static bool ds41_prefill_expert_buffers_free(ds41_prefill_expert_slot slots[2]) 
         if (!ds41_prefill_expert_read_join(&slots[i])) ok = false;
     /* Neither disk readers nor queued kernels may retain writable storage
      * when a cancelled sweep gives its two-layer reserve back to the host. */
-    if (!ds4_gpu_synchronize()) ok = false;
+    const bool drained = ds4_gpu_synchronize() != 0;
+    if (!drained) ok = false;
     if (!ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL))
         ds4_die("cannot detach V4.1 expert buffers safely");
     for (unsigned i = 0; i < 2; i++) for (unsigned j = 0; j < 3; j++) {
         if (slots[i].locked[j] &&
             munlock(ds4_gpu_tensor_contents(slots[i].tensor[j]), (size_t)slots[i].bytes[j]))
             ds4_die("cannot release V4.1 expert buffer pages safely");
+        if (slots[i].tensor[j] && drained &&
+            !ds4_gpu_stream_prefill_discard_buffer(slots[i].tensor[j])) ok = false;
         ds4_gpu_tensor_free(slots[i].tensor[j]);
     }
     memset(slots, 0, sizeof(*slots) * 2u);
@@ -41504,8 +41539,7 @@ static bool ds41_prefill_expert_buffers_init(const ds41_gpu_graph *g,
 static bool ds41_prefill_expert_read_start(ds41_prefill_expert_slot *slot,
                                           const ds4_model *m,
                                           const ds4_layer_weights *l, uint32_t il) {
-    if (slot->started) return false;
-    slot->model = m;
+    if (slot->started || slot->owns_read_fd) return false;
     slot->table = graph_stream_expert_table_make(m, l, il,
         routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
         routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
@@ -41523,6 +41557,9 @@ static bool ds41_prefill_expert_read_start(ds41_prefill_expert_slot *slot,
         slot->dst[j] = ds4_gpu_tensor_contents(slot->tensor[j]);
         if (!slot->dst[j]) return false;
     }
+    slot->read_fd = ds41_prefill_expert_open_nocache_fd(m->fd);
+    slot->owns_read_fd = slot->read_fd >= 0;
+    if (!slot->owns_read_fd) slot->read_fd = m->fd;
     slot->n_threads = metal_graph_stream_prefill_layer_pagein_threads();
     for (uint32_t i = 0; i < slot->n_threads; i++) {
         slot->ok[i] = false;
@@ -41534,6 +41571,15 @@ static bool ds41_prefill_expert_read_start(ds41_prefill_expert_slot *slot,
         slot->started++;
     }
     return true;
+}
+
+static bool ds41_prefill_expert_sweep_supported(uint32_t count, bool wide,
+                                               bool batch_hc, bool batch_core,
+                                               bool encoder_only, bool resume_encoder) {
+    /* Expert storage depends on layer bytes, not token count. Keep the same
+     * single-chunk lifetime through 2048 rows; wide/deferred sweeps stay separate. */
+    return count >= 32u && count <= 2048u && !wide && batch_hc && batch_core &&
+        !encoder_only && !resume_encoder;
 }
 
 /* Process rows in causal order within each layer. Selection/candidate rows
@@ -41579,8 +41625,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     bool engram_prefetched = overlap_engram &&
         ds41_engram_prefetch_start(&engram_prefetch, g, 0, total_count);
     ds41_prefill_expert_slot expert_slots[2] = {0};
-    const bool explicit_experts = !wide && total_count >= 32u && total_count <= 1024u && batch_hc && batch_core &&
-        !encoder_only && !resume_encoder &&
+    const bool explicit_experts = ds41_prefill_expert_sweep_supported(total_count, wide,
+        batch_hc, batch_core, encoder_only, resume_encoder) &&
         ds41_prefill_expert_buffers_init(g, m, w, expert_slots);
     bool ok = !g->streaming || (explicit_experts ? metal_graph_stream_map_decode_static_all(m, w) :
                                                   metal_graph_stream_map_token(m, w));

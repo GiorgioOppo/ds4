@@ -13217,6 +13217,27 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
     return nil;
 }
 
+int ds4_gpu_stream_prefill_discard_buffer(ds4_gpu_tensor *tensor) {
+    if (!tensor || !g_ssd_streaming_mode || g_batch_cb || [g_pending_cbs count] != 0) return 0;
+    @autoreleasepool {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        id<MTLBuffer> buffer = obj.buffer;
+        if (!obj.owner || obj.offset != 0 || !buffer ||
+            obj.bytes != (uint64_t)[buffer length] ||
+            [buffer storageMode] != MTLStorageModeShared || [buffer heap]) return 0;
+        for (unsigned j = 0; j < 3; j++)
+            if (buffer == g_stream_prefill_layer_views[j]) return 0;
+        for (uint32_t i = 0; i < g_model_view_count; i++)
+            if (buffer == g_model_views[i].buffer) return 0;
+        /* The caller has joined readers, drained GPU work, detached bindings,
+         * and unlocked these disposable layer buffers. Discard their storage
+         * before release so a driver allocation cache cannot retain its cost.
+         * Metal returns the previous purgeability state, not a success flag. */
+        (void)[buffer setPurgeableState:MTLPurgeableStateEmpty];
+        return 1;
+    }
+}
+
 int ds4_gpu_stream_prefill_bind_layer(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,

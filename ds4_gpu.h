@@ -577,6 +577,9 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
 #ifdef __APPLE__
+/* Discard dead, detached, complete prefill storage after GPU drain and munlock.
+ * The caller still owns the tensor handle and must free it normally. */
+int ds4_gpu_stream_prefill_discard_buffer(ds4_gpu_tensor *tensor);
 /* Bind explicitly loaded full-layer weights at their original model offsets.
  * All NULL detaches them. The caller must drain GPU work before either call. */
 int ds4_gpu_stream_prefill_bind_layer(

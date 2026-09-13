@@ -23,6 +23,157 @@ static bool prefill_stream_moe(const ds4_model *model,
         ds4_gpu_tensor_read(t[7], 0, output, 32u * DS4_N_EMBD * sizeof(float));
 }
 
+static int check_prefill_expert_admission(void) {
+    const struct { uint32_t rows; bool supported; } cases[] = {
+        {0, false}, {1, false}, {31, false}, {32, true}, {256, true}, {437, true},
+        {1023, true}, {1024, true}, {1025, true}, {1241, true}, {2047, true},
+        {2048, true}, {2049, false}, {4096, false}, {8192, false}, {UINT32_MAX, false}
+    };
+    int rc = 1;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
+        /* Each bit violates one independent lifetime/graph requirement. */
+        for (unsigned excluded = 0; excluded < 32; excluded++) {
+            const bool got = ds41_prefill_expert_sweep_supported(cases[i].rows,
+                (excluded & 1u) != 0, (excluded & 2u) == 0, (excluded & 4u) == 0,
+                (excluded & 8u) != 0, (excluded & 16u) != 0);
+            REQUIRE(got == (cases[i].supported && excluded == 0));
+        }
+    }
+    /* The row limit cannot override the graph's actual chunk capacity. */
+    const uint32_t capacities[] = {1024, 2048, 4096, 8192};
+    for (unsigned i = 0; i < sizeof(capacities) / sizeof(*capacities); i++) {
+        const ds41_gpu_graph graph = {.prefill_cap = capacities[i]};
+        const bool wide = 2048u > ds41_encoder_chunk_cap(&graph, 2048u);
+        REQUIRE(ds41_prefill_expert_sweep_supported(2048u, wide, true, true, false, false) ==
+                (capacities[i] >= 2048u));
+    }
+    puts("V4.1 explicit expert admission: 32..2048 rows, single-chunk boundaries and exclusions: PASS");
+    rc = 0;
+done:
+    return rc;
+}
+
+static int check_prefill_expert_fd(void) {
+    char path[] = "/private/tmp/ds41-expert-fd-XXXXXX";
+    const uint8_t expected[] = {3, 7, 11, 19, 23, 31, 43, 47};
+    uint8_t actual[sizeof(expected)];
+    int source = -1, reader = -1, replacement = -1, rc = 1;
+    int pipes[2] = {-1, -1};
+    bool path_exists = false;
+    struct stat original, reopened;
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(-1) == -1);
+    REQUIRE(pipe(pipes) == 0);
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(pipes[0]) == -1);
+    REQUIRE((source = mkstemp(path)) >= 0);
+    path_exists = true;
+    REQUIRE(write(source, expected, sizeof(expected)) == (ssize_t)sizeof(expected));
+    REQUIRE(lseek(source, 3, SEEK_SET) == 3);
+    REQUIRE((reader = ds41_prefill_expert_open_nocache_fd(source)) >= 0);
+    REQUIRE(reader != source && fstat(source, &original) == 0 && fstat(reader, &reopened) == 0);
+    REQUIRE(original.st_dev == reopened.st_dev && original.st_ino == reopened.st_ino &&
+            original.st_size == reopened.st_size);
+    REQUIRE((fcntl(reader, F_GETFD) & FD_CLOEXEC) != 0);
+    REQUIRE((fcntl(reader, F_GETFL) & O_ACCMODE) == O_RDONLY);
+    /* Independent seek positions distinguish a new open from dup(), which
+     * would also share the caching mode with the model's decode descriptor. */
+    REQUIRE(lseek(reader, 5, SEEK_SET) == 5 && lseek(source, 0, SEEK_CUR) == 3);
+    REQUIRE(pread(reader, actual, sizeof(actual), 0) == (ssize_t)sizeof(actual));
+    REQUIRE(memcmp(actual, expected, sizeof(actual)) == 0);
+    REQUIRE(close(reader) == 0); reader = -1;
+    REQUIRE(fcntl(source, F_GETFD) >= 0);
+    REQUIRE(unlink(path) == 0);
+    path_exists = false;
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(source) == -1);
+    /* Reusing the old pathname must never redirect reads to another inode. */
+    REQUIRE((replacement = open(path, O_CREAT | O_EXCL | O_RDWR, 0600)) >= 0);
+    path_exists = true;
+    REQUIRE(write(replacement, expected, sizeof(expected)) == (ssize_t)sizeof(expected));
+    REQUIRE(fstat(replacement, &reopened) == 0 && original.st_ino != reopened.st_ino);
+    REQUIRE(ds41_prefill_expert_open_nocache_fd(source) == -1);
+    REQUIRE(pread(source, actual, sizeof(actual), 0) == (ssize_t)sizeof(actual));
+    REQUIRE(memcmp(actual, expected, sizeof(actual)) == 0);
+    puts("V4.1 uncached expert descriptor: identity, independent open and unavailable-path fallback: PASS");
+    rc = 0;
+done:
+    if (reader >= 0) close(reader);
+    if (source >= 0) close(source);
+    if (replacement >= 0) close(replacement);
+    if (pipes[0] >= 0) close(pipes[0]);
+    if (pipes[1] >= 0) close(pipes[1]);
+    if (path_exists) unlink(path);
+    return rc;
+}
+
+static int check_prefill_expert_discard(void) {
+    enum { BYTES = 4096 };
+    uint8_t expected[BYTES], actual[BYTES];
+    ds4_gpu_tensor *source = NULL, *output = NULL, *view = NULL, *full_view = NULL;
+    int rc = 1;
+    for (unsigned i = 0; i < BYTES; i++) expected[i] = (uint8_t)(i * 37u + 11u);
+    ds4_gpu_stream_expert_table table = {
+        .model_map = expected, .model_size = BYTES, .n_total_expert = 1,
+        .gate_offset = 0, .up_offset = 1024, .down_offset = 2048,
+        .gate_expert_bytes = 512, .down_expert_bytes = 512
+    };
+    REQUIRE(ds4_gpu_init());
+    ds4_gpu_model_residency_skip(1);
+    REQUIRE((source = ds4_gpu_tensor_alloc(BYTES)) != NULL);
+    REQUIRE((output = ds4_gpu_tensor_alloc(BYTES)) != NULL);
+    REQUIRE(ds4_gpu_tensor_write(source, 0, expected, BYTES));
+    ds4_gpu_set_ssd_streaming(false);
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    ds4_gpu_set_ssd_streaming(true);
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(NULL));
+    view = ds4_gpu_tensor_view(source, 4, BYTES - 4);
+    full_view = ds4_gpu_tensor_view(source, 0, BYTES);
+    REQUIRE(view && full_view);
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(view));
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(full_view));
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(&table, source, source, source));
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    REQUIRE(ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL));
+    REQUIRE(ds4_gpu_begin_commands());
+    REQUIRE(ds4_gpu_tensor_copy(output, 0, source, 0, BYTES));
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    REQUIRE(ds4_gpu_flush_commands());
+    REQUIRE(!ds4_gpu_stream_prefill_discard_buffer(source));
+    REQUIRE(ds4_gpu_end_commands());
+    REQUIRE(ds4_gpu_tensor_read(output, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    REQUIRE(ds4_gpu_tensor_read(source, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    ds4_gpu_tensor_free(view); view = NULL;
+    ds4_gpu_tensor_free(full_view); full_view = NULL;
+    REQUIRE(ds4_gpu_synchronize());
+    REQUIRE(ds4_gpu_stream_prefill_discard_buffer(source));
+    /* A discarded source is never accessed again. Completed output copies
+     * stay valid, and a subsequent allocation can safely reuse its storage. */
+    ds4_gpu_tensor_free(source); source = NULL;
+    REQUIRE(ds4_gpu_tensor_read(output, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    REQUIRE((source = ds4_gpu_tensor_alloc(BYTES)) != NULL);
+    for (unsigned i = 0; i < BYTES; i++) expected[i] ^= 0x5a;
+    REQUIRE(ds4_gpu_tensor_write(source, 0, expected, BYTES));
+    REQUIRE(ds4_gpu_begin_commands());
+    REQUIRE(ds4_gpu_tensor_copy(output, 0, source, 0, BYTES));
+    REQUIRE(ds4_gpu_end_commands());
+    REQUIRE(ds4_gpu_tensor_read(output, 0, actual, BYTES));
+    REQUIRE(memcmp(actual, expected, BYTES) == 0);
+    REQUIRE(ds4_gpu_stream_prefill_discard_buffer(source));
+    puts("V4.1 explicit expert discard: ownership, binding, queued copies and reuse: PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    (void)ds4_gpu_synchronize();
+    (void)ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL);
+    ds4_gpu_tensor_free(view);
+    ds4_gpu_tensor_free(full_view);
+    ds4_gpu_tensor_free(source);
+    ds4_gpu_tensor_free(output);
+    ds4_gpu_cleanup();
+    return rc;
+}
+
 static int check_prefill_expert_stream(void) {
     enum { LAYERS = 3, EXPERTS = 8, WIDTH = 256, ROWS = 32, ROUTES = 6 };
     const ds4_shape saved_shape = g_ds4_shape;
@@ -32,7 +183,10 @@ static int check_prefill_expert_stream(void) {
     ds41_prefill_expert_slot slots[2] = {0};
     ds41_gpu_graph graph = {.streaming = true, .tp_world = 1};
     ds4_gpu_tensor *t[8] = {0}, *bad_view = NULL;
+    char model_path[] = "/private/tmp/ds41-expert-stream-XXXXXX";
     FILE *file = NULL;
+    int model_fd = -1;
+    bool model_path_exists = false;
     void *map = NULL, *aux = NULL;
     float *reference[LAYERS] = {0}, *actual = NULL;
     int rc = 1;
@@ -42,6 +196,8 @@ static int check_prefill_expert_stream(void) {
                                EXPERTS * WIDTH * sizeof(block_q2_K)};
     const uint64_t output_bytes = ROWS * WIDTH * sizeof(float);
     uint64_t end = page;
+    REQUIRE(check_prefill_expert_admission() == 0);
+    REQUIRE(check_prefill_expert_fd() == 0);
     g_ds4_shape.n_layer = LAYERS;
     g_ds4_shape.n_expert = EXPERTS;
     g_ds4_shape.n_expert_used = ROUTES;
@@ -75,7 +231,10 @@ static int check_prefill_expert_stream(void) {
                 ((block_iq2_xxs *)data)[b].d = 0x1400 + il * 0x100;
         }
     }
-    file = tmpfile();
+    REQUIRE((model_fd = mkstemp(model_path)) >= 0);
+    model_path_exists = true;
+    file = fdopen(model_fd, "w+b");
+    if (file) model_fd = -1;
     REQUIRE(file && fwrite(map, 1, end, file) == end && fflush(file) == 0);
     model.fd = fileno(file); model.map = map; model.size = model.file_size = end;
     for (unsigned j = 0; j < 3; j++) graph.streaming_prefill_bytes += 2 * align_up(sizes[j], page);
@@ -91,11 +250,19 @@ static int check_prefill_expert_stream(void) {
     graph.streaming_prefill_bytes++;
     REQUIRE(ds41_prefill_expert_buffers_init(&graph, &model, &weights, slots));
     REQUIRE(setenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_THREADS", "7", 1) == 0);
+    ds4_model invalid_model = model;
+    invalid_model.fd = -1;
+    REQUIRE(!ds41_prefill_expert_read_start(&slots[0], &invalid_model, &weights.layer[0], 0));
     for (unsigned il = 0; il < LAYERS; il++) {
         ds41_prefill_expert_slot *slot = &slots[il & 1u];
         REQUIRE(ds41_prefill_expert_read_start(slot, &model, &weights.layer[il], il));
+        const int reader = slot->read_fd;
+        REQUIRE(slot->owns_read_fd && reader != model.fd && fcntl(reader, F_GETFD) >= 0);
         REQUIRE(!ds41_prefill_expert_read_start(slot, &model, &weights.layer[il], il));
         REQUIRE(ds41_prefill_expert_read_join(slot));
+        REQUIRE(!slot->owns_read_fd && slot->read_fd == -1);
+        REQUIRE(fcntl(reader, F_GETFD) == -1 && errno == EBADF);
+        REQUIRE(fcntl(model.fd, F_GETFD) >= 0);
         REQUIRE(ds41_prefill_expert_read_join(slot));
         for (unsigned j = 0; j < 3; j++) REQUIRE(memcmp(ds4_gpu_tensor_contents(slot->tensor[j]),
             model.map + tensors[il][j].abs_offset, sizes[j]) == 0);
@@ -135,6 +302,7 @@ static int check_prefill_expert_stream(void) {
     bad_view = ds4_gpu_tensor_view(slots[0].tensor[0], 4, sizes[0] - 4);
     REQUIRE(bad_view && !ds4_gpu_stream_prefill_bind_layer(&slots[0].table,
         bad_view, slots[0].tensor[1], slots[0].tensor[2]));
+    ds4_gpu_tensor_free(bad_view); bad_view = NULL;
     REQUIRE(ds4_gpu_begin_commands());
     REQUIRE(!ds4_gpu_stream_prefill_bind_layer(NULL, NULL, NULL, NULL));
     REQUIRE(ds4_gpu_end_commands());
@@ -156,10 +324,28 @@ static int check_prefill_expert_stream(void) {
     /* EOF and cancellation cleanup join every worker before releasing slots. */
     REQUIRE(ftruncate(model.fd, tensors[2][2].abs_offset + sizes[2] / 2) == 0);
     REQUIRE(ds41_prefill_expert_read_start(&slots[0], &model, &weights.layer[2], 2));
+    int reader = slots[0].read_fd;
+    REQUIRE(slots[0].owns_read_fd);
     REQUIRE(!ds41_prefill_expert_read_join(&slots[0]));
-    REQUIRE(!slots[0].started);
+    REQUIRE(!slots[0].started && !slots[0].owns_read_fd);
+    REQUIRE(fcntl(reader, F_GETFD) == -1 && errno == EBADF);
     REQUIRE(ds41_prefill_expert_read_start(&slots[1], &model, &weights.layer[1], 1));
+    reader = slots[1].read_fd;
+    REQUIRE(slots[1].owns_read_fd);
+    /* An unlinked model keeps its original descriptor as a cached fallback;
+     * joining that reader must never close the descriptor needed by decode. */
+    REQUIRE(unlink(model_path) == 0);
+    model_path_exists = false;
+    REQUIRE(ds41_prefill_expert_read_start(&slots[0], &model, &weights.layer[1], 1));
+    REQUIRE(!slots[0].owns_read_fd && slots[0].read_fd == model.fd);
+    REQUIRE(ds41_prefill_expert_read_join(&slots[0]));
+    REQUIRE(fcntl(model.fd, F_GETFD) >= 0);
+    for (unsigned j = 0; j < 3; j++) REQUIRE(memcmp(ds4_gpu_tensor_contents(slots[0].tensor[j]),
+        model.map + tensors[1][j].abs_offset, sizes[j]) == 0);
+    /* Cancellation also closes the owned reader opened before unlink. */
     REQUIRE(ds41_prefill_expert_buffers_free(slots));
+    REQUIRE(fcntl(reader, F_GETFD) == -1 && errno == EBADF);
+    REQUIRE(fcntl(model.fd, F_GETFD) >= 0);
     REQUIRE(!slots[0].tensor[0] && !slots[1].tensor[2] && !slots[0].started && !slots[1].started);
     REQUIRE(ds41_prefill_expert_buffers_free(slots));
     puts("V4.1 explicit expert reads, binding lifetime, fallback and cancellation cleanup: PASS");
@@ -172,6 +358,8 @@ done:
     for (unsigned i = 0; i < LAYERS; i++) free(reference[i]);
     ds4_gpu_cleanup();
     if (file) fclose(file);
+    if (model_fd >= 0) close(model_fd);
+    if (model_path_exists) unlink(model_path);
     free(map); free(aux); free(actual);
     unsetenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_THREADS");
     g_ds4_shape = saved_shape;
@@ -2408,6 +2596,12 @@ int main(int argc, char **argv) {
         return check_attention_imatrix();
     if (argc == 2 && !strcmp(argv[1], "--prefill-expert-stream"))
         return check_prefill_expert_stream();
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-admission"))
+        return check_prefill_expert_admission();
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-discard"))
+        return check_prefill_expert_discard();
+    if (argc == 2 && !strcmp(argv[1], "--prefill-expert-fd"))
+        return check_prefill_expert_fd();
     if (argc == 3 && !strcmp(argv[1], "--attention-index-bypass"))
         return check_attention_index_bypass(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--batch-admission"))
