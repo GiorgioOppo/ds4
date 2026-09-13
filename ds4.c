@@ -66083,6 +66083,9 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
         return false;
     }
+#ifdef DS4_ROCM_BUILD
+    const uint64_t host_budget = budget;
+#endif
     if (budget > recommended) budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
@@ -66119,8 +66122,22 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
             return false;
         }
         const uint32_t count = (uint32_t)((budget - fixed) / expert);
+#ifdef DS4_ROCM_BUILD
+        fprintf(stderr,
+                "ds4: V4.1 SSD cache fitted %.2f -> %.2f GiB total "
+                "(dynamic %u -> %u slots) after %.2f GiB fixed "
+                "weights/context/staging/runtime; limited by %.2f GiB %s budget\n",
+                ds4_bytes_to_gib(e->ssd_streaming_cache_bytes +
+                                 e->ssd_streaming_prefill_headroom_bytes),
+                ds4_bytes_to_gib((uint64_t)count * expert +
+                                 e->ssd_streaming_prefill_headroom_bytes),
+                e->ssd_streaming_cache_experts, count,
+                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget),
+                recommended < host_budget ? "GPU working-set" : "host-RAM");
+#else
         fprintf(stderr, "ds4: V4.1 SSD cache fitted from %u to %u experts for context/runtime headroom\n",
                 e->ssd_streaming_cache_experts, count);
+#endif
         e->ssd_streaming_cache_experts = count;
 #ifdef DS4_ROCM_BUILD
         e->ssd_streaming_cache_bytes = (uint64_t)count * expert;
@@ -66681,6 +66698,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (safe_cache_bytes != 0 &&
             e->ssd_streaming_cache_bytes > safe_cache_bytes) {
             e->ssd_streaming_cache_bytes = safe_cache_bytes;
+#if defined(DS4_ROCM_BUILD) && DS4_HAVE_V41_GPU
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+                fprintf(stderr,
+                        "ds4: ROCm V4.1 SSD cache request %.2f GiB capped to %.2f GiB "
+                        "by %.2f GiB GPU recommended working set "
+                        "(7/8 allowance minus context/graph buffers)\n",
+                        ds4_bytes_to_gib(requested_cache_bytes),
+                        ds4_bytes_to_gib(safe_cache_bytes),
+                        ds4_bytes_to_gib(ds4_gpu_recommended_working_set_size()));
+            } else
+#endif
             fprintf(stderr,
                     "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
                     "to stay below the graph working-set pressure budget\n",
