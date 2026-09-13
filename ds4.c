@@ -40534,13 +40534,24 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
         if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                 &table, g->selected, DS4_N_EXPERT_USED)) return false;
     }
-    if ((!shared_owner || g->tp_rank == (il & 1u)) &&
-        (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
-        !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+    if (!shared_owner || g->tp_rank == (il & 1u)) {
+        int fused = 0;
+        if (!g->quality && !g->imatrix && g->tp_world == 1 &&
+            l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+            l->ffn_up_shexp->type == DS4_TENSOR_Q8_0) {
+            fused = ds4_gpu_dsv41_shared_swiglu(g->shared_mid, m->map, m->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP);
+        }
+        if (fused < 0) return false;
+        if (!fused &&
+            (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
+             !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
+             !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                   DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
+             !ds41_bf16(g->shared_mid, DS4_N_FF_EXP))) return false;
+        if (!ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true)) return false;
+    }
     if (!ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,

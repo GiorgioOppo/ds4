@@ -21483,6 +21483,61 @@ int ds4_gpu_matmul_q8_0_f16_out_tensor(
     return 0;
 }
 
+int ds4_gpu_dsv41_shared_swiglu(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, float clamp) {
+    if (!out || !x || !model_map || in_dim != 5120u || out_dim != 2304u ||
+        !isfinite(clamp) || clamp < 0.0f || (gate_offset & 1u) || (up_offset & 1u)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    const ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+    if (g_quality_mode || g_tp_split_world > 1 || dispatch.nsg != 4 || dispatch.nr0 != 2)
+        return 0;
+    const uint64_t x_bytes = in_dim * sizeof(float), out_bytes = out_dim * sizeof(float);
+    const uint64_t weight_bytes = out_dim * (in_dim / 32u) * 34u;
+    if (ds4_gpu_tensor_bytes(x) < x_bytes || ds4_gpu_tensor_bytes(out) < out_bytes ||
+        (ds4_gpu_tensor_offset(x) & 15u) || (ds4_gpu_tensor_offset(out) & 15u) ||
+        ds4_gpu_tensor_prefixes_overlap(x, x_bytes, out, out_bytes) ||
+        gate_offset > model_size || weight_bytes > model_size - gate_offset ||
+        up_offset > model_size || weight_bytes > model_size - up_offset) return 0;
+    @autoreleasepool {
+        uint64_t gate_inner = 0, up_inner = 0;
+        id<MTLBuffer> gate = ds4_gpu_wrap_model_range(model_map, model_size,
+            gate_offset, weight_bytes, &gate_inner);
+        id<MTLBuffer> up = ds4_gpu_wrap_model_range(model_map, model_size,
+            up_offset, weight_bytes, &up_inner);
+        id<MTLBuffer> xb = ds4_gpu_tensor_buffer(x), ob = ds4_gpu_tensor_buffer(out);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            "kernel_dsv41_mul_mv_q8_0_swiglu_bf16", dispatch.nsg);
+        const NSUInteger shared_bytes = 2u * dispatch.smem;
+        if (!gate || !up || !xb || !ob || ob == gate || ob == up || !pipeline ||
+            pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < 128u ||
+            pipeline.staticThreadgroupMemoryLength + shared_bytes > g_device.maxThreadgroupMemoryLength)
+            return 0;
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.nr0 = dispatch.nr0;
+        /* Resolve every fallback before encoding: retrying after a failed
+         * dispatch could hide an error or consume a partially written mid. */
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return -1;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:gate offset:(NSUInteger)gate_inner atIndex:1];
+        [enc setBuffer:up offset:(NSUInteger)up_inner atIndex:2];
+        [enc setBuffer:xb offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:ob offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc setBytes:&clamp length:sizeof(clamp) atIndex:5];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(out_dim / 2u, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(32u, 4u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 shared SwiGLU BF16") ? 1 : -1;
+    }
+}
+
 static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

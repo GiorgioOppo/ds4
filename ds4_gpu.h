@@ -102,6 +102,14 @@ int ds4_gpu_dsv41_q8_bf16_rows(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_rows);
+/* Single-row Q8 shared gate/up with BF16 boundaries before SwiGLU and at
+ * its output. Admits K5120/M2304, NSG4, non-quality, single-device execution.
+ * Returns 1 on success, 0 before encoding when unsupported, -1 on GPU error. */
+int ds4_gpu_dsv41_shared_swiglu(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, float clamp);
 /* Q4_K Q-B (K1280, M32768), with raw F32 output. The caller supplies dead
  * workspace of at least rows*1280*2 bytes for optional FP16 RHS reuse and owns
  * the following BF16/RoPE boundary. Used tensor ranges must be disjoint and
