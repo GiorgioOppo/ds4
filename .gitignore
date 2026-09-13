@@ -113,3 +113,5 @@ __pycache__/
 /speed-bench/cuda_q4_prefill_bench
 tests/test_deepseek41_publication
 tests/test_deepseek41_epilogues
+
+/tests/test_deepseek41_candidates

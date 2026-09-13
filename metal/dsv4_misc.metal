@@ -5429,6 +5429,14 @@ kernel void kernel_dsv4_router_project_select_fused(
 }
 
 
+// Every visible eight-key block is admitted below the V4.1 candidate limit.
+// Scalar stores preserve the physical mask tail even for partial vector widths.
+kernel void kernel_dsv41_candidate_mask_all(
+        constant uint &blocks, device float *mask,
+        uint i [[thread_position_in_grid]]) {
+    if (i < blocks) mask[i] = 0.0f;
+}
+
 // Fills the dense compressed-attention mask with -inf. The selected top-k rows
 // are enabled by kernel_dsv4_topk_mask_scatter in a second ordered dispatch.
 kernel void kernel_dsv4_topk_mask(

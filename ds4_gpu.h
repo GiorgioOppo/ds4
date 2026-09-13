@@ -188,6 +188,8 @@ int ds4_gpu_dsv41_candidate_blocks(ds4_gpu_tensor *blocks,
                                   const ds4_gpu_tensor *scores,
                                   uint32_t width, uint32_t rows,
                                   uint32_t start, uint32_t ratio);
+/* Ordered GPU publication of the all-visible candidate mask prefix. */
+int ds4_gpu_dsv41_candidate_mask_all(ds4_gpu_tensor *mask, uint32_t n_comp);
 int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
                                   const ds4_gpu_tensor *block_mask,
                                   uint32_t width, uint32_t rows,

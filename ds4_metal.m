@@ -19545,6 +19545,17 @@ static bool ds4_gpu_tensor_prefixes_overlap(
         const ds4_gpu_tensor *a, uint64_t a_bytes,
         const ds4_gpu_tensor *b, uint64_t b_bytes);
 
+static int ds4_gpu_indexer_topk_scratch(NSUInteger bytes) {
+    /* Candidate-block selection can be followed by a larger key top-k in
+     * the same batch. Unretained command buffers still reference the old
+     * slab after growth; keep it until current and flushed work completes. */
+    if (g_indexer_topk_buffer && bytes > g_indexer_topk_bytes &&
+        (g_batch_cb || [g_pending_cbs count]))
+        [g_transient_buffers addObject:g_indexer_topk_buffer];
+    return ds4_gpu_ensure_scratch_buffer(&g_indexer_topk_buffer,
+        &g_indexer_topk_bytes, bytes, "ds4_indexer_topk");
+}
+
 static int ds4_gpu_indexer_topk_compact(
         ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
         uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
@@ -19557,10 +19568,7 @@ static int ds4_gpu_indexer_topk_compact(
     // Every later width decreases, so these unequal slabs remain sufficient.
     const uint64_t first_bytes = (uint64_t)geometry.width * n_tokens * sizeof(int32_t);
     const uint64_t second_bytes = (uint64_t)first.width * n_tokens * sizeof(int32_t);
-    if (!ds4_gpu_ensure_scratch_buffer(&g_indexer_topk_buffer,
-                                      &g_indexer_topk_bytes,
-                                      (NSUInteger)(first_bytes + second_bytes),
-                                      "ds4_indexer_topk")) return 0;
+    if (!ds4_gpu_indexer_topk_scratch((NSUInteger)(first_bytes + second_bytes))) return 0;
     const ds4_gpu_kargs_argsort args = {
         .ne00 = (int32_t)n_comp, .ne01 = (int32_t)n_tokens,
         .ne02 = 1, .ne03 = 1,
@@ -19692,10 +19700,7 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         const bool one_pass = npr <= 1;
         const uint64_t scratch_bytes = one_pass ? scratch_row_bytes * n_tokens :
             2u * scratch_row_bytes * n_tokens;
-        if (!ds4_gpu_ensure_scratch_buffer(&g_indexer_topk_buffer,
-                                             &g_indexer_topk_bytes,
-                                             (NSUInteger)scratch_bytes,
-                                             "ds4_indexer_topk")) {
+        if (!ds4_gpu_indexer_topk_scratch((NSUInteger)scratch_bytes)) {
             return 0;
         }
 
@@ -52350,6 +52355,30 @@ static int dsv41_candidates(ds4_gpu_tensor *out, const ds4_gpu_tensor *scores,
              threadsPerThreadgroup:MTLSizeMake(MIN(output_width, 256u), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 candidate selection");
+    }
+}
+
+int ds4_gpu_dsv41_candidate_mask_all(ds4_gpu_tensor *mask, uint32_t n_comp) {
+    if (!n_comp || n_comp > 2048u * 8u ||
+        !dsv41_tensor_has_floats(mask, (n_comp + 7u) / 8u) ||
+        ds4_gpu_tensor_offset(mask) % sizeof(float)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_candidate_mask_all");
+        if (!pipeline) return 0;
+        const uint32_t blocks = (n_comp + 7u) / 8u;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&blocks length:sizeof(blocks) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(mask) offset:ds4_gpu_tensor_offset(mask) atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(blocks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(MIN(blocks, 256u), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 all candidate blocks");
     }
 }
 

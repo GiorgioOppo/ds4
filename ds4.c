@@ -40417,6 +40417,11 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
+        /* Up to 2048 eight-key blocks are all candidates. Publish the valid
+         * mask prefix on the GPU, after any queued carry restore; its physical
+         * tail stays untouched. Reindex scores already have causal bounds. */
+        if (n_comp <= 2048u * 8u && il >= 20u)
+            return il != 20u || ds4_gpu_dsv41_candidate_mask_all(g->block_mask, n_comp);
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
