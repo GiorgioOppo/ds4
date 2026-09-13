@@ -44,12 +44,155 @@ static float nearest(float value, int fp4) {
 }
 
 static ds4_gpu_tensor *upload(const void *data, size_t bytes) {
-    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_managed(bytes);
     if (t && data && !ds4_gpu_tensor_write(t, 0, data, bytes)) {
         ds4_gpu_tensor_free(t);
         return NULL;
     }
     return t;
+}
+
+static int check_router(void) {
+    enum { ROWS = 129, MAX_EXPERTS = 384, USED = 6 };
+    const size_t bias_bytes = (size_t)getpagesize();
+    float *bias = NULL;
+    CHECK(bias_bytes >= MAX_EXPERTS * sizeof(float));
+    CHECK(posix_memalign((void **)&bias, bias_bytes, bias_bytes) == 0);
+    memset(bias, 0, bias_bytes);
+    float *logits = malloc(ROWS * MAX_EXPERTS * sizeof(float));
+    int32_t tokens[ROWS] = {0};
+    CHECK(bias && logits);
+    for (unsigned e = 0; e < MAX_EXPERTS; e++) bias[e] = (e % 7) * 0.125f;
+    CHECK(ds4_gpu_set_model_map(bias, bias_bytes));
+    ds4_gpu_tensor *x = upload(NULL, ROWS * MAX_EXPERTS * sizeof(float));
+    ds4_gpu_tensor *p = upload(NULL, ROWS * MAX_EXPERTS * sizeof(float));
+    ds4_gpu_tensor *ids = upload(NULL, ROWS * USED * sizeof(int32_t));
+    ds4_gpu_tensor *weights = upload(NULL, ROWS * USED * sizeof(float));
+    ds4_gpu_tensor *tok = upload(tokens, sizeof(tokens));
+    CHECK(x && p && ids && weights && tok);
+#ifdef __APPLE__
+    ds4_gpu_tensor *ref_p = upload(NULL, ROWS * MAX_EXPERTS * sizeof(float));
+    ds4_gpu_tensor *ref_ids = upload(NULL, ROWS * USED * sizeof(int32_t));
+    ds4_gpu_tensor *ref_weights = upload(NULL, ROWS * USED * sizeof(float));
+    CHECK(ref_p && ref_ids && ref_weights);
+#endif
+    const unsigned counts[] = {1, 3, 17, ROWS};
+    for (unsigned n = 256; n <= MAX_EXPERTS; n += 128) {
+        for (unsigned mode = 0; mode < 3; mode++) {
+            for (unsigned i = 0; i < ROWS * n; i++) logits[i] = mode == 1 ? 0 :
+                mode == 2 ? (i % 2 ? -80 : 40) : random_value() * 8;
+            CHECK(ds4_gpu_tensor_write(x, 0, logits, ROWS * n * sizeof(float)));
+            for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+                const unsigned rows = counts[ci];
+#ifdef __APPLE__
+                /* Metal's fast log near 1 need not match host libm. Use the
+                 * established separate softplus/sqrt dispatches as reference;
+                 * selection and normalization are still checked on the CPU. */
+                ds4_gpu_set_quality(true);
+                const int ref_ok = ds4_gpu_router_select_batch_tensor(
+                    ref_ids, ref_weights, ref_p, bias, bias_bytes,
+                    0, 0, 0, 0, 0, true, false, x, tok, n, USED, 1.5f, rows);
+                ds4_gpu_set_quality(false);
+                CHECK(ref_ok);
+#endif
+                CHECK(ds4_gpu_router_select_batch_tensor(ids, weights, p, bias,
+                    bias_bytes, 0, 0, 0, 0, 0, true, false,
+                    x, tok, n, USED, 1.5f, rows));
+                CHECK(ds4_gpu_synchronize());
+                const int32_t *selected = ds4_gpu_tensor_contents(ids);
+                const float *actual = ds4_gpu_tensor_contents(weights);
+                const float *probs = ds4_gpu_tensor_contents(p);
+                CHECK(selected && actual && probs);
+#ifdef __APPLE__
+                const float *metal_ref = ds4_gpu_tensor_contents(ref_p);
+                CHECK(metal_ref);
+#endif
+                for (unsigned t = 0; t < rows; t++) {
+                    double ref[MAX_EXPERTS];
+                    int best[USED];
+                    for (unsigned k = 0; k < USED; k++) best[k] = -1;
+                    for (unsigned e = 0; e < n; e++) {
+                        const double v = logits[t * n + e];
+#ifdef __APPLE__
+                        ref[e] = metal_ref[t * n + e];
+                        CHECK(isfinite(ref[e]) && ref[e] >= 0);
+                        /* Keep an independent mathematical check where the
+                         * FP32 addition before log is well conditioned. */
+                        if (v >= 0) {
+                            const double mathematical = sqrt(v > 20 ? v : log1p(exp(v)));
+                            CHECK(fabs(ref[e] - mathematical) <= 3e-6 * (1 + mathematical));
+                        }
+                        /* At -80, FP32 1 + exp(x) rounds exactly to 1. */
+                        if (v == -80) CHECK(ref[e] == 0);
+#else
+                        ref[e] = sqrt(v > 20 ? v : v < -20 ? exp(v) : log1p(exp(v)));
+#endif
+                        if (!(fabs(probs[t * n + e] - ref[e]) <= 3e-6 * (1 + ref[e])))
+                            fprintf(stderr, "router n=%u mode=%u rows=%u row=%u expert=%u logit=%.9g actual=%.9g ref=%.9g\n",
+                                    n, mode, rows, t, e, v, probs[t * n + e], ref[e]);
+                        CHECK(fabs(probs[t * n + e] - ref[e]) <= 3e-6 * (1 + ref[e]));
+                        const double score = ref[e] + bias[e];
+                        for (unsigned k = 0; k < USED; k++) {
+                            if (best[k] < 0 || score > ref[best[k]] + bias[best[k]]) {
+                                for (unsigned j = USED - 1; j > k; j--) best[j] = best[j - 1];
+                                best[k] = (int)e;
+                                break;
+                            }
+                        }
+                    }
+                    double sum = 0;
+                    for (unsigned k = 0; k < USED; k++) {
+                        const int id = selected[t * USED + k];
+                        CHECK(id >= 0 && id < (int)n);
+                        for (unsigned j = 0; j < k; j++) CHECK(id != selected[t * USED + j]);
+#ifdef __APPLE__
+                        /* Bitonic selection does not promise CUDA's lower-ID
+                         * tie break. Still require the correct top-k scores. */
+                        CHECK(fabs((ref[id] + bias[id]) - (ref[best[k]] + bias[best[k]])) < 3e-6);
+#else
+                        CHECK(id == best[k]);
+#endif
+                        sum += ref[id];
+                    }
+                    for (unsigned k = 0; k < USED; k++) {
+                        CHECK(fabs(actual[t * USED + k] - 1.5 * ref[selected[t * USED + k]] /
+                              fmax(sum, 0x1p-14)) < 3e-6);
+                    }
+                }
+                int32_t first_ids[USED]; float first_weights[USED];
+                memcpy(first_ids, selected, sizeof(first_ids));
+                memcpy(first_weights, actual, sizeof(first_weights));
+                CHECK(ds4_gpu_router_select_tensor(ids, weights, p, bias,
+                    bias_bytes, 0, 0, 0, 0, n, USED, 1.5f,
+                    0, 0, true, false, x));
+                CHECK(ds4_gpu_synchronize());
+                const int32_t *scalar_ids = ds4_gpu_tensor_contents(ids);
+                const float *scalar_weights = ds4_gpu_tensor_contents(weights);
+#ifdef __APPLE__
+                for (unsigned k = 0; k < USED; k++) {
+                    CHECK(scalar_ids[k] >= 0 && scalar_ids[k] < (int32_t)n);
+                    CHECK(probs[first_ids[k]] + bias[first_ids[k]] ==
+                          probs[scalar_ids[k]] + bias[scalar_ids[k]]);
+                    CHECK(fabsf(first_weights[k] - scalar_weights[k]) < 3e-6f);
+                }
+#else
+                CHECK(!memcmp(first_ids, scalar_ids, sizeof(first_ids)));
+                CHECK(!memcmp(first_weights, scalar_weights, sizeof(first_weights)));
+#endif
+            }
+        }
+    }
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(p); ds4_gpu_tensor_free(ids);
+    ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(tok);
+#ifdef __APPLE__
+    ds4_gpu_tensor_free(ref_p); ds4_gpu_tensor_free(ref_ids);
+    ds4_gpu_tensor_free(ref_weights);
+#endif
+    ds4_gpu_cleanup();
+    free(bias); free(logits);
+    CHECK(ds4_gpu_init());
+    fprintf(stderr, "256/384-expert routing, ties/extremes and scalar/batch oracle: PASS\n");
+    return 1;
 }
 
 static int check_quantization(void) {
@@ -152,6 +295,7 @@ static int check_bf16_linear(void) {
     return 1;
 }
 
+#ifdef __APPLE__
 static int check_bf16_rope(void) {
     const struct { uint32_t width, heads, rows, offset; } shapes[] = {
         {64, 1, 1, 0}, {65, 2, 3, 0}, {128, 32, 5, 1}, {132, 2, 3, 4},
@@ -495,6 +639,8 @@ static int check_hc_scaled(void) {
     return 1;
 }
 
+#endif
+
 static int check_engram(void) {
     enum { D = 5120, ROWS = 5, N = ROWS * 4 * D };
     float *x = malloc(N * sizeof(float)), *actual = malloc(N * sizeof(float));
@@ -787,8 +933,9 @@ static int check_sparse_gather(void) {
     return 1;
 }
 
-static int check_attention_output(void) {
-    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120, ROWS = 513 };
+static int check_attention_output(bool large) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
+    const uint32_t ROWS = large ? 8192u : 513u;
     typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
     const uint64_t a_bytes = (uint64_t)GROUPS * RANK * GROUP / 32 * sizeof(q8_block);
     const uint64_t b_bytes = (uint64_t)OUT * GROUPS * RANK / 32 * sizeof(q8_block);
@@ -824,9 +971,10 @@ static int check_attention_output(void) {
     CHECK(ds4_gpu_end_commands());
     CHECK(ds4_gpu_tensor_read(out, 0, reference, ob));
     CHECK(ds4_gpu_tensor_read(low, 0, reference_low, lb));
-    const uint32_t sizes[] = {31, 32, 63, 64, 65, 257, 512, 513};
+    const uint32_t sizes[] = {31, 32, 63, 64, 65, 257, 512, 513, 8191, 8192};
     for (unsigned n = 0; n < sizeof(sizes) / sizeof(*sizes); n++) {
         const uint32_t rows = sizes[n];
+        if (rows > ROWS) break;
         CHECK(ds4_gpu_tensor_fill_f32(out, NAN, ob / 4));
         CHECK(ds4_gpu_tensor_fill_f32(low, NAN, lb / 4));
         CHECK(ds4_gpu_dsv41_attention_output_batch(out, low, model, a_bytes + b_bytes,
@@ -834,8 +982,12 @@ static int check_attention_output(void) {
         const float *got = ds4_gpu_tensor_contents(out);
         const float *got_low = ds4_gpu_tensor_contents(low);
         CHECK(!memcmp(got_low, reference_low, (uint64_t)rows * GROUPS * RANK * 4));
-        for (uint64_t i = 0; i < (uint64_t)rows * OUT; i++)
+        for (uint64_t i = 0; i < (uint64_t)rows * OUT; i++) {
+            if (!isfinite(got[i]) || fabsf(got[i] - reference[i]) > 2e-5f * (1 + fabsf(reference[i])))
+                fprintf(stderr, "attention output rows=%u index=%llu actual=%.9g reference=%.9g\n",
+                    rows, (unsigned long long)i, got[i], reference[i]);
             CHECK(isfinite(got[i]) && fabsf(got[i] - reference[i]) <= 2e-5f * (1 + fabsf(reference[i])));
+        }
         if (rows < ROWS) CHECK(isnan(got[(uint64_t)rows * OUT]));
         fprintf(stderr, "V4.1 batched Q8 output, BF16 boundary, rows=%u: PASS\n", rows);
     }
@@ -873,11 +1025,39 @@ static int check_attention_output(void) {
                     const q8_block *bw = (const q8_block *)((const char *)model + a_bytes) +
                         (size_t)col * 2 * low_half / 32 + rank * low_half / 32;
                     double sum = 0;
+                    double rounding_bound = 0;
+#ifndef __APPLE__
+                    /* CUDA's established Q8 dot first rounds each activation
+                     * block to signed bytes. TP must keep that same boundary. */
+                    for (uint32_t k = 0; k < low_half; k += 32) {
+                        const float *v = reference_low + (size_t)t * 2 * low_half + rank * low_half + k;
+                        float amax = 0;
+                        for (uint32_t j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(v[j]));
+                        const float scale = amax / 127.0f;
+                        const float inv = scale ? 1.0f / scale : 0;
+                        int dot = 0;
+                        for (uint32_t j = 0; j < 32; j++) {
+                            dot += bw[k / 32].qs[j] * (int)lrintf(v[j] * inv);
+                            /* The fast GPU reciprocal can approach an exact
+                             * half-integer from the other side. Bound only
+                             * those ambiguous bins, not arbitrary dot error. */
+                            const double q = amax ? fabs((double)v[j] * 127.0 / amax) : 0;
+                            if (q - floor(q) == 0.5)
+                                rounding_bound += abs(bw[k / 32].qs[j]) * (double)scale / 128.0;
+                        }
+                        sum += dot * (double)scale / 128.0;
+                    }
+#else
                     for (uint32_t k = 0; k < low_half; k++)
                         sum += bw[k / 32].qs[k % 32] / 128.0 *
                             reference_low[(size_t)t * 2 * low_half + rank * low_half + k];
+#endif
+                    if (!isfinite(got[(size_t)t * OUT + col]) ||
+                        fabs(got[(size_t)t * OUT + col] - sum) > rounding_bound + 2e-5 * (1 + fabs(sum)))
+                        fprintf(stderr, "TP output rank=%u rows=%u row=%u col=%u actual=%.9g oracle=%.9g tie_bound=%.9g\n",
+                            rank, rows, t, col, got[(size_t)t * OUT + col], sum, rounding_bound);
                     CHECK(isfinite(got[(size_t)t * OUT + col]) &&
-                        fabs(got[(size_t)t * OUT + col] - sum) <= 2e-5 * (1 + fabs(sum)));
+                        fabs(got[(size_t)t * OUT + col] - sum) <= rounding_bound + 2e-5 * (1 + fabs(sum)));
                 }
             }
             CHECK(isnan(got_low[(size_t)rows * low_half]));
@@ -912,6 +1092,10 @@ static int check_indexer_batch(void) {
     const uint64_t packed_bytes = ds4_gpu_dsv41_indexer_packed_bytes(KEYS, ROWS);
     ds4_gpu_tensor *pt = upload(NULL, (size_t)packed_bytes + 4);
     CHECK(qt && kt && wt && st && pt);
+#ifndef __APPLE__
+    ds4_gpu_tensor *reference = upload(NULL, (size_t)KEYS * sizeof(float));
+    CHECK(reference);
+#endif
     float *q = ds4_gpu_tensor_contents(qt), *k = ds4_gpu_tensor_contents(kt);
     float *w = ds4_gpu_tensor_contents(wt), *s = ds4_gpu_tensor_contents(st);
     CHECK(q && k && w && s);
@@ -946,9 +1130,30 @@ static int check_indexer_batch(void) {
                         CHECK(mode ? ds4_gpu_dsv41_indexer_scores_packed(st, qv, wv, kt, pt,
                             KEYS, rows, start, ratio, ROWS, offset) :
                             ds4_gpu_dsv41_indexer_scores_batch(st, qv, wv, kt, KEYS, rows, start, ratio));
+                        CHECK(ds4_gpu_synchronize());
                         ds4_gpu_tensor_free(qv); ds4_gpu_tensor_free(wv);
                         CHECK(s[(size_t)rows * KEYS] == 12345);
                         CHECK(*packed_guard == 0xabcdef01);
+#ifndef __APPLE__
+                        /* Compare the CUDA warp scorer with the original
+                         * shared-memory reduction, not only a loose oracle. */
+                        ds4_gpu_set_quality(true);
+                        for (uint32_t t = 0; t < rows; t++) {
+                            const uint32_t visible = (start + t + 1u) / ratio;
+                            if (!visible) continue;
+                            ds4_gpu_tensor *qr = ds4_gpu_tensor_view(qt,
+                                (uint64_t)t * HEADS * DIM * 4u, HEADS * DIM * 4u);
+                            ds4_gpu_tensor *wr = ds4_gpu_tensor_view(wt,
+                                (uint64_t)t * HEADS * 4u, HEADS * 4u);
+                            CHECK(qr && wr && ds4_gpu_glm_indexer_score_one_tensor(
+                                reference, qr, wr, kt, visible, HEADS, DIM, 1.0f / 64.0f, false));
+                            CHECK(ds4_gpu_synchronize());
+                            CHECK(!memcmp(s + (size_t)t * KEYS,
+                                ds4_gpu_tensor_contents(reference), visible * sizeof(float)));
+                            ds4_gpu_tensor_free(qr); ds4_gpu_tensor_free(wr);
+                        }
+                        ds4_gpu_set_quality(false);
+#endif
                         double worst = 0;
                         for (uint32_t t = 0; t < rows; t++) {
                             const uint32_t visible = (start + t + 1u) / ratio;
@@ -994,6 +1199,9 @@ static int check_indexer_batch(void) {
     CHECK(!ds4_gpu_dsv41_indexer_scores_packed(st, qt, wt, kt, st,
         KEYS, ROWS, 0, 1, ROWS, 0));
     ds4_gpu_tensor_free(pt);
+#ifndef __APPLE__
+    ds4_gpu_tensor_free(reference);
+#endif
     ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(qt);
     fprintf(stderr, "V4.1 causal batched index scores: double-precision oracle PASS\n");
@@ -1004,6 +1212,56 @@ static double monotonic_seconds(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static int check_embedding(void) {
+    enum { VOCAB = 19, WIDTH = 5120, HC = 4, ROWS = 257 };
+    const size_t row_bytes = WIDTH * HC * sizeof(float);
+    const size_t weight_bytes = VOCAB * WIDTH * sizeof(uint16_t);
+    uint16_t *model = NULL;
+    CHECK(posix_memalign((void **)&model, getpagesize(), weight_bytes) == 0);
+    for (unsigned i = 0; i < VOCAB * WIDTH; i++)
+        model[i] = (uint16_t)(0x2000u | (i % 1024u) | ((i & 1u) ? 0x8000u : 0));
+    int32_t ids[ROWS];
+    for (unsigned i = 0; i < ROWS; i++) ids[i] = (int32_t)((i * 7u) % VOCAB);
+    CHECK(ds4_gpu_set_model_map(model, weight_bytes));
+    ds4_gpu_tensor *tokens = upload(ids, sizeof(ids));
+    ds4_gpu_tensor *out = upload(NULL, ROWS * row_bytes + sizeof(float));
+    ds4_gpu_tensor *ref = upload(NULL, VOCAB * row_bytes);
+    CHECK(tokens && out && ref);
+    for (unsigned token = 0; token < VOCAB; token++) {
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(ref, token * row_bytes, row_bytes);
+        CHECK(row && ds4_gpu_embed_token_hc_tensor(row, model, weight_bytes, 0,
+                                                   VOCAB, token, WIDTH, HC));
+        ds4_gpu_tensor_free(row);
+    }
+    const unsigned counts[] = {1, 7, 127, 128, ROWS};
+    const float marker = 12345;
+    float *actual = malloc(ROWS * row_bytes + sizeof(float));
+    float *expected = malloc(VOCAB * row_bytes);
+    CHECK(actual && expected && ds4_gpu_tensor_read(ref, 0, expected, VOCAB * row_bytes));
+    for (unsigned i = 0; i < sizeof(counts) / sizeof(*counts); i++) {
+        const unsigned rows = counts[i];
+        CHECK(ds4_gpu_tensor_write(out, rows * row_bytes, &marker, sizeof(marker)));
+        CHECK(ds4_gpu_embed_tokens_hc_tensor(out, tokens, model, weight_bytes, 0,
+                                             VOCAB, rows, WIDTH, HC));
+        CHECK(ds4_gpu_tensor_read(out, 0, actual, rows * row_bytes + sizeof(float)));
+        CHECK(actual[rows * WIDTH * HC] == marker);
+        for (unsigned row = 0; row < rows; row++) {
+            CHECK(!memcmp(actual + row * WIDTH * HC, expected + ids[row] * WIDTH * HC, row_bytes));
+            for (unsigned hc = 0; hc < HC; hc++) for (unsigned d = 0; d < WIDTH; d++) {
+                const unsigned w = (unsigned)ids[row] * WIDTH + d;
+                const float value = (1.0f + (w % 1024u) / 1024.0f) / 128.0f * ((w & 1u) ? -1 : 1);
+                CHECK(actual[(row * HC + hc) * WIDTH + d] == value);
+            }
+        }
+        fprintf(stderr, "V4.1 batched embedding rows=%u: exact scalar and independent oracle PASS\n", rows);
+    }
+    free(expected); free(actual);
+    ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tokens);
+    ds4_gpu_cleanup(); free(model);
+    CHECK(ds4_gpu_init());
+    return 1;
 }
 
 static int check_index_projection(void) {
@@ -1042,6 +1300,7 @@ static int check_index_projection(void) {
             CHECK(ds4_gpu_end_commands());
             const double start = monotonic_seconds();
             CHECK(ds4_gpu_dsv41_projection_rows(out, model, weight_bytes, 0, width, output, rows, in));
+            CHECK(ds4_gpu_synchronize());
             const double seconds = monotonic_seconds() - start;
             CHECK(y[(size_t)rows * output] == 12345);
             double error = 0, norm = 0;
@@ -1072,6 +1331,73 @@ static int check_index_projection(void) {
         ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(in);
         ds4_gpu_cleanup(); free(model);
         CHECK(ds4_gpu_init());
+    }
+    return 1;
+}
+
+typedef struct { float value; uint32_t id; } topk_entry;
+
+static int compare_topk_entry(const void *a, const void *b) {
+    const topk_entry *x = a, *y = b;
+    if (x->value > y->value) return -1;
+    if (x->value < y->value) return 1;
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+static int check_general_topk(void) {
+    const uint32_t widths[] = {1, 2, 31, 127, 255, 256, 257, 511, 512, 513,
+        1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192};
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t width = widths[wi], rows = 3;
+        ds4_gpu_tensor *scores = upload(NULL, (size_t)width * rows * 4);
+        ds4_gpu_tensor *selected = upload(NULL, ((size_t)width * rows + 1) * 4);
+        topk_entry *reference = malloc((size_t)width * rows * sizeof(*reference));
+        bool *seen = calloc(width, sizeof(*seen));
+        CHECK(scores && selected && reference && seen);
+        float *s = ds4_gpu_tensor_contents(scores);
+        uint32_t *ids = ds4_gpu_tensor_contents(selected);
+        const uint32_t counts[] = {1, 2, 31, 128, 511, 512, 513, 2048, width};
+        for (uint32_t pattern = 0; pattern < 4; pattern++) {
+            for (uint32_t t = 0; t < rows; t++) {
+                for (uint32_t i = 0; i < width; i++) {
+                    const float value = pattern == 0 ? random_value() :
+                        pattern == 1 ? (float)(i % 7) :
+                        pattern == 2 ? -INFINITY : (i & 1 ? -0.0f : 0.0f);
+                    const float v = pattern == 1 && i % 17 == 0 ? INFINITY : value;
+                    s[t * width + i] = v;
+                    reference[t * width + i] = (topk_entry){v, i};
+                }
+                qsort(reference + t * width, width, sizeof(*reference), compare_topk_entry);
+            }
+            for (size_t ki = 0; ki < sizeof(counts) / sizeof(*counts); ki++) {
+                const uint32_t k = counts[ki];
+                if (k > width) continue;
+                ids[rows * k] = 0xabcdef01;
+                CHECK(ds4_gpu_indexer_topk_tensor(selected, scores, width, rows, k));
+                CHECK(ds4_gpu_synchronize());
+                CHECK(ids[rows * k] == 0xabcdef01);
+                for (uint32_t t = 0; t < rows; t++) {
+                    memset(seen, 0, width * sizeof(*seen));
+                    for (uint32_t i = 0; i < k; i++) {
+                        const uint32_t id = ids[t * k + i];
+                        CHECK(id < width && !seen[id]);
+                        seen[id] = true;
+#ifdef __APPLE__
+                        /* Metal's bitonic order may permute exactly tied keys. */
+                        CHECK(s[t * width + id] == reference[t * width + i].value);
+#else
+                        if (ids[t * k + i] != reference[t * width + i].id) {
+                            fprintf(stderr, "top-k width=%u k=%u pattern=%u row=%u rank=%u: %u vs %u\n",
+                                width, k, pattern, t, i, ids[t * k + i], reference[t * width + i].id);
+                            CHECK(0);
+                        }
+#endif
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "V4.1 variable-k sort width=%u: independent sorted-value/unique-ID oracle PASS\n", width);
+        ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(scores); free(reference); free(seen);
     }
     return 1;
 }
@@ -1113,6 +1439,7 @@ static int check_causal_topk(void) {
                 CHECK(ds4_gpu_end_commands());
                 ids[rows * 512u] = 123456;
                 CHECK(ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, rows, start, ratio));
+                CHECK(ds4_gpu_synchronize());
                 CHECK(ids[rows * 512u] == 123456);
                 for (uint32_t t = 0; t < rows; t++) {
                     for (uint32_t k = 0; k < 512u; k++) {
@@ -1161,9 +1488,11 @@ static int check_compact_carry(void) {
             bits[count] = 0x12345678u;
             memset(storage, 0xa5, packed_bytes);
             CHECK(ds4_gpu_dsv41_carry_copy(packed, offset, plain, width, rows, format, true));
+            CHECK(ds4_gpu_synchronize());
             CHECK(!memcmp(bits, expected, count * sizeof(uint32_t)));
             memset(bits, 0, count * sizeof(uint32_t));
             CHECK(ds4_gpu_dsv41_carry_copy(packed, offset, plain, width, rows, format, false));
+            CHECK(ds4_gpu_synchronize());
             CHECK(!memcmp(bits, expected, count * sizeof(uint32_t)) && bits[count] == 0x12345678u);
             for (size_t i = 0; i < (size_t)offset * words * 4u; i++) CHECK(storage[i] == 0xa5);
             for (size_t i = (size_t)(offset + rows) * words * 4u; i < packed_bytes; i++)
@@ -1182,8 +1511,7 @@ static int check_compact_carry(void) {
     return 1;
 }
 
-/* Exercise the full-head and compact TP layouts with the same causal keys.
- * Selected rows are shuffled; include masked future rows at odd frontiers. */
+#ifdef __APPLE__
 extern uint32_t ds4_gpu_test_indexed_prefill_rb(void);
 static uint32_t indexed_prefill_release_rb(void) {
     return ds4_gpu_device_is_pre_m5_apple_silicon() ? 16u : 1u;
@@ -1226,8 +1554,14 @@ static int benchmark_indexed_prefill(
     ds4_gpu_test_set_flags(0);
     return 1;
 }
+#endif
 
+/* Exercise the full-head and compact TP layouts with the same causal keys.
+ * Selected rows are shuffled; include masked future rows at odd frontiers. */
 static int check_tp_attention(int bench) {
+#ifndef __APPLE__
+    (void)bench;
+#endif
     enum { D = 512, H = 64, K = 512, C = 2048 };
     const uint32_t sizes[] = {1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 129, 257, 512, 1024, 2048};
     float *sinks = NULL;
@@ -1235,7 +1569,9 @@ static int check_tp_attention(int bench) {
     for (int h = 0; h < H; h++) sinks[h] = random_value();
     CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
     ds4_gpu_set_quality(false);
+#ifdef __APPLE__
     ds4_gpu_test_set_flags(0);
+#endif
     for (unsigned s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
         const uint32_t n = sizes[s], start = n > 1 && n < 31 ? (s & 1u ? 0u : 5u) : 3073u;
         const uint32_t past = start < 127u ? start : 127u, nr = n + past;
@@ -1268,6 +1604,7 @@ static int check_tp_attention(int bench) {
         CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(out, sinks, getpagesize(),
             0, qt, rt, ct, comp_f16, it, n, start, nr, nr, raw_start, C, K, 128, ratio, H, D));
         CHECK(ds4_gpu_tensor_read(out, 0, actual, nq * 4));
+#ifdef __APPLE__
         CHECK(ds4_gpu_test_indexed_prefill_rb() == (n == 1 ? 0u : indexed_prefill_release_rb()));
         if (n > 1) {
             for (unsigned arm = 0; arm < 2; arm++) {
@@ -1304,6 +1641,7 @@ static int check_tp_attention(int bench) {
         if (bench && (n == 512 || n == 1024))
             CHECK(benchmark_indexed_prefill(out, actual, qt, rt, ct, it, sinks,
                 n, H, nr, start, ratio, comp_f16, raw_start));
+#endif
         double max_split = 0, max_oracle = 0;
         for (uint32_t rank = 0; rank < 2; rank++) {
             for (uint32_t t = 0; t < n; t++)
@@ -1314,6 +1652,7 @@ static int check_tp_attention(int bench) {
                 rank * H/2 * 4, qp, rt, ct, comp_f16, it, n, start, nr, nr, raw_start,
                 C, K, 128, ratio, H/2, D));
             CHECK(ds4_gpu_tensor_read(op, 0, part, nq * 2));
+#ifdef __APPLE__
             if (n > 1) {
                 for (unsigned arm = 0; arm < 2; arm++) {
                     ds4_gpu_test_set_flags(arm ? 0u : DS4_GPU_TEST_V41_INDEXED_REFERENCE);
@@ -1336,6 +1675,23 @@ static int check_tp_attention(int bench) {
                 CHECK(benchmark_indexed_prefill(op, part, qp, rt, ct, it, sinks,
                     n, H/2, nr, start, ratio, comp_f16, raw_start));
             }
+#else
+            if (n == 2048 && rank == 0) {
+                const bool controls[] = {true, false, false, true};
+                for (unsigned pass = 0; pass < 4; pass++) {
+                    ds4_gpu_set_quality(controls[pass]);
+                    const double begin = monotonic_seconds();
+                    for (int repeat = 0; repeat < 4; repeat++)
+                        CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(op,
+                            sinks, getpagesize(), 0, qp, rt, ct, 0, it, n, start,
+                            nr, nr, 0, C, K, 128, ratio, H/2, D));
+                    CHECK(ds4_gpu_synchronize());
+                    fprintf(stderr, "TP indexed attention control=%u %.3f ms\n",
+                        controls[pass], (monotonic_seconds() - begin) * 250);
+                }
+                ds4_gpu_set_quality(false);
+            }
+#endif
             for (uint32_t t = 0; t < n; t++) {
                 for (uint32_t h = 0; h < H/2; h++) {
                     const float *got = part + ((size_t)t * H/2 + h) * D;
@@ -1395,6 +1751,7 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+#ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--bf16-norm")) {
         const int ok = ds4_gpu_init() && check_bf16_norm();
         ds4_gpu_cleanup();
@@ -1405,22 +1762,37 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+#endif
+    if (argc == 2 && !strcmp(argv[1], "--embedding")) {
+        const int ok = ds4_gpu_init() && check_embedding();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--router")) {
+        const int ok = ds4_gpu_init() && check_router();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if ((argc == 2 || (argc == 3 && !strcmp(argv[2], "--bench"))) &&
         !strcmp(argv[1], "--tp-attention")) {
         const int ok = ds4_gpu_init() && check_tp_attention(argc == 3);
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
-    if (argc == 2 && !strcmp(argv[1], "--attention-output")) {
-        const int ok = ds4_gpu_init() && check_attention_output();
+    if (argc == 2 && (!strcmp(argv[1], "--attention-output") ||
+                      !strcmp(argv[1], "--attention-output-large"))) {
+        const int ok = ds4_gpu_init() && check_attention_output(
+            !strcmp(argv[1], "--attention-output-large"));
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+#ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--hc-scaled")) {
         const int ok = ds4_gpu_init() && check_hc_scaled();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--bf16-linear")) {
         const int ok = ds4_gpu_init() && check_bf16_linear();
         ds4_gpu_cleanup();
@@ -1441,16 +1813,24 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--general-topk")) {
+        const int ok = ds4_gpu_init() && check_general_topk();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-projection")) {
         const int ok = ds4_gpu_init() && check_index_projection();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
     if (argc != 1) return 2;
-    int ok = ds4_gpu_init() && check_quantization() && check_engram() && check_engram_bf16_input() && check_rope_stride() &&
-             check_bf16_rope() && check_bf16_norm() && check_pool() &&
+    int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_engram_bf16_input() && check_rope_stride() &&
+#ifdef __APPLE__
+             check_bf16_rope() && check_bf16_norm() &&
+#endif
+             check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
-             check_index_projection() && check_causal_topk() && check_compact_carry() && check_attention_output() &&
+             check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention(0);
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
