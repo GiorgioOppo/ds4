@@ -2220,6 +2220,27 @@ A 94 GiB expert/staging cache is also tested at 16K with a 512-output continuati
 
 Resident text and vision also pass on upcoming 192 GB hardware; performance results will be released soon. The V4.1 allocation policy remains separate from other ROCm models. A future cross-model investigation may simplify allocation, streaming and teardown policies; that refactor is outside this change. Physical CUDA/Metal and multi-device/TP regression runs, exact distribution equivalence and complete I/O/compute overlap are not qualified by this ROCm validation.
 
+## DeepSeek V4.1 Flash: two-rank ROCm
+
+Two 128 GB Strix Halo systems, ROCm 10.0, calibrated V4.1 Q2, resident sharded experts and disk-backed Engram. [Setup and exact commands](docs/CLUSTERING_ROCM.md). TCP, USB4STREAM and RoCE RC use the same model arithmetic; no SSD expert streaming or speculative decoding under TP.
+
+| Official panel | Targets | Single-device NLL | Two-rank NLL | Single-device → two-rank top1 |
+|---|---:|---:|---:|---:|
+| 100 short cases | 2994 | 0.366270802 | 0.365827922 | 2703 → 2705 |
+| 12 batched cases | 768 | 0.526495829 | 0.523915363 | 666 → 680 |
+| Selected 8K, 8197 prompt tokens | 64 | 0.137936430 | 0.129784945 | 61 → 63 |
+| Selected 16K, 16389 prompt tokens | 64 | 0.498611990 | 0.519931891 | 57 → 59 |
+
+- Short/batched controls were rebuilt from the branch base; long controls are the previously qualified single-device captures above. Same Q2 weights and official fixtures; no fresh Metal comparison.
+- Numerical results are mixed: 16K NLL rises 4.276% and target-logprob MAE rises 0.235534 → 0.237530. The short/batched whole-prompt bootstrap intervals span zero, which does not establish equivalence. An isolated first-frontier KL/TV comparison also worsens. Distributed accumulation and owned-kernel scheduling are not bit-identical to single-device arithmetic.
+- 44/44 greedy practical checks and 28/28 sampled checks pass, including full 12,152-token coding and 9,509-token tool prompts with real `read_file` round-trips. Sampling: temperature 0.6, top-p 0.95, seed 1729, min-p/top-k 0; thinking and DSpark off.
+- State checks cover 60 exact comparisons, 120 complete vectors, two interleaved sessions, rewind, checkpoint restore and three cancellation/recovery paths. Six vision fixtures across all three transports and both coordinator assignments pass 72 full-vector and 48 complete-state checks, including same-session authenticated image replay.
+- TCP/USB/RoCE match all 129,280 logits at both 256- and 1,024-token native frontiers and both printed continuations. CPU/GPU transport tests include full payloads through 40 MiB, queue reuse, malformed/truncated data, stale generations, disconnects and real RoCE completion faults; Linux protocol tests pass ASan/UBSan.
+- A full 65,536-token prefix plus 512 fixed-length native greedy outputs completes over USB4STREAM with 69,632 allocated context, no OOM and at least 34.31 GiB usable RAM. Host swap-out is nonzero; this is not a zero-swap or maximum-context claim.
+- USB qualification uses the [temporary MSI-X readback fix](docs/USB4STREAM_KERNEL.md). No persistent kernel/module install or reboot. RoCE uses registered host staging, not GPUDirect; other providers and long-term production endurance are unqualified.
+- Current V4 and GLM regressions match the exact base in resident and SSD modes: full 4,096-token frontiers and 64-token continuations, 6,144 allocated context, 32/64 GiB expert caches respectively. No candidate swap-out or OOM. The first-allocation TP failure is independently injected and leaves no partial setup allocations.
+- Physical CUDA/Metal execution and other-model TP remain untested/unsupported respectively. Performance comparison and tuning are separate from this correctness baseline.
+
 ## 18. Release Sign-off
 
 Do not sign off until:

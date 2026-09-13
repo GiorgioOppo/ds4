@@ -68,6 +68,8 @@ The larger-context configuration above allocated 262,144 tokens and completed a 
 
 Use the matching V4.1 vision sidecar with `--vision FILE`. See [models and vision](MODELS.md#deepseek-v41-flash) for downloads and [qualification results](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151) for output quality, numerical drift and memory limitations. Resident text and vision inference were also tested on upcoming 192 GB hardware; performance results will be released soon.
 
+For two-machine resident V4.1 inference, see [ROCm clustering](CLUSTERING_ROCM.md): exact coordinator/worker commands for TCP, USB4STREAM and RoCE, including device setup and the tested USB driver fix.
+
 ## GLM 5.3 Flash
 
 The reference Q2 setup uses SSD streaming to leave room for its graph and KV
