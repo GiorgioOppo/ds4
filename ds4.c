@@ -40671,8 +40671,9 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
     if (!ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) ||
         !ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count)) return false;
-    /* Attention heads are dead until the projections finish. Reuse their
-     * workspace for Q-B's half RHS, retaining V4.1's BF16 output boundary. */
+    /* Attention heads are dead until the projections finish. Their full
+     * capacity can hold Q-B's half RHS and transient weights, while the
+     * following operation retains V4.1's BF16 output boundary. */
     const bool qb_ok = l->attn_q_b->type == DS4_TENSOR_Q4_K && g->tp_world == 1u ?
         ds4_gpu_dsv41_q4_qb_rows(b->q, b->heads, m->map, m->size,
             l->attn_q_b->abs_offset, b->qr, count) &&

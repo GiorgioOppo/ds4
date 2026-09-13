@@ -25085,6 +25085,7 @@ static int ds4_gpu_encode_q4_K_transient_f16(
         id<MTLBuffer>               q4_weights,
         NSUInteger                  q4_weights_offset,
         id<MTLBuffer>               f16_scratch,
+        NSUInteger                  f16_scratch_offset,
         uint64_t                    in_dim,
         uint64_t                    out_dim);
 
@@ -25671,7 +25672,7 @@ static int ds4_gpu_attn_q_b_transient_f16_head_rms_rope_tail_tensor(
 
     if (!ds4_gpu_encode_q4_K_transient_f16(
             cb, dequant_pipeline, weight_buffer,
-            (NSUInteger)weight_inner, scratch, in_dim, out_dim)) {
+            (NSUInteger)weight_inner, scratch, 0u, in_dim, out_dim)) {
         if (owned) {
             (void)ds4_gpu_finish_command_buffer(
                 cb, owned, "Q4 q_b transient dequant encode failure");
@@ -25810,6 +25811,7 @@ static int ds4_gpu_encode_q4_K_transient_f16(
         id<MTLBuffer>               q4_weights,
         NSUInteger                  q4_weights_offset,
         id<MTLBuffer>               f16_scratch,
+        NSUInteger                  f16_scratch_offset,
         uint64_t                    in_dim,
         uint64_t                    out_dim) {
     if (!cb || !pipeline || !q4_weights || !f16_scratch ||
@@ -25825,7 +25827,7 @@ static int ds4_gpu_encode_q4_K_transient_f16(
     if (!enc) return 0;
     [enc setComputePipelineState:pipeline];
     [enc setBuffer:q4_weights offset:q4_weights_offset atIndex:0];
-    [enc setBuffer:f16_scratch offset:0 atIndex:1];
+    [enc setBuffer:f16_scratch offset:f16_scratch_offset atIndex:1];
     [enc setBytes:&chunks_per_row
            length:sizeof(chunks_per_row)
           atIndex:2];
@@ -26026,7 +26028,7 @@ int ds4_gpu_test_q4_attn_q_b_mm_variant_tensor(
             encoded = ds4_gpu_encode_q4_K_transient_f16(
                 cb, dequant_pipeline, weight_buffer,
                 (NSUInteger)weight_inner, transient_scratch,
-                in_dim, out_dim) != 0;
+                0u, in_dim, out_dim) != 0;
             if (encoded) {
                 mm_weight_buffer = transient_scratch;
                 mm_weight_offset = 0u;
@@ -30926,19 +30928,46 @@ int ds4_gpu_dsv41_q4_qb_rows(
             (rb == ob && ro < oo + out_bytes && oo < ro + rhs_bytes)) return 0;
         if (!g_initialized && !ds4_gpu_init()) return 0;
 
-        /* Q-B repeats the same F32-to-half RHS conversion in 512 output bands.
-         * Reuse the graph's dead heads workspace for this conversion; no weight
-         * sidecar, allocation, or SSD admission allowance is introduced. */
-    /* On M1 Max the extra copy does not pay off at 128 rows; at 512 rows
-     * its reuse saves about 19% of Q-B time. Keep small batches native. */
-    const bool eligible = n_rows >= 512u && n_rows <= 2048u &&
+        /* Heads are dead until attention. A sufficiently large view holds the
+         * half RHS followed by the 80 MiB Q-B matrix, expanded once per call
+         * rather than once per N32 tile. Nothing persists between layers or
+         * reduces the SSD expert cache. At 128 rows expansion did not pay off
+         * on M1 Max; smaller views keep the existing RHS-only/native path. */
+        const uint64_t f16_weight_bytes = UINT64_C(1280) * 32768u * sizeof(uint16_t);
+        const uint64_t transient_bytes = rhs_bytes + f16_weight_bytes;
+        const bool eligible = n_rows >= 256u && n_rows <= 2048u &&
             !g_quality_mode && !g_batch_encoder_concurrent && g_tp_split_world <= 1 &&
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F32_F16_COPY") <= 0;
         const bool boundary = (n_rows % 32u) != 0u;
         const NSUInteger smem = boundary ? 8192u : 6144u;
-        id<MTLComputePipelineState> pipeline = eligible ? ds4_gpu_get_mul_mm_pipeline(
+        id<MTLComputePipelineState> dequant = eligible &&
+            ds4_gpu_tensor_bytes(rhs_scratch) >= transient_bytes ?
+            ds4_gpu_get_pipeline("kernel_dequantize_q4_K_f16") : nil;
+        id<MTLComputePipelineState> pipeline = dequant ? ds4_gpu_get_mul_mm_pipeline(
+            "kernel_mul_mm_f16_f16_rhs", false, boundary) : nil;
+        const bool transient = dequant && pipeline &&
+            dequant.threadExecutionWidth == 32u &&
+            dequant.maxTotalThreadsPerThreadgroup >= 64u &&
+            pipeline.threadExecutionWidth == 32u &&
+            pipeline.maxTotalThreadsPerThreadgroup >= 128u &&
+            pipeline.staticThreadgroupMemoryLength + smem <= g_device.maxThreadgroupMemoryLength;
+        if (!transient) pipeline = eligible && n_rows >= 512u ? ds4_gpu_get_mul_mm_pipeline(
             "kernel_mul_mm_q4_K_f16_rhs", false, boundary) : nil;
+        const uint64_t scratch_used = transient ? transient_bytes : rhs_bytes;
+        if (scratch_used > rb.length - ro ||
+            (rb == xb && ro < xo + x_bytes && xo < ro + scratch_used) ||
+            (rb == ob && ro < oo + out_bytes && oo < ro + scratch_used)) return 0;
+        /* No-copy model wrappers can alias tensor storage without sharing the
+         * same MTLBuffer object. Reject writes into that source range too. */
+        const uintptr_t model_addr = (uintptr_t)model_map;
+        if (weight_offset > UINTPTR_MAX - model_addr ||
+            weight_bytes > UINTPTR_MAX - (model_addr + weight_offset)) return 0;
+        const uintptr_t first = model_addr + weight_offset, last = first + weight_bytes;
+        const uintptr_t scratch_addr = (uintptr_t)rb.contents;
+        const uintptr_t out_addr = (uintptr_t)ob.contents;
+        if ((scratch_addr && scratch_addr + ro < last && first < scratch_addr + ro + scratch_used) ||
+            (out_addr && out_addr + oo < last && first < out_addr + oo + out_bytes)) return 0;
         if (!pipeline || pipeline.threadExecutionWidth != 32u ||
             pipeline.maxTotalThreadsPerThreadgroup < 128u ||
             pipeline.staticThreadgroupMemoryLength + smem > g_device.maxThreadgroupMemoryLength ||
@@ -30950,7 +30979,7 @@ int ds4_gpu_dsv41_q4_qb_rows(
         uint64_t inner = 0;
         id<MTLBuffer> wb = ds4_gpu_wrap_model_range(model_map, model_size,
             weight_offset, weight_bytes, &inner);
-        if (!wb || (wb == rb && inner < ro + rhs_bytes && ro < inner + weight_bytes) ||
+        if (!wb || (wb == rb && inner < ro + scratch_used && ro < inner + weight_bytes) ||
             (wb == ob && inner < oo + out_bytes && oo < inner + weight_bytes)) return 0;
         ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(1280u, 32768u, n_rows, row_bytes);
         args.nb10 = sizeof(uint16_t);
@@ -30962,7 +30991,16 @@ int ds4_gpu_dsv41_q4_qb_rows(
         bool ok = ds4_gpu_encode_cpy_f32_f16_1d(cb, xb, (NSUInteger)xo,
             rb, (NSUInteger)ro, n_rows * 1280u) != 0;
         if (!owned) ds4_gpu_close_batch_encoder();
-        if (ok) {
+        if (ok && transient) {
+            ok = ds4_gpu_encode_q4_K_transient_f16(cb, dequant, wb,
+                (NSUInteger)inner, rb, (NSUInteger)(ro + rhs_bytes), 1280u, 32768u) != 0;
+            if (!owned) ds4_gpu_close_batch_encoder();
+            if (ok) ok = ds4_gpu_encode_f16_rhs_mm(cb, pipeline, rb,
+                (NSUInteger)(ro + rhs_bytes), rhs_scratch, out,
+                1280u, 32768u, n_rows, 1280u * sizeof(uint16_t), boundary) != 0;
+            /* The next attention call writes heads over these weights. */
+            if (!owned) ds4_gpu_close_batch_encoder();
+        } else if (ok) {
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
             ok = enc != nil;
             if (ok) {
@@ -30977,7 +31015,7 @@ int ds4_gpu_dsv41_q4_qb_rows(
                 ds4_gpu_end_compute_encoder(cb, enc);
             }
         }
-        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 Q-B reused F16 RHS") && ok;
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 Q-B F16 workspace") && ok;
     }
 }
 

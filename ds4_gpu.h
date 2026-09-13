@@ -110,10 +110,11 @@ int ds4_gpu_dsv41_shared_swiglu(
         uint64_t gate_offset, uint64_t up_offset,
         uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, float clamp);
-/* Q4_K Q-B (K1280, M32768), with raw F32 output. The caller supplies dead
- * workspace of at least rows*1280*2 bytes for optional FP16 RHS reuse and owns
- * the following BF16/RoPE boundary. Used tensor ranges must be disjoint and
- * their offsets 16-byte aligned; ineligible batches use the native Q4 path. */
+/* Q4_K Q-B (K1280, M32768), with raw F32 output. Dead workspace must hold
+ * rows*1280*2 bytes; an additional 80 MiB permits transient FP16 weights for
+ * larger prefill batches. The caller owns the following BF16/RoPE boundary.
+ * Used ranges must be disjoint with 16-byte aligned offsets. Smaller views
+ * retain RHS-only reuse or native Q4; no persistent weight cache is allocated. */
 int ds4_gpu_dsv41_q4_qb_rows(
         ds4_gpu_tensor *out, ds4_gpu_tensor *rhs_scratch,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
