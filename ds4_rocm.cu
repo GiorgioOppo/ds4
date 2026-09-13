@@ -81,6 +81,7 @@ struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
+    void *host_ptr = nullptr; /* coherent host allocation or view; otherwise NULL */
 };
 
 typedef struct {
@@ -179,17 +180,7 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "ds4_deepseek4_vision_gpu.cuh"
 #include "rocm/ds4_rocm_deepseek4_vision.cuh"
 
-/* Tensor-parallel gates are Metal-only; stubs keep shared graph code
- * linkable (TP option validation rejects non-Metal backends). */
-extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    (void)layer; (void)gate;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
-}
-
-extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
-    (void)fn;
-}
+#include "rocm/ds4_rocm_tp.cuh"
 
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     (void)suspend;
@@ -205,24 +196,6 @@ extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
 
 extern "C" void ds4_gpu_model_residency_skip(int skip) {
     (void)skip;
-}
-
-extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
-    (void)fn;
-}
-
-extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
-                                          const ds4_gpu_tensor *out_t,
-                                          ds4_gpu_tensor *in_t,
-                                          uint64_t bytes) {
-    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    (void)layer; (void)rows;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(

@@ -51,6 +51,25 @@ int main(void) {
     assert(!ds41_memory_admit(&e, gib, false));
     recommended = 188 * gib;
     assert(!ds41_memory_admit(&e, UINT64_MAX, false));
+    /* A 128 GB rank loads only its owned expert half and replicated dense
+     * tensors. Both total admission and remaining-allocation checks must
+     * charge that same footprint, while keeping the existing reserves. */
+    e.ds41_host_memory_baseline = available = 120 * gib;
+    recommended = 124 * gib;
+    e.startup_model_span_bytes = 0;
+    g_tp_shard_model_bytes = 81 * gib;
+    assert(ds41_memory_admit(&e, 3 * gib, false));
+    available = 93 * gib;
+    assert(!ds41_memory_admit(&e, 3 * gib, false));
+    available = 120 * gib;
+    g_tp_shard_model_bytes = 0;
+    assert(!ds41_memory_admit(&e, 3 * gib, false));
+    g_tp_shard_model_bytes = e.startup_model_span_bytes = 81 * gib;
+    available = 15 * gib;
+    assert(ds41_memory_admit(&e, 3 * gib, false));
+    available = 13 * gib;
+    assert(!ds41_memory_admit(&e, 3 * gib, false));
+    g_tp_shard_model_bytes = 0;
     e.ssd_streaming = true;
     assert(ds41_rocm_host_reserve_bytes(128 * gib) == 8 * gib);
     assert(ds41_rocm_stream_reserve_bytes(128 * gib) == 10 * gib);

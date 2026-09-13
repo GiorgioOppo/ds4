@@ -6441,6 +6441,7 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
@@ -6540,6 +6541,22 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     return t;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_coherent(uint64_t bytes) {
+    if (!bytes || bytes > SIZE_MAX || !ds4_rocm_allocation_fits((size_t)bytes, true)) return NULL;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    if (!cuda_ok(hipHostMalloc(&t->host_ptr, (size_t)bytes,
+                              hipHostMallocMapped | hipHostMallocCoherent), "TP coherent allocation")) {
+        free(t); return NULL;
+    }
+    if (!cuda_ok(hipHostGetDevicePointer(&t->ptr, t->host_ptr, 0), "TP coherent device alias")) {
+        (void)hipHostFree(t->host_ptr); free(t); return NULL;
+    }
+    t->owner = 2;
+    t->bytes = bytes;
+    return t;
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
@@ -6596,12 +6613,14 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    t->host_ptr = base->host_ptr ? (char *)base->host_ptr + offset : NULL;
     return t;
 }
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner == 2 && tensor->host_ptr) (void)hipHostFree(tensor->host_ptr);
+    else if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
     free(tensor);
 }
 
@@ -6612,7 +6631,7 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
 extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
-    return tensor->ptr;
+    return tensor->host_ptr ? tensor->host_ptr : tensor->ptr;
 }
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {

@@ -670,7 +670,7 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
 
 /* V4.1 grouped output-A: retain physical token strides while using the
  * existing F16-operand/F32-accumulator WMMA body on bulk prefill rows. */
-template <uint32_t M_TILE, uint32_t WARPS>
+template <uint32_t M_TILE, uint32_t WARPS, uint32_t GROUPS = 8u>
 __launch_bounds__(WARPS * 32u, 1)
 __global__ static void v41_grouped_q8_f32_wmma_rowtile_kernel(
         float *out,
@@ -717,7 +717,7 @@ __global__ static void v41_grouped_q8_f32_wmma_rowtile_kernel(
             const uint32_t tok = block_n + nt;
             half2 xv = __floats2half2_rn(0.0f, 0.0f);
             if (tok < n_tokens) {
-                const float2 f = *(const float2 *)(x + (uint64_t)tok * 32768u + bi * 32u + kk);
+                const float2 f = *(const float2 *)(x + (uint64_t)tok * (GROUPS * 4096u) + bi * 32u + kk);
                 xv = __floats2half2_rn(f.x, f.y);
             }
             *(half2 *)(lds_x + j) = xv;
@@ -773,7 +773,7 @@ __global__ static void v41_grouped_q8_f32_wmma_rowtile_kernel(
 #pragma unroll
         for (uint32_t j = 0; j < 8u; j++) {
             const uint32_t row = warp_m + 2u * j + (lane >> 4u);
-            if (row < out_dim) out[(uint64_t)tok * 8192u + row] = acc[j];
+            if (row < out_dim) out[(uint64_t)tok * (GROUPS * 1024u) + row] = acc[j];
         }
     }
 }
@@ -832,9 +832,256 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
 extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank) {
-    (void)out; (void)low; (void)model_map; (void)model_size; (void)out_a_offset; (void)out_b_offset;
-    (void)heads; (void)n_tokens; (void)tp_rank;
-    return 0;
+    /* Heads and low rows are packed for this rank. Output-B keeps its
+     * original 8192-column physical row stride while consuming 4096 columns. */
+    const uint64_t a_bytes = UINT64_C(4096) * 128u * 34u;
+    const uint64_t b_bytes = UINT64_C(5120) * 256u * 34u;
+    if (tp_rank > 1u || !model_map || !n_tokens ||
+        !cuda_model_range_fits(model_size, out_a_offset, 2u * a_bytes) ||
+        !cuda_model_range_fits(model_size, out_b_offset, b_bytes) ||
+        !cuda_tensor_has_elems2(heads, n_tokens, 16384u, 4u) ||
+        !cuda_tensor_has_elems2(low, n_tokens, 4096u, 4u) ||
+        !cuda_tensor_has_elems2(out, n_tokens, 5120u, 4u)) return 0;
+    const unsigned char *a = (const unsigned char *)cuda_model_range_ptr(model_map,
+        out_a_offset + tp_rank * a_bytes, a_bytes, "V4.1 TP attn_out_a");
+    const unsigned char *b = (const unsigned char *)cuda_model_range_ptr(model_map,
+        out_b_offset, b_bytes, "V4.1 TP attn_out_b");
+    if (!a || !b) return 0;
+    b += (uint64_t)tp_rank * 128u * 34u;
+    if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
+        v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 4u><<<dim3(8u, (n_tokens + 63u) / 64u, 4u), 256u>>>(
+            (float *)low->ptr, a, (const float *)heads->ptr,
+            n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
+    } else if (n_tokens >= 32u && ds4_rocm_is_gfx1151()) {
+        cuda_launch_grouped_q8_a_sharedx((float *)low->ptr, a, (const float *)heads->ptr,
+            n_tokens, 4u, 128u, 1024u, 128u * 34u, 8u, 8u, 8u);
+    } else {
+        grouped_q8_0_a_f32_batch_warp8_kernel<<<dim3(512u, n_tokens), 256>>>(
+            (float *)low->ptr, a, (const float *)heads->ptr,
+            4096u, 1024u, 4u, n_tokens, 128u);
+    }
+    if (!cuda_ok(cudaGetLastError(), "V4.1 TP attention low projection") ||
+        !ds4_gpu_dsv41_quantize(low, 4096u, n_tokens, DS4_V41_BF16)) return 0;
+    if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
+        matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<160u, 1024u, 4096u * sizeof(float)>>>(
+            (float *)out->ptr, b, (const float *)low->ptr,
+            128u, 5120u, UINT64_C(256) * 34u);
+    } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
+        matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(40u, (n_tokens + 63u) / 64u), 256u>>>(
+            (float *)out->ptr, b, (const float *)low->ptr,
+            n_tokens, 4096u, 5120u, UINT64_C(256) * 34u);
+    } else if (n_tokens >= 32u && ds4_rocm_is_gfx1151()) {
+        cuda_launch_q8_batch_sharedx((float *)out->ptr, b, (const float *)low->ptr,
+            128u, 5120u, n_tokens, 256u * 34u, 8u, n_tokens <= 2048u ? 16u : 8u, 8u);
+    } else {
+        /* This scalar kernel accepts separate input length and weight stride;
+         * its column guard excludes the unowned half of each physical row. */
+        matmul_q8_0_f32_batch_warp8_kernel<<<dim3(640u, n_tokens), 256>>>(
+            (float *)out->ptr, b, (const float *)low->ptr,
+            4096u, 5120u, n_tokens, 256u);
+    }
+    return cuda_ok(cudaGetLastError(), "V4.1 TP attention output projection");
+}
+
+/* Staged correctness reference. Validate global IDs before any pointer-table
+ * lookup; a null table entry suppresses every unowned gate/up/down load.
+ * The ordinary routed-MoE dispatch is untouched. */
+extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *scratch,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank) {
+    constexpr uint32_t experts = 384u, owned = 192u, used = 6u;
+    constexpr uint64_t gate_row = 1320u, down_row = 756u;
+    constexpr uint64_t gate_expert = gate_row * 2304u, down_expert = down_row * 5120u;
+    routed_moe_launch_plan plan;
+    if (!g_deepseek41_model || tp_rank > 1u || !n_tokens || n_tokens > 2048u ||
+        !routed_moe_build_plan(out, gate, up, mid, scratch, model_map, model_size,
+            gate_offset, up_offset, down_offset, 16u, 10u, gate_expert, down_expert,
+            5120u, 2304u, 5120u, selected, weights, experts, used, x, n_tokens, &plan)) return 0;
+    const uint64_t pairs = (uint64_t)n_tokens * used;
+    std::vector<int32_t> ids((size_t)pairs);
+    if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+    for (int32_t id : ids) if (id < 0 || (uint32_t)id >= experts) {
+        fprintf(stderr, "ds4: V4.1 TP invalid global expert ID %d\n", id);
+        return 0;
+    }
+    if (n_tokens >= 128u && !g_quality_mode && ds4_rocm_is_gfx1151()) {
+        if (!ds4_gpu_dsv41_moe_tp_gate_up(gate, up, model_map, model_size,
+                gate_offset, up_offset, selected, x, n_tokens, tp_rank)) return 0;
+        const uint64_t count = pairs * 2304u;
+        moe_swiglu_weighted_f32_kernel<<<(uint32_t)((count + 255u) / 256u), 256>>>(
+            (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
+            (const float *)weights->ptr, count, 2304u, 10.f);
+        if (!cuda_ok(cudaGetLastError(), "V4.1 TP MMQ weighted activation") ||
+            !ds4_gpu_synchronize()) return 0;
+        return ds4_gpu_dsv41_moe_tp_down(out, scratch, mid, selected,
+            model_map, model_size, down_offset, n_tokens, tp_rank);
+    }
+    const uint32_t first = tp_rank * owned;
+    const char *g = cuda_model_range_ptr(model_map, gate_offset + first * gate_expert,
+                                        owned * gate_expert, "V4.1 TP owned gate");
+    const char *u = cuda_model_range_ptr(model_map, up_offset + first * gate_expert,
+                                        owned * gate_expert, "V4.1 TP owned up");
+    const char *d = cuda_model_range_ptr(model_map, down_offset + first * down_expert,
+                                        owned * down_expert, "V4.1 TP owned down");
+    if (!g || !u || !d) return 0;
+    const char *tables[3][experts] = {};
+    for (uint32_t i = 0; i < owned; ++i) {
+        tables[0][first+i] = g + i * gate_expert;
+        tables[1][first+i] = u + i * gate_expert;
+        tables[2][first+i] = d + i * down_expert;
+    }
+    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc(sizeof(tables));
+    if (!table) return 0;
+    const uint64_t mids = pairs * 2304u;
+    int ok = ds4_gpu_tensor_write(table, 0, tables, sizeof(tables)) &&
+        ds4_gpu_tensor_fill_f32(gate, 0.f, mids) &&
+        ds4_gpu_tensor_fill_f32(up, 0.f, mids) &&
+        ds4_gpu_tensor_fill_f32(mid, 0.f, mids);
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)scratch->ptr;
+    if (ok) {
+        q8_K_quantize_kernel<<<dim3(20u, n_tokens), 256u>>>(
+            xq, (const float *)x->ptr, 5120u, n_tokens);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 TP input quantization");
+    }
+    const char *const *slots = (const char *const *)table->ptr;
+    if (ok) {
+        moe_gate_up_mid_qwarp32_ptrs_kernel<<<dim3(18u, (uint32_t)pairs), 256u>>>(
+            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+            slots, slots + experts, xq, (const int32_t *)selected->ptr,
+            (const float *)weights->ptr, gate_row, 20u, 2304u, used, 0x3fu, 10.f);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned gate/up");
+    }
+    if (ok) {
+        moe_down_q2K_sum_rows_w32_ptrs_batch_kernel<<<dim3(640u, n_tokens), 256u>>>(
+            (float *)out->ptr, slots + 2u * experts, (const float *)mid->ptr,
+            (const int32_t *)selected->ptr, n_tokens, 2304u, 5120u, down_row, used);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned down");
+    }
+    /* The reference deliberately drains before releasing its pointer table.
+     * Persistent tables and a queued service follow ownership qualification. */
+    if (!ds4_gpu_synchronize()) ok = 0;
+    ds4_gpu_tensor_free(table);
+    return ok;
+}
+
+/* Staged ownership adapter for the unchanged qualified Q2 down dispatcher.
+ * Pair order is stable within each local expert, as in its GPU sort. */
+extern "C" int ds4_gpu_dsv41_moe_tp_down(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t n_tokens, uint32_t tp_rank) {
+    constexpr uint64_t expert_bytes = UINT64_C(5120) * 756u;
+    const uint64_t pairs = (uint64_t)n_tokens * 6u, mids = pairs * 2304u;
+    if (!g_deepseek41_model || !ds4_rocm_is_gfx1151() || tp_rank > 1u ||
+        n_tokens < 2u || n_tokens > 2048u || !out || !scratch || !mid || !selected ||
+        !model_map || out->bytes < (uint64_t)n_tokens * 5120u * sizeof(float) ||
+        scratch->bytes < pairs * 5120u * sizeof(float) ||
+        mid->bytes < mids * sizeof(float) || selected->bytes < pairs * sizeof(int32_t) ||
+        down_offset > model_size || 384u * expert_bytes > model_size - down_offset) return 0;
+    std::vector<int32_t> ids((size_t)pairs);
+    if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+    for (uint32_t row = 0; row < n_tokens; ++row) {
+        for (uint32_t j = 0; j < 6u; ++j) {
+            const int32_t id = ids[(size_t)row * 6u + j];
+            if (id < 0 || id >= 384) return 0;
+            for (uint32_t k = 0; k < j; ++k)
+                if (id == ids[(size_t)row * 6u + k]) return 0;
+        }
+    }
+    const uint32_t first = tp_rank * 192u;
+    const char *d = cuda_model_range_ptr(model_map, down_offset + first * expert_bytes,
+                                         192u * expert_bytes, "V4.1 TP owned bulk down");
+    if (!d) return 0;
+    /* Counts, offsets, spare hot-list storage, then original six-slot pair IDs. */
+    constexpr uint32_t offsets_at = 192u, hot_at = 385u, pairs_at = 578u;
+    std::vector<uint32_t> metadata(pairs_at + (size_t)pairs, 0u);
+    uint32_t pos = 0;
+    for (uint32_t e = 0; e < 192u; ++e) {
+        metadata[offsets_at + e] = pos;
+        for (uint32_t p = 0; p < pairs; ++p)
+            if ((uint32_t)ids[p] == first + e) {
+                metadata[pairs_at + pos++] = p;
+                ++metadata[e];
+            }
+    }
+    metadata[offsets_at + 192u] = pos;
+    ds4_gpu_tensor *meta = ds4_gpu_tensor_alloc(metadata.size() * sizeof(uint32_t));
+    ds4_gpu_tensor *mid_h = ds4_gpu_tensor_alloc(mids * sizeof(half));
+    int ok = meta && mid_h;
+    if (ok) ok = ds4_gpu_tensor_write(meta, 0, metadata.data(), metadata.size() * sizeof(uint32_t)) &&
+        cuda_ok(cudaMemset(scratch->ptr, 0, pairs * 5120u * sizeof(half)),
+                "V4.1 TP clear unowned down slots");
+    if (ok) {
+        f32_to_f16_kernel<<<(uint32_t)((mids + 255u) / 256u), 256>>>(
+            (half *)mid_h->ptr, (const float *)mid->ptr, mids);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 TP down F16 mid");
+    }
+    if (ok) {
+        uint32_t *m = (uint32_t *)meta->ptr;
+        ok = routed_moe_q2_float_down_launch(out, scratch, mid,
+            (const half *)mid_h->ptr, !g_quality_mode, d, m, m + offsets_at,
+            m + pairs_at, m + hot_at, n_tokens, 192u, 6u, 2304u, 5120u,
+            expert_bytes, 756u);
+    }
+    if (!ds4_gpu_synchronize()) ok = 0;
+    ds4_gpu_tensor_free(mid_h);
+    ds4_gpu_tensor_free(meta);
+    return ok;
+}
+
+/* Isolated bulk operator: remap owned IDs to a contiguous192-expert table.
+ * INT_MAX is a nonmatching sentinel in mm_ids_helper, so no unowned expert
+ * contributes an assignment. Cleared output rows remain zero for those slots. */
+extern "C" int ds4_gpu_dsv41_moe_tp_gate_up(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
+        uint32_t n_tokens, uint32_t tp_rank) {
+    constexpr uint64_t expert_bytes = UINT64_C(2304) * 1320u;
+    const uint64_t pairs = (uint64_t)n_tokens * 6u;
+    const uint64_t output_bytes = pairs * 2304u * sizeof(float);
+    if (!g_deepseek41_model || !ds4_rocm_is_gfx1151() || tp_rank > 1u ||
+        n_tokens < 128u || n_tokens > 2048u || !gate || !up || !selected || !x ||
+        !model_map || gate->bytes < output_bytes || up->bytes < output_bytes ||
+        selected->bytes < pairs * sizeof(int32_t) ||
+        x->bytes < (uint64_t)n_tokens * 5120u * sizeof(float) ||
+        gate_offset > model_size || 384u * expert_bytes > model_size - gate_offset ||
+        up_offset > model_size || 384u * expert_bytes > model_size - up_offset) return 0;
+    std::vector<int32_t> ids((size_t)pairs);
+    if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+    for (uint32_t row = 0; row < n_tokens; ++row) {
+        for (uint32_t j = 0; j < 6u; ++j) {
+            const int32_t id = ids[(size_t)row * 6u + j];
+            if (id < 0 || id >= 384) return 0;
+            for (uint32_t k = 0; k < j; ++k)
+                if (id == ids[(size_t)row * 6u + k]) return 0;
+        }
+    }
+    const uint32_t first = tp_rank * 192u;
+    for (int32_t &id : ids)
+        id = (uint32_t)id >= first && (uint32_t)id < first + 192u ? id - first : INT_MAX;
+    const char *g = cuda_model_range_ptr(model_map, gate_offset + first * expert_bytes,
+                                         192u * expert_bytes, "V4.1 TP MMQ owned gate");
+    const char *u = cuda_model_range_ptr(model_map, up_offset + first * expert_bytes,
+                                         192u * expert_bytes, "V4.1 TP MMQ owned up");
+    if (!g || !u) return 0;
+    ds4_gpu_tensor *local_ids = ds4_gpu_tensor_alloc(pairs * sizeof(int32_t));
+    if (!local_ids) return 0;
+    int ok = ds4_gpu_tensor_write(local_ids, 0, ids.data(), pairs * sizeof(int32_t)) &&
+        ds4_gpu_tensor_fill_f32(gate, 0.f, pairs * 2304u) &&
+        ds4_gpu_tensor_fill_f32(up, 0.f, pairs * 2304u) && ds4_mmq_init(0) == 0;
+    if (ok) ok = ds4_mmq_iq2_xxs_moe_pair(g, u, (const float *)x->ptr,
+        (const int32_t *)local_ids->ptr, (float *)gate->ptr, (float *)up->ptr,
+        2304, 5120, (int)n_tokens, 192, 6, (cudaStream_t)0) == 0;
+    if (!ds4_gpu_synchronize()) ok = 0;
+    ds4_gpu_tensor_free(local_ids);
+    return ok;
 }
 
 #endif
