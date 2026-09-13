@@ -229,10 +229,10 @@ static int cmp_double(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-static int benchmark(void) {
+static int benchmark(uint32_t rows) {
     enum { SAMPLES = 7, ITER = 20 };
     fixture f = {0};
-    CHECK(initialize(&f, 437, 0));
+    CHECK(initialize(&f, rows, 0));
     for (unsigned op = 0; op < OPS; op++) {
         CHECK(parity(&f, op));
         double samples[2][SAMPLES];
@@ -257,14 +257,15 @@ static int benchmark(void) {
         }
         for (unsigned mode = 0; mode < 2; mode++) qsort(samples[mode], SAMPLES, sizeof(double), cmp_double);
         CHECK(compare(&f, op));
-        fprintf(stderr, "V4.1 epilogue %s rows437 median us: old=%.3f fused=%.3f "
-            "(alternating ABBA, %u samples)\n", op_names[op], samples[0][SAMPLES/2], samples[1][SAMPLES/2], SAMPLES);
+        fprintf(stderr, "V4.1 epilogue %s rows%u median us: old=%.3f fused=%.3f "
+            "(alternating ABBA, %u samples)\n", op_names[op], rows,
+            samples[0][SAMPLES/2], samples[1][SAMPLES/2], SAMPLES);
     }
     destroy(&f);
     return 1;
 }
 
-static int check_all(int bench) {
+static int check_all(uint32_t bench_rows) {
     const uint32_t rows[] = {1,2,7,8,31,32,33,128,437,1024};
     for (unsigned i = 0; i < sizeof(rows)/sizeof(*rows); i++) {
         for (unsigned pattern = 0; pattern < 3; pattern++) {
@@ -285,17 +286,19 @@ static int check_all(int bench) {
     CHECK(q8_boundaries());
     fprintf(stderr, "V4.1 epilogues: bitwise BF16/SwiGLU/HC parity, ties/cancellation, "
         "row tails, slab views, block=routed, Q8 rows2..8, guards and immutable inputs PASS\n");
-    if (bench) CHECK(benchmark());
+    if (bench_rows) CHECK(benchmark(bench_rows));
     ds4_gpu_cleanup();
     CHECK(munmap(model, model_bytes) == 0);
     return 1;
 }
 
 int main(int argc, char **argv) {
-    if (argc > 2 || (argc == 2 && strcmp(argv[1], "--bench"))) {
-        fprintf(stderr, "usage: %s [--bench]\n", argv[0]);
+    if (argc > 2 || (argc == 2 && strcmp(argv[1], "--bench") &&
+                     strcmp(argv[1], "--bench-scalar"))) {
+        fprintf(stderr, "usage: %s [--bench | --bench-scalar]\n", argv[0]);
         return 1;
     }
     ds4_gpu_set_quality(false);
-    return ds4_gpu_init() && check_all(argc == 2) ? 0 : 1;
+    const uint32_t bench_rows = argc == 1 ? 0 : !strcmp(argv[1], "--bench-scalar") ? 1 : 437;
+    return ds4_gpu_init() && check_all(bench_rows) ? 0 : 1;
 }

@@ -7,6 +7,160 @@
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); goto done; \
 } } while (0)
 
+/* Exercise the scalar graph's actual HC call sites with bounded F16 mixer
+ * weights. The MoE producer is supplied explicitly; its shared contribution
+ * must survive exactly once whether or not block aliases routed. */
+static int check_scalar_epilogues(void) {
+    enum { E = 5120, PAD = 16 };
+    enum { R, A, B, T, S, P, AS, FS, X, N, FN, M, NT };
+    const uint32_t width[] = {4*E,4*E,E,E,E,4,24,24,E,E,4*E,24};
+    const ds4_shape saved_shape = g_ds4_shape;
+    const ds4_gpu_execution_phase saved_phase = ds4_gpu_get_execution_phase();
+    const char *old_env = getenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION");
+    char *saved_env = old_env ? strdup(old_env) : NULL;
+    ds41_gpu_graph *g = calloc(2, sizeof(*g));
+    ds4_imatrix_collector imatrix = {0};
+    ds4_gpu_tensor *slab[2] = {0}, *v[2][NT] = {{0}};
+    uint64_t offset[NT], total = 0;
+    const uint64_t fn_offset = 32768u;
+    const uint64_t model_bytes = fn_offset + (uint64_t)24 * 4 * E * 2;
+    void *map = MAP_FAILED;
+    float routed[E], expected_shared[E];
+    int rc = 1;
+    REQUIRE(g && (!old_env || saved_env));
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    map = mmap(NULL, model_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    REQUIRE(map != MAP_FAILED);
+    float *params = map;
+    for (unsigned i = 0; i < 3; i++) params[i] = 0.125f * (i + 1);
+    for (unsigned i = 0; i < 24; i++) params[4+i] = ((int)(i % 7) - 3) * 0.125f;
+    for (unsigned i = 0; i < E; i++) params[32+i] = 1 + (i % 5) * 0.0625f;
+    uint16_t *weights = (uint16_t *)((uint8_t *)map + fn_offset);
+    for (uint64_t i = 0; i < (uint64_t)24 * 4 * E; i++)
+        weights[i] = f32_to_f16(((int)(i % 17u) - 8) * 0x1p-12f);
+    ds4_tensor fn = {.type = DS4_TENSOR_F16, .dim = {4*E,24}, .abs_offset = fn_offset};
+    ds4_tensor scale = {.type = DS4_TENSOR_F32, .dim = {3}, .abs_offset = 0};
+    ds4_tensor base = {.type = DS4_TENSOR_F32, .dim = {24}, .abs_offset = 16};
+    ds4_tensor norm = {.type = DS4_TENSOR_F32, .dim = {E}, .abs_offset = 128};
+    ds4_layer_weights layer = {.hc_attn_fn = &fn, .hc_ffn_fn = &fn,
+        .hc_attn_scale = &scale, .hc_ffn_scale = &scale,
+        .hc_attn_base = &base, .hc_ffn_base = &base, .attn_norm = &norm, .ffn_norm = &norm};
+    const ds4_model model = {.map = map, .size = model_bytes};
+    REQUIRE(ds4_gpu_init() && ds4_gpu_set_model_map(map, model_bytes));
+    for (unsigned i = 0; i < NT; i++) {
+        offset[i] = total + PAD * sizeof(float);
+        total += (uint64_t)(width[i] + 2 * PAD) * sizeof(float);
+    }
+    for (unsigned arm = 0; arm < 2; arm++) {
+        REQUIRE((slab[arm] = ds4_gpu_tensor_alloc(total)) != NULL);
+        for (unsigned i = 0; i < NT; i++)
+            REQUIRE((v[arm][i] = ds4_gpu_tensor_view(slab[arm], offset[i], width[i] * sizeof(float))) != NULL);
+        g[arm].residual = v[arm][R]; g[arm].after_attn = v[arm][A];
+        g[arm].block = v[arm][B]; g[arm].shared = v[arm][S]; g[arm].pre = v[arm][P];
+        g[arm].attn_split = v[arm][AS]; g[arm].ffn_split = v[arm][FS];
+        g[arm].x = v[arm][X]; g[arm].norm = v[arm][N];
+        g[arm].flat_norm = v[arm][FN]; g[arm].mix = v[arm][M];
+    }
+    const ds4_gpu_execution_phase phases[] = {DS4_GPU_PHASE_DECODE,
+        DS4_GPU_PHASE_PREFILL, DS4_GPU_PHASE_VERIFY, DS4_GPU_PHASE_BATCH_DECODE,
+        DS4_GPU_PHASE_MIXED, DS4_GPU_PHASE_AUTO};
+    for (unsigned pattern = 0; pattern < 3; pattern++)
+    for (unsigned alias = 0; alias < 2; alias++)
+    for (unsigned mode = 0; mode < 9; mode++) {
+        ds4_gpu_exchange_execution_phase(mode < 6 ? phases[mode] : DS4_GPU_PHASE_DECODE);
+        ds4_gpu_set_quality(mode == 6);
+        for (unsigned arm = 0; arm < 2; arm++) {
+            g[arm].tp_world = mode == 8 ? 2 : 1;
+            g[arm].quality = mode == 6;
+            g[arm].imatrix = mode == 7 ? &imatrix : NULL;
+            g[arm].routed = v[arm][alias ? B : T];
+            uint32_t *data = ds4_gpu_tensor_contents(slab[arm]);
+            REQUIRE(data);
+            for (uint64_t i = 0; i < total / 4; i++) data[i] = 0x7fc12345u;
+            for (unsigned i = 0; i < NT; i++) {
+                float *p = ds4_gpu_tensor_contents(v[arm][i]);
+                for (unsigned j = 0; j < width[i]; j++) {
+                    const float value = ((int)((j * 37u + i * 19u + pattern * 11u) % 257u) - 128) / 64.0f;
+                    p[j] = value;
+                    if (pattern == 1 && i == R)
+                        p[j] = j / E == 0 ? 8192.0f : j / E == 1 ? -8192.0f : value;
+                }
+            }
+        }
+        for (unsigned j = 0; j < E; j++) {
+            /* Straddle ties at the routed+shared BF16 boundary. */
+            routed[j] = (j & 1u ? 1.00390625f : -1.01171875f) +
+                (pattern == 2 ? (j % 3u - 1.0f) * 0x1p-16f : 0);
+            expected_shared[j] = j & 1u ? 0x1p-16f : -0x1p-16f;
+        }
+        for (unsigned stage = 0; stage < 4; stage++) {
+            for (unsigned arm = 0; arm < 2; arm++) {
+                if (arm) REQUIRE(unsetenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION") == 0);
+                else REQUIRE(setenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION", "1", 1) == 0);
+                REQUIRE(ds41_fused_scalar_epilogues(&g[arm]) == (arm == 1 && mode == 0));
+                if (stage == 2) {
+                    REQUIRE(ds4_gpu_tensor_write(g[arm].routed, 0, routed, sizeof(routed)));
+                    REQUIRE(ds4_gpu_tensor_write(g[arm].shared, 0, expected_shared, sizeof(expected_shared)));
+                }
+                REQUIRE(ds4_gpu_begin_commands());
+                if (stage == 0) REQUIRE(ds41_graph_before_attention(&g[arm], &model, &layer, 0));
+                if (stage == 1) REQUIRE(ds41_graph_after_attention(&g[arm], &model, &layer));
+                if (stage == 2) {
+                    if (ds41_fused_scalar_epilogues(&g[arm])) {
+                        REQUIRE(ds41_graph_moe_epilogue(&g[arm], true));
+                    } else {
+                        REQUIRE(ds4_gpu_add_tensor(g[arm].block, g[arm].routed, g[arm].shared, E));
+                        REQUIRE(ds41_bf16(g[arm].block, E));
+                        REQUIRE(ds41_graph_after_moe(&g[arm]));
+                    }
+                }
+                /* Consume the copied FFN pre-mixer, as the following layer
+                 * and the vocabulary head do after the routed epilogue. */
+                if (stage == 3) REQUIRE(ds41_graph_before_attention(&g[arm], &model, &layer, 2));
+                REQUIRE(ds4_gpu_end_commands());
+                if (stage == 2) {
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(g[arm].shared), expected_shared, sizeof(expected_shared)));
+                    REQUIRE(!memcmp(ds4_gpu_tensor_contents(g[arm].pre), ds4_gpu_tensor_contents(g[arm].ffn_split), 16));
+                    if (arm == 1 && mode == 0)
+                        REQUIRE(!memcmp(ds4_gpu_tensor_contents(g[arm].routed), routed, sizeof(routed)));
+                }
+                const uint32_t *data = ds4_gpu_tensor_contents(slab[arm]);
+                for (unsigned i = 0; i < NT; i++) for (unsigned j = 0; j < PAD; j++) {
+                    REQUIRE(data[offset[i]/4 - PAD + j] == 0x7fc12345u);
+                    REQUIRE(data[offset[i]/4 + width[i] + j] == 0x7fc12345u);
+                }
+            }
+            const unsigned outputs[] = {R,A,P,AS,FS,X,N};
+            for (unsigned i = 0; i < sizeof(outputs)/sizeof(*outputs); i++) {
+                const unsigned t = outputs[i];
+                if (memcmp(ds4_gpu_tensor_contents(v[0][t]), ds4_gpu_tensor_contents(v[1][t]), width[t] * 4u)) {
+                    fprintf(stderr, "scalar epilogue pattern=%u alias=%u mode=%u stage=%u tensor=%u mismatch\n",
+                        pattern, alias, mode, stage, t);
+                    goto done;
+                }
+            }
+        }
+    }
+    puts("V4.1 scalar graph HC/MoE epilogues: bitwise calls, recurrence, ties, aliases and decode/TP/quality/imatrix guards PASS");
+    rc = 0;
+done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_gpu_set_quality(false);
+    for (unsigned arm = 0; arm < 2; arm++) {
+        for (unsigned i = 0; i < NT; i++) ds4_gpu_tensor_free(v[arm][i]);
+        ds4_gpu_tensor_free(slab[arm]);
+    }
+    ds4_gpu_cleanup();
+    if (map != MAP_FAILED) munmap(map, model_bytes);
+    free(g);
+    if (saved_env) setenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION", saved_env, 1);
+    else unsetenv("DS4_METAL_DISABLE_V41_EPILOGUE_FUSION");
+    free(saved_env);
+    ds4_gpu_exchange_execution_phase(saved_phase);
+    g_ds4_shape = saved_shape;
+    return rc;
+}
+
 static bool prefill_stream_moe(const ds4_model *model,
                                const ds4_layer_weights *layer,
                                ds4_gpu_tensor *t[8], float *output) {
@@ -2590,6 +2744,8 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--scalar-epilogues"))
+        return check_scalar_epilogues();
     if (argc == 2 && !strcmp(argv[1], "--attention-identity"))
         return check_attention_identity();
     if (argc == 2 && !strcmp(argv[1], "--attention-imatrix"))
