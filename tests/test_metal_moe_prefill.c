@@ -391,6 +391,20 @@ static int check_tail_case(const void *model, uint64_t bytes,
         }
         if (!ok) goto done;
     }
+    if (benchmark) {
+        uint32_t *counts = calloc(EXPERTS, sizeof(*counts));
+        uint32_t buckets[3] = {0};
+        if (!counts) { ok = 0; goto done; }
+        for (uint64_t i = 0; i < pairs; i++) counts[ids[i]]++;
+        for (uint32_t e = 0; e < EXPERTS; e++) {
+            buckets[2] += counts[e] / 32u;
+            const uint32_t tail = counts[e] % 32u;
+            if (tail) buckets[tail <= 8u ? 0 : tail <= 16u ? 1 : 2]++;
+        }
+        free(counts);
+        fprintf(stderr, "V4.1 tail routes rows=%u skewed=%d n8=%u n16=%u n32=%u\n",
+            tokens, skewed, buckets[0], buckets[1], buckets[2]);
+    }
     ok = ds4_gpu_tensor_write(t[0], 0, x, xb) && ds4_gpu_tensor_write(t[1], 0, ids, ib) &&
          ds4_gpu_tensor_write(t[2], 0, weights, ib);
     const uint32_t cull16 = DS4_GPU_TEST_V41_MOE_REFERENCE |
@@ -409,7 +423,8 @@ static int check_tail_case(const void *model, uint64_t bytes,
      * order. Report their median; every warmup and sample still checks exact
      * outputs and guards. REFERENCE remains a numerical oracle. Compare the release
      * column across builds with the same test and the old/new Metal object
-     * to measure the change against actual cull16 production dispatch. */
+     * to measure the change against production dispatch. All timed variants
+     * borrow a caller-owned command buffer, as layer prefill does. */
     enum { SAMPLES = 5 };
     const unsigned explicit_runs = benchmark ? (1u + SAMPLES) * VARIANTS : VARIANTS;
     double samples[VARIANTS][SAMPLES] = {{0}};
@@ -432,7 +447,7 @@ static int check_tail_case(const void *model, uint64_t bytes,
                  ds4_gpu_tensor_write(storage[i], GUARD_BYTES + consumed[i], guard, sizeof(guard));
         bool half_mid = false;
         const double begin = now_seconds();
-        const bool caller_batch = force_ssd || (!automatic && variant >= 5u);
+        const bool caller_batch = benchmark || force_ssd || (!automatic && variant >= 5u);
         if (caller_batch && ok) ok = ds4_gpu_begin_commands();
         ok = ok && ds4_gpu_routed_moe_batch_tensor(t[7], t[3], t[4], t[5], t[6],
             model, bytes, 0, up_off, down_off, 16, 10,
@@ -516,14 +531,26 @@ int main(int argc, char **argv) {
     const bool v41_tp = argc == 2 && !strcmp(argv[1], "--v41-tp");
     const bool v41_decode = argc == 2 && !strcmp(argv[1], "--v41-decode");
     const bool tail = argc == 2 && !strcmp(argv[1], "--v41-tail-cull");
+    const bool tail_large = (argc == 2 || argc == 3) && !strcmp(argv[1], "--v41-tail-cull-large");
+    uint32_t tail_rows = 0;
+    if (tail_large && argc == 3) {
+        char *end = NULL;
+        const unsigned long rows = strtoul(argv[2], &end, 10);
+        if (!end || *end || rows < 1025u || rows > 2048u) {
+            fprintf(stderr, "V4.1 large benchmark rows must be in 1025..2048\n");
+            return 1;
+        }
+        tail_rows = (uint32_t)rows;
+    }
     const bool tail_small = argc == 2 && !strcmp(argv[1], "--v41-tail-cull-small");
-    const bool v41 = v41_tp || v41_decode || tail || (argc == 2 && !strcmp(argv[1], "--v41"));
+    const bool tail_benchmark = tail || tail_large;
+    const bool v41 = v41_tp || v41_decode || tail_benchmark || (argc == 2 && !strcmp(argv[1], "--v41"));
     if (argc != 1 && !address && !v41 && !tail_small) {
-        fprintf(stderr, "usage: %s [--ssd-address | --v41 | --v41-tp | --v41-decode | --v41-q4-decode | --v41-tail-cull | --v41-tail-cull-small]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--ssd-address | --v41 | --v41-tp | --v41-decode | --v41-q4-decode | --v41-tail-cull | --v41-tail-cull-large [rows] | --v41-tail-cull-small]\n", argv[0]);
         return 1;
     }
     if (v41) { INPUT = 5120; MID = 2304; OUTPUT = 5124; EXPERTS = 384; }
-    if (v41_decode || tail) OUTPUT = 5120;
+    if (v41_decode || tail_benchmark) OUTPUT = 5120;
     const uint64_t page = getpagesize();
     const uint64_t up_off = aligned((uint64_t)EXPERTS * MID * INPUT / 256 * sizeof(iq2_block), page);
     const uint64_t down_off = up_off * 2;
@@ -547,26 +574,30 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && ds4_gpu_set_model_map(model, model_size);
     ds4_gpu_set_quality(false);
     ds4_gpu_set_ssd_streaming(false);
-    if (tail || tail_small) {
+    if (tail_benchmark || tail_small) {
         if (!ds4_gpu_device_is_pre_m5_apple_silicon()) {
             fprintf(stderr, "V4.1 tail oracle requires pre-M5 Apple Silicon\n");
             ok = 0;
         }
-        const uint32_t boundary[] = {32, 33, 34, 47, 48, 49, 63, 64, 65, 80, 81};
+        const uint32_t boundary[] = {32, 33, 34, 47, 48, 49, 63, 64, 65, 80, 81,
+            1024, 1025, 1241, 2048, 2049};
         const uint32_t timing[] = {128, 437, 1024};
+        const uint32_t timing_large[] = {1241, 1280, 2048};
         const uint32_t occupancy[] = {1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32};
         /* The complementary experts have 64-n rows, covering a full tile
          * followed by a tail, while the first six have only n rows. */
-        for (unsigned i = 0; i < sizeof(occupancy) / sizeof(*occupancy) && ok; i++)
+        for (unsigned i = 0; !tail_large && i < sizeof(occupancy) / sizeof(*occupancy) && ok; i++)
             ok = check_tail_case(model, model_size, up_off, down_off, 64, 0, occupancy[i], 0);
-        const uint32_t *rows = tail ? timing : boundary;
-        const unsigned n = tail ? sizeof(timing) / sizeof(*timing) : sizeof(boundary) / sizeof(*boundary);
+        const uint32_t *rows = tail_rows ? &tail_rows : tail_large ? timing_large : tail ? timing : boundary;
+        const unsigned n = tail_rows ? 1u : tail_large ? sizeof(timing_large) / sizeof(*timing_large) :
+            tail ? sizeof(timing) / sizeof(*timing) : sizeof(boundary) / sizeof(*boundary);
         for (unsigned i = 0; i < n && ok; i++) {
             if (tail_small) ok = check_tail_case(model, model_size, up_off, down_off, rows[i], 0, 0, 0);
-            if (ok) ok = check_tail_case(model, model_size, up_off, down_off, rows[i], 1, 0, tail);
+            if (ok) ok = check_tail_case(model, model_size, up_off, down_off, rows[i], 1, 0, tail_benchmark);
             /* Balanced 437 rows give every expert exactly 6 or 7 routes;
-             * 1024 gives exactly 16. The skewed case retains hot N32 tiles. */
-            if (ok && tail) ok = check_tail_case(model, model_size, up_off, down_off, rows[i], 2, 0, 1);
+             * 1024 gives 16, 1241 gives 19/20 and 2048 gives 32. The skewed
+             * case also exercises small tails after complete N32 tiles. */
+            if (ok && tail_benchmark) ok = check_tail_case(model, model_size, up_off, down_off, rows[i], 2, 0, 1);
         }
         ds4_gpu_cleanup();
         free(model);
