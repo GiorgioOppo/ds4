@@ -40463,10 +40463,23 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
         ds41_attention_select_published(g, m, l, il);
 }
 
+static bool ds41_attention_gather(ds41_gpu_graph *g, uint32_t il,
+                                  uint32_t n_comp, bool projected) {
+    if (!n_comp) return true;
+    /* Sequential decode visits every index source before its reuse layers.
+     * This dedicated scratch therefore already holds their selected rows.
+     * Layer-major prefill and mixed/session batches can share the scratch
+     * across positions, so retain their gather even for a reuse layer. */
+    if (!projected && ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_DECODE &&
+        !ds41_index_source(il)) return true;
+    const uint32_t owner = il < 8u ? 0u : il < 14u ? 1u : il < 20u ? 2u : 3u;
+    return ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+        g->selected_comp, n_comp, n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K);
+}
+
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
-    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
@@ -40487,8 +40500,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                         g->selected_comp, n_comp, attended)) return false;
+    if (!ds41_attention_gather(g, il, n_comp, projected)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
     if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),

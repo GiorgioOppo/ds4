@@ -311,6 +311,16 @@ tests/test_deepseek41_candidates: tests/test_deepseek41_candidates.o $(filter-ou
 test-deepseek41-candidates: tests/test_deepseek41_candidates
 	./tests/test_deepseek41_candidates
 
+tests/test_deepseek41_gather.o: tests/test_deepseek41_gather.c ds4.c ds4_gpu.h ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_deepseek41_gather: tests/test_deepseek41_gather.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-gather
+test-deepseek41-gather: tests/test_deepseek41_gather
+	./tests/test_deepseek41_gather
+
 tests/test_deepseek41_publication.o: tests/test_deepseek41_publication.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -999,6 +1009,7 @@ clean:
 	rm -f tests/test_deepseek41_qb tests/test_deepseek41_masks
 	rm -f tests/test_deepseek41_publication
 	rm -f tests/test_deepseek41_candidates
+	rm -f tests/test_deepseek41_gather
 	rm -f tests/test_deepseek41_epilogues
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_q4_attention tests/test_deepseek41_imatrix_release

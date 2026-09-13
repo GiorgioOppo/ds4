@@ -115,3 +115,4 @@ tests/test_deepseek41_publication
 tests/test_deepseek41_epilogues
 
 /tests/test_deepseek41_candidates
+/tests/test_deepseek41_gather
