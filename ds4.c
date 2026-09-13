@@ -66702,11 +66702,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
                 fprintf(stderr,
                         "ds4: ROCm V4.1 SSD cache request %.2f GiB capped to %.2f GiB "
-                        "by %.2f GiB GPU recommended working set "
+                        "by GPU recommended working-set budget "
                         "(7/8 allowance minus context/graph buffers)\n",
                         ds4_bytes_to_gib(requested_cache_bytes),
-                        ds4_bytes_to_gib(safe_cache_bytes),
-                        ds4_bytes_to_gib(ds4_gpu_recommended_working_set_size()));
+                        ds4_bytes_to_gib(safe_cache_bytes));
             } else
 #endif
             fprintf(stderr,
