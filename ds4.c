@@ -40469,42 +40469,15 @@ static bool ds41_attention_output_batch(ds41_gpu_graph *g, const ds4_model *m,
     /* Q is dead after attention and is available until the FFN reuses it. */
     return ds4_gpu_dsv41_attention_output_typed_workspace_batch(
         g->batch.block, g->batch.low, g->batch.q, m->map, m->size,
+#else
+    /* CUDA batches Q4 with scalar reduction order, keeping the BF16 boundary
+     * between A and B inside the backend and the rank sum outside it. */
+    return ds4_gpu_dsv41_attention_output_typed_batch(
+        g->batch.block, g->batch.low, m->map, m->size,
+#endif
         l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
         l->attn_output_a->type, l->attn_output_b->type,
         g->batch.heads, count, g->tp_world, g->tp_rank);
-#else
-    const uint32_t a_type = l->attn_output_a->type;
-    const uint32_t b_type = l->attn_output_b->type;
-    if ((a_type != DS4_TENSOR_Q8_0 && a_type != DS4_TENSOR_Q4_K) ||
-        (b_type != DS4_TENSOR_Q8_0 && b_type != DS4_TENSOR_Q4_K)) return false;
-    if (a_type == DS4_TENSOR_Q8_0 && b_type == DS4_TENSOR_Q8_0) {
-        return g->tp_world == 2 ?
-            ds4_gpu_dsv41_attention_output_tp_batch(g->batch.block, g->batch.low,
-                m->map, m->size, l->attn_output_a->abs_offset,
-                l->attn_output_b->abs_offset, g->batch.heads, count, g->tp_rank) :
-            ds4_gpu_dsv41_attention_output_batch(g->batch.block, g->batch.low,
-                m->map, m->size, l->attn_output_a->abs_offset,
-                l->attn_output_b->abs_offset, g->batch.heads, count);
-    }
-    /* CUDA's Q8 batch kernels cannot consume Q4 weights. Use the typed scalar
-     * projections, retaining BF16 between A and B and rank reduction outside.
-     * TP batches pack local heads/low tightly; rows_view has full-world strides. */
-    const uint64_t heads_bytes = (uint64_t)(DS4_N_HEAD / g->tp_world) *
-                                DS4_N_HEAD_DIM * sizeof(float);
-    const uint64_t low_bytes = (uint64_t)(DS4_N_OUT_GROUP / g->tp_world) *
-                              DS4_N_LORA_O * sizeof(float);
-    ds41_gpu_graph row = *g;
-    for (uint32_t t = 0; t < count; t++) {
-        row.block = g->rows_view[t].block;
-        row.heads = ds4_gpu_tensor_view(g->batch.heads, t * heads_bytes, heads_bytes);
-        row.low = ds4_gpu_tensor_view(g->batch.low, t * low_bytes, low_bytes);
-        const bool ok = row.heads && row.low && ds41_attention_output(&row, m, l);
-        ds4_gpu_tensor_free(row.low);
-        ds4_gpu_tensor_free(row.heads);
-        if (!ok) return false;
-    }
-    return true;
-#endif
 }
 
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,

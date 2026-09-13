@@ -5568,6 +5568,58 @@ extern "C" int ds4_mmq_q4_K_grouped_vec(
         W, X, out, M, K, 1, n_groups, stream);
 }
 
+extern "C" int ds4_mmq_q4_K_decode_samples(
+        const void *weights, const float *input, float *out,
+        void *scratch, size_t scratch_bytes,
+        int M, int K, int rows, int groups, cudaStream_t stream) {
+    if (!weights || !input || !out || !scratch ||
+        ((uintptr_t)weights & 3u) || ((uintptr_t)input & 3u) || ((uintptr_t)out & 3u) ||
+        ((uintptr_t)scratch & 15u) || rows < 1 || rows > 64 ||
+        !((M == 1024 && K == 4096 && (groups == 4 || groups == 8)) ||
+          (M == 5120 && K == 8192 && groups == 1))) return -1;
+    const int padded_k = GGML_PAD(K, MATRIX_ROW_PADDING);
+    const int q8_stride = padded_k / QK8_1;
+    const size_t required = (size_t)rows * groups * q8_stride * sizeof(block_q8_1);
+    if (scratch_bytes < required) return -1;
+
+    quantize_row_q8_1_cuda(
+        input, nullptr, scratch, GGML_TYPE_Q4_K, K,
+        K, (int64_t)K * rows * groups, (int64_t)K * rows * groups,
+        padded_k, rows * groups, 1, 1, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: V4.1 Q4 sample quantize failed: %s\n",
+                cudaGetErrorString(err));
+        return -2;
+    }
+
+    // Keep ncols_dst=1: batching columns would select a different MMVQ
+    // warp count and reduction tree. Grid.z repeats the decode calculation;
+    // sample_x stays zero while sample_y/out advance by one packed token.
+    const ggml_cuda_mm_fusion_args_device fusion = {};
+    mul_mat_vec_q_switch_type(
+        weights, GGML_TYPE_Q4_K, scratch, nullptr, fusion, out,
+        K, M, 1, K / QK_K, q8_stride, M,
+        groups, groups, groups, M * (K / QK_K), q8_stride, M,
+        1, rows, 0, groups * q8_stride, groups * M, 0, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: V4.1 Q4 sample MMVQ failed: %s\n",
+                cudaGetErrorString(err));
+        return -3;
+    }
+    // M consists of complete MMVQ row cohorts, so every value was written.
+    // Match both the scalar dense and grouped finite-value epilogues.
+    ds4_mmq_sanitize_f32(out, (uint64_t)rows * groups * M, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: V4.1 Q4 sample sanitize failed: %s\n",
+                cudaGetErrorString(err));
+        return -4;
+    }
+    return 0;
+}
+
 extern "C" int ds4_mmq_q4_K_dense_pair_vec(
         const void * W0, const void * W1, const float * X,
         float * out0, float * out1,
