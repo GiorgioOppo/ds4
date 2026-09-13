@@ -41770,6 +41770,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
              ds4_gpu_tensor_copy(g->pre, 0, row.pre, 0, DS4_N_HC * 4u);
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     }
+    /* All layer command buffers have drained; no cache users survive the sweep. */
+    ds4_gpu_release_zero_prefix_prefill_mask_cache();
     g->pos = initial_start;
     if (ok) { g->pos += total_count; g->history = next_history; g->valid = !encoder_only; }
     return ok;

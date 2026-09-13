@@ -678,7 +678,10 @@ enum {
     DS4_GPU_PREFILL_MASK_CACHE_RAW = 1,
     DS4_GPU_PREFILL_MASK_CACHE_RATIO4 = 2,
     DS4_GPU_PREFILL_MASK_CACHE_RATIO128 = 3,
-    DS4_GPU_PREFILL_MASK_CACHE_SLOTS = 3,
+    DS4_GPU_PREFILL_MASK_CACHE_V41_RAW = 4,
+    DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO2 = 5,
+    DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO1 = 6,
+    DS4_GPU_PREFILL_MASK_CACHE_SLOTS = 6,
 };
 
 static ds4_gpu_zero_prefix_prefill_mask_cache_entry
@@ -2721,12 +2724,17 @@ static id<MTLBuffer> ds4_gpu_new_transient_buffer(NSUInteger bytes, const char *
     return buffer;
 }
 
-static int ds4_gpu_zero_prefix_prefill_mask_cache_enabled(void) {
+static int ds4_gpu_zero_prefix_prefill_mask_cache_enabled(uint32_t kind) {
     if (getenv("DS4_METAL_DISABLE_ZERO_PREFIX_PREFILL_MASK_CACHE") != NULL ||
         getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL) {
         return 0;
     }
-    return ds4_gpu_device_name_contains("M3");
+    /* The V4.1 batch wrappers admit only static, zero-prefix masks. Keep
+     * their entries separate from the existing M3/V4 prefill policy. */
+    return kind == DS4_GPU_PREFILL_MASK_CACHE_V41_RAW ||
+           kind == DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO2 ||
+           kind == DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO1 ||
+           ds4_gpu_device_name_contains("M3");
 }
 
 static ds4_gpu_zero_prefix_prefill_mask_cache_entry *
@@ -2745,7 +2753,7 @@ ds4_gpu_get_zero_prefix_prefill_mask_cache(
         NSUInteger blk_bytes,
         bool      *created) {
     if (created) *created = false;
-    if (!created || !ds4_gpu_zero_prefix_prefill_mask_cache_enabled() ||
+    if (!created || !ds4_gpu_zero_prefix_prefill_mask_cache_enabled(kind) ||
         mask_bytes == 0 || blk_bytes == 0) {
         return NULL;
     }
@@ -2755,6 +2763,9 @@ ds4_gpu_get_zero_prefix_prefill_mask_cache(
         case DS4_GPU_PREFILL_MASK_CACHE_RAW:      slot = 0; break;
         case DS4_GPU_PREFILL_MASK_CACHE_RATIO4:   slot = 1; break;
         case DS4_GPU_PREFILL_MASK_CACHE_RATIO128: slot = 2; break;
+        case DS4_GPU_PREFILL_MASK_CACHE_V41_RAW:  slot = 3; break;
+        case DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO2: slot = 4; break;
+        case DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO1: slot = 5; break;
         default: return NULL;
     }
 
@@ -33661,7 +33672,21 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
     const NSUInteger nblk1 = ((NSUInteger)n_tokens + nqptg - 1u) / nqptg;
     const NSUInteger blk_bytes = ds4_gpu_align_up_ns(nblk0 * nblk1, 32u);
 
-    id<MTLBuffer> mask_buffer =
+    /* V4 sends its zero-prefix SWA work through the prefill wrapper. This
+     * causal zero-prefix batch shape is the V4.1 layer-major SWA path. Only
+     * the mask and its block map are shared: raw KV and pad contents change
+     * at every layer and must still be staged below. */
+    const bool cacheable = !noncausal && !visual_tokens &&
+        !g_batch_encoder_concurrent && g_tp_split_world <= 1 &&
+        pos0 == 0 && n_tokens <= 2048 && n_raw == n_tokens && raw_start == 0 &&
+        window == 128 && n_head == 64 && head_dim == 512;
+    bool mask_created = false;
+    ds4_gpu_zero_prefix_prefill_mask_cache_entry *mask_cache = cacheable
+        ? ds4_gpu_get_zero_prefix_prefill_mask_cache(
+            DS4_GPU_PREFILL_MASK_CACHE_V41_RAW, n_tokens, 0, n_raw,
+            window, 0, nqptg, ncpsg, has_kvpad, bc_mask,
+            mask_bytes, blk_bytes, &mask_created) : NULL;
+    id<MTLBuffer> mask_buffer = mask_cache ? mask_cache->mask :
         ds4_gpu_new_transient_buffer(mask_bytes, "ds4_flash_attn_mask");
     if (!mask_buffer ||
         !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
@@ -33672,12 +33697,13 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
                                          &g_flash_attn_pad_bytes,
                                          pad_bytes,
                                          "ds4_flash_attn_pad") ||
-        !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
+        (!mask_cache && !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
                                          &g_flash_attn_blk_bytes,
                                          blk_bytes,
-                                         "ds4_flash_attn_blk")) {
+                                         "ds4_flash_attn_blk"))) {
         return 0;
     }
+    id<MTLBuffer> blk_buffer = mask_cache ? mask_cache->blk : g_flash_attn_blk_buffer;
 
     if (!ds4_gpu_encode_copy_raw_ring_to_f16(cb,
                                               rawbuf,
@@ -33691,19 +33717,22 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         return 0;
     }
 
-    if (visual_tokens) {
-        if (!ds4_gpu_fill_visual_mixed_batch_mask(
-                    (uint16_t *)[mask_buffer contents],
-                    visual_tokens, vocab_size, n_tokens, n_raw, 0u,
-                    pos0, window, 0u)) return 0;
-    } else if (noncausal) {
-        memset([mask_buffer contents], 0, mask_bytes);
-    } else {
-        ds4_gpu_fill_raw_decode_batch_mask((uint16_t *)[mask_buffer contents],
-                                             n_tokens,
-                                             n_raw,
-                                             pos0,
-                                             window);
+    if (!mask_cache || mask_created) {
+        if (visual_tokens) {
+            if (!ds4_gpu_fill_visual_mixed_batch_mask(
+                        (uint16_t *)[mask_buffer contents],
+                        visual_tokens, vocab_size, n_tokens, n_raw, 0u,
+                        pos0, window, 0u)) return 0;
+        } else if (noncausal) {
+            memset([mask_buffer contents], 0, mask_bytes);
+        } else {
+            ds4_gpu_fill_raw_decode_batch_mask((uint16_t *)[mask_buffer contents],
+                                                 n_tokens,
+                                                 n_raw,
+                                                 pos0,
+                                                 window);
+        }
+        if (mask_cache) mask_cache->valid = true;
     }
 
     id<MTLComputePipelineState> pad_pipeline = nil;
@@ -33741,6 +33770,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         };
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
         [enc setComputePipelineState:pad_pipeline];
         [enc setBytes:&pad_args length:sizeof(pad_args) atIndex:0];
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:1];
@@ -33752,25 +33782,29 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         ds4_gpu_end_compute_encoder(cb, enc);
     }
 
-    ds4_gpu_flash_attn_blk_args blk_args = {
-        .ne01 = (int32_t)n_tokens,
-        .ne30 = (int32_t)n_raw,
-        .ne31 = (int32_t)n_tokens,
-        .ne32 = 1,
-        .ne33 = 1,
-        .nb31 = (uint64_t)n_raw * sizeof(uint16_t),
-        .nb32 = mask_bytes,
-        .nb33 = mask_bytes,
-    };
+    if (!mask_cache || !mask_cache->blk_ready) {
+        ds4_gpu_flash_attn_blk_args blk_args = {
+            .ne01 = (int32_t)n_tokens,
+            .ne30 = (int32_t)n_raw,
+            .ne31 = (int32_t)n_tokens,
+            .ne32 = 1,
+            .ne33 = 1,
+            .nb31 = (uint64_t)n_raw * sizeof(uint16_t),
+            .nb32 = mask_bytes,
+            .nb33 = mask_bytes,
+        };
 
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:blk_pipeline];
-    [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
-    [enc setBuffer:mask_buffer offset:0 atIndex:1];
-    [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:blk_pipeline];
+        [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
+        [enc setBuffer:mask_buffer offset:0 atIndex:1];
+        [enc setBuffer:blk_buffer offset:0 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (mask_cache) mask_cache->blk_ready = true;
+    }
 
     ds4_gpu_flash_attn_vec_args args = {
         .ne01 = (int32_t)n_tokens,
@@ -33812,7 +33846,11 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         ((NSUInteger)head_dim + 2u * padded_v + 2u * (2u * (NSUInteger)ncpsg));
     const NSUInteger shared_bytes = ds4_gpu_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
 
-    enc = ds4_gpu_compute_encoder(cb);
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) {
+        if (mask_cache) mask_cache->blk_ready = false;
+        return 0;
+    }
     [enc setComputePipelineState:attn_pipeline];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
@@ -33821,7 +33859,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
     [enc setBuffer:mask_buffer offset:0 atIndex:4];
     [enc setBuffer:sinks_buf offset:sinks_offset atIndex:5];
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
-    [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
+    [enc setBuffer:blk_buffer offset:0 atIndex:7];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
@@ -33916,7 +33954,22 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     const NSUInteger nblk1 = ((NSUInteger)n_tokens + nqptg - 1u) / nqptg;
     const NSUInteger blk_bytes = ds4_gpu_align_up_ns(nblk0 * nblk1, 32u);
 
-    id<MTLBuffer> mask_buffer =
+    /* CSA2 keeps the same causal geometry across Full/Reuse/Reindex layers.
+     * A zero-prefix ratio-1/2 batch below top-k needs no dynamic selection
+     * mask. Raw/comp storage and dtype do not affect this logical mask. */
+    const bool cacheable = !visual_tokens && !use_comp_mask && !comp_mask &&
+        !g_batch_encoder_concurrent && g_tp_split_world <= 1 &&
+        pos0 == 0 && n_tokens <= 2048 && n_raw == n_tokens && raw_start == 0 &&
+        window == 128 && n_head == 64 && head_dim == 512 &&
+        (ratio == 1 || ratio == 2) && n_comp < 512 && n_comp == n_tokens / ratio;
+    bool mask_created = false;
+    ds4_gpu_zero_prefix_prefill_mask_cache_entry *mask_cache = cacheable
+        ? ds4_gpu_get_zero_prefix_prefill_mask_cache(
+            ratio == 2 ? DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO2 :
+                         DS4_GPU_PREFILL_MASK_CACHE_V41_RATIO1,
+            n_tokens, n_comp, n_keys, window, ratio, nqptg, ncpsg,
+            has_kvpad, bc_mask, mask_bytes, blk_bytes, &mask_created) : NULL;
+    id<MTLBuffer> mask_buffer = mask_cache ? mask_cache->mask :
         ds4_gpu_new_transient_buffer(mask_bytes, "ds4_flash_attn_mask");
     if (!mask_buffer ||
         !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
@@ -33927,12 +33980,13 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
                                          &g_flash_attn_pad_bytes,
                                          pad_bytes,
                                          "ds4_flash_attn_pad") ||
-        !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
+        (!mask_cache && !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
                                          &g_flash_attn_blk_bytes,
                                          blk_bytes,
-                                         "ds4_flash_attn_blk")) {
+                                         "ds4_flash_attn_blk"))) {
         return 0;
     }
+    id<MTLBuffer> blk_buffer = mask_cache ? mask_cache->blk : g_flash_attn_blk_buffer;
 
     if (!ds4_gpu_encode_copy_raw_ring_to_f16(cb,
                                               rawbuf,
@@ -33953,32 +34007,35 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         return 0;
     }
 
-    if (visual_tokens) {
-        if (!ds4_gpu_fill_visual_mixed_batch_mask(
-                    (uint16_t *)[mask_buffer contents],
-                    visual_tokens, vocab_size, n_tokens, n_raw, n_comp,
-                    pos0, window, ratio)) return 0;
-    } else {
-        ds4_gpu_fill_mixed_decode_batch_mask((uint16_t *)[mask_buffer contents],
-                                               n_tokens,
-                                               n_raw,
-                                               n_comp,
-                                               pos0,
-                                               window,
-                                               ratio);
-    }
-    if (use_comp_mask) {
-        if (!ds4_gpu_encode_cpy_f32_f16_2d(cb,
-                                             maskbuf,
-                                             ds4_gpu_tensor_offset(comp_mask),
-                                             mask_buffer,
-                                             (NSUInteger)n_raw * sizeof(uint16_t),
-                                             n_comp,
-                                             n_tokens,
-                                             (uint64_t)n_comp * sizeof(float),
-                                             (uint64_t)n_keys * sizeof(uint16_t))) {
-            return 0;
+    if (!mask_cache || mask_created) {
+        if (visual_tokens) {
+            if (!ds4_gpu_fill_visual_mixed_batch_mask(
+                        (uint16_t *)[mask_buffer contents],
+                        visual_tokens, vocab_size, n_tokens, n_raw, n_comp,
+                        pos0, window, ratio)) return 0;
+        } else {
+            ds4_gpu_fill_mixed_decode_batch_mask((uint16_t *)[mask_buffer contents],
+                                                   n_tokens,
+                                                   n_raw,
+                                                   n_comp,
+                                                   pos0,
+                                                   window,
+                                                   ratio);
         }
+        if (use_comp_mask) {
+            if (!ds4_gpu_encode_cpy_f32_f16_2d(cb,
+                                                 maskbuf,
+                                                 ds4_gpu_tensor_offset(comp_mask),
+                                                 mask_buffer,
+                                                 (NSUInteger)n_raw * sizeof(uint16_t),
+                                                 n_comp,
+                                                 n_tokens,
+                                                 (uint64_t)n_comp * sizeof(float),
+                                                 (uint64_t)n_keys * sizeof(uint16_t))) {
+                return 0;
+            }
+        }
+        if (mask_cache) mask_cache->valid = true;
     }
 
     id<MTLComputePipelineState> pad_pipeline = nil;
@@ -34016,6 +34073,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         };
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
         [enc setComputePipelineState:pad_pipeline];
         [enc setBytes:&pad_args length:sizeof(pad_args) atIndex:0];
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:1];
@@ -34027,25 +34085,29 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         ds4_gpu_end_compute_encoder(cb, enc);
     }
 
-    ds4_gpu_flash_attn_blk_args blk_args = {
-        .ne01 = (int32_t)n_tokens,
-        .ne30 = (int32_t)n_keys,
-        .ne31 = (int32_t)n_tokens,
-        .ne32 = 1,
-        .ne33 = 1,
-        .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
-        .nb32 = mask_bytes,
-        .nb33 = mask_bytes,
-    };
+    if (!mask_cache || !mask_cache->blk_ready) {
+        ds4_gpu_flash_attn_blk_args blk_args = {
+            .ne01 = (int32_t)n_tokens,
+            .ne30 = (int32_t)n_keys,
+            .ne31 = (int32_t)n_tokens,
+            .ne32 = 1,
+            .ne33 = 1,
+            .nb31 = (uint64_t)n_keys * sizeof(uint16_t),
+            .nb32 = mask_bytes,
+            .nb33 = mask_bytes,
+        };
 
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:blk_pipeline];
-    [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
-    [enc setBuffer:mask_buffer offset:0 atIndex:1];
-    [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:blk_pipeline];
+        [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
+        [enc setBuffer:mask_buffer offset:0 atIndex:1];
+        [enc setBuffer:blk_buffer offset:0 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (mask_cache) mask_cache->blk_ready = true;
+    }
 
     ds4_gpu_flash_attn_vec_args args = {
         .ne01 = (int32_t)n_tokens,
@@ -34087,7 +34149,11 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         ((NSUInteger)head_dim + 2u * padded_v + 2u * (2u * (NSUInteger)ncpsg));
     const NSUInteger shared_bytes = ds4_gpu_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
 
-    enc = ds4_gpu_compute_encoder(cb);
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) {
+        if (mask_cache) mask_cache->blk_ready = false;
+        return 0;
+    }
     [enc setComputePipelineState:attn_pipeline];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
@@ -34096,7 +34162,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     [enc setBuffer:mask_buffer offset:0 atIndex:4];
     [enc setBuffer:sinks_buf offset:sinks_offset atIndex:5];
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
-    [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
+    [enc setBuffer:blk_buffer offset:0 atIndex:7];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
