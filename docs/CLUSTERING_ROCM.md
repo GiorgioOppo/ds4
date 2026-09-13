@@ -2,7 +2,7 @@
 
 - Two ROCm/gfx1151 machines; tested with 128 GB RAM each.
 - Same engine revision and `DeepSeek-V4.1-Flash-Q2.gguf` on both. Each keeps the full GGUF; resident weights are approximately 80.6 GiB per rank. Engram stays on disk.
-- Exactly one coordinator and one worker. No `--layers`, SSD expert streaming or DSpark.
+- Exactly one coordinator and one worker. Attention is tensor-parallel; routed MoE is expert-parallel (192 whole experts per rank). Both execute every layer; KV and the output head are replicated. No `--layers`, SSD expert streaming or DSpark.
 - All three transports require a reachable TCP control address. Use a trusted network: peer traffic has no authentication or encryption.
 - Build both peers with `make strix-halo ROCM_ARCH=gfx1151` after installing any required RoCE headers.
 - Run from the engine build directory. Set these variables in **both** terminals; `MODEL` may differ between machines:
@@ -172,3 +172,23 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_tokens":64,"thinking":false}'
 ```
+
+
+## Measured performance
+
+Two 128 GB Strix Halo machines, ROCm 10.0, Q2 weights, context allocation 69,632, greedy generation of 128 tokens (127 steady), no DSpark or images. Values are **prefill / decode tokens/s**.
+
+| Populated context | TCP, 100 GbE | USB4STREAM, 40 Gb/s | RoCE RC, 100 GbE |
+|---|---:|---:|---:|
+| 1,024: 768-token append | 72.29 / 6.92 | 69.54 / 7.08 | 71.62 / 6.97 |
+| 8,192: full prefix | 247.59 / 6.69 | 232.39 / 6.72 | 247.53 / 6.74 |
+| 16,384: full prefix | 259.44 / 6.35 | 244.31 / 6.39 | 259.07 / 6.40 |
+| 65,536: full prefix | 228.31 / 5.07 | 215.83 / 5.06 | 228.01 / 5.12 |
+
+- Native `ds4-bench` measurements; one matched run per cell. The 1K case excludes its initial 256-token frontier. The deeper cases use the native timing loop with an excluded 256-token/128-output warmup, then a fresh session before measuring the complete prefix. The warmup adapter does not change engine objects or the measured loop.
+- Both peers passed continuous fan/profile readiness checks. All frontier logits and printed continuations matched across transports at each depth. No OOM; minimum usable RAM 34.1 GiB. Host swap activity and some sampled process swap were nonzero.
+- USB4STREAM used the temporary interrupt-readback patch described above. These physical-link/configuration results are not a universal protocol ranking.
+- V4.1 CED activates about 8B parameters/token during prefill and 16B during decode. Full long prefixes reach the decoder-suffix optimization; short appends may not. [Model architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
+- Short decode traces show roughly 86 ms/token in local kernels and 22 ms/token in guarded reductions on each peer. RoCE reduces coordinator wait from roughly 26 to 22 ms/token, but this wait also includes peer readiness and CPU scheduling. Faster networking alone does not double decode throughput. Traces include profiler overhead and are separate from the table.
+- The 64K trace confirms CED: all 20 encoder layers process 65,536 tokens; decoder work totals only 24,150 layer-rows. Local kernels account for 79–83% of the traced prefill window.
+- Deep decode slows mainly in indexer scoring: about 1 ms/token at 1K grows to 52–54 ms/token at 64K, while main attention remains about 5 ms and network wait does not grow. Indexer kernels and guarded-reduction launch sizing are the first optimization targets; no speedup from those changes is claimed here.
