@@ -70,7 +70,7 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
-template<short NR0, bool SINGLE_BARRIER = false>
+template<short NR0, bool SINGLE_BARRIER = false, bool BF16 = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -112,12 +112,20 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
+            if (BF16) {
+                // Preserve the F32 reduction, then apply V4.1's BF16 boundary
+                // exactly where the separate activation pass would read it.
+                uint bits = as_type<uint>(tot);
+                if ((bits & 0x7f800000u) != 0x7f800000u)
+                    bits += 0x7fffu + ((bits >> 16u) & 1u);
+                tot = as_type<float>(bits & 0xffff0000u);
+            }
             dst_f32[r0 + row] = tot;
         }
     }
 }
 
-template<short NR0, typename args_t, bool SINGLE_BARRIER = false>
+template<short NR0, typename args_t, bool SINGLE_BARRIER = false, bool BF16 = false>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -184,7 +192,7 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0, SINGLE_BARRIER>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, SINGLE_BARRIER, BF16>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -213,6 +221,20 @@ kernel void kernel_mul_mv_q8_0_f32_single_barrier(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_dsv41_mul_mv_q8_0_bf16")]]
+kernel void kernel_dsv41_mul_mv_q8_0_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, false, true>(
         args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
@@ -2611,7 +2633,7 @@ kernel void kernel_mul_mm(
 
     constexpr int NR0 = M32_K64 ? 32 : 64;
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 64u*32u*sizeof(S0));
     constexpr int NR1 = 32;
 
     constexpr int NK  = M32_K64 ? 64 : 32;
@@ -3031,7 +3053,8 @@ kernel void kernel_mul_mm_f16_f32_scaled(
 
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
-// Host-visible prefill matmul variants for F16 and Q8_0 weights.
+// Dense prefill variants, including a full-F32 router without half conversion.
+template [[host_name("kernel_mul_mm_f32_f32_full")]] kernel mul_mm_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;

@@ -161,6 +161,104 @@ gguf-tools/deepseek4-quantize \
 `--compare-tensor` regenerates a single tensor and byte-compares it against the
 template or `--compare-gguf`.  `--threads N` controls routed-expert workers.
 
+## Convert DeepSeek V4.1 Flash
+
+V4.1 uses its own converter; a V4 template is not compatible. Install NumPy,
+tokenizers and SymPy, then build the quantizer library:
+
+```sh
+make -C gguf-tools libds4quants.dylib
+python3 gguf-tools/deepseek41_quantize.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --out gguf/DeepSeek-V4.1-Flash-IQ2_XXS-Q2_K-bootstrap.gguf --dry-run
+```
+
+Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversion.
+Use `libds4quants.so` on Linux. Gate/up experts use IQ2_XXS and down experts use
+Q2_K; attention, shared experts and the output head use Q8_0. Engram rows retain
+their original FP8 values and scales, packed together at the end of the GGUF for
+disk lookups. Vision and DSpark weights are not included.
+
+The first conversion uses weight-energy importance for IQ2_XXS. After runtime
+calibration, add `--imatrix FILE` and choose a new output filename to regenerate
+from the original safetensors. Do not requantize the first GGUF.
+
+For Q4, add `--quant q4` and use `DeepSeek-V4.1-Flash-Q4.gguf` as the output.
+This changes only the routed experts to Q4_K; the other tensor formats and
+disk-only Engram layout stay the same. The same imatrix works for both recipes.
+
+Dense attention projections can be selected independently with
+`--attention-proj q4_k` (the default is `q8_0`). This changes Q_A, Q_B, KV, O_A
+and O_B in every layer, preserving the chosen routed-expert recipe, shared
+experts, output head, indexer and compressor types. For calibrated attention,
+also pass `--attention-imatrix FILE`. Its entries use the canonical GGUF tensor
+names and contain exactly one importance value per input column. O_A aggregates
+importance across its eight input groups into one shared column vector. All
+five projection families must be present, with finite, nonnegative values and
+at least one positive value per tensor; missing coverage is an error.
+
+The V4.1 Metal runner selects the kernels from these tensor types. Prefill uses
+FP16 matrix tiles with FP32 accumulation and preserves the model's BF16
+activation boundaries, including between O_A and O_B. This changes projection
+weights, not the attention algorithm or KV-cache precision. Saved V4.1 state
+and TP identities distinguish attention type layouts; legacy all-Q8 snapshots
+remain compatible with the all-Q8 model.
+
+Expert calibration remains controlled by `--imatrix`; a collection containing
+both routed and dense entries can be passed to both options. Attention without
+`--attention-imatrix` is explicitly marked `uncalibrated`, even if the experts
+have an imatrix. Pass the same attention options to `deepseek41_validate_gguf.py`
+when auditing the original-source conversion.
+
+For a local experiment when only the Q8-attention GGUF is available, macOS
+supports a separate copy-on-write conversion:
+
+```sh
+python3 gguf-tools/deepseek41_requantize.py \
+  --source-gguf gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+  --out gguf/DeepSeek-V4.1-Flash-Q2-AProjQ4-requant.gguf --dry-run
+```
+
+Omit `--dry-run` to create the output, or use `--check` to audit an existing
+output's header and all changed attention payloads against the source.
+`--attention-imatrix FILE` also works here. This requantizes already quantized
+Q8_0 weights and adds another quantization error; it is not equivalent to
+conversion from the original safetensors. The metadata records this provenance.
+
+The tool requires filesystem `clonefile` support and never falls back to a full
+copy or modifies the source. It keeps all tensor offsets, unchanged expert and
+Engram bytes, and the original logical file size. On APFS, only rewritten
+extents consume additional physical space (about 2.65 GiB of attention payload
+for Flash, plus allocation overhead); a 2 GiB free-space reserve is required.
+The output is published only after conversion succeeds. Filesystems without
+cloning, insufficient header padding, and existing destinations are rejected.
+Inference quality and speed still need separate checks on the target hardware.
+
+The bounded Metal checks need no full model:
+
+```sh
+make test-deepseek41-q4-attention
+make test-deepseek41-imatrix-release
+```
+
+The second target retains release fast-math flags to check that invalid dense
+calibration values and incompatible attention snapshots are still rejected.
+
+Check the finished artifact against the pinned source before running it:
+
+```sh
+python3 gguf-tools/deepseek41_validate_gguf.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --gguf gguf/DeepSeek-V4.1-Flash-IQ2_XXS-Q2_K-bootstrap.gguf --payload
+```
+
+For a calibrated file, pass the same `--imatrix FILE` used during conversion.
+Pass `--quant q4` to the audit as well when checking a Q4 file.
+The audit checks the complete layout, all non-expert tensors, sampled experts
+and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores

@@ -26,6 +26,7 @@ def production_bodies():
         "static uint32_t metal_graph_prefill_max_chunk_rows(",
         "static int ds4_session_prepare_q4_attn_q_b_sidecars(",
         "int ds4_session_prepare_sync(",
+        "static void ds4_session_mark_engine_counted(",
     )
     # The descriptor collector also has an earlier forward declaration.
     marker = "#ifndef DS4_NO_GPU\nstatic int ds4_prepare_q4_attn_q_b_sidecars("
@@ -78,7 +79,7 @@ typedef struct {
 } ds4_engine;
 typedef struct {
     ds4_engine *engine;
-    bool glm, cpu, engine_session_counted, checkpoint_valid, vision_matches;
+    bool glm, cpu, ds41, engine_session_counted, checkpoint_valid, vision_matches;
     uint64_t q4_attn_q_b_f16_sidecars_generation;
     uint32_t q4_attn_q_b_f16_prepared_rows;
     int ctx_size;
@@ -89,6 +90,7 @@ typedef struct {
 } ds4_session;
 
 static unsigned calls, desc_count;
+static unsigned generation_queries, prefix_queries;
 static uint64_t reserve, generation = 1, memory_bytes = 100, streaming_bytes = 50;
 static int prepare_result = 1;
 static bool grow_during_prepare;
@@ -100,8 +102,10 @@ static uint64_t size_seen;
 static bool ds4_backend_uses_graph(int backend) { return backend == 1; }
 static bool ds4_session_is_cpu(ds4_session *s) { return s->cpu; }
 static bool ds4_session_is_glm(ds4_session *s) { return s->glm; }
+static bool ds4_session_is_ds41(ds4_session *s) { return s->ds41; }
 static bool ds4_session_vision_prefix_matches(ds4_session *s,
                                              void *images, size_t count) {
+    ++prefix_queries;
     (void)images;
     (void)count;
     return s->vision_matches;
@@ -114,7 +118,10 @@ static bool ds4_tokens_starts_with(const ds4_tokens *prompt,
 static uint32_t metal_graph_resume_prefill_min_tokens(void) { return 16; }
 static const char *ds4_backend_name(int backend) { (void)backend; return "test"; }
 static uint32_t engine_placement_session_count(ds4_engine *e) { return e->sessions; }
-uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void) { return generation; }
+uint64_t ds4_gpu_q4_attn_q_b_f16_cache_generation(void) {
+    ++generation_queries;
+    return generation;
+}
 static uint64_t ds4_engine_streaming_transient_guard_bytes(ds4_engine *e) {
     (void)e;
     return streaming_bytes;
@@ -322,6 +329,39 @@ int main(void) {
     session.glm = true;
     assert(!ds4_session_prepare_sync(&session, &prompt, err, sizeof(err)));
     session.glm = false;
+
+    /* V4.1 owns a separate graph. Give its unused V4 graph plausible batch
+     * dimensions so a missing family guard cannot hide behind zero capacity.
+     * A required V4 sidecar failure must not block the V4.1 session. */
+    session.ds41 = true;
+    prepare_result = -1;
+    ++generation;
+    const unsigned generation_before = generation_queries, prefix_before = prefix_queries;
+    unsigned char ds41_before[sizeof(session)];
+    memcpy(ds41_before, &session, sizeof(session));
+    assert(ds4_session_prepare_q4_attn_q_b_sidecars(&session, 128));
+    assert(!ds4_session_prepare_sync(&session, &prompt, err, sizeof(err)));
+    assert(calls == before && generation_queries == generation_before);
+    assert(prefix_queries == prefix_before);
+    assert(!memcmp(&session, ds41_before, sizeof(session)));
+
+    /* The common registration helper must count each V4.1 session once.
+     * The public session fixture also checks its new creation-path call. */
+    ds4_engine ds41_engine = {.backend = 1};
+    ds4_session first = {.engine = &ds41_engine, .ds41 = true};
+    ds4_session second = {.engine = &ds41_engine, .ds41 = true};
+    ds4_session no_engine = {0};
+    ds4_session_mark_engine_counted(NULL);
+    ds4_session_mark_engine_counted(&no_engine);
+    assert(!no_engine.engine_session_counted);
+    ds4_session_mark_engine_counted(&first);
+    assert(first.engine_session_counted && ds41_engine.live_session_count == 1);
+    ds4_session_mark_engine_counted(&first);
+    assert(ds41_engine.live_session_count == 1);
+    ds4_session_mark_engine_counted(&second);
+    assert(second.engine_session_counted && ds41_engine.live_session_count == 2);
+    session.ds41 = false;
+    prepare_result = 1;
     engine.backend = 0;
     assert(!ds4_session_prepare_sync(&session, &prompt, err, sizeof(err)));
     assert(calls == before);
@@ -335,7 +375,8 @@ int main(void) {
 
     printf("PASS Q4 preflight: %u chunk schedules, descriptors, future-session "
            "reserves, saturation, generation changes, rc -1/0/1 and prompt "
-           "resume/vision/CPU/GLM paths. GPU/concurrency unverified.\n", schedules);
+           "resume/vision/CPU/GLM/V4.1 paths and idempotent session counts. "
+           "GPU/concurrency unverified.\n", schedules);
     return 0;
 }
 '''

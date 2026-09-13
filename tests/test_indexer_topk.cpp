@@ -10,6 +10,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <utility>
 #include <vector>
 
 using uint = unsigned;
@@ -18,7 +19,7 @@ struct ushort3 { unsigned short x, y, z; };
 using std::min;
 #include "indexer_topk_actual.h"
 
-static unsigned cases, stages;
+static unsigned cases, stages, causal_leaves;
 static uint64_t geometry_checks;
 static constexpr int32_t poison = -715813;
 static constexpr size_t guard = 19;
@@ -214,9 +215,42 @@ static void geometry_sweep(){
         geometry_one(n,1u+(state&7u),k,1u<<((state>>3)%11));
     }
 }
+static void causal_leaf_sweep() {
+    // A causal row must have the legacy permutation of its visible prefix,
+    // even when future scores would win. Shuffle changes transport only.
+    for (uint32_t n : {1024u,1025u,2049u,4097u,8193u})
+    for (uint32_t nth : {256u,512u,1024u})
+    for (unsigned pattern = 0; pattern < 4; ++pattern) {
+        std::vector<float> scores(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            scores[i] = pattern == 0 ? float((i*73u)%19u) : pattern == 1 ? float(i) :
+                pattern == 2 ? ((i & 1u) ? -0.0f : 0.0f) :
+                (i%17u == 0 ? std::numeric_limits<float>::infinity() :
+                             -std::numeric_limits<float>::infinity());
+        }
+        const auto original = scores;
+        for (uint32_t ratio : {1u,2u})
+        for (uint32_t initial : {1023u,1024u,2048u})
+        for (uint32_t row : {0u,1u,2u,7u}) {
+            const uint32_t start = initial*ratio;
+            const uint32_t visible = std::min(n,initial+(row+1u)/ratio);
+            for (uint32_t begin = 0; begin < n; begin += nth) {
+                const auto expected = actual_leaf(scores.data(),visible,begin,nth);
+                require(actual_leaf(scores.data(),n,begin,nth,false,start,ratio,row) == expected,
+                        "causal leaf matches independent clipped prefix");
+                require(actual_leaf(scores.data(),n,begin,nth,true,start,ratio,row) == expected,
+                        "causal shuffle preserves scalar permutation");
+                ++causal_leaves;
+            }
+        }
+        require(!std::memcmp(scores.data(),original.data(),n*sizeof(float)),
+                "causal leaves preserve score input");
+    }
+}
 int main() {
     bounds();
     geometry_sweep();
+    causal_leaf_sweep();
     for (uint32_t n : {1u,2u,7u,31u,33u,255u,257u,511u,513u,1025u,2049u,4097u})
         for (uint32_t threads : {1u,32u,256u,1024u})
             for (uint32_t k : {1u,6u,31u,512u,1025u,n})
@@ -230,5 +264,6 @@ int main() {
                 if(k<=n)for(unsigned pattern=4;pattern<8;++pattern)one(n,k,threads,3,pattern);
     std::printf("PASS: %llu geometry/stage checks, %u tree cases, %u actual-source kernel stage/thread-grid cases; actual legacy leaves and shuffled tied runs, infinities, signed zero, full-merge exact IDs, guards, immutable inputs.\n",
         static_cast<unsigned long long>(geometry_checks),cases,stages);
+    std::printf("PASS: %u causal leaf cases; masked future rows, tails, scalar/shuffle exact IDs.\n",causal_leaves);
     std::puts("Host-only: Metal compilation, synchronization and GPU performance require native validation.");
 }

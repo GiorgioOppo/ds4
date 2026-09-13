@@ -4207,7 +4207,6 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
         device const char * weights,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     const int iid1 = tgpig.z / args.nei0;
@@ -4280,8 +4279,6 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
-
-    (void)tiitg;
 }
 
 kernel void kernel_mul_mv_addr_iq2_xxs_f32(
@@ -8143,9 +8140,8 @@ template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_6")]]
 kernel kernel_mul_mm_id_map_scatter_work_t
     kernel_mul_mm_id_map_scatter_work<6>;
 
-// Batched routed-expert matmul. It reads the expert-major map produced above,
-// loads selected expert weights, and writes results back to token-major slots
-// so the DS4 FFN can apply SwiGLU, weighting, and the down projection.
+// Output-A assigns each token slot to the same fixed weight group. Keep
+// the routed Q4 MMA and half staging, without constructing a route map.
 kernel void kernel_attn_out_low_q4_K_legacy_direct(
         constant ds4_metal_args_mul_mm_id & args,
         device const char * src0,
@@ -8273,6 +8269,9 @@ kernel void kernel_attn_out_low_q4_K_legacy_direct(
     }
 }
 
+// Batched routed-expert matmul. It reads the expert-major map produced above,
+// loads selected expert weights, and writes results back to token-major slots
+// so the DS4 FFN can apply SwiGLU, weighting, and the down projection.
 template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false, bool EXPERT_ADDRESSES = false>
 kernel void kernel_mul_mm_id(
         constant ds4_metal_args_mul_mm_id & args,
@@ -9161,6 +9160,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
 
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mul_mm_id_pair_swiglu_f16_iq2;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, false, half, half2x4>) mul_mm_id_pair_swiglu_f16_rhs_iq2;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, true>) mul_mm_id_pair_swiglu_f16_iq2_tail_cull;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_id_pair_swiglu_f16_q4;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>) mul_mm_id_pair_swiglu_f16_mxfp4;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4, true>) mul_mm_id_pair_swiglu_f16_mxfp4_tail_cull;
@@ -9171,6 +9171,7 @@ template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]] kernel mul_mm
 // Token-compact RHS: the preceding copy uses the same F32-to-half rounding
 // once per token. Keep routing, dequantization, MMA order and SwiGLU intact.
 template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_rhs")]] kernel mul_mm_id_pair_swiglu_f16_rhs_iq2 kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, false, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_tail_cull")]] kernel mul_mm_id_pair_swiglu_f16_iq2_tail_cull kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, true>;
 template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_q4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale>;
@@ -9181,6 +9182,7 @@ template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull")
 
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_f16_rhs;
+typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, true>) mul_mm_id_q2_f16_rhs_tail_cull;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4, true>) mul_mm_id_mxfp4_f16_rhs_tail_cull;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4_half_lut, half, half4x4, half, half2x4>) mul_mm_id_mxfp4_f16_rhs_half_lut;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4_half_lut, half, half4x4, half, half2x4, true>) mul_mm_id_mxfp4_f16_rhs_half_lut_tail_cull;
@@ -9197,6 +9199,7 @@ template [[host_name("kernel_mul_mm_id_iq2_xxs_f32")]]      kernel mul_mm_id ker
 template [[host_name("kernel_mul_mm_id_mxfp4_f32")]]        kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4,   2,     dequantize_mxfp4,   float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q8_0_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,    2,     dequantize_q8_0,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_tail_cull")]] kernel mul_mm_id_q2_f16_rhs_tail_cull kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, true>;
 template [[host_name("kernel_mul_mm_id_q4_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K,    QK_NL, dequantize_q5_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K,    QK_NL, dequantize_q6_K,    half, half4x4, half, half2x4>;
@@ -9343,7 +9346,18 @@ kernel void kernel_attn_out_low_mpp_direct_rhs(
     }
 }
 
-// Gather each expert's activation tile once for reuse by all output tiles.
+kernel void kernel_moe_packed_offsets(
+        constant uint &experts, device const uint *counts,
+        device uint *offsets, uint tid [[thread_position_in_grid]]) {
+    if (tid) return;
+    uint row = 0;
+    for (uint e = 0; e < experts; e++) {
+        offsets[e] = row;
+        row += counts[e];
+    }
+}
+
+// Store only live expert rows; tensor views bound the final matrix tile.
 template<typename T>
 kernel void kernel_moe_pack_rhs(
         constant ds4_metal_args_mul_mm_id &args,
@@ -9359,12 +9373,16 @@ kernel void kernel_moe_pack_rhs(
     if (wi >= work[0]) return;
     const uint2 item = ((device const uint2 *)(work + 2))[wi];
     if (!ds4_tp_owns_expert(item.x, args.ne02, args.tp_rank, args.tp_world)) return;
-    const uint ri = min(item.y + row%N, counts[item.x] - 1);
+    const uint ri = item.y + row%N;
+    if (ri >= counts[item.x]) return;
+    device const uint *offsets = (device const uint *)dst;
+    const uint packed_row = offsets[item.x] + ri;
+    dst = (device half *)((device uint *)dst + ((args.ne02 + 31u) & ~31u));
     const int id = ids[item.x*args.ne21 + ri];
     device const T *x = (device const T *)(src +
         args.nb12*(id/args.ne20) + args.nb11*((id%args.ne20)%args.ne11));
     for (uint k = tid; k < (uint)args.ne00; k += 128)
-        dst[(uint64_t)row*args.ne00 + k] = (half)x[k];
+        dst[(uint64_t)packed_row*args.ne00 + k] = (half)x[k];
 }
 
 typedef decltype(kernel_moe_pack_rhs<float>) moe_pack_rhs_t;
@@ -9372,7 +9390,8 @@ template [[host_name("kernel_moe_pack_rhs_f32")]] kernel moe_pack_rhs_t kernel_m
 template [[host_name("kernel_moe_pack_rhs_f16")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<half>;
 
 template<typename block_q, short nl,
-         void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+         void (*dequantize_func)(device const block_q *, short, thread half4x4 &),
+         int TileM = 64, int TileN = 32>
 kernel void kernel_mul_mm_id_mpp_packed(
         constant ds4_metal_args_mul_mm_id &args,
         device const char *src0,
@@ -9384,9 +9403,10 @@ kernel void kernel_mul_mm_id_mpp_packed(
         threadgroup char *shmem [[threadgroup(0)]],
         uint2 group [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]]) {
-    constexpr int M = 64, N = 32, K = 32;
+    constexpr int M = TileM, N = TileN, K = 32;
     if (group.x >= work[0]) return;
     const uint2 item = ((device const uint2 *)(work + 2))[group.x];
+    if (item.y % N) return;
     const int expert = item.x, r0 = group.y*M, r1 = item.y;
     const int nr0 = min(M, args.ne0 - r0);
     const int nr1 = min(N, (int)counts[expert] - r1);
@@ -9403,8 +9423,10 @@ kernel void kernel_mul_mm_id_mpp_packed(
     threadgroup half *sa = (threadgroup half *)shmem;
     auto tA0 = tensor(sa, dextents<int32_t, 2>(K, M));
     auto tA1 = tensor(sa + M*K, dextents<int32_t, 2>(K, M));
-    auto tB = tensor((device half *)src1 + (uint64_t)group.x*N*args.ne00,
-                     dextents<int32_t, 2>(args.ne00, N));
+    device const uint *offsets = (device const uint *)src1;
+    device half *rhs = (device half *)(offsets + ((args.ne02 + 31u) & ~31u));
+    auto tB = tensor(rhs + (uint64_t)(offsets[expert] + r1)*args.ne00,
+                     dextents<int32_t, 2>(args.ne00, nr1));
     matmul2d<matmul2d_descriptor(N, M, K, false, true, false,
                                 matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<4>> mm;
@@ -9413,6 +9435,7 @@ kernel void kernel_mul_mm_id_mpp_packed(
         if (acc.is_valid_element(i)) acc[i] = 0;
 
     auto stage = [&](int k, threadgroup half *tile) {
+        if (tid >= M*2) return;
         const int row = min((int)tid/2, nr0 - 1);
         const int col = k + 16*(tid%2);
         device const block_q *w = (device const block_q *)(src0 +
@@ -9450,6 +9473,8 @@ typedef decltype(kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq
 template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
 template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K>;
 template [[host_name("kernel_mul_mm_id_mxfp4_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_mxfp4, 2, dequantize_mxfp4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n128")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 32, 128>;
+template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed_m32n128")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K, 32, 128>;
 
 // Routed-expert grouped matmul on the Metal4 TensorOps/MPP pipeline. The
 // barrier after mm.run prevents the next K iteration from replacing staged
