@@ -48000,8 +48000,13 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLComputePipelineState> v41_small_down[3] = {nil, nil, down_mm_pipeline};
         id<MTLComputePipelineState> v41_partition = nil;
         id<MTLBuffer> v41_small_work = nil;
+        id<MTLBuffer> v41_rhs_f16 = nil;
         NSUInteger v41_small_stride = 0;
         const bool force_v41_small_tiles = (g_test_flags & DS4_GPU_TEST_V41_MOE_SMALL_TILES) != 0u;
+        const bool test_v41_rhs_f16 = (g_test_flags & DS4_GPU_TEST_V41_MOE_RHS_F16) != 0u;
+        const bool test_v41_q2_k128 = (g_test_flags & DS4_GPU_TEST_V41_MOE_Q2_K128) != 0u;
+        const NSUInteger pair_shared[3] = {8704u, 9216u, 16384u};
+        const NSUInteger down_shared[3] = {4608u, 5120u, 8192u};
         bool use_v41_small_tiles = v41_mm_tail_supported && use_mm_id_pair_swiglu &&
             (v41_mm_tail_auto || force_v41_small_tiles) &&
             expert_in_dim % 256u == 0u && expert_mid_dim % 256u == 0u && out_dim % 4u == 0u &&
@@ -48014,8 +48019,6 @@ int ds4_gpu_routed_moe_batch_tensor(
             v41_small_down[1] = ds4_gpu_get_pipeline("kernel_dsv41_moe_q2_down_n16");
             use_v41_small_tiles = v41_partition &&
                 v41_partition.maxTotalThreadsPerThreadgroup >= 128u;
-            const NSUInteger pair_shared[3] = {8704u, 9216u, 16384u};
-            const NSUInteger down_shared[3] = {4608u, 5120u, 8192u};
             for (unsigned i = 0; i < 3 && use_v41_small_tiles; i++) {
                 id<MTLComputePipelineState> p = v41_small_pair[i], d = v41_small_down[i];
                 use_v41_small_tiles = p && d && p.threadExecutionWidth == 32u &&
@@ -48038,9 +48041,57 @@ int ds4_gpu_routed_moe_batch_tensor(
                 }
             }
         }
+        // M1 median-five trials favor packed Q2 reuse only at N8; N16/N32
+        // retain their established kernels. REFERENCE suppresses the default.
+        bool use_v41_q2_k128 = false;
+        if (use_v41_small_tiles && (v41_mm_tail_auto || test_v41_q2_k128) &&
+            ((down_inner | down_row_bytes | down_expert_bytes) & 3u) == 0u) {
+            id<MTLComputePipelineState> candidate = ds4_gpu_get_pipeline(
+                "kernel_dsv41_moe_q2_down_n8_k128");
+            if (candidate && candidate.threadExecutionWidth == 32u &&
+                candidate.maxTotalThreadsPerThreadgroup >= 128u &&
+                candidate.staticThreadgroupMemoryLength + down_shared[0] <= g_device.maxThreadgroupMemoryLength) {
+                v41_small_down[0] = candidate;
+                use_v41_q2_k128 = true;
+            }
+        }
+        // M1 trials do not amortize the half-copy setup at 128 rows. Resolve
+        // this optional plan completely before replacing any baseline tile.
+        if (use_v41_small_tiles && (test_v41_rhs_f16 || (v41_mm_tail_auto && n_tokens >= 256u))) {
+            id<MTLComputePipelineState> candidates[3] = {
+                ds4_gpu_get_pipeline("kernel_dsv41_moe_iq2_pair_n8_f16_rhs"),
+                ds4_gpu_get_pipeline("kernel_dsv41_moe_iq2_pair_n16_f16_rhs"),
+                // N32 items have >16 occupied rows: no half is culled.
+                ds4_gpu_get_pipeline("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_rhs")
+            };
+            const uint64_t values = (uint64_t)n_tokens * expert_in_dim;
+            id<MTLComputePipelineState> copy_pipeline =
+                ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F32_F16_COPY") <= 0 ?
+                g_cpy_contig_f32_f16_pipeline : g_cpy_f32_f16_pipeline;
+            bool fits = values <= UINT32_MAX && values <= NSUIntegerMax / 2u &&
+                copy_pipeline && copy_pipeline.maxTotalThreadsPerThreadgroup > 0u;
+            for (unsigned i = 0; i < 3 && fits; i++) {
+                id<MTLComputePipelineState> p = candidates[i];
+                fits = p && p.threadExecutionWidth == 32u &&
+                    p.maxTotalThreadsPerThreadgroup >= 128u &&
+                    p.staticThreadgroupMemoryLength + pair_shared[i] <= g_device.maxThreadgroupMemoryLength;
+            }
+            if (fits) {
+                // One token-major copy, shared by all six routes. Retention
+                // includes borrowed/flushed unretained command buffers.
+                id<MTLBuffer> rhs = ds4_gpu_new_transient_buffer((NSUInteger)(values * 2u),
+                    "ds4_v41_moe_rhs_f16");
+                if (rhs) {
+                    for (unsigned i = 0; i < 3; i++) v41_small_pair[i] = candidates[i];
+                    v41_rhs_f16 = rhs;
+                }
+            }
+        }
 
         // A diagnostic force must fail instead of silently testing fallback.
-        if (force_v41_small_tiles && !use_v41_small_tiles) return 0;
+        if ((force_v41_small_tiles && !use_v41_small_tiles) ||
+            (test_v41_rhs_f16 && !v41_rhs_f16) ||
+            (test_v41_q2_k128 && !use_v41_q2_k128)) return 0;
 
         const bool q4_batch_table_boundary =
             use_q4_batch_expert_table &&
@@ -48248,12 +48299,12 @@ int ds4_gpu_routed_moe_batch_tensor(
                 ds4_gpu_mul_mm_id_args pair_mm_args = gate_mm_args;
                 id<MTLBuffer> pair_rhs = xbuf;
                 NSUInteger pair_rhs_offset = ds4_gpu_tensor_offset(x);
-                if (use_iq2_pair_f16_rhs) {
+                if (use_iq2_pair_f16_rhs || v41_rhs_f16) {
                     pair_mm_args.nb10 /= 2u;
                     pair_mm_args.nb11 /= 2u;
                     pair_mm_args.nb12 /= 2u;
                     pair_mm_args.nb13 /= 2u;
-                    pair_rhs = g_iq2_pair_rhs_f16_buffer;
+                    pair_rhs = v41_rhs_f16 ? v41_rhs_f16 : g_iq2_pair_rhs_f16_buffer;
                     pair_rhs_offset = 0u;
                     ok = ds4_gpu_encode_cpy_f32_f16_1d(cb,
                         xbuf, ds4_gpu_tensor_offset(x), pair_rhs, 0u,

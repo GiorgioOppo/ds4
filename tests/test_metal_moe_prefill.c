@@ -354,8 +354,22 @@ static int check_tail_case(const void *model, uint64_t bytes,
         ok = storage[i] && (t[i + 5] = ds4_gpu_tensor_view(storage[i], GUARD_BYTES, sizes[i + 5])) != NULL;
     }
     if (!ok) goto done;
-    for (uint64_t i = 0; i < xb / sizeof(float); i++)
+    for (uint64_t i = 0; i < xb / sizeof(float); i++) {
         x[i] = ((int)(random_u32() % 101) - 50) / 256.0f;
+        // Distinguish the copy's half rounding from merely copying inputs
+        // already exactly representable in half. Include signed ties and
+        // both neighbors, plus a half-subnormal boundary.
+        const float tie = 1.0f + 0x1p-11f;
+        switch (i % 32u) {
+        case 0: x[i] = tie; break;
+        case 1: x[i] = nextafterf(tie, INFINITY); break;
+        case 2: x[i] = nextafterf(tie, -INFINITY); break;
+        case 3: x[i] = -tie; break;
+        case 4: x[i] = nextafterf(-tie, -INFINITY); break;
+        case 5: x[i] = 0x1p-25f; break;
+        case 6: x[i] = nextafterf(0x1p-25f, INFINITY); break;
+        }
+    }
     for (uint32_t row = 0; row < tokens; row++) for (uint32_t s = 0; s < SELECTED; s++) {
         /* Controlled routes give each of the first six experts exactly
          * occupancy rows; disjoint experts consume the rest. Global batches
@@ -381,25 +395,34 @@ static int check_tail_case(const void *model, uint64_t bytes,
          ds4_gpu_tensor_write(t[2], 0, weights, ib);
     const uint32_t cull16 = DS4_GPU_TEST_V41_MOE_REFERENCE |
         DS4_GPU_TEST_V41_PAIR_TAIL_CULL | DS4_GPU_TEST_V41_DOWN_TAIL_CULL;
+    const uint32_t small = cull16 | DS4_GPU_TEST_V41_MOE_SMALL_TILES;
+    // Q2_K128 now changes only the N8 bucket; N16/N32 remain release kernels.
+    // Keep mixed occupancy cases to verify both sides of that dispatch.
     const uint32_t flags[] = {DS4_GPU_TEST_V41_MOE_REFERENCE,
         DS4_GPU_TEST_V41_MOE_REFERENCE | DS4_GPU_TEST_V41_PAIR_TAIL_CULL,
         DS4_GPU_TEST_V41_MOE_REFERENCE | DS4_GPU_TEST_V41_DOWN_TAIL_CULL,
-        cull16, 0u, cull16 | DS4_GPU_TEST_V41_MOE_SMALL_TILES};
-    /* Warm every pipeline, including release dispatch, then measure in both
-     * orders. REFERENCE remains a numerical oracle. Compare the release
+        cull16, 0u, small, small | DS4_GPU_TEST_V41_MOE_RHS_F16,
+        small | DS4_GPU_TEST_V41_MOE_Q2_K128,
+        small | DS4_GPU_TEST_V41_MOE_RHS_F16 | DS4_GPU_TEST_V41_MOE_Q2_K128};
+    enum { VARIANTS = sizeof(flags) / sizeof(flags[0]) };
+    /* One full warmup sweep, then five measured sweeps with alternating
+     * order. Report their median; every warmup and sample still checks exact
+     * outputs and guards. REFERENCE remains a numerical oracle. Compare the release
      * column across builds with the same test and the old/new Metal object
      * to measure the change against actual cull16 production dispatch. */
-    const unsigned order[] = {0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5};
-    const unsigned explicit_runs = benchmark ? 18u : 6u;
-    double elapsed[6] = {0};
-    for (unsigned run = 0; run < explicit_runs + 3u && ok; run++) {
+    enum { SAMPLES = 5 };
+    const unsigned explicit_runs = benchmark ? (1u + SAMPLES) * VARIANTS : VARIANTS;
+    double samples[VARIANTS][SAMPLES] = {{0}};
+    double elapsed[VARIANTS] = {0};
+    for (unsigned run = 0; run < explicit_runs + 6u && ok; run++) {
         const bool automatic = run >= explicit_runs;
-        const unsigned variant = automatic ? 0u : order[run];
+        const bool force_ssd = run >= explicit_runs + 2u;
+        const unsigned variant = force_ssd ? 5u + run - explicit_runs - 2u : automatic ? 0u :
+            (run / VARIANTS) % 2u ? VARIANTS - 1u - run % VARIANTS : run % VARIANTS;
         /* Also validate release dispatch against the forced reference, with
          * both resident views and the streamed full-layer binding mode. */
-        const bool force_ssd = run == explicit_runs + 2u;
         ds4_gpu_set_ssd_streaming(run >= explicit_runs + 1u);
-        ds4_gpu_test_set_flags(force_ssd ? flags[5] : automatic ? 0u : flags[variant]);
+        ds4_gpu_test_set_flags(force_ssd ? flags[variant] : automatic ? 0u : flags[variant]);
         for (unsigned i = 5; i < 8 && ok; i++)
             ok = ds4_gpu_tensor_fill_f32(t[i], NAN, sizes[i] / sizeof(float));
         /* Mid retains F32 capacity, but its produced half range ends at
@@ -409,7 +432,7 @@ static int check_tail_case(const void *model, uint64_t bytes,
                  ds4_gpu_tensor_write(storage[i], GUARD_BYTES + consumed[i], guard, sizeof(guard));
         bool half_mid = false;
         const double begin = now_seconds();
-        const bool caller_batch = force_ssd || (!automatic && variant == 5u);
+        const bool caller_batch = force_ssd || (!automatic && variant >= 5u);
         if (caller_batch && ok) ok = ds4_gpu_begin_commands();
         ok = ok && ds4_gpu_routed_moe_batch_tensor(t[7], t[3], t[4], t[5], t[6],
             model, bytes, 0, up_off, down_off, 16, 10,
@@ -421,7 +444,8 @@ static int check_tail_case(const void *model, uint64_t bytes,
         // buffer retention when MoE borrows an unretained caller-owned CB.
         if (caller_batch && ds4_gpu_commands_active()) ok = ds4_gpu_end_commands() && ok;
         const double ms = (now_seconds() - begin) * 1000;
-        if (run >= 6 && !automatic) elapsed[variant] += ms / 2;
+        if (run >= VARIANTS && !automatic)
+            samples[variant][run / VARIANTS - 1u] = ms;
         for (unsigned i = 0; i < 3 && ok; i++) {
             const uint64_t size = consumed[i];
             ok = ds4_gpu_tensor_read(t[i + 5], 0, actual, size);
@@ -441,12 +465,34 @@ static int check_tail_case(const void *model, uint64_t bytes,
                     tokens, occupancy, variant, i, side);
             }
         }
+        // The transient half input must not modify any caller-owned source.
+        const void *inputs[] = {x, ids, weights};
+        for (unsigned i = 0; i < 3 && ok; i++) {
+            ok = ds4_gpu_tensor_read(t[i], 0, actual, sizes[i]) &&
+                !memcmp(inputs[i], actual, sizes[i]);
+            if (!ok) fprintf(stderr, "V4.1 tail input modified variant=%u input=%u\n", variant, i);
+        }
         if (automatic) fprintf(stderr, "V4.1 tail auto rows=%u ssd=%u force_small=%u: %s\n",
             tokens, run >= explicit_runs + 1u, force_ssd, ok ? "PASS" : "FAIL");
     }
-    if (benchmark && ok) fprintf(stderr,
-        "V4.1 tail timing rows=%u skewed=%d uncull=%.3f pair=%.3f down=%.3f both=%.3f release=%.3f force_small=%.3f ms\n",
-        tokens, skewed, elapsed[0], elapsed[1], elapsed[2], elapsed[3], elapsed[4], elapsed[5]);
+    if (benchmark && ok) {
+        for (unsigned variant = 0; variant < VARIANTS; variant++) {
+            for (unsigned i = 1; i < SAMPLES; i++) {
+                const double value = samples[variant][i];
+                unsigned j = i;
+                while (j && samples[variant][j - 1u] > value) {
+                    samples[variant][j] = samples[variant][j - 1u];
+                    j--;
+                }
+                samples[variant][j] = value;
+            }
+            elapsed[variant] = samples[variant][SAMPLES / 2u];
+        }
+        fprintf(stderr,
+        "V4.1 tail timing rows=%u skewed=%d stat=median5 warmup=1 sweeps=5 uncull=%.3f pair=%.3f down=%.3f both=%.3f release=%.3f force_small=%.3f rhs_f16=%.3f q2_k128=%.3f rhs_q2=%.3f ms\n",
+        tokens, skewed, elapsed[0], elapsed[1], elapsed[2], elapsed[3], elapsed[4], elapsed[5],
+        elapsed[6], elapsed[7], elapsed[8]);
+    }
 done:
     ds4_gpu_test_set_flags(0);
     ds4_gpu_set_ssd_streaming(false);

@@ -545,6 +545,8 @@ enum {
     DS4_GPU_TEST_V41_MOE_REFERENCE = 1u << 15,
     DS4_GPU_TEST_V41_MOE_SMALL_TILES = 1u << 16,
     DS4_GPU_TEST_V41_INDEXED_REFERENCE = 1u << 17,
+    DS4_GPU_TEST_V41_MOE_RHS_F16 = 1u << 18,
+    DS4_GPU_TEST_V41_MOE_Q2_K128 = 1u << 19,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);

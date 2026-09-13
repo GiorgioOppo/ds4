@@ -8973,7 +8973,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 // covering all N8 or N16 routed rows. Their smaller accumulator arrays and B
 // staging are compile-time shapes, not predicates inside the MMA loop.
 template<short NR1, bool PAIR, typename block_q,
-         void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+         void (*dequantize_func)(device const block_q *, short, thread half4x4 &),
+         bool HALF_RHS = false, bool Q2_K128 = false>
 kernel void kernel_dsv41_moe_small_tile(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -8991,7 +8992,10 @@ kernel void kernel_dsv41_moe_small_tile(
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     static_assert(NR1 == 8 || NR1 == 16, "short routed tiles require N8/N16");
+    static_assert(!Q2_K128 || (!PAIR && is_same<block_q, block_q2_K>::value),
+        "packed K128 reuse requires Q2 down");
     constexpr short NR0 = 64, NK = 32, NB = NR1/8, NC = 2*NB;
+    constexpr short K_STEPS = Q2_K128 ? 4 : 1;
     constexpr short B_LOAD = NR1/4, B_THREADS = 128/NR1;
     if (tgpig.x >= ((device const uint *)work)[0]) return;
     const uint2 item = ((device const uint2 *)(work + 8))[tgpig.x];
@@ -9024,57 +9028,90 @@ kernel void kernel_dsv41_moe_small_tile(
         if (PAIR) mc_up[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
-    for (int k = 0; k < args.ne00; k += NK) {
-        half4x4 ag, au;
-        dequantize_func(xg, il, ag);
-        if (PAIR) dequantize_func(xu, il, au);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = 0; k < args.ne00; k += NK*K_STEPS) {
+        uint4 packed_q;
+        uchar4 cached_scales;
+        float cached_d, cached_min;
+        if (Q2_K128) {
+            // A lane owns one 16-byte qs slice for four successive K32
+            // steps. Keep its packed bits, not 128 expanded half values.
+            // Four scalar uint loads need only the admitted 4-byte alignment;
+            // Q2 blocks have stride84 and are not uniformly uint4-aligned.
+            device const block_q2_K *q2 = (device const block_q2_K *)xg;
+            device const uint *q = (device const uint *)(q2->qs +
+                32*(il/8) + 16*(il&1));
+            packed_q = uint4(q[0], q[1], q[2], q[3]);
+            FOR_UNROLL (short step = 0; step < 4; step++)
+                cached_scales[step] = q2->scales[il + 2*step];
+            cached_d = q2->d;
+            cached_min = q2->dmin;
+        }
+        FOR_UNROLL (short step = 0; step < K_STEPS; step++) {
+            half4x4 ag, au;
+            if (Q2_K128) {
+                const short shift = (il/2)%4;
+                const half coef = shift>1 ? (shift>2 ? 1/64.h : 1/16.h) :
+                    (shift>0 ? 1/4.h : 1.h);
+                const uchar mask = shift>1 ? (shift>2 ? 192 : 48) : (shift>0 ? 12 : 3);
+                const uchar sc = cached_scales[step];
+                const float dl = cached_d * (sc & 0xF) * coef;
+                const float ml = cached_min * (sc >> 4);
+                FOR_UNROLL (short i = 0; i < 16; i++) {
+                    const uchar q = (uchar)(packed_q[i/4] >> (8*(i%4)));
+                    // Match dequantize_q2_K, including its float arithmetic and
+                    // half conversion, before the unchanged K8 MMA sequence.
+                    ag[i/4][i%4] = dl * (q & mask) - ml;
+                }
+            } else dequantize_func(xg, il, ag);
+            if (PAIR) dequantize_func(xu, il, au);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const short b_block = NB*(col_b/8) + row_b/8;
-        threadgroup half *b = sb + 64*b_block + 8*(row_b%8) + col_b%8;
-        if (NR1 == 8) {
-            *(threadgroup half2 *)b = PAIR ?
-                half2(*(device const float2 *)y) : *(device const half2 *)y;
-        } else {
-            *(threadgroup half4 *)b = PAIR ?
-                half4(*(device const float4 *)y) : *(device const half4 *)y;
-        }
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            const short sx = 2*(tid%2) + i/8;
-            const short sy = (tid/2)/8;
-            const short lx = (tid/2)%8;
-            const short ly = i%8;
-            const short offset = 64*(8*sx + sy) + 8*ly + lx;
-            sa_gate[offset] = ag[i/4][i%4];
-            if (PAIR) sa_up[offset] = au[i/4][i%4];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            const short b_block = NB*(col_b/8) + row_b/8;
+            threadgroup half *b = sb + 64*b_block + 8*(row_b%8) + col_b%8;
+            if (NR1 == 8) {
+                *(threadgroup half2 *)b = PAIR && !HALF_RHS ?
+                    half2(*(device const float2 *)y) : *(device const half2 *)y;
+            } else {
+                *(threadgroup half4 *)b = PAIR && !HALF_RHS ?
+                    half4(*(device const float4 *)y) : *(device const half4 *)y;
+            }
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2*(tid%2) + i/8;
+                const short sy = (tid/2)/8;
+                const short lx = (tid/2)%8;
+                const short ly = i%8;
+                const short offset = 64*(8*sx + sy) + 8*ly + lx;
+                sa_gate[offset] = ag[i/4][i%4];
+                if (PAIR) sa_up[offset] = au[i/4][i%4];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup const half *a_gate = sa_gate + 2*64*sg;
-        threadgroup const half *a_up = sa_up + 2*64*sg;
-        threadgroup const half *b_tile = sb;
-        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
-            FOR_UNROLL (short i = 0; i < 2; i++) {
-                simdgroup_load(ma_gate[i], a_gate + 64*i, 8, 0, false);
-                if (PAIR) simdgroup_load(ma_up[i], a_up + 64*i, 8, 0, false);
+            threadgroup const half *a_gate = sa_gate + 2*64*sg;
+            threadgroup const half *a_up = sa_up + 2*64*sg;
+            threadgroup const half *b_tile = sb;
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(ma_gate[i], a_gate + 64*i, 8, 0, false);
+                    if (PAIR) simdgroup_load(ma_up[i], a_up + 64*i, 8, 0, false);
+                }
+                if (!PAIR) simdgroup_barrier(mem_flags::mem_none);
+                FOR_UNROLL (short i = 0; i < NB; i++)
+                    simdgroup_load(mb[i], b_tile + 64*i, 8, 0, false);
+                simdgroup_barrier(mem_flags::mem_none);
+                FOR_UNROLL (short i = 0; i < NC; i++) {
+                    simdgroup_multiply_accumulate(mc_gate[i], mb[i/2], ma_gate[i%2], mc_gate[i]);
+                    if (PAIR)
+                        simdgroup_multiply_accumulate(mc_up[i], mb[i/2], ma_up[i%2], mc_up[i]);
+                }
+                a_gate += 8*64;
+                a_up += 8*64;
+                b_tile += NB*64;
             }
-            if (!PAIR) simdgroup_barrier(mem_flags::mem_none);
-            FOR_UNROLL (short i = 0; i < NB; i++)
-                simdgroup_load(mb[i], b_tile + 64*i, 8, 0, false);
-            simdgroup_barrier(mem_flags::mem_none);
-            FOR_UNROLL (short i = 0; i < NC; i++) {
-                simdgroup_multiply_accumulate(mc_gate[i], mb[i/2], ma_gate[i%2], mc_gate[i]);
-                if (PAIR)
-                    simdgroup_multiply_accumulate(mc_up[i], mb[i/2], ma_up[i%2], mc_up[i]);
-            }
-            a_gate += 8*64;
-            a_up += 8*64;
-            b_tile += NB*64;
+            il = il + 2 < QK_NL ? il + 2 : il%2;
+            if (il < 2) { xg++; if (PAIR) xu++; }
+            y += NK*args.nb10;
         }
-        il = il + 2 < QK_NL ? il + 2 : il%2;
-        if (il < 2) { xg++; if (PAIR) xu++; }
-        y += NK*args.nb10;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9116,8 +9153,11 @@ kernel void kernel_dsv41_moe_small_tile(
 typedef decltype(kernel_dsv41_moe_small_tile<8, true, block_iq2_xxs, dequantize_iq2_xxs>) dsv41_moe_small_tile_t;
 template [[host_name("kernel_dsv41_moe_iq2_pair_n8")]] kernel dsv41_moe_small_tile_t kernel_dsv41_moe_small_tile<8, true, block_iq2_xxs, dequantize_iq2_xxs>;
 template [[host_name("kernel_dsv41_moe_iq2_pair_n16")]] kernel dsv41_moe_small_tile_t kernel_dsv41_moe_small_tile<16, true, block_iq2_xxs, dequantize_iq2_xxs>;
+template [[host_name("kernel_dsv41_moe_iq2_pair_n8_f16_rhs")]] kernel dsv41_moe_small_tile_t kernel_dsv41_moe_small_tile<8, true, block_iq2_xxs, dequantize_iq2_xxs, true>;
+template [[host_name("kernel_dsv41_moe_iq2_pair_n16_f16_rhs")]] kernel dsv41_moe_small_tile_t kernel_dsv41_moe_small_tile<16, true, block_iq2_xxs, dequantize_iq2_xxs, true>;
 template [[host_name("kernel_dsv41_moe_q2_down_n8")]] kernel dsv41_moe_small_tile_t kernel_dsv41_moe_small_tile<8, false, block_q2_K, dequantize_q2_K>;
 template [[host_name("kernel_dsv41_moe_q2_down_n16")]] kernel dsv41_moe_small_tile_t kernel_dsv41_moe_small_tile<16, false, block_q2_K, dequantize_q2_K>;
+template [[host_name("kernel_dsv41_moe_q2_down_n8_k128")]] kernel dsv41_moe_small_tile_t kernel_dsv41_moe_small_tile<8, false, block_q2_K, dequantize_q2_K, false, true>;
 
 // MXFP4 resident-prefill specialization with a compact 32x32
 // output/routed-row tile. Two SIMDgroups share the same four 8-column A
