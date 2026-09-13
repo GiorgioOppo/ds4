@@ -1184,17 +1184,64 @@ static int check_compact_carry(void) {
 
 /* Exercise the full-head and compact TP layouts with the same causal keys.
  * Selected rows are shuffled; include masked future rows at odd frontiers. */
-static int check_tp_attention(void) {
+extern uint32_t ds4_gpu_test_indexed_prefill_rb(void);
+static uint32_t indexed_prefill_release_rb(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() ? 16u : 1u;
+}
+static int compare_attention_time(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static int benchmark_indexed_prefill(
+        ds4_gpu_tensor *out, const float *reference, ds4_gpu_tensor *q,
+        ds4_gpu_tensor *raw, ds4_gpu_tensor *comp, ds4_gpu_tensor *ids,
+        const void *sinks, uint32_t n, uint32_t heads, uint32_t nr,
+        uint32_t start, uint32_t ratio, uint32_t comp_f16, uint32_t raw_start) {
+    enum { SAMPLES = 7, D = 512, C = 2048, K = 512 };
+    const size_t bytes = (size_t)n * heads * D * sizeof(float);
+    double times[2][SAMPLES];
+    for (unsigned sample = 0; sample < SAMPLES; sample++) {
+        double pair[2] = {0, 0};
+        for (unsigned pass = 0; pass < 4; pass++) {
+            const unsigned arm = (pass == 1 || pass == 2) ^ (sample & 1u);
+            ds4_gpu_test_set_flags(arm ? 0u : DS4_GPU_TEST_V41_INDEXED_REFERENCE);
+            const double begin = monotonic_seconds();
+            CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(out,
+                sinks, getpagesize(), 0, q, raw, comp, comp_f16, ids, n, start,
+                nr, nr, raw_start, C, K, 128, ratio, heads, D));
+            pair[arm] += (monotonic_seconds() - begin) * 500;
+            CHECK(ds4_gpu_test_indexed_prefill_rb() ==
+                  (arm ? indexed_prefill_release_rb() : 1u));
+            CHECK(!memcmp(reference, ds4_gpu_tensor_contents(out), bytes));
+        }
+        times[0][sample] = pair[0]; times[1][sample] = pair[1];
+    }
+    qsort(times[0], SAMPLES, sizeof(double), compare_attention_time);
+    qsort(times[1], SAMPLES, sizeof(double), compare_attention_time);
+    fprintf(stderr, "indexed prefill rows=%u heads=%u ratio=%u comp_f16=%u RB=%u "
+        "reference=%.3f release=%.3f ms (sort included, ABBA median %u)\n",
+        n, heads, ratio, comp_f16, indexed_prefill_release_rb(), times[0][SAMPLES/2],
+        times[1][SAMPLES/2], SAMPLES);
+    ds4_gpu_test_set_flags(0);
+    return 1;
+}
+
+static int check_tp_attention(int bench) {
     enum { D = 512, H = 64, K = 512, C = 2048 };
-    const uint32_t sizes[] = {1, 31, 32, 33, 129, 257, 2048};
+    const uint32_t sizes[] = {1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 129, 257, 512, 1024, 2048};
     float *sinks = NULL;
     CHECK(posix_memalign((void **)&sinks, getpagesize(), getpagesize()) == 0);
     for (int h = 0; h < H; h++) sinks[h] = random_value();
     CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
     ds4_gpu_set_quality(false);
+    ds4_gpu_test_set_flags(0);
     for (unsigned s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
-        const uint32_t n = sizes[s], nr = n + 127, start = 3073;
+        const uint32_t n = sizes[s], start = n > 1 && n < 31 ? (s & 1u ? 0u : 5u) : 3073u;
+        const uint32_t past = start < 127u ? start : 127u, nr = n + past;
+        const uint32_t raw_start = n > 1 && n < 31 && nr > 3 ? nr - 3u : 0u;
         const uint32_t ratio = 1u + s % 2u;
+        const uint32_t comp_f16 = n >= 512u ? 0u : s & 1u;
         const size_t nq = (size_t)n * H * D;
         float *q = malloc(nq * 4), *actual = malloc(nq * 4);
         float *compact = malloc(nq * 2), *part = malloc(nq * 2);
@@ -1206,15 +1253,57 @@ static int check_tp_attention(void) {
         for (uint32_t i = 0; i < C * D; i++) comp[i] = bf16(random_value() / 4);
         for (uint32_t t = 0; t < n; t++)
             for (uint32_t j = 0; j < K; j++)
-                ids[t * K + j] = j % 29 ? (int32_t)((j * 127u + t * 17u) % C) : -1;
+                ids[t * K + j] = t % 17 == 0 ? -1 : t % 17 == 1 ? INT32_MAX :
+                    j % 29 ? (int32_t)((j * 127u + t * 17u) % C) : -1;
+        _Float16 *comp_half = malloc(C * D * sizeof(*comp_half));
+        CHECK(comp_half);
+        for (uint32_t i = 0; i < C * D; i++) comp_half[i] = (_Float16)comp[i];
         ds4_gpu_tensor *qt = upload(q, nq * 4), *rt = upload(raw, (size_t)nr * D * 4);
-        ds4_gpu_tensor *ct = upload(comp, C * D * 4), *it = upload(ids, (size_t)n * K * 4);
+        ds4_gpu_tensor *ct = upload(comp_f16 ? (const void *)comp_half : comp,
+            (size_t)C * D * (comp_f16 ? 2u : 4u)), *it = upload(ids, (size_t)n * K * 4);
+        free(comp_half);
         ds4_gpu_tensor *out = upload(NULL, nq * 4), *qp = upload(NULL, nq * 2);
         ds4_gpu_tensor *op = upload(NULL, nq * 2);
         CHECK(qt && rt && ct && it && out && qp && op);
         CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(out, sinks, getpagesize(),
-            0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
+            0, qt, rt, ct, comp_f16, it, n, start, nr, nr, raw_start, C, K, 128, ratio, H, D));
         CHECK(ds4_gpu_tensor_read(out, 0, actual, nq * 4));
+        CHECK(ds4_gpu_test_indexed_prefill_rb() == (n == 1 ? 0u : indexed_prefill_release_rb()));
+        if (n > 1) {
+            for (unsigned arm = 0; arm < 2; arm++) {
+                ds4_gpu_test_set_flags(arm ? 0u : DS4_GPU_TEST_V41_INDEXED_REFERENCE);
+                CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(out,
+                    sinks, getpagesize(), 0, qt, rt, ct, comp_f16, it, n, start,
+                    nr, nr, raw_start, C, K, 128, ratio, H, D));
+                CHECK(ds4_gpu_test_indexed_prefill_rb() == (arm ? indexed_prefill_release_rb() : 1u));
+                CHECK(!memcmp(actual, ds4_gpu_tensor_contents(out), nq * 4));
+            }
+            ds4_gpu_test_set_flags(0);
+        }
+        if (n == 33) {
+            float *fallback = malloc(nq * 4);
+            CHECK(fallback);
+            for (unsigned edge = 0; edge < 3; edge++) {
+                const uint32_t edge_ratio = edge == 0 ? 4u : ratio;
+                const uint32_t edge_window = edge == 1 ? 64u : 128u;
+                const uint32_t edge_heads = edge == 2 ? 16u : H;
+                const size_t edge_bytes = (size_t)n * edge_heads * D * 4;
+                for (unsigned arm = 0; arm < 2; arm++) {
+                    ds4_gpu_test_set_flags(arm ? 0u : DS4_GPU_TEST_V41_INDEXED_REFERENCE);
+                    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(out,
+                        sinks, getpagesize(), 0, qt, rt, ct, comp_f16, it, n, start,
+                        nr, nr, raw_start, C, K, edge_window, edge_ratio, edge_heads, D));
+                    CHECK(ds4_gpu_test_indexed_prefill_rb() == 1u);
+                    if (!arm) memcpy(fallback, ds4_gpu_tensor_contents(out), edge_bytes);
+                    else CHECK(!memcmp(fallback, ds4_gpu_tensor_contents(out), edge_bytes));
+                }
+            }
+            free(fallback);
+            ds4_gpu_test_set_flags(0);
+        }
+        if (bench && (n == 512 || n == 1024))
+            CHECK(benchmark_indexed_prefill(out, actual, qt, rt, ct, it, sinks,
+                n, H, nr, start, ratio, comp_f16, raw_start));
         double max_split = 0, max_oracle = 0;
         for (uint32_t rank = 0; rank < 2; rank++) {
             for (uint32_t t = 0; t < n; t++)
@@ -1222,28 +1311,30 @@ static int check_tp_attention(void) {
                     q + ((size_t)t * H + rank * H/2) * D, H/2 * D * 4);
             CHECK(ds4_gpu_tensor_write(qp, 0, compact, nq * 2));
             CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(op, sinks, getpagesize(),
-                rank * H/2 * 4, qp, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H/2, D));
+                rank * H/2 * 4, qp, rt, ct, comp_f16, it, n, start, nr, nr, raw_start,
+                C, K, 128, ratio, H/2, D));
             CHECK(ds4_gpu_tensor_read(op, 0, part, nq * 2));
             if (n > 1) {
+                for (unsigned arm = 0; arm < 2; arm++) {
+                    ds4_gpu_test_set_flags(arm ? 0u : DS4_GPU_TEST_V41_INDEXED_REFERENCE);
+                    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(op,
+                        sinks, getpagesize(), rank * H/2 * 4, qp, rt, ct, comp_f16, it,
+                        n, start, nr, nr, raw_start, C, K, 128, ratio, H/2, D));
+                    CHECK(ds4_gpu_test_indexed_prefill_rb() == (arm ? indexed_prefill_release_rb() : 1u));
+                    CHECK(!memcmp(part, ds4_gpu_tensor_contents(op), nq * 2));
+                }
+                ds4_gpu_test_set_flags(0);
                 ds4_gpu_set_quality(true); /* Existing eight-head kernel. */
                 CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(op, sinks, getpagesize(),
-                    rank * H/2 * 4, qp, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H/2, D));
+                    rank * H/2 * 4, qp, rt, ct, comp_f16, it, n, start, nr, nr, raw_start,
+                    C, K, 128, ratio, H/2, D));
                 CHECK(!memcmp(part, ds4_gpu_tensor_contents(op), nq * 2));
+                CHECK(ds4_gpu_test_indexed_prefill_rb() == 1u);
                 ds4_gpu_set_quality(false);
             }
-            if (n == 2048 && rank == 0) {
-                const bool controls[] = {true, false, false, true};
-                for (unsigned pass = 0; pass < 4; pass++) {
-                    ds4_gpu_set_quality(controls[pass]);
-                    const double begin = monotonic_seconds();
-                    for (int repeat = 0; repeat < 4; repeat++)
-                        CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(op,
-                            sinks, getpagesize(), 0, qp, rt, ct, 0, it, n, start,
-                            nr, nr, 0, C, K, 128, ratio, H/2, D));
-                    fprintf(stderr, "TP indexed attention control=%u %.3f ms\n",
-                        controls[pass], (monotonic_seconds() - begin) * 250);
-                }
-                ds4_gpu_set_quality(false);
+            if (bench && n == 2048 && rank == 0) {
+                CHECK(benchmark_indexed_prefill(op, part, qp, rt, ct, it, sinks,
+                    n, H/2, nr, start, ratio, comp_f16, raw_start));
             }
             for (uint32_t t = 0; t < n; t++) {
                 for (uint32_t h = 0; h < H/2; h++) {
@@ -1259,10 +1350,15 @@ static int check_tp_attention(void) {
                     double logits[128 + K + 1], values[128 + K + 1];
                     const uint32_t col = (t * 71u + h * 19u) % D;
                     unsigned count = 0;
-                    for (uint32_t j = 0; j < 128 + K; j++) {
-                        const int32_t id = j < 128 ? (int32_t)(t + j) : ids[t * K + j - 128];
-                        if (j >= 128 && (uint32_t)id >= (start + t + 1) / ratio) continue;
-                        const float *key = (j < 128 ? raw : comp) + (size_t)id * D;
+                    const uint32_t raw_count = past + t + 1u < 128u ? past + t + 1u : 128u;
+                    const uint32_t first_raw = past + t + 1u - raw_count;
+                    const uint32_t visible = (start + t + 1u) / ratio < C ?
+                        (start + t + 1u) / ratio : C;
+                    for (uint32_t j = 0; j < raw_count + K; j++) {
+                        const int32_t id = j < raw_count ?
+                            (int32_t)((raw_start + first_raw + j) % nr) : ids[t * K + j - raw_count];
+                        if (j >= raw_count && (uint32_t)id >= visible) continue;
+                        const float *key = (j < raw_count ? raw : comp) + (size_t)id * D;
                         double dot = 0;
                         for (int d = 0; d < D; d++) dot += (double)query[d] * key[d];
                         logits[count] = dot / sqrt(512.0);
@@ -1309,8 +1405,9 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
-    if (argc == 2 && !strcmp(argv[1], "--tp-attention")) {
-        const int ok = ds4_gpu_init() && check_tp_attention();
+    if ((argc == 2 || (argc == 3 && !strcmp(argv[2], "--bench"))) &&
+        !strcmp(argv[1], "--tp-attention")) {
+        const int ok = ds4_gpu_init() && check_tp_attention(argc == 3);
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
@@ -1354,7 +1451,7 @@ int main(int argc, char **argv) {
              check_bf16_rope() && check_bf16_norm() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_index_projection() && check_causal_topk() && check_compact_carry() && check_attention_output() &&
-             check_tp_attention();
+             check_tp_attention(0);
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }
