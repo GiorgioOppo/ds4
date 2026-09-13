@@ -685,6 +685,23 @@ static int output_coefficient(uint32_t output, uint32_t term) {
     return (int)((output + term * 3u) % 7u) - 3;
 }
 
+/* Independent operand rounding and the standard forward-error bound already
+ * used to qualify the F16-operand/F32-accumulator bulk projection. */
+static float reference_f16(float value) {
+    const double magnitude = fabs((double)value);
+    if (!magnitude) return value;
+    int exponent;
+    (void)frexp(magnitude, &exponent);
+    const double step = ldexp(1.0, exponent < -13 ? -24 : exponent - 11);
+    return (float)copysign(nearbyint(magnitude / step) * step, (double)value);
+}
+
+static double projection_roundoff_bound(double magnitude, unsigned width) {
+    const double f32 = (2.0 * width + 1.0) * 0x1p-24;
+    const double f64 = (width + 1.0) * 0x1p-53;
+    return (f32 / (1.0 - f32) + f64 / (1.0 - f64)) * magnitude;
+}
+
 static int check_attention_output(void) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120, TERMS = 8 };
     const uint32_t counts[] = {1,31,32,33,65,513}, rows = counts[requested_shape];
@@ -721,23 +738,49 @@ static int check_attention_output(void) {
     RUN(ds4_gpu_dsv41_attention_output_batch(out, low, model, bytes, 0, a_bytes, xt, rows));
     CHECK(ds4_gpu_tensor_read(low, 0, low_got, nl * 4));
     CHECK(ds4_gpu_tensor_read(out, 0, out_got, ny * 4));
+    const int bulk = rows >= 32u && rows <= 2048u;
+    double worst_low = 0, worst_output = 0;
+    CHECK(reference_f16(0x1.002p0f) == 1.0f);
+    CHECK(reference_f16(0x1.006p0f) == 0x1.008p0f);
+    CHECK(reference_f16(0x1p-25f) == 0.0f);
+    CHECK(reference_f16(-0x1.8p-24f) == -0x1p-23f);
     for (uint32_t row = 0; row < rows; row++) for (uint32_t group = 0; group < GROUPS; group++) {
         for (uint32_t o = 0; o < RANK; o++) {
-            double sum = 0;
-            for (uint32_t j = 0; j < TERMS; j++)
-                sum += input[((size_t)row * GROUPS + group) * GROUP + low_column(group, o, j)] * low_coefficient(group, o, j) / 128.0;
+            double sum = 0, magnitude = 0;
+            for (uint32_t j = 0; j < TERMS; j++) {
+                /* These fixture inputs and scaled coefficients are exactly F16. */
+                const double term = input[((size_t)row * GROUPS + group) * GROUP + low_column(group, o, j)] * low_coefficient(group, o, j) / 128.0;
+                sum += term; magnitude += fabs(term);
+            }
             const size_t at = ((size_t)row * GROUPS + group) * RANK + o;
             low_ref[at] = bf16((float)sum);
-            CHECK(low_got[at] == low_ref[at]);
+            CHECK(isfinite(low_got[at]) && low_got[at] == bf16(low_got[at]));
+            if (bulk) {
+                /* Propagate accumulation error through the required BF16 boundary,
+                 * including cancellation and sums on a rounding midpoint. */
+                const double bound = projection_roundoff_bound(magnitude, GROUP);
+                CHECK(low_got[at] >= bf16((float)(sum - bound)) &&
+                      low_got[at] <= bf16((float)(sum + bound)));
+            } else {
+                CHECK(low_got[at] == low_ref[at]);
+            }
+            worst_low = fmax(worst_low, fabs(low_got[at] - low_ref[at]));
         }
     }
     for (uint32_t row = 0; row < rows; row++) for (uint32_t o = 0; o < OUT; o++) {
-        double sum = 0;
-        for (uint32_t j = 0; j < TERMS; j++)
-            sum += low_ref[(size_t)row * GROUPS * RANK + output_column(o, j)] * output_coefficient(o, j) / 128.0;
+        double sum = 0, magnitude = 0;
+        for (uint32_t j = 0; j < TERMS; j++) {
+            const float low_value = low_got[(size_t)row * GROUPS * RANK + output_column(o, j)];
+            const double term = (bulk ? reference_f16(low_value) : low_value) * output_coefficient(o, j) / 128.0;
+            sum += term; magnitude += fabs(term);
+        }
         const float got = out_got[(size_t)row * OUT + o];
-        CHECK(isfinite(got) && fabs(got - sum) <= 2e-5 * (1 + fabs(sum)));
+        const double bound = bulk ? projection_roundoff_bound(magnitude, GROUPS * RANK) : 2e-5 * (1 + fabs(sum));
+        CHECK(isfinite(got) && fabs(got - sum) <= bound);
+        worst_output = fmax(worst_output, fabs(got - sum));
     }
+    fprintf(stderr, "attention-output full reference rows=%u low_values=%zu output_values=%zu bulk=%d max_low_drift=%.9g max_output_error=%.9g\n",
+            rows, nl, ny, bulk, worst_low, worst_output);
 
     /* Exercise the graph's direct Q8 projection helper independently, using
      * values that an accidental F16/BF16 activation cast would change. */
