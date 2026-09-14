@@ -45,7 +45,7 @@ To build weights rather than download them, see [GGUF tools](../gguf-tools/READM
 
 ## DeepSeek V4.1 Flash
 
-V4.1 Flash text and vision inference work on Metal and ROCm on Strix Halo (`gfx1151`). ROCm Q2 text and vision qualification covers resident expert weights and SSD streaming; see the [Strix Halo setup](STRIX_HALO.md#deepseek-v41-flash). It needs its own GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files are not interchangeable with it.
+V4.1 Flash text and vision inference work on Metal and ROCm on Strix Halo (`gfx1151`). ROCm Q2 supports resident expert weights, SSD streaming and two-machine resident clustering; see [Strix Halo setup](STRIX_HALO.md#deepseek-v41-flash) and [clustering commands](CLUSTERING_ROCM.md). CUDA supports text with Q2 SSD streaming on one Spark or resident shards across two Sparks. V4.1 needs its own GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files are not interchangeable with it.
 
 | Target | File size | Main weights |
 | --- | ---: | ---: |
@@ -65,11 +65,12 @@ On one 128 GB Mac, use SSD streaming. Leave the expert cache budget automatic:
 ```
 
 Use `ds4-agent` or `ds4-server` with the same model and memory options.
+On a DGX Spark, add `--cuda`; see the [Spark guide](DGX_SPARK.md#deepseek-v41-flash).
 `--think-level 25` sets reasoning effort explicitly; the range is 1 to 100,
 with 0 disabling thinking. `/think 25` changes it in the CLI or native agent.
 `--think` selects 75 and `--think-max` selects 100.
 
-For two 128 GB Macs, follow the [TP/RDMA setup](DISTRIBUTED.md), passing this
+For two 128 GB Macs or Sparks, follow the [TP/RDMA setup](DISTRIBUTED.md), passing this
 GGUF with `-m` on both ranks and omitting `--ssd-streaming`. Each rank holds
 about 81 GiB of main weights, plus context and runtime buffers. Both machines
 need the complete GGUF on disk. A 256 GB or larger Mac can instead hold all
@@ -82,20 +83,19 @@ The download comes in two parts; the script joins and verifies them automaticall
 Allow another 37 GiB of free disk space while joining. Rerun the command to resume an
 interrupted download or join.
 
-Large SSD prefills process layers in wide batches, overlapping computation
-with the next layer's reads. Short appends keep using the expert cache.
+Large SSD prefills process layers in wide batches. Metal overlaps computation
+with the next layer's reads; CUDA stages experts into its bounded device cache.
+Short appends keep using the expert cache.
 Resident and TP inference also batch continued prefills automatically.
 
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
-increasing both context and slot count.
-
-DSpark, pipeline execution and CUDA are not implemented for V4.1. Distributed ROCm inference is not qualified.
+increasing both context and slot count. CUDA Q2 SSD mode batches up to eight decode rows; CUDA network TP currently serves sessions in order. DSpark and pipeline execution are unsupported for V4.1. ROCm network TP requires resident expert shards; SSD streaming is single-node only.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
 continuation test, with unchanged overall top-token agreement. See the
-[QA results](../QA_BEFORE_RELEASES.md#17-deepseek-v41-flash-metal) for details
+[QA results](../QA_BEFORE_RELEASES.md#17-deepseek-v41-flash) for details
 and remaining differences.
 
 For images, download the matching encoder and add it to the same command:
@@ -170,7 +170,7 @@ Directional steering is supported for GLM 5.3, not GLM 5.2.
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,
 single-GPU CUDA, and ROCm. The encoder must match the model.
-V4.1 Flash also supports ROCm on Strix Halo; its setup is [above](#deepseek-v41-flash).
+V4.1 Flash vision supports Metal and ROCm on Strix Halo; CUDA V4.1 vision is not implemented. Setup is [above](#deepseek-v41-flash).
 
 ### DeepSeek Flash Vision Experimental
 

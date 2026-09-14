@@ -64,10 +64,10 @@ static void check_mapping(const char *path, bool shared, uint64_t first, uint64_
     check_unmapped(&m);
     uint64_t prepared = UINT64_MAX;
 #ifndef DS4_ROCM_BUILD
-    /* CUDA keeps its original rejection of disk-only V4.1 descriptors. The
-     * ordinary mapped-tensor path must still work without the ROCm exemption. */
+    /* CUDA startup spans still reject disk-only descriptors, while its Q8
+     * cache skips V4.1 Engram tables as of upstream a04f46f. */
     assert(!accelerator_prepare_model_tensor_spans(&m, NULL, NULL, 0, &prepared));
-    assert(!accelerator_cache_q8_tensors(&m, NULL, NULL, 0));
+    assert(accelerator_cache_q8_tensors(&m, NULL, NULL, 0));
     assert(cache_calls == 0);
     const uint64_t tensor_count = m.n_tensors;
     m.n_tensors = 1;

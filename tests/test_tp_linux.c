@@ -127,7 +127,7 @@ static void *hello(void *arg) {
     return NULL;
 }
 static void handshakes(void) {
-    for (unsigned mode=0;mode<4;++mode) {
+    for (unsigned mode=0;mode<5;++mode) {
         int fd[2];socket_pair(fd);
         hello_peer p[2]={0};
         for (unsigned r=0;r<2;++r) {
@@ -139,10 +139,10 @@ static void handshakes(void) {
         }
         if (mode==1) p[1].id.n_embd++;
         if (mode==2) p[1].tp.opt.transport=DS4_TP_TRANSPORT_USB4STREAM;
-        if (mode==3) {
-            /* A version-12 peer sends only the common fixed header. Reject
-             * immediately, without waiting for the Linux nonce. */
-            ds4_tp_hello_fixed old={.magic=DS4_TP_MAGIC,.version=12};
+        if (mode>=3) {
+            /* Reject legacy12 and CUDA/old-ROCm14 before reading a nonce or
+             * backend-specific frames, even if the peer keeps the socket open. */
+            ds4_tp_hello_fixed old={.magic=DS4_TP_MAGIC,.version=mode==3?12:14};
             assert(write(fd[1], &old, offsetof(ds4_tp_hello_fixed,nonce))==
                    offsetof(ds4_tp_hello_fixed,nonce));
             double start=tp_now_sec();hello(&p[0]);
@@ -250,7 +250,7 @@ static void checkpoint_streams(void) {
 }
 
 int main(void) {
-    assert(DS4_TP_PROTOCOL_VERSION==14);
+    assert(DS4_TP_PROTOCOL_VERSION==15);
     negotiation(); handshakes(); transfers(); failures(); cancellation(); checkpoint_streams();
     puts("Linux TP: negotiation, full-duplex TCP/device I/O, tails, canaries, generations and failures PASS");
     return 0;
