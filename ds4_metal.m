@@ -48086,10 +48086,12 @@ static bool qwen4_bind_weight(qwen4_bind *b, const void *map, uint64_t size,
 
 /* Scoped to one routed mid/down call. Indirect cache buffers are registered
  * on each encoder and protected by the same completion sequence as DeepSeek.
- * Full-layer staging instead supplies ordinary owned, contiguous buffers. */
+ * Compact staging supplies private address tables backed by owned payloads;
+ * full-layer staging supplies ordinary owned, contiguous buffers. */
 typedef struct {
     const ds4_gpu_stream_expert_table *table;
     __strong id<MTLBuffer> gate, up, down;
+    __strong id<MTLBuffer> owned_gate, owned_up, owned_down;
     ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     uint32_t n_entries;
     bool addresses;
@@ -48423,7 +48425,7 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
-        if (addresses && !ds4_gpu_stream_expert_cache_mark_entries_inflight(
+        if (addresses && g_qwen4_stream_weights->n_entries && !ds4_gpu_stream_expert_cache_mark_entries_inflight(
                 g_qwen4_stream_weights->entries, g_qwen4_stream_weights->n_entries, 0)) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (addresses) {
@@ -48432,6 +48434,11 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
                 [enc useResource:e->gate_buffer usage:MTLResourceUsageRead];
                 [enc useResource:e->up_buffer usage:MTLResourceUsageRead];
                 [enc useResource:e->down_buffer usage:MTLResourceUsageRead];
+            }
+            if (g_qwen4_stream_weights->owned_gate) {
+                [enc useResource:g_qwen4_stream_weights->owned_gate usage:MTLResourceUsageRead];
+                [enc useResource:g_qwen4_stream_weights->owned_up usage:MTLResourceUsageRead];
+                [enc useResource:g_qwen4_stream_weights->owned_down usage:MTLResourceUsageRead];
             }
         }
         [enc setComputePipelineState:pipeline];
@@ -49603,6 +49610,81 @@ static int qwen4_stream_read_layer(qwen4_stream_weights *s) {
     return ok;
 }
 
+static int qwen4_stream_read_selected(qwen4_stream_weights *s,
+                                      const uint32_t *frequency, uint32_t unique) {
+    const ds4_gpu_stream_expert_table *t = s->table;
+    if (!frequency || !unique || unique > t->n_total_expert) return 0;
+    if (unique == t->n_total_expert) return qwen4_stream_read_layer(s);
+    if (@available(macOS 13.0, *)) {
+        /* Only the payload is compacted. Original expert IDs still index
+         * private address tables, preserving routing and every kernel stride. */
+        const uint64_t gate_bytes = t->gate_expert_bytes * unique;
+        const uint64_t down_bytes = t->down_expert_bytes * unique;
+        const NSUInteger addr_bytes = (NSUInteger)t->n_total_expert * sizeof(uint64_t);
+        if (g_model_fd < 0 || gate_bytes > (uint64_t)NSUIntegerMax || down_bytes > (uint64_t)NSUIntegerMax ||
+            gate_bytes > (uint64_t)[g_device maxBufferLength] || down_bytes > (uint64_t)[g_device maxBufferLength]) return 0;
+        s->owned_gate = [g_device newBufferWithLength:(NSUInteger)gate_bytes options:MTLResourceStorageModeShared];
+        s->owned_up = [g_device newBufferWithLength:(NSUInteger)gate_bytes options:MTLResourceStorageModeShared];
+        s->owned_down = [g_device newBufferWithLength:(NSUInteger)down_bytes options:MTLResourceStorageModeShared];
+        if (!s->owned_gate || !s->owned_up || !s->owned_down) return 0;
+        const uint64_t ga = ds4_gpu_buffer_address(s->owned_gate, 0);
+        const uint64_t ua = ds4_gpu_buffer_address(s->owned_up, 0);
+        const uint64_t da = ds4_gpu_buffer_address(s->owned_down, 0);
+        if (!ga || !ua || !da) {
+            /* Decide before any I/O; devices without indirect addresses keep
+             * the ordinary three contiguous reads. */
+            s->owned_gate = nil; s->owned_up = nil; s->owned_down = nil;
+            return qwen4_stream_read_layer(s);
+        }
+        s->gate = [g_device newBufferWithLength:addr_bytes options:MTLResourceStorageModeShared];
+        s->up = [g_device newBufferWithLength:addr_bytes options:MTLResourceStorageModeShared];
+        s->down = [g_device newBufferWithLength:addr_bytes options:MTLResourceStorageModeShared];
+        if (!s->gate || !s->up || !s->down) return 0;
+        s->owned_gate.label = @"qwen4_stream_selected_gate";
+        s->owned_up.label = @"qwen4_stream_selected_up";
+        s->owned_down.label = @"qwen4_stream_selected_down";
+        s->gate.label = @"qwen4_stream_selected_gate_addresses";
+        s->up.label = @"qwen4_stream_selected_up_addresses";
+        s->down.label = @"qwen4_stream_selected_down_addresses";
+        uint64_t *gate_addr = [s->gate contents], *up_addr = [s->up contents], *down_addr = [s->down contents];
+        uint8_t *gate_dst = [s->owned_gate contents], *up_dst = [s->owned_up contents], *down_dst = [s->owned_down contents];
+        if (!gate_addr || !up_addr || !down_addr || !gate_dst || !up_dst || !down_dst) return 0;
+        memset(gate_addr, 0, addr_bytes);
+        memset(up_addr, 0, addr_bytes);
+        memset(down_addr, 0, addr_bytes);
+        ds4_gpu_stream_expert_pread_task *tasks = calloc((size_t)unique * 3u, sizeof(*tasks));
+        if (!tasks) return 0;
+        uint32_t u = 0;
+        for (uint32_t e = 0; e < t->n_total_expert; e++) {
+            if (!frequency[e]) continue;
+            if (u >= unique) { free(tasks); return 0; }
+            const uint64_t go = (uint64_t)u * t->gate_expert_bytes;
+            const uint64_t d = (uint64_t)u * t->down_expert_bytes;
+            gate_addr[e] = ga + go;
+            up_addr[e] = ua + go;
+            down_addr[e] = da + d;
+            tasks[3u * u] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = t->gate_offset + (uint64_t)e * t->gate_expert_bytes,
+                .len = t->gate_expert_bytes, .dst = gate_dst + go };
+            tasks[3u * u + 1u] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = t->up_offset + (uint64_t)e * t->gate_expert_bytes,
+                .len = t->gate_expert_bytes, .dst = up_dst + go };
+            tasks[3u * u + 2u] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = t->down_offset + (uint64_t)e * t->down_expert_bytes,
+                .len = t->down_expert_bytes, .dst = down_dst + d };
+            u++;
+        }
+        uint64_t bytes = 0;
+        double ms = 0.0;
+        const int ok = u == unique && ds4_gpu_stream_expert_pread_tasks(tasks, 3u * unique, &bytes, &ms);
+        free(tasks);
+        ds4_gpu_stream_expert_cache_note_pread(t->layer, bytes, ms);
+        s->addresses = ok != 0;
+        return ok;
+    }
+    return qwen4_stream_read_layer(s);
+}
+
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
@@ -49737,16 +49819,21 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         stream.addresses = true;
     } else {
         ds4_gpu_stream_expert_cache_note_frequency_hotness(table->layer, frequency, table->n_total_expert);
-        ok = qwen4_stream_read_layer(&stream);
+        ok = qwen4_stream_read_selected(&stream, frequency, unique);
     }
     if (timing) ds4_gpu_stream_expert_timing_note_selected(sync_ms, copy_ms, ds4_gpu_now_ms() - t0);
     if (!ok || !ds4_gpu_begin_commands()) { ok = 0; goto done; }
-    if (!stream.addresses) {
+    if (!stream.addresses || stream.owned_gate) {
         /* An enclosing batch may outlive this stack frame. Retain staging
          * until completion even with unretained Metal command buffers. */
         [g_transient_buffers addObject:stream.gate];
         [g_transient_buffers addObject:stream.up];
         [g_transient_buffers addObject:stream.down];
+        if (stream.owned_gate) {
+            [g_transient_buffers addObject:stream.owned_gate];
+            [g_transient_buffers addObject:stream.owned_up];
+            [g_transient_buffers addObject:stream.owned_down];
+        }
     }
     g_qwen4_stream_weights = &stream;
     if (mm) {

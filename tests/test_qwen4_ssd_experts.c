@@ -1,6 +1,8 @@
 #define _DARWIN_C_SOURCE
 #include "ds4_gpu.h"
+#include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,8 +24,90 @@ typedef struct {
 } weights;
 typedef struct { ds4_gpu_tensor *base, *view; uint64_t n; } guarded;
 
+/* This binary links a test-only backend object whose pread calls reach this
+ * wrapper. All accepted requests still perform real file I/O. Sparse holes
+ * alone cannot prove selected-only reads: reading a hole succeeds with zeros. */
+static pthread_mutex_t probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int enabled, fd, empty_fd, violation;
+    uint32_t inflight;
+    uint64_t offset[3], stride[3], bytes, calls, coverage[3][E];
+    unsigned char selected[E];
+} probe;
+typedef struct { uint64_t bytes, calls; } read_stats;
+
 static void need(int ok, const char *what) {
     if (!ok) { fprintf(stderr, "Qwen SSD: %s failed\n", what); exit(1); }
+}
+ssize_t ds4_test_pread(int fd, void *dst, size_t bytes, off_t offset) {
+    pthread_mutex_lock(&probe_mutex);
+    if (!probe.enabled || (fd != probe.fd && fd != probe.empty_fd)) {
+        pthread_mutex_unlock(&probe_mutex);
+        return pread(fd, dst, bytes, offset);
+    }
+    int projection = -1;
+    const uint64_t start = (uint64_t)offset;
+    if (offset >= 0 && bytes) for (unsigned p = 0; p < 3; p++) {
+        if (start < probe.offset[p]) continue;
+        const uint64_t relative = start - probe.offset[p], total = E * probe.stride[p];
+        if (relative >= total || bytes > total - relative) continue;
+        projection = (int)p;
+        const uint32_t first = (uint32_t)(relative / probe.stride[p]);
+        const uint32_t last = (uint32_t)((relative + bytes - 1) / probe.stride[p]);
+        for (uint32_t e = first; e <= last; e++) if (!probe.selected[e]) projection = -1;
+        break;
+    }
+    probe.calls++;
+    if (projection < 0) {
+        probe.violation = 1;
+        pthread_mutex_unlock(&probe_mutex);
+        errno = EIO; return -1;
+    }
+    probe.inflight++;
+    pthread_mutex_unlock(&probe_mutex);
+    const ssize_t got = pread(fd, dst, bytes, offset);
+    const int saved_errno = errno;
+    pthread_mutex_lock(&probe_mutex);
+    probe.inflight--;
+    if (got > 0) {
+        probe.bytes += (uint64_t)got;
+        uint64_t relative = start - probe.offset[projection], remaining = (uint64_t)got;
+        const uint64_t stride = probe.stride[projection];
+        while (remaining) {
+            const uint32_t e = (uint32_t)(relative / stride);
+            const uint64_t room = stride - relative % stride, n = remaining < room ? remaining : room;
+            probe.coverage[projection][e] += n; remaining -= n; relative += n;
+        }
+    }
+    pthread_mutex_unlock(&probe_mutex);
+    errno = saved_errno; return got;
+}
+static void probe_begin(const weights *w, const int32_t *ids, uint64_t n, int fd, int empty_fd) {
+    pthread_mutex_lock(&probe_mutex);
+    need(!probe.enabled && !probe.inflight, "read probe idle");
+    memset(&probe, 0, sizeof(probe));
+    probe.fd = fd; probe.empty_fd = empty_fd; probe.enabled = 1;
+    probe.offset[0] = w->table.gate_offset; probe.offset[1] = w->table.up_offset;
+    probe.offset[2] = w->table.down_offset;
+    probe.stride[0] = probe.stride[1] = w->table.gate_expert_bytes;
+    probe.stride[2] = w->table.down_expert_bytes;
+    for (uint64_t i = 0; i < n; i++) {
+        need(ids[i] >= 0 && ids[i] < E, "probe selected ID"); probe.selected[ids[i]] = 1;
+    }
+    pthread_mutex_unlock(&probe_mutex);
+}
+static read_stats probe_end(int all_selected, int no_reads) {
+    pthread_mutex_lock(&probe_mutex);
+    need(probe.enabled && !probe.inflight, "read workers retired");
+    need(!probe.violation, "pread never accesses an unselected expert");
+    if (no_reads) need(!probe.calls && !probe.bytes, "resident/cache-hit path performs no pread");
+    for (unsigned p = 0; p < 3; p++) for (unsigned e = 0; e < E; e++) {
+        const uint64_t expected = probe.selected[e] ? probe.stride[p] : 0;
+        need(probe.coverage[p][e] <= expected, "expert bytes read at most once");
+        if (all_selected) need(probe.coverage[p][e] == expected, "each selected projection fully read");
+    }
+    const read_stats result = {probe.bytes, probe.calls}; probe.enabled = 0;
+    pthread_mutex_unlock(&probe_mutex); return result;
 }
 static uint32_t random_u32(void) {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng;
@@ -127,7 +211,8 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
     for (uint32_t t = 0; t < T; t++) {
         sg[t] = ((int)(t % 7) - 3) * 0.25f;
         for (uint32_t s = 0; s < S; s++) {
-            ids[t * S + s] = active[route == 2 ? (t + s) % 24 : route * 10 + (t + s) % 10];
+            ids[t * S + s] = route == 3 ? (int32_t)((t * S + s) % E) :
+                active[route == 2 ? (t + s) % 24 : route * 10 + (t + s) % 10];
             mix[t * S + s] = (s + 1) / 55.f;
         }
     }
@@ -163,13 +248,16 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
     if (fail_first) {
         need(ds4_gpu_set_model_fd(empty_fd), "empty input fd");
         need(ds4_gpu_begin_commands(), "failure batch begin");
+        probe_begin(w, ids, sn, good_fd, empty_fd);
         const int accepted = project(w, T, 1, outputs[0].view, outputs[1].view, gx, gi, lists, counts);
         need(!accepted, "uncached read must fail on empty file");
         need(ds4_gpu_commands_active(), "failure preserves active batch ownership");
         need(ds4_gpu_end_commands(), "failure batch drain");
+        (void)probe_end(0, 0);
         need(ds4_gpu_set_model_fd(good_fd), "restore input fd after failure");
     }
     const unsigned runs = warm_probe ? 3 : 2;
+    read_stats reads[3] = {{0,0}, {0,0}, {0,0}};
     for (unsigned run = 0; run < runs; run++) {
         /* The third pass must use cache hits: the backing fd cannot provide
          * any bytes. Restore the real fd before cleanup or the next case. */
@@ -177,11 +265,13 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
         for (unsigned i = 0; i < 4; i++) reset(outputs + i);
         need(ds4_gpu_tensor_write(outputs[3].view, 0, r, rn * 4), "reset HC input");
         need(ds4_gpu_begin_commands(), "projection batch begin");
+        probe_begin(w, ids, sn, good_fd, empty_fd);
         need(project(w, T, run != 0, outputs[0].view, outputs[1].view, gx, gi, lists, counts), "resident/SSD projection");
         need(ds4_gpu_commands_active(), "projection preserves active batch ownership");
         need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, gw,
             mm ? NULL : gsg, NULL, outputs[3].view, ginj, T, S, stride, D, HC), "reduce and HC");
         need(ds4_gpu_end_commands(), "projection batch drain");
+        reads[run] = probe_end(run && !warm_probe, run == 0 || run == 2);
         for (unsigned i = 0; i < 4; i++) {
             float *got = read_output(outputs + i);
             if (!run) reference[i] = got;
@@ -196,8 +286,9 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
     need(read_x && read_ids && ds4_gpu_tensor_read(gx, 0, read_x, xn * 4) &&
          ds4_gpu_tensor_read(gi, 0, read_ids, sn * 4), "input integrity read");
     need(!memcmp(x, read_x, xn * 4) && !memcmp(ids, read_ids, sn * 4), "input and selected IDs unchanged");
-    printf("PASS Qwen SSD %u/%u T=%u %s route=%u: exact mid/down/reduce/HC, guards%s%s\n",
+    printf("PASS Qwen SSD %u/%u T=%u %s route=%u: exact mid/down/reduce/HC, guards; pread=%llu bytes/%llu calls%s%s\n",
            w->gate_type, w->down_type, T, mm ? "MM" : "rows", route,
+           (unsigned long long)reads[1].bytes, (unsigned long long)reads[1].calls,
            warm_probe ? ", warm hits without readable fd" : "",
            fail_first ? ", failed read and exact retry" : "");
     for (unsigned i = 0; i < 4; i++) { free(reference[i]); free_output(outputs + i); }
@@ -256,17 +347,21 @@ int main(void) {
         check_case(w, T, 0, fileno(file), fileno(empty), 0, 1);
         check_case(w, T, 1, fileno(file), fileno(empty), c == 0, 1);
         check_case(w, T, 0, fileno(file), fileno(empty), 0, 1);
-        if (T == 128) check_case(w, T, 2, fileno(file), fileno(empty), 1, 0);
+        if (T == 128) {
+            check_case(w, T, 2, fileno(file), fileno(empty), 1, 0);
+            check_case(w, T, 3, fileno(file), fileno(empty), 0, 0);
+        }
     }
     /* A different-size MTP layer must use owned reads without replacing the
      * trunk's slab class. The old trunk selection must still hit with no fd. */
     ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * formats[0].table.gate_expert_bytes + formats[0].table.down_expert_bytes);
     check_case(formats, 2, 0, fileno(file), fileno(empty), 0, 1);
-    check_case(formats + 1, 2, 0, fileno(file), fileno(empty), 0, 0);
+    check_case(formats + 1, 2, 0, fileno(file), fileno(empty), 1, 0);
+    check_case(formats + 1, 3, 0, fileno(file), fileno(empty), 0, 0);
     need(ds4_gpu_set_model_fd(fileno(empty)), "trunk retained after off-size MTP");
     check_case(formats, 2, 0, fileno(file), fileno(empty), 0, 1);
     ds4_gpu_cleanup(); munmap(map, bytes); fclose(empty); fclose(file);
-    puts("PASS Qwen SSD expert streaming: selected cache, eviction, owned layer fallback and retry");
+    puts("PASS Qwen SSD: cache, exact selected-only reads, full-selection fallback and retry");
     return 0;
 }

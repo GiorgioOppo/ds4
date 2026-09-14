@@ -44,11 +44,15 @@ weights, shared experts, context and runtime buffers still need RAM; the
 n-gram table continues to use its existing disk reads. Missing routed experts
 are read into owned buffers. If a prefill batch needs more experts than the
 cache can hold, or an MTP layer uses a different expert size, it uses explicit
-layer staging while retaining the normal kernel arithmetic.
+temporary staging while retaining the normal kernel arithmetic. On devices
+with GPU buffer addresses, this staging contains only the distinct selected
+experts. Selecting every expert, or running without buffer-address support,
+retains the full-layer fallback.
 
 The current implementation does not overlap these expert reads with GPU
 computation. An MTP layer whose expert size differs from the main model is
-read in full on every invocation, about 1.29 GiB for the Q2 pack.
+staged again on each invocation; its temporary experts do not replace the
+main model's cache entries.
 
 Leave the expert-cache budget automatic initially. A plain count passed to
 `--ssd-streaming-cache-experts` requests dynamic cache slots; an `NGB` budget
@@ -166,6 +170,9 @@ including indices 383, 384 and 511, with cold and warm selections, eviction,
 prefill staging, different-size MTP layers and failed reads followed by exact recovery. It
 compares routed intermediates, reduced outputs and hyper-connection residuals
 bit for bit against the resident kernels, including the padded Q2 down rows.
+Its test-only backend checks actual `pread` requests against selected expert
+ranges and counts returned bytes: ten experts for off-size MTP, 24 for cache
+overflow, zero reads for cache hits, and the full 512-expert fallback.
 The memory-estimate test runs without a GPU or model.
 Run `tests/test_qwen4_ngram_state MODEL.gguf` under Metal validation to check
 failed disk reads during prefill, decode and MTP, then exact recovery.

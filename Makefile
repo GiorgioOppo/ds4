@@ -179,7 +179,10 @@ test-qwen4-moe-mm-specialize: tests/test_qwen4_moe_mm_specialize
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(CORE_OBJS)
+tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
+	$(CC) $(OBJCFLAGS) -include tests/qwen4_ssd_pread_probe.h -c -o $@ ds4_metal.m
+
+tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(filter-out ds4_metal.o,$(CORE_OBJS)) tests/ds4_metal_qwen_ssd.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-qwen4-ssd-experts
