@@ -189,7 +189,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 16,384 | 259.05 / 13.86 | 242.99 / 14.17 | 259.89 / 14.38 |
 | 65,536 | 227.38 / 13.65 | 215.82 / 13.78 | 228.70 / 14.03 |
 
-- A separate 16,384-prefix /512-output RoCE run measures **258.09 prefill /14.65 decode tok/s** (511 steady:14.66), with the same complete frontier and128-output prefix. Reproduce with `--gen-tokens 512`.
+- Two separate 16,384-prefix /512-output RoCE runs measure **258.09 /14.65** and **258.43 /14.77 tok/s** (511 steady:14.66 /14.78). Complete frontiers and all512 outputs match between runs. Reproduce with `--gen-tokens 512`.
+- The second 512-output run checks integration with main `9139e2a`; the GPU code and existing V4.1 ROCm functions are unchanged. The transport/depth matrix retains its original observations.
 - All 129,280 frontier logits and printed continuations match across transports at each depth. No OOM; minimum usable RAM 33.6 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
 - Current 16K profiles attribute about 48–49 ms/token to local kernels, 1.53 ms to guarded reductions, 8–9 ms to waits and 14–15 ms to gaps. Waits include peer readiness and CPU scheduling; faster networking alone does not double decode throughput. Profiled windows include instrumentation overhead and are separate from the table.
 - V4.1 CED uses about 8B active parameters/token in prefill and 16B in decode. Full prefixes exercise the decoder-suffix optimization; short appends can follow a different schedule. [Architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).

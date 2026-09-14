@@ -69,9 +69,11 @@ Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images
 | 16,384 | 18,432 | 128 | 258.31 | 8.81 |
 | 65,536 | 262,144 | 128 | 234.50 | 8.82 |
 | 16,384 | 18,432 | 512 | 256.81 | 9.05 |
+| 16,384 | 18,432 | 512 (repeat) | 256.63 | 9.34 |
 
-- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs, including 512 outputs. Minimum usable RAM: 13.9 GiB; no OOM or sampled model swap. The 16K/128 run records 126 host zram swap-out pages; the other two record zero. These are not cold-cache or zero-swap results.
+- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs, including 512 outputs. Minimum usable RAM: 13.9 GiB; no OOM or sampled model swap. Host zram swap-out pages in table order: 126, 0, 0, 3. These are not cold-cache or zero-swap results.
 - 262,144-token allocation and actual 65,536-token use passed; populated 256K and retrieval quality were not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
+- The 512-output repeat checks the integration with main `9139e2a`; GPU instructions/constants and the existing V4.1 ROCm functions are unchanged. Earlier cells retain their original observations.
 - Six image/state cases pass separately in resident and SSD modes. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
 
 ### Run text or vision
