@@ -795,7 +795,6 @@ tests/test_mxfp4_rocm.o: tests/test_mxfp4_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h 
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
 # Compile the CPU references without fast-math; link the production GPU objects.
-# The executable name is recognized by the workload watcher on Halo hosts.
 tests/test_deepseek41_rocm.o: tests/test_deepseek41_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 

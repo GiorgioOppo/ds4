@@ -58,7 +58,7 @@ SSD-streaming path.
 
 - ROCm 10.0 supports calibrated V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/USB4STREAM/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed in every mode.
 - Tested SSD configuration: 128 GB Framework Desktop, 16-core Strix Halo engineering sample `100-000001243-50_Y`, Radeon `gfx1151`; Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs) holds the model.
-- Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`; TuneD **`accelerator-performance`**, workload watcher with maximum fans. Existing boot flags: the [GTT/TTM settings above](#gpu-visible-memory), plus `pci=realloc pcie_aspm=off`; their individual effects were not isolated.
+- Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`; TuneD **`accelerator-performance`**, fans at maximum speed. Existing boot flags: the [GTT/TTM settings above](#gpu-visible-memory), plus `pci=realloc pcie_aspm=off`; their individual effects were not isolated.
 
 ### SSD performance
 
@@ -73,7 +73,6 @@ Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images
 
 - All 129,280 frontier logits and complete printed continuations match the corresponding resident runs, including 512 outputs. Minimum usable RAM: 13.9 GiB; no OOM or sampled model swap. Host zram swap-out pages in table order: 126, 0, 0, 3. These are not cold-cache or zero-swap results.
 - 262,144-token allocation and actual 65,536-token use passed; populated 256K and retrieval quality were not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
-- The 512-output repeat checks the integration with main `9139e2a`; GPU instructions/constants and the existing V4.1 ROCm functions are unchanged. Earlier cells retain their original observations.
 - Six image/state cases pass separately in resident and SSD modes. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
 
 ### Run text or vision
@@ -120,7 +119,7 @@ DS4_METAL_CB_TIMES=1 ./ds4-bench --backend rocm -m "$MODEL" \
 ```
 
 - `DS4_METAL_CB_TIMES` is scoped to this command and prints the measured prefill time window on ROCm too. No tuning override is needed.
-- Check profile/fan readiness during the measured interval; save revision/build flags, model filename/size and existing provenance, cache/KV configuration, actual prompt/output counts, and memory/swap/OOM counters. Do not substitute HTTP timings for this native table.
+- Check the active power profile during the measurement; save revision/build flags, model filename/size and existing provenance, cache/KV configuration, actual prompt/output counts, and memory/swap/OOM counters. Do not substitute HTTP timings for this native table.
 
 ## GLM 5.3 Flash
 

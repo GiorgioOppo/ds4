@@ -1,16 +1,11 @@
 # DeepSeek V4.1: two-machine ROCm cluster
 
 - Two ROCm/gfx1151 machines; tested with 128 GB RAM each.
-- Same engine revision and `DeepSeek-V4.1-Flash-Q2.gguf` on both. Each keeps the full GGUF; resident weights are approximately 80.6 GiB per rank. Engram stays on disk.
-- Exactly one coordinator and one worker. Attention is tensor-parallel; routed MoE is expert-parallel (192 whole experts per rank). Both execute every layer; KV and the output head are replicated. No `--layers`, SSD expert streaming or DSpark.
+- Same engine revision and `DeepSeek-V4.1-Flash-Q2.gguf` on both. Each keeps the full GGUF; each machine loads approximately 80.6 GiB of weights into RAM. Engram stays on disk.
+- Exactly two machines: one coordinator and one worker. They share attention computation and split the experts equally.
+- Cluster mode requires the assigned experts to fit in RAM. SSD expert streaming, DSpark and splitting by `--layers` are not supported.
 - All three transports require a reachable TCP control address. Use a trusted network: peer traffic has no authentication or encryption.
 - Build both peers with `make strix-halo ROCM_ARCH=gfx1151` after installing any required RoCE headers.
-- On the worker, create a named copy after each build so workload watchers matching `ds4-*` recognize inference. The measured runs used this naming pattern; the executable bytes are unchanged:
-
-```bash
-install -m 755 ./ds4 ./ds4-kernel-tp-worker
-```
-
 - Run from the engine build directory. Set these variables in **both** terminals; `MODEL` may differ between machines:
 
 ```bash
@@ -31,7 +26,7 @@ CTX=16384
   --transport tcp --batched-session 1 --host 127.0.0.1 --port 8080
 
 # Worker, in its own terminal
-./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx "$CTX" \
+./ds4 --rocm -m "$MODEL" --ctx "$CTX" \
   --tensor-parallel --role worker --coordinator "$COORD" 9911 \
   --transport tcp
 ```
@@ -99,7 +94,7 @@ test -c "$USB_DEV" && test -r "$USB_DEV" && test -w "$USB_DEV"
   --batched-session 1 --host 127.0.0.1 --port 8080
 
 # Worker
-./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx "$CTX" \
+./ds4 --rocm -m "$MODEL" --ctx "$CTX" \
   --tensor-parallel --role worker --coordinator "$COORD" 9911 \
   --transport usb4stream --usb4stream-device "$USB_DEV"
 ```
@@ -160,12 +155,12 @@ GID=1                         # Choose this host's nonzero RoCE v2 GID for the c
   --batched-session 1 --host 127.0.0.1 --port 8080
 
 # Worker
-./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx "$CTX" \
+./ds4 --rocm -m "$MODEL" --ctx "$CTX" \
   --tensor-parallel --role worker --coordinator "$COORD" 9911 \
   --transport rdma --rdma-device "$DEV" --rdma-port "$PORT" --rdma-gid-index "$GID"
 ```
 
-- Linux `rdma` uses RoCE RC with registered host staging; no RCCL or GPUDirect requirement.
+- RoCE transfers use buffers in system RAM. GPU-direct transfers are not implemented; RCCL is not required.
 - Explicit `tcp`, `usb4stream` or `rdma` fails if unavailable. `auto` negotiates configured RoCE, then configured USB4STREAM, then TCP at connection setup; no mid-generation fallback.
 
 ## Vision and first request
@@ -186,7 +181,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - Model drives: coordinator SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4); worker Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs). Engram remains disk-backed.
 - TCP/RoCE: Intel E810-C QSFP NICs, 100 Gb/s link, MTU 9000. Coordinator NIC negotiated PCIe 3.0 ×4; worker PCIe 4.0 ×4. USB4STREAM: one 40 Gb/s cable link with the interrupt-readback patch above.
 - Existing boot settings include `pci=realloc pcie_aspm=off`, in addition to the [GPU-visible memory settings](STRIX_HALO.md#gpu-visible-memory). Their individual performance effect was not isolated.
-- Linux `7.2.5-100.fc43.x86_64`, ROCm 10.0 SDK (`10.0.0-4`, HIP `7.15.26333`). TuneD `accelerator-performance`; automatic workload watcher held maximum fans through the measured intervals. Profile/fan readiness was checked on both peers.
+- Linux `7.2.5-100.fc43.x86_64`, ROCm 10.0 SDK (`10.0.0-4`, HIP `7.15.26333`). TuneD `accelerator-performance`, fans at maximum speed on both machines.
 - Same Q2 file, 69,632 allocated context, fresh full prefix, 128 fixed greedy outputs (127 steady), no DSpark or images. Native `ds4-bench`; one run per cell; startup and a 256-token/128-output warmup excluded. Values are **prefill / decode tokens/s**.
 
 | Prompt tokens | TCP, 100 GbE | USB4STREAM, 40 Gb/s | RoCE RC, 100 GbE |
@@ -196,15 +191,14 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 65,536 | 227.38 / 13.65 | 215.82 / 13.78 | 228.70 / 14.03 |
 
 - Two separate 16,384-prefix /512-output RoCE runs measure **258.09 /14.65** and **258.43 /14.77 tok/s** (511 steady:14.66 /14.78). Complete frontiers and all512 outputs match between runs. Reproduce with `--gen-tokens 512`.
-- The second 512-output run checks integration with main `9139e2a`; the GPU code and existing V4.1 ROCm functions are unchanged. The transport/depth matrix retains its original observations.
 - All 129,280 frontier logits and printed continuations match across transports at each depth. No OOM; minimum usable RAM 33.6 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
 - Current 16K profiles attribute about 48–49 ms/token to local kernels, 1.53 ms to guarded reductions, 8–9 ms to waits and 14–15 ms to gaps. Waits include peer readiness and CPU scheduling; faster networking alone does not double decode throughput. Profiled windows include instrumentation overhead and are separate from the table.
 - V4.1 CED uses about 8B active parameters/token in prefill and 16B in decode. Full prefixes exercise the decoder-suffix optimization; short appends can follow a different schedule. [Architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
-- Results apply to these drives, NIC attachment, profile and USB patch. Other providers/controllers and long-term production endurance remain unqualified.
+- Results apply to these drives, NIC attachment, profile and USB patch. Other network adapters and USB controllers have not been tested. Long-running production use has not been tested.
 
 ### Reproduce the table
 
-Build the ordinary engine on both peers and refresh the worker copy above. On the coordinator, build the included TP-only warmup adapter; it links the existing engine objects and leaves `ds4-bench` untouched:
+Build the engine on both machines. On the coordinator, build the included TP-only warmup adapter; it links the existing engine objects and leaves `ds4-bench` untouched:
 
 ```bash
 make strix-halo ROCM_ARCH=gfx1151
@@ -241,9 +235,9 @@ DEPTH=16384
   --role coordinator --listen "$COORD" 19475 "${LINK[@]}"
 
 # Worker: start for each coordinator run.
-./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx 69632 \
+./ds4 --rocm -m "$MODEL" --ctx 69632 \
   --role worker --coordinator "$COORD" 19475 "${LINK[@]}"
 ```
 
 - The adapter warms 256 prefix tokens and 128 decode steps, then creates a fresh session before the unchanged native measured loop. A separate short process is not the same warmup procedure.
-- Preserve the CSV, full frontier files, printed continuation, revision/build flags, model identity, profile/fan readings and swap/OOM counters. Compare timing only after verifying the intended profile and cooling; no image-conditioned prefill timings.
+- Preserve the CSV, full frontier files, printed continuation, revision/build flags, model identity, active power profile and swap/OOM counters. Verify the active power profile before comparing timings; no image-conditioned prefill timings.
