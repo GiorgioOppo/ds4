@@ -33,8 +33,16 @@ int main(int argc, char **argv) {
         assert(ds4_session_sync(live, &prompt, error, sizeof(error)) == 0);
         int accepted[3];
         if (mode == 2) {
-            assert(ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
-                3, -1, accepted, 3, error, sizeof(error)) == 1);
+            /* Prefix preparation may already seed a proposal. Otherwise run
+             * a cycle, checking its committed frontier rather than assuming
+             * the first call always consumes exactly one token. */
+            for (int attempt = 0; !live->glm_mtp_have && attempt < 3; attempt++) {
+                const int before = ds4_session_pos(live);
+                const int n = ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
+                    3, -1, accepted, 3, error, sizeof(error));
+                assert(n >= 1 && n <= 3);
+                assert(ds4_session_pos(live) == before + n);
+            }
             assert(live->glm_mtp_have);
         }
         const ds4_tokens *current = ds4_session_tokens(live);

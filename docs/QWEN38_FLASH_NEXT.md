@@ -204,6 +204,19 @@ For a smaller memory footprint, run
 256-token context, an eight-token prefill chunk and a 1024-expert cache request
 while keeping both comparison sessions and MTP enabled.
 
+To compare the predictor's cache-only prefill with a complete MTP pass:
+
+```sh
+make tests/test_qwen4_mtp_prefill
+./tests/test_qwen4_mtp_prefill gguf/Qwen3.8-Flash-Next-Q2.gguf --ssd-streaming
+```
+
+This checks one-token prompts, chunk boundaries, non-argmax continuation,
+stale cache contents and payload restore, followed by greedy, depth-three
+and exact-sampling continuation checks. It uses a 128-token context and a
+1024-expert cache request. The small-buffer MTP CLI regression also accepts
+`--ssd-streaming`.
+
 [Checkpoint-fix benchmark charts and measurements](../speed-bench/qwen38-checkpoints/README.md)
 compare prefill, ordinary decode, and MTP decode against the preceding PR head.
 
