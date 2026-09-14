@@ -1241,6 +1241,60 @@ kernel void kernel_qwen4_attn_prep(
     }
 }
 
+/* Predictor prefix rows need only K/V and raw indexer K. Keep the full
+ * preparation kernel's lane walk, normalization and serial RoPE unchanged. */
+kernel void kernel_qwen4_attn_cache_prep(
+        constant ds4_metal_args_qwen4_attn_prep & args,
+        device const float *kproj,
+        device const float *vproj,
+        device const float *ik,
+        device const float *g_k,
+        device half *k_cache,
+        device half *v_cache,
+        device float *ik_cache,
+        device const uint4 *pos3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint slot = tgpig.x, tok = tgpig.y;
+    if (tok >= args.n_tokens || slot > args.n_head_kv) return;
+    const uint Hkv = args.n_head_kv, D = args.head_dim, Di = args.idx_dim;
+    const uint pos = args.pos0 + tok;
+    float v[8];
+    threadgroup float row[576];
+    float tmp[64];
+    if (slot < Hkv) {
+        const uint h = slot;
+        const uint npt = D / 32;
+        const uint4 p3 = pos3[pos];
+        device const float *src = kproj + ((uint64_t)tok * Hkv + h) * D;
+        device const float *vs = vproj + ((uint64_t)tok * Hkv + h) * D;
+        float ss = 0.0f;
+        for (uint i = 0; i < npt; i++) { v[i] = src[tiisg * npt + i]; ss += v[i] * v[i]; }
+        ss = simd_sum(ss);
+        const float r = rsqrt(ss / (float)D + args.eps);
+        for (uint i = 0; i < npt; i++) v[i] = v[i] * r * g_k[tiisg * npt + i];
+        for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
+            qwen4_rope_neox(tmp, args.n_rot, p3, args.rope_freq, args.rope_mscale);
+            for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        device half *dk = k_cache + ((uint64_t)pos * Hkv + h) * D;
+        device half *dv = v_cache + ((uint64_t)pos * Hkv + h) * D;
+        for (uint i = 0; i < npt; i++) {
+            dk[tiisg * npt + i] = (half)row[tiisg * npt + i];
+            dv[tiisg * npt + i] = (half)vs[tiisg * npt + i];
+        }
+        return;
+    }
+    const uint npt = Di / 32;
+    device const float *src = ik + (uint64_t)tok * Di;
+    device float *dst = ik_cache + (uint64_t)pos * Di;
+    for (uint i = 0; i < npt; i++) dst[tiisg * npt + i] = src[tiisg * npt + i];
+}
+
 struct ds4_metal_args_qwen4_idx_block {
     uint32_t block0;      /* first block to (re)build */
     uint32_t n_blocks;
@@ -3786,6 +3840,99 @@ kernel void kernel_qwen4_mtp_stage(
         o[hi + i] = 0.0f;
     }
 }
+
+/* Separate embedding/hidden dispatches keep every row in the SIMD batch
+ * active. Each walks only its E-wide half, with the original mul_mv_ext
+ * float4 dots and shuffle tree; weight/concat strides remain full-width. */
+template<short r1ptg, bool emb>
+kernel void kernel_qwen4_mtp_project_q8(
+        constant ds4_metal_args_mul_mv_ext & args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const short nxpsg = FC_mul_mv_nxpsg;
+    const short chpt = 4, chpb = 8;
+    const short nypsg = 32 / nxpsg;
+    const short tx = tiisg % nxpsg, ty = tiisg / nxpsg;
+    const int i01 = tgpig.x * (nypsg * NSG) + nypsg * sgitg + ty;
+    const int E = args.ne00 / 2;
+    const int k0 = emb ? 0 : E;
+    int out_row[r1ptg];
+    device const float4 *y4[r1ptg];
+    for (short ir1 = 0; ir1 < r1ptg; ir1++) {
+        out_row[ir1] = emb ? ir1 * 5 : (int)tgpig.y * 5 + 1 + ir1;
+        y4[ir1] = (device const float4 *)(src1 + (uint64_t)out_row[ir1] * args.nb11 +
+                                         (uint64_t)k0 * sizeof(float)) + tx;
+    }
+    device const block_q8_0 *wrow = i01 < args.ne01 ?
+        (device const block_q8_0 *)(src0 + (uint64_t)i01 * args.nb01) :
+        (device const block_q8_0 *)src0;
+    device const block_q8_0 *xq = wrow + k0 / 32 + tx / chpb;
+    float sumf[r1ptg] = { [0 ... r1ptg - 1] = 0.0f };
+    short cch = tx % chpb;
+    for (int ich = tx; 4 * ich < E; ich += chpt * nxpsg) {
+        float4 lx[chpt];
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ch++) {
+            dequantize_q8_0_t4(xq, cch, lx[ch]);
+            cch += nxpsg;
+            if (cch >= chpb) {
+                xq += cch / chpb;
+                cch %= chpb;
+            }
+        }
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ch++) {
+#pragma unroll(r1ptg)
+            for (short ir1 = 0; ir1 < r1ptg; ir1++) {
+                sumf[ir1] += dot(lx[ch], y4[ir1][ch * nxpsg]);
+            }
+        }
+#pragma unroll(r1ptg)
+        for (short ir1 = 0; ir1 < r1ptg; ir1++) y4[ir1] += chpt * nxpsg;
+    }
+    for (short ir1 = 0; ir1 < r1ptg; ir1++) {
+        if (nxpsg >= 32) sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+        if (nxpsg >= 16) sumf[ir1] += simd_shuffle_down(sumf[ir1], 8);
+        if (nxpsg >= 8) sumf[ir1] += simd_shuffle_down(sumf[ir1], 4);
+        if (nxpsg >= 4) sumf[ir1] += simd_shuffle_down(sumf[ir1], 2);
+        if (nxpsg >= 2) sumf[ir1] += simd_shuffle_down(sumf[ir1], 1);
+    }
+    /* The zero half contributes nothing for finite scales. Any Inf/NaN
+     * scale makes its original dot NaN, regardless of the packed quants.
+     * Read only those scale words, once per row across its eight lanes. */
+    uint nonfinite = 0u;
+    device const block_q8_0 *zero_half = wrow + (emb ? E / 32 : 0);
+    for (int b = tx; b < E / 32; b += nxpsg)
+        nonfinite |= (as_type<ushort>(zero_half[b].d) & 0x7c00u) == 0x7c00u;
+    if (nxpsg >= 32) nonfinite |= simd_shuffle_down(nonfinite, 16);
+    if (nxpsg >= 16) nonfinite |= simd_shuffle_down(nonfinite, 8);
+    if (nxpsg >= 8) nonfinite |= simd_shuffle_down(nonfinite, 4);
+    if (nxpsg >= 4) nonfinite |= simd_shuffle_down(nonfinite, 2);
+    if (nxpsg >= 2) nonfinite |= simd_shuffle_down(nonfinite, 1);
+    if (tx == 0 && i01 < args.ne01) {
+        for (short ir1 = 0; ir1 < r1ptg; ir1++) {
+            device float *out = (device float *)dst + (uint64_t)out_row[ir1] * args.ne0;
+            out[i01] = nonfinite ? as_type<float>(0x7fc00000u) : sumf[ir1];
+        }
+    }
+}
+template [[host_name("kernel_qwen4_mtp_project_q8_emb_1")]]
+kernel void kernel_qwen4_mtp_project_q8<1, true>(constant ds4_metal_args_mul_mv_ext &, device const char *,
+    device const char *, device char *, uint3, ushort, ushort);
+template [[host_name("kernel_qwen4_mtp_project_q8_emb_2")]]
+kernel void kernel_qwen4_mtp_project_q8<2, true>(constant ds4_metal_args_mul_mv_ext &, device const char *,
+    device const char *, device char *, uint3, ushort, ushort);
+template [[host_name("kernel_qwen4_mtp_project_q8_emb_3")]]
+kernel void kernel_qwen4_mtp_project_q8<3, true>(constant ds4_metal_args_mul_mv_ext &, device const char *,
+    device const char *, device char *, uint3, ushort, ushort);
+template [[host_name("kernel_qwen4_mtp_project_q8_hidden_4")]]
+kernel void kernel_qwen4_mtp_project_q8<4, false>(constant ds4_metal_args_mul_mv_ext &, device const char *,
+    device const char *, device char *, uint3, ushort, ushort);
 
 struct ds4_metal_args_qwen4_mtp_combine {
     uint32_t n_embd;

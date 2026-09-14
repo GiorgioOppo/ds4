@@ -57593,7 +57593,7 @@ typedef struct {
     int32_t mrope_delta;
     int32_t snap_mrope_delta;
     const ds4_vision_span *vis_spans;
-    uint32_t mtp_last_rows;  /* rows of the last predictor pass resident in mtp_R */
+    uint32_t mtp_last_rows;  /* final predictor output is mtp_R[mtp_last_rows - 1]; zero means none */
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
@@ -58234,28 +58234,40 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
 }
 
 static bool qwen4_graph_attention_cache(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                                  uint32_t il, uint32_t pos0, uint32_t T) {
+                                  uint32_t il, uint32_t pos0, uint32_t T, bool cache_only) {
     const uint32_t ratio = 4u;
     const uint32_t last = pos0 + T - 1u;
     {
-        bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
+        /* Historical predictor rows need keys and values only. Keep their
+         * projection kernels and K normalization identical to a full step. */
+        bool ok = cache_only || qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
         if (ok && qwen4_graph_fused(g, T)) {
-            ds4_gpu_tensor *outs[4] = { g->kp, g->vp, g->iq, g->ik };
+            ds4_gpu_tensor *outs[4] = { g->kp, g->vp, cache_only ? g->ik : g->iq, g->ik };
             const uint64_t offs[4] = { l->attn_k->abs_offset, l->attn_v->abs_offset,
-                                       l->indexer_q_proj->abs_offset, l->indexer_k_proj->abs_offset };
-            const uint32_t types[4] = { l->attn_k->type, l->attn_v->type, l->indexer_q_proj->type, l->indexer_k_proj->type };
+                                       cache_only ? l->indexer_k_proj->abs_offset : l->indexer_q_proj->abs_offset,
+                                       l->indexer_k_proj->abs_offset };
+            const uint32_t types[4] = { l->attn_k->type, l->attn_v->type,
+                                       cache_only ? l->indexer_k_proj->type : l->indexer_q_proj->type,
+                                       l->indexer_k_proj->type };
             const uint32_t rows[4] = { (uint32_t)l->attn_k->dim[1], (uint32_t)l->attn_v->dim[1],
-                                       (uint32_t)l->indexer_q_proj->dim[1], (uint32_t)l->indexer_k_proj->dim[1] };
-            ok = ds4_gpu_qwen4_multi_gemv_tensor(g->mixed, T, DS4_N_EMBD, 4, outs, m->map, m->size, offs, types, rows) != 0;
+                                       (uint32_t)(cache_only ? l->indexer_k_proj->dim[1] : l->indexer_q_proj->dim[1]),
+                                       (uint32_t)l->indexer_k_proj->dim[1] };
+            ok = ds4_gpu_qwen4_multi_gemv_tensor(g->mixed, T, DS4_N_EMBD, cache_only ? 3u : 4u,
+                                                outs, m->map, m->size, offs, types, rows) != 0;
         } else if (ok) {
             ok = qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
                  qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
-                 qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
+                 (cache_only || qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T)) &&
                  qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
         }
         if (!ok) return false;
     }
-    if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
+    if (cache_only) {
+        if (!ds4_gpu_qwen4_attn_cache_prep_tensor(g->layer_k_cache[il], g->layer_v_cache[il],
+                g->layer_ik_cache[il], g->kp, g->vp, g->ik, g->pos3, m->map, m->size,
+                l->attn_k_norm->abs_offset, T, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
+                DS4_N_INDEXER_HEAD_DIM, pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return false;
+    } else if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                          l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
@@ -58281,7 +58293,7 @@ static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const uint32_t ratio = 4u;
     const uint32_t n_blocks_after = (pos0 + T) / ratio;
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
-    if (!qwen4_graph_attention_cache(g, m, l, il, pos0, T)) return false;
+    if (!qwen4_graph_attention_cache(g, m, l, il, pos0, T, false)) return false;
     if (T == 3u && g->verify_rows_exact) {
         /* 3-row speculative verify: run the attention core as 2/1-row
          * sub-batches so every dispatch keeps the exact T <= 2 kernel paths
@@ -58328,8 +58340,8 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
-static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                           uint32_t il, uint32_t T) {
+static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                uint32_t il, uint32_t T, bool last_only) {
     const bool profile = !g->ssd_streaming && T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
@@ -58338,6 +58350,35 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+    ds4_gpu_tensor **fields[] = {
+        &g->mixed, &g->selected, &g->weights, &g->sh_gate_logit, &g->R, &g->inj,
+    };
+    ds4_gpu_tensor *saved[6] = {0}, *views[6] = {0};
+    bool bound = false;
+    if (ok && last_only && T > 1u) {
+        /* MTP only consumes the final residual row. Keep the router's original
+         * batch geometry, then run its independent expert rows once. The HC
+         * injection has a chunk matrix per row; mid/part/blk remain scratch. */
+        const uint64_t row_bytes[] = {
+            (uint64_t)DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t),
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(float),
+            sizeof(float),
+            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_HC * DS4_QWEN4_HC_CHUNKS * DS4_N_HC * sizeof(float),
+        };
+        for (uint32_t i = 0; i < 6u; i++) {
+            saved[i] = *fields[i];
+            views[i] = ds4_gpu_tensor_view(saved[i], (uint64_t)(T - 1u) * row_bytes[i], row_bytes[i]);
+            if (!views[i]) {
+                ok = false;
+                goto done;
+            }
+        }
+        for (uint32_t i = 0; i < 6u; i++) *fields[i] = views[i];
+        bound = true;
+        T = 1u;
+    }
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -58352,7 +58393,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         uint64_t gate_bytes = 0, down_bytes = 0;
         if (!streaming_layer_gate_down_expert_bytes(l, &gate_bytes, &down_bytes) ||
             l->ffn_gate_exps->type != l->ffn_up_exps->type ||
-            l->ffn_gate_exps->bytes != l->ffn_up_exps->bytes) return false;
+            l->ffn_gate_exps->bytes != l->ffn_up_exps->bytes) {
+            ok = false;
+            goto done;
+        }
         const ds4_gpu_stream_expert_table table = {
             .model_map = m->map, .model_size = m->size, .layer = il,
             .n_total_expert = DS4_N_EXPERT,
@@ -58380,10 +58424,11 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
             qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
             ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
             qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
-        return ok && ds4_gpu_qwen4_moe_reduce_tensor(
+        ok = ok && ds4_gpu_qwen4_moe_reduce_tensor(
             g->blk, g->part, g->weights, g->sh_gate_logit, mm ? g->sh_out : NULL,
             g->R, g->inj, T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED + (mm ? 0u : 1u),
             DS4_N_EMBD, DS4_N_HC) != 0;
+        goto done;
     }
     if (mm) {
         if (ok) {
@@ -58419,7 +58464,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                 g->pos, T, (int)l->ffn_gate_exps->name.len, l->ffn_gate_exps->name.ptr, ok ? 1 : 0,
                 elapsed[0] * 1e3, elapsed[1] * 1e3, elapsed[2] * 1e3, elapsed[3] * 1e3,
                 elapsed[4] * 1e3, elapsed[5] * 1e3, elapsed[6] * 1e3);
-        return ok;
+        goto done;
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
@@ -58437,7 +58482,24 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, NULL, g->R, g->inj, T,
                                              DS4_N_EXPERT_USED, DS4_N_EXPERT_USED + 1u, DS4_N_EMBD, DS4_N_HC) != 0;
     }
+done:
+    if (last_only) {
+        if (bound) {
+            for (uint32_t i = 0; i < 6u; i++) *fields[i] = saved[i];
+        }
+        for (uint32_t i = 0; i < 6u; i++) ds4_gpu_tensor_free(views[i]);
+    }
     return ok;
+}
+
+static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                           uint32_t il, uint32_t T) {
+    return qwen4_graph_moe_impl(g, m, l, il, T, false);
+}
+
+static bool qwen4_graph_moe_last(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                uint32_t il, uint32_t T) {
+    return T >= 1u && T <= 3u && qwen4_graph_moe_impl(g, m, l, il, T, true);
 }
 
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
@@ -58867,13 +58929,20 @@ static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
     return true;
 }
 
+/* Each staged EH row has one zero half. The Q8 kernel skips its quantized
+ * products while retaining the full projection's reduction order. */
+static bool qwen4_graph_mtp_project(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                    const ds4_layer_weights *l, uint32_t T) {
+    if (l->nextn_eh_proj->type == DS4_TENSOR_Q8_0)
+        return ds4_gpu_qwen4_mtp_project_tensor(g->mtp_proj, g->mtp_cat, m->map, m->size,
+            l->nextn_eh_proj->abs_offset, DS4_N_EMBD, DS4_N_HC, T) != 0;
+    return qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (DS4_N_HC + 1u));
+}
+
 /* The steering bank contains trunk layers only. The predictor remains
- * unsteered; its drafts are verified by the steered target trunk.
- * One to three causal predictor steps at idx, using consecutive rows of the
- * trunk's pre-mixer streams and the embeddings of their following tokens.
- * The nextn layer runs on its own residual; want_logits returns the last
- * row only. Batching catches up accepted drafts and predicts again with
- * one command submission and one set of weight reads. */
+ * unsteered; its drafts are verified by the steered target trunk. Each row
+ * uses a trunk pre-mixer stream and the embedding of its following token,
+ * producing the predictor's own residual without modifying the trunk. */
 static bool qwen4_graph_mtp_input(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                    uint32_t row, const int *next_tokens, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
@@ -58901,7 +58970,7 @@ static bool qwen4_graph_mtp_input(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
     }
-    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
+    if (ok) ok = qwen4_graph_mtp_project(g, m, l, T);
     for (uint32_t t = 0; t < T && ok; t++) {
         ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, t * hc * emb_bytes, hc * emb_bytes);
@@ -58927,7 +58996,7 @@ static bool qwen4_graph_mtp_cache_steps(ds4_qwen4_gpu_graph *g, const ds4_model 
     bool ok = qwen4_graph_mtp_input(g, m, w, row, next_tokens, T);
     g->R = g->mtp_R;
     if (ok) ok = qwen4_graph_attention_cache(g, m, &w->layer[DS4_N_LAYER - 1u],
-                                             DS4_N_LAYER - 1u, idx, T);
+                                             DS4_N_LAYER - 1u, idx, T, true);
     g->R = R;
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     g->mtp_last_rows = 0;  /* staged inputs are not recursive predictor outputs */
@@ -58941,6 +59010,8 @@ static bool qwen4_graph_mtp_cache_steps(ds4_qwen4_gpu_graph *g, const ds4_model 
     return ok;
 }
 
+/* Catch up one to three consecutive predictor rows. Only the final row's
+ * output feeds the head or recursive draft; earlier rows contribute KV. */
 static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                  uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx, bool want_logits,
                                  float *logits_out, int *draft_out) {
@@ -58956,7 +59027,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-    if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
+    if (ok) ok = qwen4_graph_moe_last(g, m, l, il, T);
     ds4_gpu_tensor *last = NULL;
     const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
@@ -59041,7 +59112,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
     }
-    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, hc + 1u);
+    if (ok) ok = qwen4_graph_mtp_project(g, m, l, 1u);
     if (ok) {
         ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, 0, proj_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, 0, hc * emb_bytes);

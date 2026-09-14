@@ -3358,6 +3358,15 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap,
         float rope_base, float eps);
+/* Predictor prefix preparation: identical K/V/IK arithmetic to attn_prep,
+ * without query, gate or indexer-query inputs/outputs. Cache spans and all
+ * inputs must be disjoint from the three output spans. */
+int ds4_gpu_qwen4_attn_cache_prep_tensor(
+        ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, ds4_gpu_tensor *ik_cache,
+        const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj, const ds4_gpu_tensor *ik,
+        const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size, uint64_t g_k_offset,
+        uint32_t n_tokens, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap, float rope_base, float eps);
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
         const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
@@ -3478,6 +3487,13 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
         uint32_t n_embd, uint32_t n_hc, float eps);
+/* Apply Q8 weights [E][2E] to the exact [T][hc+1][2E] layout written by
+ * mtp_stage: [embedding|0], then hc rows [0|hidden]. Preserves the existing
+ * Q8 batch arithmetic and full row strides; out must not overlap cat/weights. */
+int ds4_gpu_qwen4_mtp_project_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *cat,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens);
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
