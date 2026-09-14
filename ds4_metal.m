@@ -48113,8 +48113,10 @@ typedef struct {
     uint32_t n_entries;
     uint32_t slot_mask;
     bool addresses;
+    const uint32_t *frequency;  /* validated CPU routing counts, scoped to this call */
 } qwen4_stream_weights;
 static qwen4_stream_weights *g_qwen4_stream_weights;
+static bool qwen4_moe_mm_m1_ssd(uint32_t n_tokens, uint32_t type);
 
 static bool qwen4_bind_experts(qwen4_bind *b, const void *map, uint64_t size,
                                uint64_t offset, uint64_t bytes, const char *what) {
@@ -48396,14 +48398,15 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
             }
         } else if (kernel >= QWEN4_K_MOE_MM_MID && kernel <= QWEN4_K_MOE_MM_DOWN_NAXC64) {
             /* Keep each quantization's dequantizer constant through the K
-             * loop. M3 Ultra and M5 have balanced full-model measurements;
-             * other devices can opt in, and zero restores the generic kernel. */
+             * loop. Also measured for short IQ2/Q2 SSD batches on M1 Max;
+             * zero restores the generic kernel for numerical/perf comparison. */
+            const qwen4_moe_mm_args *mm = args;
             const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_SPECIALIZE");
             const bool specialize = override >= 0 ? override != 0 :
                 ds4_gpu_device_name_contains("M3 Ultra") ||
-                ds4_gpu_device_is_m5_apple_silicon();
-            const uint32_t type = specialize ?
-                ((const qwen4_moe_mm_args *)args)->weight_type : 0u;
+                ds4_gpu_device_is_m5_apple_silicon() ||
+                qwen4_moe_mm_m1_ssd(mm->n_tokens, mm->weight_type);
+            const uint32_t type = specialize ? mm->weight_type : 0u;
             if (type >= 40u) return 0;
             const uint32_t tail_base = ((const qwen4_moe_mm_args *)args)->tail_base;
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_tail=%u_addr=%u",
@@ -49320,14 +49323,40 @@ int ds4_gpu_qwen4_moe_build_lists_tensor(
                           MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1), 0);
 }
 
-static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens, bool mid) {
+/* Scope the M1 policy to the measured SSD model shape. Prompt-sized batches
+ * up to one 32-token tile showed no stable end-to-end gain; keep their old
+ * pipelines, as well as resident inference and other devices/types. */
+static bool qwen4_moe_mm_m1_ssd(uint32_t n_tokens, uint32_t type) {
+    const qwen4_stream_weights *s = g_qwen4_stream_weights;
+    return s && s->frequency && n_tokens > 32u && n_tokens <= 128u && s->table->n_total_expert == 512u &&
+        (type == 16u || type == 10u) && ds4_gpu_device_name_contains("M1 Max");
+}
+
+/* Short SSD chunks can route only a few tokens to each of 512 experts.
+ * Use eight-token matrix tiles when they cut padded token work by more than
+ * half. Concentrated routing keeps the wider tile's weight reuse. Restrict
+ * this policy to the measured M1 Max IQ2/Q2 path; resident inference retains
+ * its existing defaults. Counts have already been checked against the GPU
+ * lists and selected IDs, so this adds no synchronization or readback. */
+static bool qwen4_moe_mm_sparse_ssd(uint32_t n_tokens, uint32_t type) {
+    if (!qwen4_moe_mm_m1_ssd(n_tokens, type)) return false;
+    const qwen4_stream_weights *s = g_qwen4_stream_weights;
+    uint32_t tiles8 = 0, tiles32 = 0;
+    for (uint32_t e = 0; e < s->table->n_total_expert; e++) {
+        tiles8 += (s->frequency[e] + 7u) / 8u;
+        tiles32 += (s->frequency[e] + 31u) / 32u;
+    }
+    return tiles8 < 2u * tiles32;
+}
+
+static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens, uint32_t type, bool mid) {
     uint32_t tiles = (n_tokens + 31u) / 32u;
     /* Spread large routed batches over more independent tiles on M3 Ultra
      * (gate/up and down) and on M5 (gate/up; the down tiles measured flat).
      * Each tile keeps the same K loop and accumulation order. */
     const bool spread = ds4_gpu_device_name_contains("M3 Ultra") ||
                         (mid && ds4_gpu_device_is_m5_apple_silicon());
-    const uint32_t default_cap = spread ?
+    const uint32_t default_cap = qwen4_moe_mm_sparse_ssd(n_tokens, type) ? 1u : spread ?
         (n_tokens >= 8192u ? 32u : n_tokens >= 4096u ? 16u : 8u) : 8u;
     const uint32_t cap = (uint32_t)ds4_gpu_env_u64(
         mid ? "DS4_QWEN4_MOE_MID_TILES" : "DS4_QWEN4_MOE_DOWN_TILES", default_cap, 1u, 32u);
@@ -49338,7 +49367,7 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
     /* Low-bit experts receive few tokens in short prefills. Smaller token
      * tiles avoid unused matrix products while retaining the same K order.
      * Keep 32-token tiles for larger batches and unmeasured devices/types. */
-    uint32_t default_nt = 4u;
+    uint32_t default_nt = qwen4_moe_mm_sparse_ssd(n_tokens, type) ? 1u : 4u;
     if ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) {
         if (n_tokens <= 512u) default_nt = 1u;
         else if (n_tokens <= 1024u) default_nt = 2u;
@@ -49454,7 +49483,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap) {
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
-    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, true);
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, weight_type, true);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_MID_NT");
     const int kernel = nt == 1u ? QWEN4_K_MOE_MM_MID_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_MID_NT2 :
@@ -49537,7 +49566,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
-    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, weight_type, false);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
     const int kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_DOWN_NT2 :
@@ -49967,6 +49996,7 @@ int ds4_gpu_qwen4_moe_stream_tensor(
             [g_transient_buffers addObject:stream.owned_down];
         }
     }
+    stream.frequency = frequency;
     g_qwen4_stream_weights = &stream;
     if (mm) {
         ok = ds4_gpu_qwen4_moe_mm_mid_tensor(mid, x, lists, counts, table->model_map, table->model_size,

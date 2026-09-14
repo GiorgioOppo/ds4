@@ -170,6 +170,41 @@ static void free_output(guarded *t) {
     ds4_gpu_tensor_free(t->view); ds4_gpu_tensor_free(t->base);
 }
 
+static const char *mm_env[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES",
+                               "DS4_QWEN4_MOE_MID_NT", "DS4_QWEN4_MOE_DOWN_NT",
+                               "DS4_QWEN4_MOE_MM_SPECIALIZE"};
+static void mm_variant(unsigned nt) {
+    for (unsigned i = 0; i < 5; i++) {
+        const char *value = i == 4 ? "0" : i < 2 || nt == 4 ? "4" : "1";
+        need((nt ? setenv(mm_env[i], value, 1) : unsetenv(mm_env[i])) == 0,
+             "select generic full-grid/default MM dispatch");
+    }
+}
+
+/* Check the real GPU-built lists against the frozen router IDs, without
+ * assuming the order in which GPU atomics append a token's slot. */
+static void check_mm_lists(const int32_t *ids, uint32_t T, unsigned route,
+                           const float *lists, const float *counts) {
+    uint32_t freq[E] = {0}, hot = 0, tail = 0, inactive = 0;
+    unsigned char *seen = calloc((size_t)T * S, 1);
+    need(seen != NULL, "list membership scratch");
+    for (uint32_t p = 0; p < T * S; p++) freq[ids[p]]++;
+    for (uint32_t e = 0; e < E; e++) {
+        int32_t count; memcpy(&count, counts + GUARD + e, 4);
+        need(count >= 0 && (uint32_t)count == freq[e], "GPU list frequency matches router IDs");
+        hot += count > 8; tail += count > 0 && count < 8; inactive += count == 0;
+        for (int32_t j = 0; j < count; j++) {
+            int32_t p; memcpy(&p, lists + GUARD + (uint64_t)e * T + (uint32_t)j, 4);
+            need(p >= 0 && (uint32_t)p < T * S && ids[p] == (int32_t)e && !seen[p],
+                 "GPU lists contain every routed slot exactly once");
+            seen[p] = 1;
+        }
+    }
+    for (uint32_t p = 0; p < T * S; p++) need(seen[p], "complete GPU list membership");
+    if (route == 4) need(hot && tail && inactive > 400, "skewed lists span hot, tail and inactive experts");
+    free(seen);
+}
+
 static int project_rows(const weights *w, uint32_t T, uint32_t slots, int has_shared,
                         int streamed, ds4_gpu_tensor *mid, ds4_gpu_tensor *part,
                         ds4_gpu_tensor *x, ds4_gpu_tensor *ids) {
@@ -208,6 +243,16 @@ static int project(const weights *w, uint32_t T, int streamed,
 static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd,
                        int empty_fd, int fail_first, int warm_probe) {
     const int mm = T > 8;
+    const int compare_mm = mm && T <= 128 && w->gate_type == 16 && w->down_type == 10;
+    char *saved_mm_env[5] = {NULL, NULL, NULL, NULL, NULL};
+    if (compare_mm) {
+        for (unsigned i = 0; i < 5; i++) {
+            const char *v = getenv(mm_env[i]);
+            saved_mm_env[i] = v ? strdup(v) : NULL;
+            need(!v || saved_mm_env[i], "save MM dispatch environment");
+        }
+        mm_variant(0);
+    }
     const uint32_t stride = S + !mm;
     const uint64_t xn = (uint64_t)T * D, sn = (uint64_t)T * S;
     const uint64_t rn = xn * HC, in = (uint64_t)T * HC * DS4_QWEN4_HC_CHUNKS * HC;
@@ -223,19 +268,29 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
         sg[t] = ((int)(t % 7) - 3) * 0.25f;
         for (uint32_t s = 0; s < S; s++) {
             ids[t * S + s] = route == 3 ? (int32_t)((t * S + s) % E) :
+                route == 4 ? active[s < 8 ? s : 8 + (2 * t + s - 8) % 16] :
                 active[route == 2 ? (t + s) % 24 : route * 10 + (t + s) % 10];
             mix[t * S + s] = (s + 1) / 55.f;
         }
     }
     ds4_gpu_tensor *gx = upload(x, xn * 4), *gi = upload(ids, sn * 4);
     ds4_gpu_tensor *gw = upload(mix, sn * 4), *ginj = upload(inj, in * 4), *gsg = upload(sg, T * 4);
-    ds4_gpu_tensor *lists = mm ? upload(NULL, (uint64_t)E * T * 4) : NULL;
-    ds4_gpu_tensor *counts = mm ? upload(NULL, E * 4) : NULL;
+    guarded routing[2] = {{0}, {0}};
+    float *routing_reference[2] = {NULL, NULL};
+    if (mm) {
+        routing[0] = output((uint64_t)E * T); routing[1] = output(E);
+        reset(routing); reset(routing + 1);
+    }
+    ds4_gpu_tensor *lists = routing[0].view, *counts = routing[1].view;
     guarded outputs[] = {output((uint64_t)T * stride * F), output((uint64_t)T * stride * D),
                          output(xn), output(rn)};
     const char *stages[] = {"mid", "down", "reduce", "HC residual"};
     float *reference[4] = {NULL, NULL, NULL, NULL};
-    if (mm) need(ds4_gpu_qwen4_moe_build_lists_tensor(lists, counts, gi, T, S, E, T), "expert lists");
+    if (mm) {
+        need(ds4_gpu_qwen4_moe_build_lists_tensor(lists, counts, gi, T, S, E, T), "expert lists");
+        for (unsigned i = 0; i < 2; i++) routing_reference[i] = read_output(routing + i);
+        check_mm_lists(ids, T, route, routing_reference[0], routing_reference[1]);
+    }
     ds4_gpu_qwen4_set_verify_rows_exact(T == 3);
     if (w->gate_type == 16 && T == 1 && route == 0) {
         weights invalid = *w; invalid.table.down_expert_bytes--;
@@ -267,12 +322,19 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
         (void)probe_end(0, 0);
         need(ds4_gpu_set_model_fd(good_fd), "restore input fd after failure");
     }
-    const unsigned runs = warm_probe ? 3 : 2;
-    read_stats reads[3] = {{0,0}, {0,0}, {0,0}};
+    const unsigned variants[] = {4, 0, 4, 1, 0, 1};
+    const unsigned runs = compare_mm ? 6 : warm_probe ? 3 : 2;
+    read_stats reads[6] = {{0}};
     for (unsigned run = 0; run < runs; run++) {
-        /* The third pass must use cache hits: the backing fd cannot provide
-         * any bytes. Restore the real fd before cleanup or the next case. */
-        if (run == 2) need(ds4_gpu_set_model_fd(empty_fd), "warm-cache empty fd");
+        /* Preserve the independent generic resident reference. Low-bit MM runs
+         * default SSD cold -> old NT4 SSD on these same buffers, followed by
+         * NT1/grid4 -> default -> NT1/grid4. This covers both automatic tile
+         * widths and specialization against forced generic kernels. Warm
+         * cases remove the readable fd; overflow cases must reread only the
+         * selected union on every arm. TILES alone does not force old NT4. */
+        if (compare_mm) mm_variant(variants[run]);
+        const int warm = warm_probe && run >= 2;
+        if (warm) need(ds4_gpu_set_model_fd(empty_fd), "warm-cache empty fd");
         for (unsigned i = 0; i < 4; i++) reset(outputs + i);
         need(ds4_gpu_tensor_write(outputs[3].view, 0, r, rn * 4), "reset HC input");
         need(ds4_gpu_begin_commands(), "projection batch begin");
@@ -282,11 +344,16 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
         need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, gw,
             mm ? NULL : gsg, NULL, outputs[3].view, ginj, T, S, stride, D, HC), "reduce and HC");
         need(ds4_gpu_end_commands(), "projection batch drain");
-        reads[run] = probe_end(run && !warm_probe, run == 0 || run == 2);
+        reads[run] = probe_end(run && !warm_probe, run == 0 || warm);
         for (unsigned i = 0; i < 4; i++) {
             float *got = read_output(outputs + i);
             if (!run) reference[i] = got;
             else { exact(stages[i], reference[i], got, outputs[i].n + 2 * GUARD); free(got); }
+        }
+        if (mm) for (unsigned i = 0; i < 2; i++) {
+            float *got = read_output(routing + i);
+            exact("frozen lists/counts and guards", routing_reference[i], got, routing[i].n + 2 * GUARD);
+            free(got);
         }
         const uint32_t cached = ds4_gpu_stream_expert_cache_current_count();
         need(cached <= BUDGET, "bounded cache count");
@@ -297,15 +364,22 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
     need(read_x && read_ids && ds4_gpu_tensor_read(gx, 0, read_x, xn * 4) &&
          ds4_gpu_tensor_read(gi, 0, read_ids, sn * 4), "input integrity read");
     need(!memcmp(x, read_x, xn * 4) && !memcmp(ids, read_ids, sn * 4), "input and selected IDs unchanged");
-    printf("PASS Qwen SSD %u/%u T=%u %s route=%u: exact mid/down/reduce/HC, guards; pread=%llu bytes/%llu calls%s%s\n",
+    printf("PASS Qwen SSD %u/%u T=%u %s route=%u: exact mid/down/reduce/HC, guards; pread=%llu bytes/%llu calls%s%s%s\n",
            w->gate_type, w->down_type, T, mm ? "MM" : "rows", route,
            (unsigned long long)reads[1].bytes, (unsigned long long)reads[1].calls,
            warm_probe ? ", warm hits without readable fd" : "",
-           fail_first ? ", failed read and exact retry" : "");
+           fail_first ? ", failed read and exact retry" : "",
+           compare_mm ? ", generic NT4/grid4 reference exact; generic NT1/grid4/default/generic NT1/grid4 on same buffers" : "");
     for (unsigned i = 0; i < 4; i++) { free(reference[i]); free_output(outputs + i); }
     ds4_gpu_qwen4_set_verify_rows_exact(false);
     ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gi); ds4_gpu_tensor_free(gw);
-    ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gsg); ds4_gpu_tensor_free(lists); ds4_gpu_tensor_free(counts);
+    ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gsg);
+    if (mm) for (unsigned i = 0; i < 2; i++) { free(routing_reference[i]); free_output(routing + i); }
+    if (compare_mm) for (unsigned i = 0; i < 5; i++) {
+        need((saved_mm_env[i] ? setenv(mm_env[i], saved_mm_env[i], 1) : unsetenv(mm_env[i])) == 0,
+             "restore MM dispatch environment");
+        free(saved_mm_env[i]);
+    }
     free(x); free(mix); free(r); free(inj); free(sg); free(ids); free(read_x); free(read_ids);
 }
 
@@ -474,6 +548,14 @@ int main(void) {
         check_case(w, T, 1, fileno(file), fileno(empty), c == 0, 1);
         check_case(w, T, 0, fileno(file), fileno(empty), 0, 1);
         if (T == 128) {
+            /* Eight experts appear in all 29 rows, sixteen in only 3/4 rows:
+             * both >8-token counts and partial tiles, with 488 inactive. */
+            check_case(w, 29, 4, fileno(file), fileno(empty), 0, 0);
+            if (w->gate_type == 16) {
+                /* Both sides of the measured M1 SSD batch-size boundary. */
+                check_case(w, 32, 3, fileno(file), fileno(empty), 0, 0);
+                check_case(w, 33, 3, fileno(file), fileno(empty), 0, 0);
+            }
             check_case(w, T, 2, fileno(file), fileno(empty), 1, 0);
             check_case(w, T, 3, fileno(file), fileno(empty), 0, 0);
         }
