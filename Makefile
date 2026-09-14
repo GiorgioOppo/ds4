@@ -550,6 +550,19 @@ test-cuda-v41-q4-output: tests/test_cuda_v41_q4_output
 bench-cuda-v41-q4-output: tests/test_cuda_v41_q4_output
 	./tests/test_cuda_v41_q4_output --bench
 
+tests/test_cuda_v41_hc.o: tests/test_cuda_v41_hc.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
+
+tests/test_cuda_v41_hc: tests/test_cuda_v41_hc.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-v41-hc bench-cuda-v41-hc
+test-cuda-v41-hc: tests/test_cuda_v41_hc
+	./tests/test_cuda_v41_hc
+
+bench-cuda-v41-hc: tests/test_cuda_v41_hc
+	./tests/test_cuda_v41_hc --bench
+
 .PHONY: test-cuda-q8-rows
 test-cuda-q8-rows: tests/test_cuda_q8_rows
 	./tests/test_cuda_q8_rows
@@ -1146,6 +1159,7 @@ clean:
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows
 	rm -f tests/test_cuda_v41_q4_output
+	rm -f tests/test_cuda_v41_hc
 	rm -f tests/test_cuda_reductions
 	rm -f tests/test_cuda_shared
 	rm -f tests/test_cuda_ssd_cache
@@ -1175,6 +1189,11 @@ test-cuda-v41-q4-output-host: tests/test_cuda_v41_q4_output_host.py tests/kernel
 		tests/test_cuda_v41_q4_dispatch_host.py cuda/mmq/ds4_mmq.cu ds4_deepseek41_cuda.cuh
 	python3 tests/test_cuda_v41_q4_output_host.py
 	python3 tests/test_cuda_v41_q4_dispatch_host.py
+
+.PHONY: test-cuda-v41-hc-host
+test-cuda-v41-hc-host: tests/test_cuda_v41_hc_host.py tests/kernel_source.py \
+		ds4_deepseek41_cuda.cuh ds4_cuda.cu ds4.c ds4_gpu_phase.h
+	python3 tests/test_cuda_v41_hc_host.py
 
 GPU_INDEXER_PREPARED_DEPS := tests/test_gpu_indexer_prepared.py tests/test_gpu_indexer_prepared.cpp \
 	tests/kernel_source.py ds4_indexer_prepared.h ds4_indexer_prepared_launch.cuh \

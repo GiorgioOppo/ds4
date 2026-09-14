@@ -61,6 +61,14 @@ int ds4_gpu_dsv41_attention_output_typed_batch(
         uint32_t out_a_type, uint32_t out_b_type,
         const ds4_gpu_tensor *heads, uint32_t n_tokens,
         uint32_t tp_world, uint32_t tp_rank);
+/* HC expansion at width 5120 with four streams. Round block[+add] to BF16
+ * before the ordered sums, then round each output. Output must be disjoint
+ * from all used input ranges; buffers require 16-byte alignment. CUDA requires
+ * an initialized single-device backend with quality mode disabled. */
+int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *block, const ds4_gpu_tensor *add,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t rows);
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
@@ -167,10 +175,6 @@ int ds4_gpu_dsv41_shared_swiglu(
 int ds4_gpu_dsv41_swiglu_bf16(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
         uint32_t rows, float clamp);
-int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *block, const ds4_gpu_tensor *add,
-        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
-        uint32_t rows);
 int ds4_gpu_dsv41_hc_sum_bf16(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *weights,
         uint32_t rows, bool split);

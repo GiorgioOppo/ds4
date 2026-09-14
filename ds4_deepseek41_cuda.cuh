@@ -61,6 +61,73 @@ extern "C" int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width,
     return cuda_ok(cudaGetLastError(), "V4.1 activation rounding");
 }
 
+/* Keep the legacy hc_expand_kernel's initial multiply and ascending source
+ * accumulation. The plain MAC expressions intentionally retain the build's
+ * contraction policy; forcing FMA would change --fmad=false builds. One
+ * thread reuses the block and residual loads for all four output streams. */
+__global__ static void dsv41_hc_expand_bf16_kernel(
+        float *out, const float *block, const float *add,
+        const float *residual, const float *split, uint32_t rows) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)rows * 5120u) return;
+    const uint32_t d = i % 5120u, row = i / 5120u;
+    float b = block[i];
+    if (add) b = __fadd_rn(b, add[i]);
+    b = dsv41_bf16(b);
+    const uint64_t base = (uint64_t)row * 20480u + d;
+    const float r0 = residual[base];
+    const float r1 = residual[base + 5120u];
+    const float r2 = residual[base + 10240u];
+    const float r3 = residual[base + 15360u];
+    const float *post = split + (uint64_t)row * 24u + 4u;
+    const float *comb = post + 4u;
+    for (uint32_t h = 0u; h < 4u; h++) {
+        float acc = __fmul_rn(b, post[h]);
+        acc += comb[h] * r0;
+        acc += comb[h + 4u] * r1;
+        acc += comb[h + 8u] * r2;
+        acc += comb[h + 12u] * r3;
+        out[base + (uint64_t)h * 5120u] = dsv41_bf16(acc);
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_hc_expand_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *block, const ds4_gpu_tensor *add,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t rows) {
+    const uint64_t n = (uint64_t)rows * 5120u;
+    if (!rows || n > UINT32_MAX || g_quality_mode || g_n_gpus != 1) return 0;
+    const ds4_gpu_tensor *tensors[] = {out, block, add ? add : block, residual, split};
+    const uint64_t counts[] = {n * 4u, n, n, n * 4u, (uint64_t)rows * 24u};
+    for (uint32_t j = 0u; j < 5u; j++) {
+        if (!dsv41_has_floats(tensors[j], counts[j]) || tensors[j]->device_id < -1)
+            return 0;
+        const uintptr_t p = (uintptr_t)tensors[j]->ptr;
+        if ((p & 15u) || counts[j] * sizeof(float) > UINTPTR_MAX - p) return 0;
+    }
+    const uintptr_t dest = (uintptr_t)out->ptr;
+    const uint64_t dest_bytes = counts[0] * sizeof(float);
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= g_n_gpus) return 0;
+    for (uint32_t j = 1u; j < 5u; j++) {
+        const uintptr_t src = (uintptr_t)tensors[j]->ptr;
+        const uint64_t src_bytes = counts[j] * sizeof(float);
+        if (ds4_tensor_device_idx(tensors[j]) != tier ||
+            (dest <= src ? src - dest < dest_bytes : dest - src < src_bytes)) return 0;
+    }
+    int device = -1;
+    if (!cuda_ok(cudaGetDevice(&device), "V4.1 HC device") ||
+        device != g_gpu[tier].device_id) return 0;
+    /* No allocation, weight resolution, device changes, or synchronization:
+     * tensor lifetimes and stream ordering remain with the caller. */
+    dsv41_hc_expand_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256,
+                                 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)block->ptr,
+        add ? (const float *)add->ptr : nullptr,
+        (const float *)residual->ptr, (const float *)split->ptr, rows);
+    return cuda_ok(cudaGetLastError(), "V4.1 HC expand BF16");
+}
+
 extern "C" int ds4_gpu_dsv41_shared_join(void) {
     if (!g_dsv41_shared.pending) return 1;
     g_dsv41_shared.pending = false;

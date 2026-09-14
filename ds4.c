@@ -40902,6 +40902,13 @@ static bool ds41_expand_batch(const ds41_gpu_graph *g, ds41_prefill_row *b,
     if (ds41_fused_epilogues(g))
         return ds4_gpu_dsv41_hc_expand_bf16(out, ffn ? b->routed : b->block,
             ffn && !shared_owner ? b->shared : NULL, residual, split, count);
+#elif !defined(DS4_ROCM_BUILD)
+    /* Preserve decode/TP/quality dispatch while fusing the prefill-only
+     * block sum and both BF16 boundaries into the existing HC arithmetic. */
+    if (count > 1u && g_n_gpus == 1 && g->tp_world == 1 && !g->quality && !g->imatrix &&
+        ds4_gpu_get_execution_phase() == DS4_GPU_PHASE_PREFILL)
+        return ds4_gpu_dsv41_hc_expand_bf16(out, ffn ? b->routed : b->block,
+            ffn && !shared_owner ? b->shared : NULL, residual, split, count);
 #else
     (void)g;
 #endif
