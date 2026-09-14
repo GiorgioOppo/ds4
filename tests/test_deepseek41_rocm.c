@@ -824,7 +824,9 @@ static int check_attention_output(void) {
     fprintf(stderr, "Q8 projection full scan outputs=%zu mismatches=%zu worst_absolute=%.17g worst_error_over_tolerance=%.17g worst_index=%zu\n",
             ny, q8_mismatches, q8_worst_absolute, q8_worst_fraction, q8_worst_at);
     CHECK(q8_mismatches == 0);
-    /* A different row count must not change arithmetic for the same input. */
+    /* Scalar decode uses a different F32 reduction from batched rows. Check
+     * every scalar output against the same independent oracle and unchanged
+     * gamma6 bound above; retain bit equality for repeated scalar calls. */
     ds4_gpu_tensor *one = upload(NULL, OUT * 4);
     CHECK(one);
     const uint32_t probes[] = {0, rows / 2, rows - 1};
@@ -835,7 +837,23 @@ static int check_attention_output(void) {
         CHECK(view);
         RUN(ds4_gpu_dsv41_q8_projection_rows(one, model, bytes, a_bytes, GROUPS * RANK, OUT, 1, view));
         CHECK(ds4_gpu_tensor_read(one, 0, low_got, OUT * 4));
-        CHECK(!memcmp(low_got, out_got + (size_t)row * OUT, OUT * 4));
+        double scalar_worst_fraction = 0, scalar_batch_drift = 0;
+        for (uint32_t o = 0; o < OUT; o++) {
+            double sum = 0, magnitude = 0;
+            for (uint32_t j = 0; j < TERMS; j++) {
+                const double term = (double)low_ref[(size_t)row * GROUPS * RANK + output_column(o, j)] * output_coefficient(o, j) / 128.0;
+                sum += term;
+                magnitude += fabs(term);
+            }
+            const double error = fabs((double)low_got[o] - sum);
+            const double tolerance = q8_gamma6 * fmax(magnitude, 0.001);
+            CHECK(isfinite(low_got[o]) && error <= tolerance);
+            scalar_worst_fraction = fmax(scalar_worst_fraction, error / tolerance);
+            scalar_batch_drift = fmax(scalar_batch_drift, fabs((double)low_got[o] - out_got[(size_t)row * OUT + o]));
+        }
+        if (rows == 1u) CHECK(!memcmp(low_got, out_got, OUT * 4));
+        fprintf(stderr, "Q8 scalar full oracle row=%u outputs=%u worst_error_over_unchanged_bound=%.9g scalar_batch_maxabs=%.9g\n",
+                row, OUT, scalar_worst_fraction, scalar_batch_drift);
         ds4_gpu_tensor_free(view);
     }
     ds4_gpu_tensor_free(one);

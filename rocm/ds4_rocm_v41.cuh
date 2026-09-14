@@ -363,6 +363,44 @@ extern "C" int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor
     return cuda_ok(cudaGetLastError(), "V4.1 sparse KV gather");
 }
 
+/* One wave per score: retain the scalar F32 reduction tree and scale boundary. */
+__global__ static void v41_indexer_scalar_warp8_kernel(
+        float *out, const float *q, const float *w, const float *k, uint32_t width, uint32_t start,
+        uint32_t ratio) {
+    uint32_t key = blockIdx.x * 8u + threadIdx.x / 32, lane = threadIdx.x & 31, row = blockIdx.y;
+    if (key >= width) return;
+    if (key >= (start + row + 1) / ratio) {
+        if (!lane) out[(uint64_t) row * width + key] = -INFINITY;
+        return;
+    }
+    const float *p = k + (uint64_t) key * 128 + lane;
+    float k0 = p[0], k1 = p[32], k2 = p[64], k3 = p[96], total = 0;
+    for (uint32_t h = 0; h < 32; h++) {
+        const float *x = q + ((uint64_t) row * 32 + h) * 128 + lane;
+        float a = v41_mul(x[0], k0), b = v41_mul(x[32], k1), c = v41_mul(x[64], k2), d = v41_mul(x[96], k3);
+        float dot = v41_add(v41_add(a, c), v41_add(b, d));
+        for (int s = 16; s; s >>= 1) dot = v41_add(dot, __shfl_down(dot, s, 32));
+        total = v41_add(total, v41_mul(fmaxf(v41_mul(dot, 1.f / 64.f), 0.f), w[row * 32 + h]));
+    }
+    if (!lane) out[(uint64_t) row * width + key] = total;
+}
+extern "C" int ds4_gpu_dsv41_indexer_scores_one(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *keys, uint32_t source_rows) {
+    if (!ds4_rocm_is_gfx1151())
+        return ds4_gpu_glm_indexer_score_one_tensor(scores, q, weights,
+            keys, source_rows, 32u, 128u, 1.0f / 64.0f, false);
+    if (!source_rows || source_rows > INT32_MAX ||
+        !cuda_tensor_has_f32(scores, source_rows) ||
+        !cuda_tensor_has_f32(q, 32u * 128u) ||
+        !cuda_tensor_has_f32(weights, 32u) ||
+        !cuda_tensor_has_elems2(keys, source_rows, 128u, 4u)) return 0;
+    v41_indexer_scalar_warp8_kernel<<<(source_rows + 7u) / 8u, 256>>>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+        (const float *)keys->ptr, source_rows, source_rows - 1u, 1u);
+    return cuda_ok(cudaGetLastError(), "V4.1 scalar warp indexer");
+}
+
 __global__ static void v41_indexer_kernel(float *scores, const float *q, const float *weights,
                                          const float *keys, uint32_t width, uint32_t start, uint32_t ratio) {
     const uint32_t key = blockIdx.x, token = blockIdx.y, lane = threadIdx.x & 31u, wave = threadIdx.x >> 5u;
@@ -619,6 +657,31 @@ extern "C" int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor *out, ds4_
         ds4_gpu_dsv41_projection_rows(out, model_map, model_size, weight_offset, in_dim, out_dim, n_rows, scale_scratch);
 }
 
+/* Four input values per lane, four Q8 blocks per wave. Scalar V4.1
+ * projections retain F32 activations; the block-wise reduction differs from
+ * the original lane accumulation and is qualified independently. */
+__global__ static void v41_q8_f32_blocks4_kernel(float *out,
+        const unsigned char *weights, const float *input,
+        uint32_t width, uint32_t outputs, uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (row >= outputs) return;
+    const uint32_t blocks = width / 32u;
+    float acc = 0.0f;
+    for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
+        const unsigned char *p = weights + row * row_bytes + (uint64_t)b * 34u;
+        const float d = q8_0_scale_scalar(p);
+        const uint32_t j = (lane & 7u) * 4u;
+        float value = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++)
+            value += (float)((const int8_t *)(p + 2u))[j + k] * input[b * 32u + j + k];
+        acc += d * value;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                                 uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                                 uint32_t rows, const ds4_gpu_tensor *in) {
@@ -630,12 +693,10 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
     const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "V4.1 Q8 projection");
     if (!weights) return 0;
-    if (rows == 1u && width == 1280u && outputs == 32768u && ds4_rocm_is_gfx1151()) {
-        /* Share the query-B activation row across 32 output waves; preserve
-         * the existing per-lane Q8 accumulation and wave reduction. */
-        matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<1024u, 1024u, 1280u * sizeof(float)>>>(
+    if (rows == 1u && ds4_rocm_is_gfx1151()) {
+        v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
-            40u, 32768u, UINT64_C(40) * 34u);
+            width, outputs, (uint64_t)(width / 32u) * 34u);
     } else if (!g_quality_mode && width == 1280u && outputs == 32768u && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Use the existing generic bulk matrix kernel on bulk prefill rows.
          * This numerical path rounds activations and decoded Q8 weights to
@@ -778,6 +839,25 @@ __global__ static void v41_grouped_q8_f32_wmma_rowtile_kernel(
     }
 }
 
+/* Scalar grouped projection with packed four-weight loads and F32 activations. */
+__global__ static void v41_grouped_q8_f32_blocks4_kernel(
+        float *out, const unsigned char *w, const float *x, int K, int M, int G) {
+    int lane = threadIdx.x & 31, row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= M * G) return;
+    const float *in = x + (row / M) * K;
+    float acc = 0;
+    for (int b = lane / 8; b < K / 32; b += 4) {
+        const unsigned char *p = w + ((size_t) row * (K / 32) + b) * 34;
+        float d = __half2float(* (const __half *) p), v = 0;
+        int j = (lane & 7) * 4;
+#pragma unroll
+        for (int k = 0; k < 4; k++) v += (float) ((const int8_t *) (p + 2)) [j + k] * in[b * 32 + j + k];
+        acc += d * v;
+    }
+    acc = warp_sum_f32(acc);
+    if (!lane) out[row] = acc;
+}
+
 extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens) {
@@ -789,7 +869,10 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     const unsigned char *a = (const unsigned char *)cuda_model_range_ptr(model_map, out_a_offset, a_bytes, "V4.1 attn_out_a");
     const unsigned char *b = (const unsigned char *)cuda_model_range_ptr(model_map, out_b_offset, b_bytes, "V4.1 attn_out_b");
     if (!a || !b) return 0;
-    if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
+    if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
+        v41_grouped_q8_f32_blocks4_kernel<<<1024u, 256u>>>(
+            (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 8);
+    } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Canonical eight groups of 4096 -> 1024, with physical F32 token
          * strides32768/8192. Keep the explicit BF16 low boundary below. */
         v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u><<<dim3(8u, (n_tokens + 63u) / 64u, 8u), 256u>>>(
@@ -806,9 +889,9 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
         !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16)) return 0;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
         /* The shared input is the same BF16-rounded output-A row above. */
-        matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<160u, 1024u, 8192u * sizeof(float)>>>(
+        v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
-            256u, 5120u, UINT64_C(256) * 34u);
+            8192u, 5120u, UINT64_C(256) * 34u);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Keep the BF16 boundary above and use the existing generic bulk
          * matrix path: F16-rounded operands with F32 accumulation. */
@@ -848,7 +931,10 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
         out_b_offset, b_bytes, "V4.1 TP attn_out_b");
     if (!a || !b) return 0;
     b += (uint64_t)tp_rank * 128u * 34u;
-    if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
+    if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
+        v41_grouped_q8_f32_blocks4_kernel<<<512u, 256u>>>(
+            (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 4);
+    } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 4u><<<dim3(8u, (n_tokens + 63u) / 64u, 4u), 256u>>>(
             (float *)low->ptr, a, (const float *)heads->ptr,
             n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
@@ -863,9 +949,9 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
     if (!cuda_ok(cudaGetLastError(), "V4.1 TP attention low projection") ||
         !ds4_gpu_dsv41_quantize(low, 4096u, n_tokens, DS4_V41_BF16)) return 0;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
-        matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<160u, 1024u, 4096u * sizeof(float)>>>(
+        v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
-            128u, 5120u, UINT64_C(256) * 34u);
+            4096u, 5120u, UINT64_C(256) * 34u);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(40u, (n_tokens + 63u) / 64u), 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
