@@ -213,7 +213,10 @@ extern "C" int ds4_gpu_tp_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     if (!g_rocm_tp.active || !seq || !out || !a || !b || n != g_rocm_tp.pending_count ||
         bytes > out->bytes || bytes > a->bytes || bytes > b->bytes || ds4_gpu_tp_failed()) return rocm_tp_fail();
     const unsigned slot = (unsigned)((seq - 1) % ROCM_TP_QUEUE);
-    rocm_tp_add<<<256, 256>>>(g_rocm_tp.device, slot, seq, (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+    /* Avoid coherent guard loads from idle workgroups on scalar payloads.
+     * The grid-stride loop preserves full coverage for larger batches. */
+    const uint32_t blocks = n / 256u + (n % 256u != 0u);
+    rocm_tp_add<<<blocks < 256u ? blocks : 256u, 256>>>(g_rocm_tp.device, slot, seq, (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
     rocm_tp_release<<<1, 1>>>(g_rocm_tp.device, slot, seq);
     g_rocm_tp.pending = 0;
     return cuda_ok(cudaGetLastError(), "TP guarded reduction") || rocm_tp_fail();

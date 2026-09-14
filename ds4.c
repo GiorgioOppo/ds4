@@ -40628,8 +40628,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    const bool queue_layers =
+#ifdef DS4_ROCM_BUILD
+        /* The resident default-stream path has stable model/scratch pointers.
+         * Keep the existing Engram overwrite and final-token drains below. */
+        (g->tp_world == 1u && !g->streaming && !g->quality && !g->imatrix &&
+         !g->image_count && !g_expert_profile.active &&
+         !getenv("DS4_ROCM_DISABLE_V41_RESIDENT_QUEUE")) ||
+#endif
+        (g->tp_world == 2 && !g->imatrix &&
+         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -40662,6 +40670,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+#ifdef DS4_ROCM_BUILD
+    /* ROCm commands_active() is always false. A failed resident layer can
+     * leave ordered work queued; drain it before invalidating the graph. */
+    if (!ok && queue_layers && g->tp_world == 1u)
+        (void)ds4_gpu_end_commands();
+#endif
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
 #ifdef DS4_ROCM_BUILD
