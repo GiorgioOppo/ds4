@@ -49,10 +49,29 @@ with GPU buffer addresses, this staging contains only the distinct selected
 experts. Selecting every expert, or running without buffer-address support,
 retains the full-layer fallback.
 
-The current implementation does not overlap these expert reads with GPU
-computation. An MTP layer whose expert size differs from the main model is
-staged again on each invocation; its temporary experts do not replace the
-main model's cache entries.
+During single-token decode, cache misses overlap with gate/up computation
+for cached experts and the shared expert. Once the reads finish, the missing
+gate/up slots are computed, followed by one down pass and the original ordered
+reduction. Private address snapshots keep the running GPU work independent of
+cache updates. Fully cached selections use one gate/up pass. Batched prefill
+and temporary staging retain their existing schedule; an MTP layer whose
+expert size differs from the main model is staged again on each invocation,
+without replacing the main model's cache entries.
+
+A local M1 Max 32 GiB check compared this compact split schedule with
+`85d37ae`, using the Q2 pack, automatic expert cache, `--ctx 4096`,
+`--prefill-chunk 128`, `-n 100`, `--temp 0 --nothink`, and the prompt
+`narrami la storia di roma`. Three alternating pairs produced:
+
+| Decode | Runs (t/s) | Median (t/s) |
+| --- | --- | --- |
+| Before | 8.40, 8.25, 7.26 | 8.25 |
+| Compact split | 8.44, 8.51, 8.14 | 8.44 |
+
+All generated output was identical. The observed median gain was 2.3%; the
+variation between runs does not establish a 10% improvement. Prefill medians
+were 9.98 and 10.05 t/s; its execution path is unchanged. These are local
+warm-file measurements, not a guarantee for other Macs or cold SSD reads.
 
 Leave the expert-cache budget automatic initially. A plain count passed to
 `--ssd-streaming-cache-experts` requests dynamic cache slots; an `NGB` budget
@@ -173,6 +192,10 @@ bit for bit against the resident kernels, including the padded Q2 down rows.
 Its test-only backend checks actual `pread` requests against selected expert
 ranges and counts returned bytes: ten experts for off-size MTP, 24 for cache
 overflow, zero reads for cache hits, and the full 512-expert fallback.
+Single-token tests also cover partially cached selections, duplicate IDs,
+optional shared experts and all 16 routed slots. A failed SSD read must leave
+the completed cached/shared gate/up slots exact, preserve the untouched slots,
+and allow an exact retry after draining GPU work.
 The memory-estimate test runs without a GPU or model.
 Run `tests/test_qwen4_ngram_state MODEL.gguf` under Metal validation to check
 failed disk reads during prefill, decode and MTP, then exact recovery.

@@ -2115,7 +2115,22 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_type;
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
+    uint32_t slot_mask;    /* mid only: zero executes all slots, including shared */
 };
+
+/* SSD split launches compact the grid, but all addressing keeps the original
+ * routed/shared slot. Resident specializations eliminate this remapping. */
+static inline uint qwen4_moe_mid_slot(constant ds4_metal_args_qwen4_moe &args,
+                                      uint grid_slot) {
+    if (is_function_constant_defined(qwen4_expert_addresses) && qwen4_expert_addresses) {
+        uint mask = args.slot_mask;
+        if (mask) {
+            for (uint i = 0; i < grid_slot && mask; i++) mask &= mask - 1u;
+            return mask ? ctz(mask) : 0xffffffffu;
+        }
+    }
+    return grid_slot;
+}
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
  * ix = block stride, it = element pair inside the block */
@@ -2298,7 +2313,7 @@ kernel void kernel_qwen4_moe_mid(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
-    const uint slot = tgpig.y;
+    const uint slot = qwen4_moe_mid_slot(args, tgpig.y);
     const uint tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint nr = is_function_constant_defined(qwen4_mv_rows) ? qwen4_mv_rows : 2u;
@@ -2342,7 +2357,7 @@ kernel void kernel_qwen4_moe_mid_q4k(
         ushort3 ntg [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint slot = qwen4_moe_mid_slot(args, tgpig.y), tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint row0 = (tgpig.x * (ntg.x / 32) + (uint)sgitg) * NR;
     if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;

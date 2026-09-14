@@ -17347,6 +17347,12 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
     g_stream_expert_cache_layer_count[layer] = 0;
 }
 
+/* Optional work submitted after every selected entry is protected, but before
+ * the first missing payload is read. Existing batch users leave this unset. */
+typedef int (*ds4_gpu_stream_expert_before_read_fn)(
+        void *context, const int32_t *unique_ids,
+        ds4_gpu_stream_expert_cache_entry *const *entries, uint32_t n_unique);
+
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const void    *model_map,
         uint64_t       model_size,
@@ -17369,7 +17375,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         id<MTLBuffer> *overflow_gate,
         id<MTLBuffer> *overflow_up,
         id<MTLBuffer> *overflow_down,
-        bool allow_mapped_overflow) {
+        bool allow_mapped_overflow,
+        ds4_gpu_stream_expert_before_read_fn before_read,
+        void *before_read_context) {
     if (overflow_gate) *overflow_gate = nil;
     if (overflow_up) *overflow_up = nil;
     if (overflow_down) *overflow_down = nil;
@@ -17490,6 +17498,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     ds4_gpu_stream_expert_pread_task *tasks = NULL;
     uint32_t n_loads = 0;
     uint32_t n_tasks = 0;
+    bool before_read_called = false;
     double load_prepare_ms = 0.0;
     double load_install_ms = 0.0;
     double load_timing_t0 = ds4_gpu_stream_expert_timing_summary_enabled() ?
@@ -17616,6 +17625,10 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             }
             n_loads++;
         }
+    }
+    if (ok && n_loads != 0 && before_read) {
+        before_read_called = true;
+        ok = before_read(before_read_context, unique_ids, unique_entries, unique_count);
     }
     if (ok && n_loads != 0) {
         if (load_timing_t0 != 0.0) {
@@ -17769,6 +17782,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     free(ids);
 
     if (!ok || (*n_resources == 0 && view_served == 0)) {
+        /* clear_layer skips inflight entries, then resets its count. Finish
+         * any submitted prefix before releasing payloads or changing counts. */
+        if (before_read_called) (void)ds4_gpu_synchronize();
         ds4_gpu_stream_expert_cache_clear_layer(layer);
         return 0;
     }
@@ -17776,6 +17792,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                   gate_addrs,
                                                   up_addrs,
                                                   down_addrs)) {
+        if (before_read_called) (void)ds4_gpu_synchronize();
         ds4_gpu_stream_expert_cache_clear_layer(layer);
         return 0;
     }
@@ -39702,7 +39719,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down, true)) {
+                        &stream_overflow_down, true, NULL, NULL)) {
                 return 0;
             }
             if (stream_unique == 0) {
@@ -43736,7 +43753,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down, true)) {
+                        &stream_overflow_down, true, NULL, NULL)) {
                 g_stream_prefill_batch_selected_addr_building--;
                 return 0;
             }
@@ -48094,6 +48111,7 @@ typedef struct {
     __strong id<MTLBuffer> owned_gate, owned_up, owned_down;
     ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     uint32_t n_entries;
+    uint32_t slot_mask;
     bool addresses;
 } qwen4_stream_weights;
 static qwen4_stream_weights *g_qwen4_stream_weights;
@@ -48314,6 +48332,7 @@ typedef struct {
     uint32_t n_tokens, n_slots, in_dim, out_rows, weight_type, row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
+    uint32_t slot_mask;
 } qwen4_moe_args;
 
 static bool qwen4_moe_mv_specialize(uint32_t type) {
@@ -49135,7 +49154,8 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * ff_dim;
     qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert,
+                            g_qwen4_stream_weights ? g_qwen4_stream_weights->slot_mask : 0u };
     qwen4_bind b[7];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || (has_shared && sh_row_bytes == 0) ||
         !qwen4_bind_experts(&b[0], model_map, model_size, gate_offset, experts_bytes, "moe gate experts") ||
@@ -49175,8 +49195,12 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
     const uint32_t rows_per_tg = nr * nsg;
     const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
+    /* Masked dispatches compact only the grid. The kernel restores original
+     * slot indices, so shared placement and output strides stay unchanged. */
+    const uint32_t dispatch_slots = args.slot_mask ?
+        ds4_gpu_stream_expert_popcount(args.slot_mask) : n_out;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
-                          MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
+                          MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, dispatch_slots, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
 }
 
@@ -49195,7 +49219,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0 };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0, 0 };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
         out_dim == 0 || (has_shared && sh_row_bytes == 0) ||
@@ -49685,6 +49709,85 @@ static int qwen4_stream_read_selected(qwen4_stream_weights *s,
     return qwen4_stream_read_layer(s);
 }
 
+typedef struct {
+    const ds4_gpu_stream_expert_table *table;
+    ds4_gpu_tensor *mid;
+    const ds4_gpu_tensor *x, *selected;
+    const int32_t *ids;
+    uint32_t gate_type, n_slots, in_dim, ff_dim, shared_type;
+    uint64_t shared_gate_offset, shared_up_offset;
+    uint32_t resident_mask, missing_mask;
+    double resident_ms, missing_t0;
+    bool started;
+} qwen4_stream_mid_overlap;
+
+static int qwen4_stream_mid_before_read(
+        void *context, const int32_t *unique_ids,
+        ds4_gpu_stream_expert_cache_entry *const *entries, uint32_t n_unique) {
+    qwen4_stream_mid_overlap *p = context;
+    const ds4_gpu_stream_expert_table *t = p->table;
+    const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
+    const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
+    const uint32_t routed_mask = (1u << p->n_slots) - 1u;
+    qwen4_stream_weights snapshot = { .table = t, .addresses = true };
+    for (uint32_t u = 0; u < n_unique; u++) {
+        if (!entries[u]) continue;
+        snapshot.entries[snapshot.n_entries++] = entries[u];
+        for (uint32_t s = 0; s < p->n_slots; s++) {
+            if (p->ids[s] == unique_ids[u]) snapshot.slot_mask |= 1u << s;
+        }
+    }
+    p->resident_mask = snapshot.slot_mask;
+    const uint32_t missing_mask = routed_mask & ~snapshot.slot_mask;
+    if (p->shared_type != UINT32_MAX) snapshot.slot_mask |= 1u << p->n_slots;
+    /* Mask zero means all slots. With nothing resident and no shared expert,
+     * leave the original single mid dispatch after I/O. */
+    if (!snapshot.slot_mask || !missing_mask) return 1;
+
+    /* Missing-entry installation mutates the cache's address tables during
+     * this dispatch. Snapshot resident addresses; every selected payload was
+     * protected from eviction before this callback, and dispatch marks the
+     * resident entries inflight until their command buffer completes. */
+    const NSUInteger addr_bytes = (NSUInteger)t->n_total_expert * sizeof(uint64_t);
+    snapshot.gate = [g_device newBufferWithLength:addr_bytes options:MTLResourceStorageModeShared];
+    snapshot.up = [g_device newBufferWithLength:addr_bytes options:MTLResourceStorageModeShared];
+    /* This prefix only computes gate/up; down uses the completed cache later. */
+    if (!snapshot.gate || !snapshot.up) return 0;
+    uint64_t *ga = [snapshot.gate contents], *ua = [snapshot.up contents];
+    if (!ga || !ua) return 0;
+    memset(ga, 0, addr_bytes);
+    memset(ua, 0, addr_bytes);
+    for (uint32_t u = 0; u < n_unique; u++) {
+        const ds4_gpu_stream_expert_cache_entry *e = entries[u];
+        if (!e) continue;
+        const uint32_t id = (uint32_t)unique_ids[u];
+        ga[id] = ds4_gpu_buffer_address(e->gate_buffer, e->gate_inner);
+        ua[id] = ds4_gpu_buffer_address(e->up_buffer, e->up_inner);
+        if (!ga[id] || !ua[id]) return 0;
+    }
+    if (!ds4_gpu_begin_commands()) return 0;
+    p->started = true;
+    /* Unretained command buffers may outlive both this callback and the
+     * public wrapper; the normal completion drain releases these tables. */
+    [g_transient_buffers addObject:snapshot.gate];
+    [g_transient_buffers addObject:snapshot.up];
+    g_qwen4_stream_weights = &snapshot;
+    int ok = ds4_gpu_qwen4_moe_mid_tensor(p->mid, p->x, p->selected,
+            t->model_map, t->model_size, t->gate_offset, t->up_offset,
+            p->gate_type, t->n_total_expert, 1, p->n_slots, p->in_dim, p->ff_dim,
+            p->shared_gate_offset, p->shared_up_offset, p->shared_type);
+    g_qwen4_stream_weights = NULL;
+    if (ok) ok = ds4_gpu_flush_commands();
+    if (ok) {
+        p->missing_mask = missing_mask;
+        if (timing) {
+            p->missing_t0 = ds4_gpu_now_ms();
+            p->resident_ms = p->missing_t0 - t0;
+        }
+    }
+    return ok;
+}
+
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
@@ -49748,6 +49851,12 @@ int ds4_gpu_qwen4_moe_stream_tensor(
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
     if (!ids) return 0;
     qwen4_stream_weights stream = { .table = table };
+    qwen4_stream_mid_overlap overlap = {
+        .table = table, .mid = mid, .x = x, .selected = selected, .ids = ids,
+        .gate_type = gate_type, .n_slots = n_slots, .in_dim = in_dim, .ff_dim = ff_dim,
+        .shared_type = shared_type, .shared_gate_offset = shared_gate_offset,
+        .shared_up_offset = shared_up_offset,
+    };
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = {0};
     uint32_t unique = 0;
     const int had_batch = g_batch_cb != nil;
@@ -49802,7 +49911,8 @@ int ds4_gpu_qwen4_moe_stream_tensor(
                 table->n_total_expert, n_slots, table->gate_offset, table->up_offset, table->down_offset,
                 table->gate_expert_bytes, table->down_expert_bytes,
                 &gate, &up, &down, stream.entries, &stream.n_entries,
-                &prepared_unique, &overflow_gate, &overflow_up, &overflow_down, false);
+                &prepared_unique, &overflow_gate, &overflow_up, &overflow_down, false,
+                n_tokens == 1u && !mm ? qwen4_stream_mid_before_read : NULL, &overlap);
         g_stream_prefill_batch_selected_addr_building--;
         stream.gate = gate;
         stream.up = up;
@@ -49817,12 +49927,17 @@ int ds4_gpu_qwen4_moe_stream_tensor(
                 entry->down_buffer, entry->down_inner);
         }
         stream.addresses = true;
+        stream.slot_mask = overlap.missing_mask;
     } else {
         ds4_gpu_stream_expert_cache_note_frequency_hotness(table->layer, frequency, table->n_total_expert);
         ok = qwen4_stream_read_selected(&stream, frequency, unique);
     }
+    if (timing && overlap.missing_mask) {
+        ds4_gpu_stream_expert_timing_note_split(overlap.resident_mask, overlap.missing_mask,
+                overlap.resident_ms, ds4_gpu_now_ms() - overlap.missing_t0);
+    }
     if (timing) ds4_gpu_stream_expert_timing_note_selected(sync_ms, copy_ms, ds4_gpu_now_ms() - t0);
-    if (!ok || !ds4_gpu_begin_commands()) { ok = 0; goto done; }
+    if (!ok || (!g_batch_cb && !ds4_gpu_begin_commands())) { ok = 0; goto done; }
     if (!stream.addresses || stream.owned_gate) {
         /* An enclosing batch may outlive this stack frame. Retain staging
          * until completion even with unretained Metal command buffers. */
@@ -49853,6 +49968,10 @@ int ds4_gpu_qwen4_moe_stream_tensor(
     }
     g_qwen4_stream_weights = NULL;
 done:
+    /* Errors after the prefix must not leave GPU readers alive across cache
+     * reuse. Restore the caller's batch ownership after completing that work. */
+    if (!ok && overlap.started && (g_batch_cb || [g_pending_cbs count] != 0))
+        (void)ds4_gpu_synchronize();
     free(ids);
     if (!had_batch && g_batch_cb && !ds4_gpu_end_commands()) ok = 0;
     if (had_batch && !g_batch_cb && !ds4_gpu_begin_commands()) ok = 0;
