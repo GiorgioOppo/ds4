@@ -38,6 +38,7 @@
 /tests/test_cpu_q4_dense
 /tests/test_quantizer_indexer_q4
 /tests/test_sampling
+/tests/test_web_recovery
 /tests/test_quality_api
 /tests/test_cuda_q8_scratch
 /tests/test_cuda_dspark_moe
@@ -56,6 +57,9 @@
 /tests/test_glm_attention_rocm
 /tests/test_linux_memory
 /tests/test_rocm_memory
+/tests/test_qwen4_kernels
+/tests/test_qwen4_moe_mm_specialize
+/tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
 /tests/test_deepseek41_metal
 /tests/test_deepseek41_q8_bf16
@@ -74,6 +78,8 @@
 /tests/test_cuda_ssd_batch
 /tests/test_cuda_ssd_repack
 /tests/test_deepseek41_gguf
+/tests/test_qwen4_ngrams
+/tests/test_qwen4_ngram_state
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_q4_attention
 /tests/test_deepseek41_imatrix_release
@@ -131,3 +137,5 @@ tests/test_deepseek41_epilogues
 
 /tests/test_deepseek41_candidates
 /tests/test_deepseek41_gather
+/tests/test_qwen4_conv_parallel
+/tests/test_q8_prefill_variants

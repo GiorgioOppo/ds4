@@ -2699,7 +2699,72 @@ M3 inference, large-Mac residency, GLM/pipeline regression, full vision workflow
 or extended 64/96K official-quality pass was run. CUDA/HIP GPU tests were not
 repeated during consolidation.
 
-## 18. Release Sign-off
+## 18. Qwen3.8 Flash Next
+
+- Use the self-contained Q2 and Q4 GGUFs with original BF16 n-grams. Old
+  main-only files and quantized n-gram sidecars are not the release layout.
+  Run `make test-qwen4-ngrams test-deepseek41-gguf` and
+  `python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py`.
+  Repeat the reader with ASan/UBSan. Check exact BF16 values, duplicate and
+  reordered rows, parallel reads, truncated files, invalid IDs and cleanup.
+  Build `tests/test_qwen4_ngram_state` and run it with each real model under
+  Metal validation: prefill, decode and MTP failures must invalidate the live
+  frontier; rebuilding and continuing must match an independent session exactly.
+- Audit every copied main/MTP tensor against its input and every n-gram shard
+  against the pinned BF16 source. Packaging must not requantize the calibrated
+  experts. Verify the final checksum and download target before release.
+- Confirm the table is outside the runtime mapping and all Metal residency
+  views, including weight warming. Measure actual memory during short/long
+  prefill and generation; adding 95.37 GiB on disk must not add that much RAM.
+  Test one model at a time on an M5 Max. Keep space for the complete output
+  plus a reserve during conversion; do not fill the system disk.
+- Run ordinary and MTP decoding, including exact sampling, at small and large
+  initial/continued prefixes. Follow the save/restore, rewind, checkpoint,
+  logit-dump, vision and steering tests in `docs/QWEN38_FLASH_NEXT.md`.
+  A table read failure must stop inference, not consume stale staging data.
+- Exercise native-agent coding and real server tool-result continuations with
+  prefix reuse, then an image turn and a text follow-up. Compare quality and
+  speed against the old table separately: restoring original BF16 changes
+  logits, so byte-identical text is not a quality requirement. Disk-only
+  timings must be taken without concurrent downloads or model copies.
+- Repeat focused DeepSeek and GLM checks after shared loader changes. Record
+  skipped hardware or reference checks explicitly; coherent Qwen replies do
+  not establish parity with the original HF model or a hosted API.
+
+### Native n-gram release, 2026-09-14
+
+M5 Max IT, 128 GiB, one model at a time: Q2 and Q4 payload audits, reader
+ASan/UBSan, Metal kernel validation, failed-read recovery, logit dumps,
+ordinary/MTP generation, checkpoints/restarts/rewinds, CLI images, native-agent
+image/code-edit tasks, steering and full-context save/load passed. Pi completed
+the image/code task through Chat Completions, Responses and Anthropic with Q2,
+including prefix reuse. One earlier native-agent run recovered from a malformed
+tool call; the final Q2/Q4 tasks passed their independent code checks.
+
+The Q4 tail check exposed half-query rounding amplified by nearly tied expert
+scores. Batches of up to eight rows now retain FP32-query attention; the expanded
+full-logit checks pass without changing their tolerance. The steering test also
+found that standalone greedy generation ignored the vector. Both runners now
+load it, and their Q2/Q4 steering continuations match exactly.
+
+Representative timings, no concurrent transfer; these are single runs, not
+medians. The 32K row adds 16K tokens to the existing 16K prefix:
+
+| Model | 16K initial prefill | Continued prefill to 32K | Decode at 32K |
+| --- | ---: | ---: | ---: |
+| Q2 | 1492.40 t/s | 1438.19 t/s | 48.74 t/s |
+| Q4 | 1457.69 t/s | 1330.24 t/s | 48.40 t/s |
+
+Short-prompt MTP measured 68.85/68.10 t/s for Q2/Q4. At 8K context and a
+1024-token prefill chunk, planned memory was 42.86/70.87 GiB; the 95.37 GiB
+n-gram table was excluded. Swap use did not grow. DeepSeek Vision Exp and
+GLM 5.3 Flash Q2 snapshot regressions passed after the loader change.
+The non-Metal-4 paths passed on M5 with Metal 4 disabled. No physical M3,
+64 GiB Mac, CUDA or ROCm tests were run. Original-HF/API matched-checkpoint
+quality scoring and a full HF-to-main conversion were not run; the published
+files reuse audited calibrated main/MTP tensors and original BF16 n-gram bytes.
+
+## 19. Release Sign-off
 
 Do not sign off until:
 
