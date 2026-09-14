@@ -5,6 +5,12 @@
 - Exactly one coordinator and one worker. Attention is tensor-parallel; routed MoE is expert-parallel (192 whole experts per rank). Both execute every layer; KV and the output head are replicated. No `--layers`, SSD expert streaming or DSpark.
 - All three transports require a reachable TCP control address. Use a trusted network: peer traffic has no authentication or encryption.
 - Build both peers with `make strix-halo ROCM_ARCH=gfx1151` after installing any required RoCE headers.
+- On the worker, create a named copy after each build so workload watchers matching `ds4-*` recognize inference. The measured runs used this naming pattern; the executable bytes are unchanged:
+
+```bash
+install -m 755 ./ds4 ./ds4-kernel-tp-worker
+```
+
 - Run from the engine build directory. Set these variables in **both** terminals; `MODEL` may differ between machines:
 
 ```bash
@@ -25,7 +31,7 @@ CTX=16384
   --transport tcp --batched-session 1 --host 127.0.0.1 --port 8080
 
 # Worker, in its own terminal
-./ds4 --rocm -m "$MODEL" --ctx "$CTX" \
+./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx "$CTX" \
   --tensor-parallel --role worker --coordinator "$COORD" 9911 \
   --transport tcp
 ```
@@ -93,7 +99,7 @@ test -c "$USB_DEV" && test -r "$USB_DEV" && test -w "$USB_DEV"
   --batched-session 1 --host 127.0.0.1 --port 8080
 
 # Worker
-./ds4 --rocm -m "$MODEL" --ctx "$CTX" \
+./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx "$CTX" \
   --tensor-parallel --role worker --coordinator "$COORD" 9911 \
   --transport usb4stream --usb4stream-device "$USB_DEV"
 ```
@@ -154,7 +160,7 @@ GID=1                         # Choose this host's nonzero RoCE v2 GID for the c
   --batched-session 1 --host 127.0.0.1 --port 8080
 
 # Worker
-./ds4 --rocm -m "$MODEL" --ctx "$CTX" \
+./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx "$CTX" \
   --tensor-parallel --role worker --coordinator "$COORD" 9911 \
   --transport rdma --rdma-device "$DEV" --rdma-port "$PORT" --rdma-gid-index "$GID"
 ```
@@ -198,7 +204,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ### Reproduce the table
 
-Build the ordinary engine on both peers. On the coordinator, build the included TP-only warmup adapter; it links the existing engine objects and leaves `ds4-bench` untouched:
+Build the ordinary engine on both peers and refresh the worker copy above. On the coordinator, build the included TP-only warmup adapter; it links the existing engine objects and leaves `ds4-bench` untouched:
 
 ```bash
 make strix-halo ROCM_ARCH=gfx1151
@@ -235,7 +241,7 @@ DEPTH=16384
   --role coordinator --listen "$COORD" 19475 "${LINK[@]}"
 
 # Worker: start for each coordinator run.
-./ds4 --rocm -m "$MODEL" --ctx 69632 \
+./ds4-kernel-tp-worker --rocm -m "$MODEL" --ctx 69632 \
   --role worker --coordinator "$COORD" 19475 "${LINK[@]}"
 ```
 
