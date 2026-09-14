@@ -2197,6 +2197,11 @@ Never load this Q2 model resident on a 128 GB Spark. Its 341 GiB file includes
   pooling, and the 8,192-row projection launch boundary. The cache oracle
   checks IQ2/Q2_K, Q4_K and MXFP4, eviction, remapped slots, small/zero and
   10,000-slot budgets, and prefill after its source becomes unreadable.
+  Also check next-layer read-ahead: protect active inputs and pending slots,
+  never publish partial reads, and evict unused read-ahead before demand-hot
+  experts. Exercise cancellation, changed budgets/model descriptors and
+  `tests/test_cuda_ssd_cache --prefetch-exit`; repeat with
+  `DS4_CUDA_NO_DIRECT_IO=1` to cover buffered reads.
   Prefill must not accumulate full expert tensors in an unbounded second
   cache. Q8 row projections must match scalar execution
   with ragged shapes, untouched output tails and no padding after the weights.
@@ -2213,6 +2218,14 @@ Never load this Q2 model resident on a 128 GB Spark. Its 341 GiB file includes
   `--cuda-long` for decoder/deferred-state boundaries through 60K. Short
   CUDA IQ2/Q2_K SSD prefills use exact 2..8-row chunks below the 256-token
   matrix-prefill threshold. Check both sides of each dispatch boundary.
+  Compare CUDA SSD read-ahead and medium one-sweep appends with
+  `DS4_CUDA_DISABLE_SSD_PREFETCH=1` and
+  `DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP=1`. The optimized path must preserve
+  complete logits and saved state. Time actual `/read README.md`, fresh and
+  continued 1K/2K/4K/8K/32K prompts, and the following decode, with both
+  automatic and explicit cache budgets. Check whether prefills displace
+  useful decode experts, and report any decode regression alongside the
+  prefill gain. Unused read-ahead must not count as an actual demand hit.
 - Score the same V4.1 short general and long manifests used on Metal, not the
   V4 Flash vectors. Exercise 8/16/32K sparse frontiers and continued prefill.
   Compare paired probability scores, not sampled-prefix length alone.
@@ -2346,6 +2359,79 @@ with `DS4_TEST_CUDA_SINGLE_GPU=1`, `DS4_TEST_SSD_CACHE_GIB=auto`,
 Mixed five-prefill/three-decode rows also pass exact parity; larger mixed
 prefills retain the correct ordered fallback. These results do not establish
 native CUDA network-TP batching or V4.1 vision support.
+
+#### SSD Read-Ahead and Medium Appends
+
+September 13-14, 2026, single Spark, V4.1 Q2 SSD, 64 GiB expert-cache hint
+(56.88 GiB dynamic experts plus 7.12 GiB prefill reserve), disk-only Engram.
+The control is `a04f46fa`. No arithmetic, expert selection or precision changes.
+Read-ahead uses the admitted expert cache and two 8 MiB staging buffers;
+it starts at 2K tokens when two layers fit. Reading ahead below that threshold
+was slower and is not the default. Medium appends retain their existing
+2048-row arithmetic partitions but visit each layer only once; small tails
+and explicitly reduced prefill chunks retain their previous dispatch.
+
+Actual `/read README.md`, 3,241 prompt tokens, 32K allocated context,
+temperature zero, no thinking, 64 generated tokens, balanced two-run pairs:
+
+| Path | Prefill t/s |
+| --- | ---: |
+| Control | 54.30 / 55.02 |
+| One layer sweep, read-ahead disabled | 81.66 / 81.75 |
+| One layer sweep and read-ahead | 97.88 / 98.60 |
+
+All six 64-token continuations are identical. Generation overlaps the
+control's range, around 6 t/s. Separate size checks use 64K allocated context,
+`promessi_sposi.txt`, and 32 teacher-forced decode tokens per frontier.
+These are single paired measurements, not medians:
+
+| Existing tokens | Added tokens | Control prefill t/s | Optimized prefill t/s |
+| ---: | ---: | ---: | ---: |
+| 0 | 2,048 | 69.31 | 84.90 |
+| 2,048 | 2,048 | 76.67 | 90.70 |
+| 0 | 4,096 | 101.44 | 116.34 |
+| 4,096 | 4,096 | 105.15 | 116.31 |
+| 0 | 8,192 | 202.72 | 228.44 |
+| 8,192 | 4,096 | 102.03 | 111.15 |
+| 0 | 32,768 | 350.47 | 384.45 |
+| 32,768 | 3,241 | 54.21 | 87.77 |
+
+Complete frontier logits match byte-for-byte in every pair. At the last two
+frontiers, generation remains about 6.5 t/s. The mixed-state oracle passes
+through 60,298 tokens and fresh 49,153-token deferred replay: full caches,
+logits, snapshots, cancellation, progress and next decode. Available memory
+stayed above 21 GiB with the two-session state oracle, without swap growth.
+IQ2/Q2_K, Q4_K and MXFP4 cache tests, read failures, cancellation, descriptor
+and budget changes, early exit and buffered fallback pass. Compute Sanitizer
+reports zero errors; the SSD scalar/batch oracle also remains exact.
+
+The 17 official boundary cases reproduce the control score file byte-for-byte:
+NLL 0.405201234, API top-token agreement 126/141. The three long cases
+`000`, `003` and `008` from `deepseek-v4.1-flash-20260911-long`, each with
+a 3,241-token continued suffix, also reproduce the control exactly:
+NLL 0.502778649, 172/192 API top tokens. The native agent reads and edits
+the source, runs the four unchanged tests and completes its coding task.
+The older Flash 0731 ten-case SSD score file is also unchanged:
+NLL 0.418845497, 201/240 top tokens.
+This is focused CUDA SSD QA, not a new Metal, ROCm or physical TP release pass.
+
+With automatic sizing (80.17 GiB dynamic cache), the same 32K-context README
+test reaches 93.18 / 96.41 t/s versus 49.45 / 53.80. Its short 64-token
+decode timings vary: 6.58 / 7.42 versus 7.08 / 7.74 t/s. A balanced four-run
+check with 256 generated tokens confirms a small decode cost in this case:
+
+| Path | Prefill t/s | Generation t/s |
+| --- | ---: | ---: |
+| Optimized, first | 102.92 | 9.23 |
+| Control, first | 51.30 | 9.81 |
+| Control, second | 55.39 | 9.77 |
+| Optimized, second | 100.25 | 9.39 |
+
+All replies are identical. Prefill plus generation averages about 59 seconds
+instead of 87, excluding model loading, but decode alone is about 5% slower.
+Do not call this a decoding speedup or assume this short-reply result holds
+for all prompts and reply lengths. Automatic-cache runs retain at least
+6.59 GiB available memory with no swap growth; the agent retains over 13 GiB.
 
 ### CUDA Network Tensor Parallelism
 

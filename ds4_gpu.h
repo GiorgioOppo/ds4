@@ -434,6 +434,15 @@ int ds4_gpu_stream_prefill_bind_layer(
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
         const ds4_gpu_tensor *down);
 #endif
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* Optional CUDA look-ahead between completed layers, inside the existing
+ * expert cache. The foreground owns slots; the reader cannot publish them
+ * or evict the current layer's inputs. */
+int ds4_gpu_stream_expert_cache_prefetch(
+        const ds4_gpu_stream_expert_table *current,
+        const ds4_gpu_stream_expert_table *next);
+void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
+#endif
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
