@@ -30883,6 +30883,57 @@ static int ds4_gpu_dsv41_output_projection_typed(
     return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 typed output-B K slice");
 }
 
+static bool ds4_gpu_dsv41_bf16_f16_rhs_valid(
+        const ds4_gpu_tensor *low, const ds4_gpu_tensor *rhs, uint64_t count) {
+    if (!low || !rhs || !count || count > UINT32_MAX) return false;
+    const uint64_t low_bytes = count * sizeof(float), rhs_bytes = count * sizeof(uint16_t);
+    id<MTLBuffer> lb = ds4_gpu_tensor_buffer(low), rb = ds4_gpu_tensor_buffer(rhs);
+    const uint64_t lo = ds4_gpu_tensor_offset(low), ro = ds4_gpu_tensor_offset(rhs);
+    if (!lb || !rb || (lo & 15u) || (ro & 15u) ||
+        ds4_gpu_tensor_bytes(low) < low_bytes || ds4_gpu_tensor_bytes(rhs) < rhs_bytes ||
+        lo > lb.length || low_bytes > lb.length - lo ||
+        ro > rb.length || rhs_bytes > rb.length - ro ||
+        ds4_gpu_tensor_prefixes_overlap(low, low_bytes, rhs, rhs_bytes)) return false;
+    /* Separate no-copy Metal objects can still refer to the same CPU pages. */
+    const uintptr_t lp = (uintptr_t)lb.contents, rp = (uintptr_t)rb.contents;
+    if (lp && rp) {
+        if (lo > UINTPTR_MAX - lp || low_bytes > UINTPTR_MAX - lp - lo ||
+            ro > UINTPTR_MAX - rp || rhs_bytes > UINTPTR_MAX - rp - ro) return false;
+        const uintptr_t l = lp + lo, r = rp + ro;
+        if (l <= r ? r - l < low_bytes : l - r < rhs_bytes) return false;
+    }
+    return true;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_dsv41_bf16_f16_rhs_pipeline(void) {
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_bf16_f16_rhs");
+    return pipeline && pipeline.threadExecutionWidth == 32u &&
+        pipeline.maxTotalThreadsPerThreadgroup >= 256u ? pipeline : nil;
+}
+
+int ds4_gpu_dsv41_bf16_f16_rhs(ds4_gpu_tensor *low, ds4_gpu_tensor *rhs,
+                               uint32_t width, uint32_t rows) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!ds4_gpu_dsv41_bf16_f16_rhs_valid(low, rhs, count)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_dsv41_bf16_f16_rhs_pipeline();
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&count length:sizeof(count) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(low) offset:ds4_gpu_tensor_offset(low) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(rhs) offset:ds4_gpu_tensor_offset(rhs) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((count + 1023u) / 1024u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 BF16 low and F16 RHS");
+    }
+}
+
 static int ds4_gpu_dsv41_attention_output_typed_impl(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *workspace,
         const void *model_map, uint64_t model_size,
@@ -30934,7 +30985,7 @@ static int ds4_gpu_dsv41_attention_output_typed_impl(
         const uint64_t scratch_offset = eligible ? ds4_gpu_tensor_offset(workspace) : 0;
         id<MTLBuffer> b_weights = nil;
         uint64_t b_inner = 0;
-        id<MTLComputePipelineState> dequant = nil, mm = nil;
+        id<MTLComputePipelineState> dequant = nil, mm = nil, low_rhs = nil;
         const bool boundary = n_tokens % 32u != 0u;
         if (eligible) {
             if (!scratch || (scratch_offset & 15u) || scratch_offset > scratch.length ||
@@ -30971,6 +31022,9 @@ static int ds4_gpu_dsv41_attention_output_typed_impl(
                     out_b_offset, 5120u * row_b_bytes, &b_inner);
                 if (!b_weights || (b_weights == scratch && b_inner < scratch_offset + workspace_bytes &&
                     scratch_offset < b_inner + 5120u * row_b_bytes)) return 0;
+                low_rhs = ds4_gpu_dsv41_bf16_f16_rhs_pipeline();
+                if (low_rhs && !ds4_gpu_dsv41_bf16_f16_rhs_valid(low, workspace,
+                        (uint64_t)n_tokens * low_dim)) return 0;
             }
         }
         /* Keep the established Q8/Q8 schedule and arithmetic untouched. */
@@ -30984,12 +31038,14 @@ static int ds4_gpu_dsv41_attention_output_typed_impl(
         const uint32_t k_off = tp_rank * low_dim;
         bool ok = ds4_gpu_dsv41_output_low_typed(low, heads, model_map, model_size,
             out_a_offset + (uint64_t)k_off * row_a_bytes, out_a_type, groups, n_tokens) &&
-            ds4_gpu_dsv41_quantize(low, low_dim, n_tokens, DS4_V41_BF16);
+            (low_rhs || ds4_gpu_dsv41_quantize(low, low_dim, n_tokens, DS4_V41_BF16));
         if (ok && b_weights) {
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-            ok = cb && !owned && ds4_gpu_encode_cpy_f32_f16_1d(cb, lb, (NSUInteger)lo,
-                scratch, (NSUInteger)scratch_offset, n_tokens * 8192u);
+            ok = cb && !owned && (low_rhs ?
+                ds4_gpu_dsv41_bf16_f16_rhs(low, workspace, low_dim, n_tokens) :
+                ds4_gpu_encode_cpy_f32_f16_1d(cb, lb, (NSUInteger)lo,
+                    scratch, (NSUInteger)scratch_offset, n_tokens * 8192u));
             ds4_gpu_close_batch_encoder();
             if (ok) ok = ds4_gpu_encode_q4_K_transient_f16(cb, dequant,
                 b_weights, (NSUInteger)b_inner, scratch,

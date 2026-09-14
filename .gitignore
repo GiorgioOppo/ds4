@@ -67,6 +67,7 @@
 /tests/test_cuda_q8_rows
 /tests/test_cuda_v41_q4_output
 /tests/test_cuda_v41_hc
+/tests/test_deepseek41_bf16_rhs
 /tests/test_cuda_reductions
 /tests/test_cuda_shared
 /tests/test_cuda_ssd_cache

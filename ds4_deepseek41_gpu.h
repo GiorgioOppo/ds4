@@ -146,6 +146,11 @@ int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
 
 #ifdef __APPLE__
 /* Metal V4.1 specializations; other backends retain the shared graph APIs. */
+/* Round low in place to BF16 (F32 storage), then write its F16 RHS in one
+ * pass. Used ranges must be disjoint and 16-byte aligned; count <= UINT32_MAX.
+ * The two conversions retain the F32 -> BF16 -> F16 rounding order. */
+int ds4_gpu_dsv41_bf16_f16_rhs(ds4_gpu_tensor *low, ds4_gpu_tensor *rhs,
+                              uint32_t width, uint32_t rows);
 /* F32 weighted RMSNorm with the V4.1 BF16 output boundary. Activation views
  * and weight offsets must be 16-byte aligned; in-place normalization is safe. */
 int ds4_gpu_dsv41_norm_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,

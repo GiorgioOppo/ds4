@@ -376,6 +376,19 @@ tests/test_deepseek41_q4_attention: tests/test_deepseek41_q4_attention.o $(CORE_
 test-deepseek41-q4-attention: tests/test_deepseek41_q4_attention
 	./tests/test_deepseek41_q4_attention
 
+tests/test_deepseek41_bf16_rhs.o: tests/test_deepseek41_bf16_rhs.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_deepseek41_bf16_rhs: tests/test_deepseek41_bf16_rhs.o $(CORE_OBJS)
+	$(CC) $(QUALITY_CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-bf16-rhs bench-deepseek41-bf16-rhs
+test-deepseek41-bf16-rhs: tests/test_deepseek41_bf16_rhs
+	./tests/test_deepseek41_bf16_rhs
+
+bench-deepseek41-bf16-rhs: tests/test_deepseek41_bf16_rhs
+	./tests/test_deepseek41_bf16_rhs --bench
+
 tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1159,7 +1172,7 @@ clean:
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows
 	rm -f tests/test_cuda_v41_q4_output
-	rm -f tests/test_cuda_v41_hc
+	rm -f tests/test_cuda_v41_hc tests/test_deepseek41_bf16_rhs
 	rm -f tests/test_cuda_reductions
 	rm -f tests/test_cuda_shared
 	rm -f tests/test_cuda_ssd_cache

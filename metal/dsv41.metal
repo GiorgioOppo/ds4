@@ -114,6 +114,34 @@ kernel void kernel_dsv41_bf16_linear(
     }
 }
 
+// The output-A boundary must materialize BF16 in low before narrowing the
+// output-B RHS to half. Converting the original F32 directly would skip a
+// rounding step; keep the integer BF16 operation identical to the linear pass.
+kernel void kernel_dsv41_bf16_f16_rhs(
+        constant ulong &count,
+        device uint *low,
+        device half *rhs,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong first = (ulong)gid * 4u;
+    if (first + 4u <= count) {
+        uint4 bits = *((device uint4 *)(low + first));
+        const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+        bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+        bits &= 0xffff0000u;
+        *((device uint4 *)(low + first)) = bits;
+        *((device half4 *)(rhs + first)) = half4(as_type<float4>(bits));
+    } else {
+        for (ulong i = first; i < count; i++) {
+            uint bits = low[i];
+            if ((bits & 0x7f800000u) != 0x7f800000u)
+                bits += 0x7fffu + ((bits >> 16u) & 1u);
+            bits &= 0xffff0000u;
+            low[i] = bits;
+            rhs[i] = half(as_type<float>(bits));
+        }
+    }
+}
+
 struct ds4_metal_args_dsv41_rope {
     uint width, heads, rows, start, inverse, stride;
     float frequencies[32];
