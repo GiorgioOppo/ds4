@@ -890,11 +890,13 @@ int ds4_mmq_q4_K_dense_vec(
 // token samples, with contiguous groups inside each sample. Scratch is
 // caller-owned canonical Q8_1 storage; no weights or activations are cached.
 // Accepted (M,K,groups): (1024,4096,4/8), (5120,8192,1).
+// output_bf16=1 fuses BF16 rounding after sanitize for output-A; zero keeps
+// the F32 output required before output-B's tensor-parallel rank reduction.
 // Returns 0 on success, nonzero on validation or launch failure.
 int ds4_mmq_q4_K_decode_samples(
     const void *weights, const float *input, float *out,
     void *scratch, size_t scratch_bytes,
-    int M, int K, int rows, int groups, cudaStream_t stream);
+    int M, int K, int rows, int groups, int output_bf16, cudaStream_t stream);
 
 int ds4_mmq_q4_K_grouped_vec(
     const void  * W_q4_K,

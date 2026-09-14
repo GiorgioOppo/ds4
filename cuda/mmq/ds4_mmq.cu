@@ -502,6 +502,25 @@ static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
     ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
 }
 
+// V4.1 output-A consumes sanitize followed by BF16 rounding. Keep that order:
+// a finite value may round to infinity, which the old second pass retained.
+__device__ static float ds4_mmq_sanitize_bf16_value(float x) {
+    uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7f800000u) == 0x7f800000u) return 0.0f;
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return __uint_as_float(bits & 0xffff0000u);
+}
+
+__global__ static void ds4_mmq_sanitize_bf16_kernel(float *p, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = ds4_mmq_sanitize_bf16_value(p[i]);
+}
+
+static void ds4_mmq_sanitize_bf16(float *p, uint64_t n, cudaStream_t stream) {
+    if (!p || n == 0) return;
+    ds4_mmq_sanitize_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
+}
+
 ggml_backend_cuda_context * get_ctx_for_device(int device) {
     static ggml_backend_cuda_context * cached[GGML_CUDA_MAX_DEVICES] = {};
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return nullptr;
@@ -5571,10 +5590,11 @@ extern "C" int ds4_mmq_q4_K_grouped_vec(
 extern "C" int ds4_mmq_q4_K_decode_samples(
         const void *weights, const float *input, float *out,
         void *scratch, size_t scratch_bytes,
-        int M, int K, int rows, int groups, cudaStream_t stream) {
+        int M, int K, int rows, int groups, int output_bf16, cudaStream_t stream) {
     if (!weights || !input || !out || !scratch ||
         ((uintptr_t)weights & 3u) || ((uintptr_t)input & 3u) || ((uintptr_t)out & 3u) ||
         ((uintptr_t)scratch & 15u) || rows < 1 || rows > 64 ||
+        (output_bf16 != 0 && output_bf16 != 1) ||
         !((M == 1024 && K == 4096 && (groups == 4 || groups == 8)) ||
           (M == 5120 && K == 8192 && groups == 1))) return -1;
     const int padded_k = GGML_PAD(K, MATRIX_ROW_PADDING);
@@ -5610,7 +5630,8 @@ extern "C" int ds4_mmq_q4_K_decode_samples(
     }
     // M consists of complete MMVQ row cohorts, so every value was written.
     // Match both the scalar dense and grouped finite-value epilogues.
-    ds4_mmq_sanitize_f32(out, (uint64_t)rows * groups * M, stream);
+    if (output_bf16) ds4_mmq_sanitize_bf16(out, (uint64_t)rows * groups * M, stream);
+    else ds4_mmq_sanitize_f32(out, (uint64_t)rows * groups * M, stream);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: V4.1 Q4 sample sanitize failed: %s\n",

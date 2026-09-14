@@ -532,7 +532,7 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(
 __global__ static void dsv41_output_q4_native_kernel(
         float *out, const char *weights, const cuda_block_q8_K *xq,
         uint32_t outputs, uint32_t blocks, uint32_t full_blocks,
-        uint32_t block0, uint32_t groups) {
+        uint32_t block0, uint32_t groups, bool output_bf16) {
     const uint32_t lane = threadIdx.x & 7u;
     const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= groups * outputs) return;
@@ -545,18 +545,19 @@ __global__ static void dsv41_output_q4_native_kernel(
     for (uint32_t b = lane; b < blocks; b += 8u)
         acc += dev_dot_q4_K_q8_K_block(wr + b, xr + b);
     acc = quarter_warp_sum_f32(acc, lane);
-    if (lane == 0u) out[(uint64_t)token * groups * outputs + row] = acc;
+    if (lane == 0u)
+        out[(uint64_t)token * groups * outputs + row] = output_bf16 ? dsv41_bf16(acc) : acc;
 }
 
 static int dsv41_output_q4_rows(
         float *out, const char *weights, const float *input,
         void *scratch, uint64_t scratch_bytes, uint32_t outputs,
         uint32_t width, uint32_t full_width, uint32_t k0,
-        uint32_t groups, uint32_t rows, bool use_mmq) {
+        uint32_t groups, uint32_t rows, bool use_mmq, bool output_bf16) {
     if (use_mmq && width == full_width)
         return ds4_mmq_q4_K_decode_samples(weights, input, out,
             scratch, (size_t)scratch_bytes, (int)outputs, (int)width,
-            (int)rows, (int)groups, cuda_decode_stream()) == 0;
+            (int)rows, (int)groups, output_bf16, cuda_decode_stream()) == 0;
     const uint32_t blocks = width / CUDA_QK_K;
     q8_K_quantize_kernel<<<dim3(blocks, rows * groups), 256, 0, cuda_decode_stream()>>>(
         (cuda_block_q8_K *)scratch, input, width, rows * groups);
@@ -564,7 +565,7 @@ static int dsv41_output_q4_rows(
     dsv41_output_q4_native_kernel<<<dim3(groups * outputs / 32u, rows), 256,
                                     0, cuda_decode_stream()>>>(
         out, weights, (const cuda_block_q8_K *)scratch, outputs, blocks,
-        full_width / CUDA_QK_K, k0 / CUDA_QK_K, groups);
+        full_width / CUDA_QK_K, k0 / CUDA_QK_K, groups, output_bf16);
     return cuda_ok(cudaGetLastError(), "V4.1 output Q4 rows");
 }
 
@@ -705,13 +706,17 @@ extern "C" int ds4_gpu_dsv41_attention_output_typed_batch(
         float *y = (float *)out->ptr + (uint64_t)first * 5120u;
         const int a_ok = a_type == 12u ?
             dsv41_output_q4_rows(l, wa, x, scratch, scratch_bytes,
-                1024u, 4096u, 4096u, 0u, groups, count, use_mmq) :
+                1024u, 4096u, 4096u, 0u, groups, count, use_mmq, true) :
             dsv41_output_q8_rows(l, wa, x, scratch,
                 1024u, 4096u, 4096u, 0u, groups, count);
         if (!a_ok) return 0;
-        dsv41_bf16_kernel<<<(uint64_t)count * low_width / 256u, 256,
-                            0, cuda_decode_stream()>>>(l, (uint64_t)count * low_width);
-        if (!cuda_ok(cudaGetLastError(), "V4.1 output low BF16")) return 0;
+        /* Q4 rounds only after its complete reduction (after sanitize on
+         * MMVQ). The mixed Q8-A path retains the established separate pass. */
+        if (a_type == 8u) {
+            dsv41_bf16_kernel<<<(uint64_t)count * low_width / 256u, 256,
+                                0, cuda_decode_stream()>>>(l, (uint64_t)count * low_width);
+            if (!cuda_ok(cudaGetLastError(), "V4.1 output low BF16")) return 0;
+        }
         if (b_type == 8u && tp_world == 1u) {
             /* Scalar Q8 B may use resident aligned weights. Keep its exact
              * dispatcher until batching that representation is validated. */
@@ -729,7 +734,7 @@ extern "C" int ds4_gpu_dsv41_attention_output_typed_batch(
         }
         const int b_ok = b_type == 12u ?
             dsv41_output_q4_rows(y, wb, l, scratch, scratch_bytes,
-                5120u, low_width, 8192u, tp_rank * low_width, 1u, count, use_mmq) :
+                5120u, low_width, 8192u, tp_rank * low_width, 1u, count, use_mmq, false) :
             dsv41_output_q8_rows(y, wb, l, scratch,
                 5120u, low_width, 8192u, tp_rank * low_width, 1u, count);
         if (!b_ok) return 0;

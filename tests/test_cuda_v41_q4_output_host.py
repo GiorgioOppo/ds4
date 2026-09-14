@@ -26,6 +26,11 @@ COMMON = r'''
 #include <vector>
 #include <climits>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+using std::isfinite;
+static uint32_t __float_as_uint(float f) { uint32_t u; memcpy(&u,&f,4); return u; }
+static float __uint_as_float(uint32_t u) { float f; memcpy(&f,&u,4); return f; }
 using cudaStream_t = uintptr_t;
 using cudaError_t = int;
 enum ggml_type { GGML_TYPE_Q4_K = 12 };
@@ -37,7 +42,7 @@ struct cuda_block_q4_K { uint16_t d,dmin; uint8_t scales[12],qs[128]; };
 struct cuda_block_q8_K { float d; int8_t qs[256]; int16_t bsums[16]; };
 static_assert(sizeof(cuda_block_q4_K) == 144 && sizeof(cuda_block_q8_K) == 292,
               "GGUF block sizes");
-static struct { uint32_t x, y; } blockIdx, threadIdx;
+static struct { uint32_t x, y; } blockIdx, threadIdx, blockDim;
 static const cuda_block_q4_K *expected_w;
 static const cuda_block_q8_K *expected_x;
 static uint32_t expected_block, expected_step, dot_calls;
@@ -55,7 +60,7 @@ static float quarter_warp_sum_f32(float acc, uint32_t lane) {
 }
 struct ggml_cuda_mm_fusion_args_device { const void *gate; };
 struct Call {
-    int quant = 0, mmvq = 0, sanitize = 0, errors = 0, fail_at = 0;
+    int quant = 0, mmvq = 0, sanitize = 0, bf16 = 0, errors = 0, fail_at = 0;
     std::array<int64_t, 8> q{};
     std::array<int, 18> m{};
     uint64_t sanitized = 0;
@@ -92,6 +97,10 @@ static void ds4_mmq_sanitize_f32(float *, uint64_t count, cudaStream_t stream) {
     ++called.sanitize;
     called.sanitized = count;
 }
+static void ds4_mmq_sanitize_bf16(float *p, uint64_t count, cudaStream_t stream) {
+    ds4_mmq_sanitize_f32(p, count, stream);
+    ++called.bf16;
+}
 '''
 
 CHECKS = r'''
@@ -104,15 +113,16 @@ int main() {
     const int shapes[][3] = {{1024,4096,4}, {1024,4096,8}, {5120,8192,1}};
     for (const auto &shape : shapes) {
         const int m = shape[0], k = shape[1], groups = shape[2];
-        for (int rows = 1; rows <= 64; ++rows) {
+        for (int rows = 1; rows <= 64; ++rows) for (int bf16 : {0,1}) {
             // Independent layout oracle: one canonical Q8_1 block per 32
             // elements; each admitted K is already a 512-element multiple.
             const int qblocks = k / 32;
             const size_t need = size_t(rows) * groups * qblocks * 36;
             called = {};
             assert(ds4_mmq_q4_K_decode_samples(weights, input, out, scratch,
-                need, m, k, rows, groups, 7) == 0);
+                need, m, k, rows, groups, bf16, 7) == 0);
             assert(called.quant == 1 && called.mmvq == 1 && called.sanitize == 1);
+            assert(called.bf16 == bf16);
             const std::array<int64_t,8> quant = {
                 k, k, int64_t(k)*rows*groups, int64_t(k)*rows*groups,
                 k, rows*groups, 1, 1};
@@ -125,7 +135,7 @@ int main() {
             // One byte below the canonical allocation must not enqueue work.
             called = {};
             assert(ds4_mmq_q4_K_decode_samples(weights, input, out, scratch,
-                need-1, m, k, rows, groups, 7) != 0);
+                need-1, m, k, rows, groups, bf16, 7) != 0);
             assert(called.quant == 0 && called.mmvq == 0 && called.sanitize == 0);
         }
     }
@@ -133,7 +143,7 @@ int main() {
                         int m, int k, int rows, int groups) {
         called = {};
         assert(ds4_mmq_q4_K_decode_samples(w,x,y,s,arena.size()*8,
-            m,k,rows,groups,7) != 0);
+            m,k,rows,groups,0,7) != 0);
         assert(called.quant == 0 && called.mmvq == 0 && called.sanitize == 0);
     };
     rejected(nullptr,input,out,scratch,1024,4096,1,8);
@@ -147,14 +157,39 @@ int main() {
         {1023,4096,8}, {1024,4095,8}, {1024,4096,1}, {5120,8192,4},
         {1024,1280,8}, {INT_MAX,INT_MAX,INT_MAX}, {0,0,0}}})
         rejected(weights,input,out,scratch,s[0],s[1],1,s[2]);
-    for (int stage = 1; stage <= 3; ++stage) {
+    for (int invalid : {-1,2}) {
+        called = {};
+        assert(ds4_mmq_q4_K_decode_samples(weights,input,out,scratch,
+            arena.size()*8,1024,4096,1,8,invalid,7) != 0);
+        assert(called.quant == 0);
+    }
+    for (int stage = 1; stage <= 3; ++stage) for (int bf16 : {0,1}) {
         called = {};
         called.fail_at = stage;
         assert(ds4_mmq_q4_K_decode_samples(weights,input,out,scratch,
-            arena.size()*8,1024,4096,64,8,7) == -(stage+1));
+            arena.size()*8,1024,4096,64,8,bf16,7) == -(stage+1));
         assert(called.quant == 1);
         assert(called.mmvq == (stage >= 2));
         assert(called.sanitize == (stage >= 3));
+        assert(called.bf16 == (stage >= 3 ? bf16 : 0));
+    }
+    // Numerical oracle uses the two previous production operations, including
+    // finite overflow to infinity after BF16 and non-finite input sanitizing.
+    blockIdx = {0,0}; threadIdx = {0,0}; blockDim = {1,1};
+    auto check_bits = [](uint32_t bits) {
+        float old_value = __uint_as_float(bits);
+        ds4_mmq_sanitize_f32_kernel(&old_value, 1);
+        const float expected = dsv41_bf16(old_value);
+        const float fused = ds4_mmq_sanitize_bf16_value(__uint_as_float(bits));
+        assert(__float_as_uint(expected) == __float_as_uint(fused));
+    };
+    for (uint32_t hi = 0; hi < 65536u; ++hi)
+        for (uint32_t lo : {0u,1u,0x7fffu,0x8000u,0x8001u,0xffffu})
+            check_bits((hi << 16u) | lo);
+    uint32_t random = 7919;
+    for (uint32_t i = 0; i < 262144u; ++i) {
+        random = random * 1664525u + 1013904223u;
+        check_bits(random);
     }
     // Compile and exercise the actual range helpers at adjacency and pointer
     // overflow boundaries. Integer-created pointers are never dereferenced.
@@ -193,7 +228,7 @@ int main() {
                     expected_step = 8;
                     dot_calls = 0;
                     dsv41_output_q4_native_kernel(y.data(), (const char *)w.data(),
-                        x.data(), outputs, blocks, full_blocks, block0, groups);
+                        x.data(), outputs, blocks, full_blocks, block0, groups, true);
                     assert(dot_calls == blocks/8);
                 }
         // The first entirely out-of-range row must not touch either input.
@@ -201,10 +236,10 @@ int main() {
         threadIdx = {0,0};
         dot_calls = 0;
         dsv41_output_q4_native_kernel(y.data(), (const char *)w.data(), x.data(),
-            outputs, blocks, full_blocks, block0, groups);
+            outputs, blocks, full_blocks, block0, groups, false);
         assert(dot_calls == 0);
     }
-    puts("CUDA V4.1 Q4 host: admission, ranges, sample/group/TP strides and launch errors PASS");
+    puts("CUDA V4.1 Q4 host: admission, strides, fused BF16 bit patterns and launch errors PASS");
 }
 '''
 
@@ -213,6 +248,10 @@ def main():
     production = (ROOT / "cuda/mmq/ds4_mmq.cu").read_text()
     body = extract_function(production, 'extern "C" int ds4_mmq_q4_K_decode_samples(')
     backend = (ROOT / "ds4_deepseek41_cuda.cuh").read_text()
+    numeric = (extract_function(production, "__device__ static float ds4_mmq_sanitize_bf16_value(") +
+               extract_function(production, "__global__ static void ds4_mmq_sanitize_f32_kernel(") +
+               extract_function(backend, "__device__ static float dsv41_bf16(")).replace(
+                   "__device__ ", "").replace("__global__ ", "")
     helpers = "\n".join(extract_function(backend, signature) for signature in (
         "static bool dsv41_output_range(",
         "static bool dsv41_output_overlap(",
@@ -221,7 +260,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ds4-v41-q4-host-") as directory:
         source = Path(directory) / "check.cpp"
         binary = Path(directory) / "check"
-        source.write_text(COMMON + body + helpers + CHECKS)
+        source.write_text(COMMON + numeric + body + helpers + CHECKS)
         compiler = shlex.split(os.environ.get("CXX", "c++"))
         subprocess.run(compiler + ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
             "-fsanitize=address,undefined", "-fno-sanitize-recover=all",

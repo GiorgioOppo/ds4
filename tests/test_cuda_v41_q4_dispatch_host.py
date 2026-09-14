@@ -62,7 +62,7 @@ struct Event {
     char op;
     uint32_t type, outputs, width, full_width, k0, groups, rows;
     const void *w, *x, *y, *scratch;
-    bool mmq;
+    bool mmq, bf16=false;
 };
 struct WeightRequest { uint64_t offset, bytes; int tier; };
 static std::vector<Event> events;
@@ -97,9 +97,12 @@ static int record_projection(uint32_t type,float *out,const char *w,const float 
     return fail_stage!=op;
 }
 static int dsv41_output_q4_rows(float *o,const char *w,const float *x,void *s,uint64_t bytes,
-        uint32_t m,uint32_t k,uint32_t full,uint32_t k0,uint32_t groups,uint32_t rows,bool mmq) {
+        uint32_t m,uint32_t k,uint32_t full,uint32_t k0,uint32_t groups,uint32_t rows,
+        bool mmq,bool bf16) {
     assert(bytes==last_scratch_bytes);
-    return record_projection(12,o,w,x,s,m,k,full,k0,groups,rows,mmq);
+    const int ok=record_projection(12,o,w,x,s,m,k,full,k0,groups,rows,mmq);
+    events.back().bf16=bf16;
+    return ok;
 }
 static int dsv41_output_q8_rows(float *o,const char *w,const float *x,void *s,
         uint32_t m,uint32_t k,uint32_t full,uint32_t k0,uint32_t groups,uint32_t rows) {
@@ -116,7 +119,8 @@ static int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out,const void *,uint64_t,
         uint64_t,uint64_t width,uint64_t outputs,const ds4_gpu_tensor *in,uint64_t rows) {
     assert(rows==1 && width==8192 && outputs==5120);
     assert(in->bytes==width*4 && out->bytes==outputs*4);
-    assert(!events.empty() && (events.back().op=='R' || events.back().op=='S'));
+    assert(!events.empty() && (events.back().op=='R' || events.back().op=='S' ||
+        (events.back().op=='A' && events.back().bf16)));
     events.push_back({'S',8,uint32_t(outputs),uint32_t(width),8192,0,1,1,
                       nullptr,in->ptr,out->ptr,nullptr,false});
     if (grow_in_scalar && ++scalar_calls==1) arena=arena1.data();
@@ -186,7 +190,8 @@ int main() {
                 assert(ae.x==hs.data()+uint64_t(first)*heads);
                 assert(ae.y==ls.data()+uint64_t(first)*low);
                 assert(ae.scratch==(grow_in_scalar && first ? arena1.data() : arena0.data()));
-                assert(events.at(event++).op=='R');
+                if (at==8) assert(events.at(event++).op=='R');
+                else assert(ae.bf16);
                 if (world==1 && bt==8) {
                     for (uint32_t row=0;row<count;++row) {
                         const auto &se=events.at(event++);
@@ -197,6 +202,7 @@ int main() {
                 } else {
                     const auto &be=events.at(event++);
                     assert(be.op=='B' && be.type==bt && be.rows==count && be.groups==1);
+                    assert(!be.bf16);
                     assert(be.outputs==5120 && be.width==low && be.full_width==8192);
                     assert(be.k0==rank*low && be.w==(char *)model.data()+b);
                     assert(be.x==ls.data()+uint64_t(first)*low);
@@ -242,10 +248,12 @@ int main() {
         reset(); fail_stage=failure;
         assert(!call(12,failure=='S' ? 8 : 12));
         assert(events.front().op=='A' && events.back().op==failure);
-        assert(events.size()==(failure=='A' ? 1u : 3u));
+        assert(events.size()==(failure=='A' ? 1u : 2u));
     }
     reset(); bf16_error=true;
-    assert(!call() && events.size()==2 && events.back().op=='R');
+    assert(!call(8,12) && events.size()==2 && events.back().op=='R');
+    reset(); bf16_error=true;
+    assert(call(12,12)); // Q4-A owns its rounding; no standalone launch.
     puts("CUDA V4.1 Q4 dispatcher host: preflight, TP, chunks, BF16 order, scratch and device PASS");
 }
 '''
