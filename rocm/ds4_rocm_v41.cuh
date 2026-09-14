@@ -1035,17 +1035,39 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
     }
     const char *const *slots = (const char *const *)table->ptr;
     if (ok) {
-        moe_gate_up_mid_qwarp32_ptrs_kernel<<<dim3(18u, (uint32_t)pairs), 256u>>>(
-            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-            slots, slots + experts, xq, (const int32_t *)selected->ptr,
-            (const float *)weights->ptr, gate_row, 20u, 2304u, used, 0x3fu, 10.f);
+        if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
+            moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3(576u, used), 128>>>(
+                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                slots, slots + experts, xq, (const int32_t *)selected->ptr,
+                (const float *)weights->ptr, 0, gate_row, 20u, 2304u, used,
+                1u, 0x3fu, 10.f);
+        } else {
+            moe_gate_up_mid_qwarp32_ptrs_kernel<<<dim3(18u, (uint32_t)pairs), 256u>>>(
+                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                slots, slots + experts, xq, (const int32_t *)selected->ptr,
+                (const float *)weights->ptr, gate_row, 20u, 2304u, used, 0x3fu, 10.f);
+        }
         ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned gate/up");
     }
     if (ok) {
-        moe_down_q2K_sum_rows_w32_ptrs_batch_kernel<<<dim3(640u, n_tokens), 256u>>>(
-            (float *)out->ptr, slots + 2u * experts, (const float *)mid->ptr,
-            (const int32_t *)selected->ptr, n_tokens, 2304u, 5120u, down_row, used);
-        ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned down");
+        if (n_tokens == 1u && !g_quality_mode && ds4_rocm_is_gfx1151()) {
+            // Gate/up has consumed xq; reuse its scratch for the six mid rows.
+            cuda_block_q8_K *midq = (cuda_block_q8_K *)scratch->ptr;
+            q8_K_quantize_kernel<<<dim3(9u, used), 256u>>>(
+                midq, (const float *)mid->ptr, 2304u, used);
+            ok = cuda_ok(cudaGetLastError(), "V4.1 TP mid quantization");
+            if (ok) {
+                moe_v41_down_wave_ptrs_kernel<4><<<1280u, 128>>>(
+                    (float *)out->ptr, slots + 2u * experts, midq,
+                    (const int32_t *)selected->ptr, 0, down_row, 9u, 5120u, used);
+                ok = cuda_ok(cudaGetLastError(), "V4.1 TP quantized wave down");
+            }
+        } else {
+            moe_down_q2K_sum_rows_w32_ptrs_batch_kernel<<<dim3(640u, n_tokens), 256u>>>(
+                (float *)out->ptr, slots + 2u * experts, (const float *)mid->ptr,
+                (const int32_t *)selected->ptr, n_tokens, 2304u, 5120u, down_row, used);
+            ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned down");
+        }
     }
     /* The reference deliberately drains before releasing its pointer table.
      * Persistent tables and a queued service follow ownership qualification. */
