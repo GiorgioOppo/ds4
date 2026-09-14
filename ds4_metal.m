@@ -48141,6 +48141,7 @@ enum {
     QWEN4_K_HC_NORM_REUSE_Q8,
     QWEN4_K_HC_GATE_MIX_F16,
     QWEN4_K_HC_GATE_MIX_F16_PF,
+    QWEN4_K_HC_GATE_MIX_F16_REUSE,
     QWEN4_K_HC_GATE_MIX_F32,
     QWEN4_K_HC_GATE_MIX_Q8,
     QWEN4_K_HC_GATE_MIX_PAIR_F16,
@@ -48175,6 +48176,7 @@ enum {
     QWEN4_K_ATTN_MERGE_WIDE_NPT4,
     QWEN4_K_ATTN_MM,
     QWEN4_K_MOE_MID,
+    QWEN4_K_MOE_MID_IQ2,
     QWEN4_K_MOE_MID_Q4K,
     QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
@@ -48228,6 +48230,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_norm_reuse_q8",
     "kernel_qwen4_hc_gate_mix_f16",
     "kernel_qwen4_hc_gate_mix_f16_pf",
+    "kernel_qwen4_hc_gate_mix_f16_reuse",
     "kernel_qwen4_hc_gate_mix_f32",
     "kernel_qwen4_hc_gate_mix_q8",
     "kernel_qwen4_hc_gate_mix_pair_f16",
@@ -48262,6 +48265,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_merge_wide_npt4",
     "kernel_qwen4_attn_mm",
     "kernel_qwen4_moe_mid",
+    "kernel_qwen4_moe_mid_iq2",
     "kernel_qwen4_moe_mid_q4k",
     "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
@@ -48365,10 +48369,11 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
     @autoreleasepool {
         const bool addresses = g_qwen4_stream_weights && g_qwen4_stream_weights->addresses;
         const bool q4_mid = kernel == QWEN4_K_MOE_MID_Q4K || kernel == QWEN4_K_MOE_MID_Q4K_NR1;
+        const bool iq2_mid = kernel == QWEN4_K_MOE_MID_IQ2;
         id<MTLComputePipelineState> pipeline = nil;
-        if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF || q4_mid) {
+        if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF || q4_mid || iq2_mid) {
             const qwen4_moe_args *a = args;
-            const bool specialize = !q4_mid && qwen4_moe_mv_specialize(a->weight_type);
+            const bool specialize = !q4_mid && !iq2_mid && qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%u",
                              qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addresses];
@@ -48603,11 +48608,17 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
      * against the plain kernel by tests/test_qwen4_kernels.c); M5 default. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");
+    /* M1 Max shares each low-rank activation and sigmoid across the four
+     * output rows in a threadgroup. The existing override retains both
+     * original kernels for numerical and timing comparisons. */
+    const bool reuse = !pair && weight_type == 1u && n_rank == 320u &&
+        prefetch_override < 0 && ds4_gpu_device_name_contains("M1 Max");
     const bool prefetch = weight_type == 1u &&
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
                                               QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
+                            : reuse ? QWEN4_K_HC_GATE_MIX_F16_REUSE
                             : prefetch ? QWEN4_K_HC_GATE_MIX_F16_PF
                             : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
                                        QWEN4_K_HC_GATE_MIX_Q8);
@@ -48619,7 +48630,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u) : 4u;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
                           MTLSizeMake((n_embd + nsg - 1u) / nsg, pair ? 1u : n_tokens, 1), MTLSizeMake(nsg * 32u, 1, 1),
-                          pair ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
+                          (pair || reuse) ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
 }
 
 int ds4_gpu_qwen4_hc_combine_tensor(
@@ -49194,7 +49205,13 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) :
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
     const uint32_t rows_per_tg = nr * nsg;
-    const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
+    /* IQ2 gate and up reuse the same eight input values across both rows.
+     * Preserve the NR2 mapping, including the existing SSD slot masks. */
+    const bool iq2 = weight_type == 16u && nr == 2u &&
+        ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE") != 0 &&
+        ds4_gpu_device_name_contains("M1 Max");
+    const int kernel = iq2 ? QWEN4_K_MOE_MID_IQ2 : !q4k ? QWEN4_K_MOE_MID :
+        nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
     /* Masked dispatches compact only the grid. The kernel restores original
      * slot indices, so shared placement and output strides stay unchanged. */
     const uint32_t dispatch_slots = args.slot_mask ?

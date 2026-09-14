@@ -319,6 +319,68 @@ kernel void kernel_qwen4_hc_gate_mix_f16_pf(
     if (tiisg == 0) mixed[(uint64_t)tok * E + d] = g / (float)hc;
 }
 
+/* Reuse the low-rank sigmoid across streams and output rows. Keep x and
+ * sigmoid(x) separate: storing silu(x) would change the single-row
+ * accumulation's (x * weight) * sigmoid(x) rounding. */
+kernel void kernel_qwen4_hc_gate_mix_f16_reuse(
+        constant ds4_metal_args_qwen4_hc_gate_mix & args,
+        device const float *xn,
+        device const float *lo,
+        device const char  *w_up,
+        device float       *mixed,
+        threadgroup float2 *low_sig [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint hc = args.n_hc, E = args.n_embd, rank = args.n_rank;
+    const uint d = tgpig.x * (ntg.x / 32) + sgitg;
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    device const float *l = lo + (uint64_t)tok * rank;
+    const float inv_hc = 1.0f / (float)hc;
+    for (uint r = tid; r < rank; r += ntg.x) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        const float x = l[r] * inv_hc;
+        low_sig[r] = float2(x, qwen4_sigmoid(x));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d >= E) return;
+    const uint s = tiisg / 8, lane = tiisg % 8;
+    device const half *wr = (device const half *)w_up + (uint64_t)(s * E + d) * rank;
+    float acc = 0.0f;
+    uint r = lane;
+    for (; r + 56u < rank; r += 64u) {
+        float wv[8];
+        float2 av[8];
+        for (uint i = 0; i < 8; i++) { wv[i] = (float)wr[r + 8u * i]; av[i] = low_sig[r + 8u * i]; }
+        for (uint i = 0; i < 8; i++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            const float t = av[i].x * wv[i];
+            const float u = t * av[i].y;
+            acc = acc + u;
+        }
+    }
+    for (; r < rank; r += 8u) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        const float2 a = low_sig[r];
+        const float t = a.x * (float)wr[r];
+        const float u = t * a.y;
+        acc = acc + u;
+    }
+    acc += simd_shuffle_xor(acc, 1);
+    acc += simd_shuffle_xor(acc, 2);
+    acc += simd_shuffle_xor(acc, 4);
+    float g = qwen4_sigmoid(acc) * xn[(uint64_t)tok * E * hc + s * E + d];
+    g += simd_shuffle_xor(g, 8);
+    g += simd_shuffle_xor(g, 16);
+    if (tiisg == 0) mixed[(uint64_t)tok * E + d] = g / (float)hc;
+}
+
 /* Two-token MTP verification: reuse each up-projection weight for both
  * rows, and activate the low-rank inputs once per threadgroup. */
 template <typename W>
@@ -2336,6 +2398,90 @@ kernel void kernel_qwen4_moe_mid(
         if (tiisg == 0) {
             mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
         }
+    }
+}
+
+/* IQ2XXS gate/up input reuse, two output rows per SIMD group.  Each lane
+ * keeps the generic dot's eight-value part and ordered dl * part additions;
+ * only independent rows and projections share the activation loads. */
+kernel void kernel_qwen4_moe_mid_iq2(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *gate_base,
+        device const char *up_base,
+        device const int32_t *selected,
+        device const float *x,
+        device float *mid,
+        device const char *sh_gate,
+        device const char *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    constexpr uint NR = 2;
+    const uint slot = qwen4_moe_mid_slot(args, tgpig.y), tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    const uint64_t mid_base = ((uint64_t)tok * n_out + slot) * args.out_rows;
+    if (slot == args.n_slots) {
+        for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+        }
+        return;
+    }
+
+    const int32_t expert = selected[(uint64_t)tok * args.n_slots + slot];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) mid[mid_base + r] = 0.0f;
+        }
+        return;
+    }
+    device const char *gb = qwen4_expert_base(gate_base, (uint)expert, args.expert_bytes);
+    device const char *ub = qwen4_expert_base(up_base, (uint)expert, args.expert_bytes);
+    const uint nb = args.in_dim / 256;
+    const uint ib32 = tiisg / 4, j = tiisg % 4;
+    float sumg[NR] = {0.0f}, sumu[NR] = {0.0f};
+    for (uint ib = 0; ib < nb; ib++) {
+        device const float *yp = xt + ib * 256 + ib32 * 32 + j * 8;
+        float y[8];
+        for (uint i = 0; i < 8; i++) y[i] = yp[i];
+        for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+            const uint64_t off = (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 66;
+            device const uchar *bg = (device const uchar *)(gb + off);
+            device const uchar *bu = (device const uchar *)(ub + off);
+            const float dg = (float)(*(device const half *)bg);
+            const float du = (float)(*(device const half *)bu);
+            /* IQ2XXS blocks are only two-byte aligned. */
+            device const ushort *qg = (device const ushort *)(bg + 2) + 4 * ib32;
+            device const ushort *qu = (device const ushort *)(bu + 2) + 4 * ib32;
+            const uint ag = (uint)qg[0] | ((uint)qg[1] << 16);
+            const uint sg = (uint)qg[2] | ((uint)qg[3] << 16);
+            const uint au = (uint)qu[0] | ((uint)qu[1] << 16);
+            const uint su = (uint)qu[2] | ((uint)qu[3] << 16);
+            const float dlg = dg * (0.5f + (float)(sg >> 28)) * 0.25f;
+            const float dlu = du * (0.5f + (float)(su >> 28)) * 0.25f;
+            constant const uchar *gridg = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((ag >> (8 * j)) & 0xFFu));
+            constant const uchar *gridu = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((au >> (8 * j)) & 0xFFu));
+            const uint signsg = ds4_metal_ksigns_iq2xs[(sg >> (7 * j)) & 127u];
+            const uint signsu = ds4_metal_ksigns_iq2xs[(su >> (7 * j)) & 127u];
+            float partg = 0.0f, partu = 0.0f;
+            for (uint i = 0; i < 8; i++) {
+                partg += (float)gridg[i] * ((signsg >> i) & 1u ? -y[i] : y[i]);
+                partu += (float)gridu[i] * ((signsu >> i) & 1u ? -y[i] : y[i]);
+            }
+            sumg[r] += dlg * partg;
+            sumu[r] += dlu * partu;
+        }
+    }
+    for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+        const float g = simd_sum(sumg[r]);
+        const float u = simd_sum(sumu[r]);
+        if (tiisg == 0) mid[mid_base + row0 + r] = qwen4_silu(g) * u;
     }
 }
 
