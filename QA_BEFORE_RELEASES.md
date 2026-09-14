@@ -2181,71 +2181,40 @@ the others append to the preceding frontier.
 
 ## DeepSeek V4.1 Flash (ROCm/gfx1151)
 
-Qualified on ROCm 10.0 and AMD Strix Halo `gfx1151` with calibrated Q2 GGUF SHA-256 `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`. Text and vision are tested with resident expert weights and SSD streaming. Engram remains disk-backed in both modes. Unless specified below, checks use default arithmetic, greedy sampling and no DSpark or quality override.
+- ROCm 10.0, Strix Halo `gfx1151`, calibrated `DeepSeek-V4.1-Flash-Q2.gguf` (365,713,686,528 bytes; saved SHA-256 `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`). Text/vision, resident experts, SSD streaming and two-rank inference are covered. Engram stays disk-backed.
+- Official scoring: 115 cases /3,954 teacher-forced targets for the resident ROCm panel, the two-rank panel and the CUDA reference, default arithmetic, no DSpark or `--quality`. Metal values are published same-Q2 aggregates; CUDA was freshly scored on GB10 with a 76 GiB SSD cache. Individual long prompts are not population-level quality estimates.
 
-The official 100-case fixture contains 2,994 teacher-forced targets. The Metal results are published measurements using the same GGUF and fixture, not a fresh paired hardware run.
-
-| Backend and mode | Mean NLL | API top-token agreement |
-|---|---:|---:|
-| ROCm | 0.366244923 | 2709/2994 |
-| Metal resident batching | 0.365680596 | 2705/2994 |
-| Metal scalar/SSD | 0.364576009 | 2697/2994 |
-
-ROCm NLL is 0.154% above Metal resident and 0.458% above Metal scalar/SSD. The following additional cases exercise batched and longer-context arithmetic. Their recorded ROCm references use the same inputs and weights without the optimized prefill arithmetic; no matched per-case Metal results are available for these extended cases.
-
-| Scoring panel | Targets | ROCm reference NLL | Final NLL | Change | Target-logprob MAE, reference → final | API top1, reference → final |
-|---|---:|---:|---:|---:|---:|---:|
-| 12 batched cases, prompts 388–4101 | 768 | 0.523150693 | 0.526495829 | +0.639% | 0.300796 → 0.304914 | 671 → 666 |
-| Selected 8K, prompt 8197 | 64 | 0.132215235 | 0.137936430 | +4.327% | 0.056327 → 0.060620 | 62 → 61 |
-| Selected 16K, prompt 16389 | 64 | 0.493057761 | 0.498611990 | +1.126% | 0.219980 → 0.235534 | 57 → 57 |
-| Selected 64K, prompt 65541 | 64 | 0.443550858 | 0.463227127 | +4.436% | 0.194422 → 0.233752 | 59 → 59 |
-
-Seven batched prompts have higher NLL and five lower; all three selected long cases have higher NLL. The largest mean increase is 0.019676 nats per target at 64K, approximately 1.99% higher perplexity. The batched whole-prompt bootstrap interval spans zero, which does not establish equivalence. Individual long prompts do not establish population-level quality equivalence.
-
-Final validation covers:
-
-- 44/44 executable, format and tool checks across eight greedy tasks, including long coding and a real `read_file` exchange; 28/28 checks across six sampled tasks at temperature 0.6, top-p 0.95, seed 1729, min-p/top-k 0, with thinking and DSpark off.
-- Six image fact cases in each storage mode, totaling 144 complete vectors and 96 serialized states; native image-driven code edits checked by an independent Python oracle; ordered image-tool reads and cached-prefix continuations at 16K allocated context. Six thinking image requests also complete across two 8K sessions with a 4,096-token output budget. Image-conditioned work is correctness-only.
-- Resident/SSD equality with matching schedules: all 129,280 logits and 64 target scores in the selected 8K scorer, a complete native 16K frontier and 512-output printed continuation, and a 4K/8K state panel covering 2,068,480 logit values, 16 states, 16 guarded vectors and 16 token histories. Engram replay, cancellation and reconstruction checks also pass.
-- The full 118-shape public ROCm primitive harness, independent production-shape numerical references, partial-tile boundaries and allocation canaries. Bulk Q8 projection checks use independent F16 operand rounding and F32 accumulation bounds, including the BF16 low boundary; direct F32 Q8 and row-count equality checks remain enforced. The CPU F16 reference passes 167,936 independent encoding and midpoint checks.
-- 333 extracted host-policy allocation, fault, lookup and lifecycle cases; CPU frontend/session, Engram, GGUF, cache-span and quality-parser checks; five frontend help/link smokes.
-- GLM 5.3 Flash Q2 and older DeepSeek V4 regressions against main: 4,096-token native prompts, 64 greedy outputs, 6,144 allocated context, resident and SSD modes, no MTP/DSpark. All 154,880 GLM / 129,280 DeepSeek logits and printed continuations match main, with no swap-out or OOM. SSD caches are 64 GiB and 32 GiB respectively. Shared-source preprocessing matches main for the selected CPU/CUDA/Metal configurations; includes are removed and changed headers checked separately. This is not a physical CUDA/Metal execution test.
-
-The image embeddings are identical across storage modes. Different prefill schedules can produce different logits and generated text: resident batching starts at 8 tokens and SSD batching at 256. Five tested images have identical initial logits and answers; the 210-token photo uses different schedules, with initial-logit maximum absolute/RMS differences of 3.51717/0.80149, while both answers correctly identify Earth, Africa and Madagascar. Universal bit-identical generation is not claimed.
-
-SSD performance was measured on a single 128 GB Strix Halo with a 2 TB Kingston FURY Renegade (`KINGSTON SFYRD2000G`, PCIe 4.0 ×4). An 8 GiB direct model-file read measured 5.16 GB/s, corroborated by physical device-read counters. Native `ds4-bench` measurements use greedy generation, exclude startup and do not time image-conditioned prefill. These are individual unprofiled runs without a global cache flush.
-
-| Prompt tokens | Allocated context | Generated tokens | Expert/staging cache | Prefill tok/s | Decode tok/s |
-|---:|---:|---:|---:|---:|---:|
-| 8,192 | 10,240 | 16 | 89 GiB | 214.15 | 5.47 |
-| 65,536 | 262,144 | 128 | 92 GiB | 232.21 | 4.45 |
-
-Both resident and SSD modes allocate 262,144 tokens and complete a real 65,536-token `speed-bench/promessi_sposi.txt` prefix plus 128 greedy outputs, with all 129,280 frontier logits and the complete printed continuation identical. Context graph storage is 4,733.02 MiB. The SSD configuration retains at least 14.10 GiB available RAM and resident at least 22.05 GiB. There is no OOM or sampled model-process swap; host zram swap-out is 46 pages for SSD and 93 pages for resident. This qualifies 256K allocation and 64K populated context, not populated-256K inference, maximum capacity or retrieval quality. The selected-64K NLL limitations above still apply.
-
-A 94 GiB expert/staging cache is also tested at 16K with a 512-output continuation and image/state checks. It fills 9,372 dynamic slots, uses 86.88 GiB dynamic cache plus 7.12 GiB two-layer staging, and keeps at least 11.48 GiB available RAM during the continuation, with no swap-out or OOM. Separate scoring/agent checks record 2.62 MiB total host zram swap-out, no sampled model swap or OOM, and at least 10.40 GiB available RAM. Automatic sizing at 89.82 GiB also passes. Cache sizing must account for context, sidecars, concurrent sessions and current host memory; the GTT limit is not an independent physical-memory budget. Use the tested 92 GiB cache for the 256K-allocation example; other workloads may require less.
-
-Resident text and vision also pass on upcoming 192 GB hardware; performance results will be released soon. The V4.1 allocation policy remains separate from other ROCm models. A future cross-model investigation may simplify allocation, streaming and teardown policies; that refactor is outside this change. Physical CUDA/Metal and multi-device/TP regression runs, exact distribution equivalence and complete I/O/compute overlap are not qualified by this ROCm validation.
-
-## DeepSeek V4.1 Flash: two-rank ROCm
-
-Two 128 GB Strix Halo systems, ROCm 10.0, calibrated V4.1 Q2, resident sharded experts and disk-backed Engram. [Setup and exact commands](docs/CLUSTERING_ROCM.md). TCP, USB4STREAM and RoCE RC use the same model arithmetic; no SSD expert streaming or speculative decoding under TP.
-
-| Official panel | Targets | Single-device NLL | Two-rank NLL | Single-device → two-rank top1 |
+| Official panel | Targets | ROCm resident NLL | ROCm two-rank NLL | CUDA NLL |
 |---|---:|---:|---:|---:|
-| 100 short cases | 2994 | 0.366270802 | 0.365827922 | 2703 → 2705 |
-| 12 batched cases | 768 | 0.526495829 | 0.523915363 | 666 → 680 |
-| Selected 8K, 8197 prompt tokens | 64 | 0.137936430 | 0.129784945 | 61 → 63 |
-| Selected 16K, 16389 prompt tokens | 64 | 0.498611990 | 0.519931891 | 57 → 59 |
+| General 100 | 2,994 | 0.368267385 | 0.362317121 | 0.363135483 |
+| Batched 12 | 768 | 0.522408145 | 0.520533442 | 0.521390812 |
+| Selected 8K; 8,197 prompt tokens | 64 | 0.132358932 | 0.142812963 | 0.116477286 |
+| Selected 16K; 16,389 prompt tokens | 64 | 0.487369894 | 0.513686330 | 0.478793408 |
+| Selected 64K; 65,541 prompt tokens | 64 | 0.443306857 | 0.437706626 | 0.437359191 |
 
-- Short/batched controls were rebuilt from the branch base; long controls are the previously qualified single-device captures above. Same Q2 weights and official fixtures; no fresh Metal comparison.
-- Numerical results are mixed: 16K NLL rises 4.276% and target-logprob MAE rises 0.235534 → 0.237530. The short/batched whole-prompt bootstrap intervals span zero, which does not establish equivalence. An isolated first-frontier KL/TV comparison also worsens. Distributed accumulation and owned-kernel scheduling are not bit-identical to single-device arithmetic.
-- 44/44 greedy practical checks and 28/28 sampled checks pass, including full 12,152-token coding and 9,509-token tool prompts with real `read_file` round-trips. Sampling: temperature 0.6, top-p 0.95, seed 1729, min-p/top-k 0; thinking and DSpark off.
-- State checks cover 60 exact comparisons, 120 complete vectors, two interleaved sessions, rewind, checkpoint restore and three cancellation/recovery paths. Six vision fixtures across all three transports and both coordinator assignments pass 72 full-vector and 48 complete-state checks, including same-session authenticated image replay.
-- TCP/USB/RoCE match all 129,280 logits at both 256- and 1,024-token native frontiers and both printed continuations. CPU/GPU transport tests include full payloads through 40 MiB, queue reuse, malformed/truncated data, stale generations, disconnects and real RoCE completion faults; Linux protocol tests pass ASan/UBSan.
-- A full 65,536-token prefix plus 512 fixed-length native greedy outputs completes over USB4STREAM with 69,632 allocated context, no OOM and at least 34.31 GiB usable RAM. Host swap-out is nonzero; this is not a zero-swap or maximum-context claim.
-- USB qualification uses the [temporary MSI-X readback fix](docs/USB4STREAM_KERNEL.md). No persistent kernel/module install or reboot. RoCE uses registered host staging, not GPUDirect; other providers and long-term production endurance are unqualified.
-- Current V4 and GLM regressions match the exact base in resident and SSD modes: full 4,096-token frontiers and 64-token continuations, 6,144 allocated context, 32/64 GiB expert caches respectively. No candidate swap-out or OOM. The first-allocation TP failure is independently injected and leaves no partial setup allocations.
-- Physical CUDA/Metal execution and other-model TP remain untested/unsupported respectively. Performance comparison and tuning are separate from this correctness baseline.
+| General 100 backend/mode | NLL | Target-logprob MAE | Recorded API top1 agreement |
+|---|---:|---:|---:|
+| ROCm resident | 0.368267385 | 0.230736441 | 2705/2994 |
+| ROCm two-rank | 0.362317121 | 0.223234795 | 2704/2994 |
+| CUDA SSD | 0.363135483 | 0.223383502 | 2696/2994 |
+| Published Metal resident batching | 0.365680596 | — | 2705/2994 |
+| Published Metal scalar/SSD | 0.364576009 | 0.227531809 | 2697/2994 |
+
+- Probability results are mixed. Single-device general NLL is 0.71% above published Metal resident and 1.41% above CUDA; two-rank general NLL is lower, while its selected 8K/16K cases are worse. These results and passing practical checks do not establish distribution or universal generation equivalence.
+- Resident practical checks: 44/44 greedy checks including 12,152-token coding and 9,509-token real tool use; 28/28 sampled checks. Final two-rank checks: 28/28 greedy and 28/28 sampled short checks, including executable code, strict JSON, a real `read_file` exchange and natural stop. Sampled settings: temperature 0.6, top-p 0.95, seed 1729, min-p/top-k 0, thinking and DSpark off.
+- State: 60 exact comparisons per final single-device/two-rank panel, 120 full 129,280-element vectors per panel, six checkpoints, rewind, two interleaved sessions and three cancellation/recovery modes. All three transports preserve complete native frontiers and printed continuations at 8K/16K/64K.
+- Primitive qualification: 118 public shapes with complete independent numerical references, tails and canaries, plus production-layout scalar Q8/indexer/MoE and coherent-grid tests. Scalar/batched Q8 reductions are assessed against the same independent F64 oracle and unchanged error bound; they are not required to be bit-identical. Repeated scalar calls remain exact.
+- Frozen formatted build: GPU instruction/constant sections are byte-identical to the qualified arithmetic; rebuilt unchanged CPU code/data/relocations match after removing debug metadata. Five frontend help/link smokes pass on the single-device and both cluster builds.
+- Scope: non-V4.1 dispatch retains its existing policies. GLM 5.3 and older DeepSeek V4 resident/SSD full-frontier and 64-output regressions passed on the integration base; new runtime dispatch is guarded by V4.1/gfx1151. Shared CPU/CUDA/Metal preprocessing is unchanged except parentheses around an existing complete boolean expression. No fresh physical Metal regression run; CUDA vision is unsupported by the reference source.
+
+- Vision: six image cases each in resident and SSD modes (144 complete vectors /96 complete states), with facts and exact replay passing. Final two-rank coverage is a focused photo/state case over RoCE (12 vectors /8 states); the integration base had the broader six-image/all-transport/both-leader matrix. The latter was not repeated with the final arithmetic. Image checks establish correctness only; fresh-session image restore is not claimed.
+- SSD: 92 GiB cache, actual 64K/128 outputs at 256K allocation and 16K/512 outputs; complete frontier logits and printed continuations match resident execution. Minimum usable RAM 13.9 GiB, no OOM or sampled model swap. The 16K/128 run had 126 host zram swap-out pages; final 64K and 512 runs had zero. Native TP 512 also passes exact continuation-prefix/full-frontier checks.
+
+- V4.1 scalar decode keeps F32 dense/grouped Q8 activations; routed IQ2 gate/up and Q2 down use Q8_K activations and integer-dot lane mapping. Bulk prefill retains its qualified dispatch. Small reduction/quantization differences are expected and evaluated with the probability/practical evidence above.
+- TP uses attention tensor parallelism plus 192 owned routed experts per rank, replicated KV/output head, one compute stream and an ordered CPU transport service. No TP SSD expert streaming, DSpark, other-model TP, populated 256K or long-term transport endurance claim. RoCE uses registered host staging, not GPUDirect. USB4STREAM requires the documented temporary controller fix on the tested AMD systems.
+- Performance, complete hardware/SSD/profile details and reproducible commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/USB4STREAM/RoCE](docs/CLUSTERING_ROCM.md#measured-performance), [USB patch/rollback](docs/USB4STREAM_KERNEL.md).
+
+
 ### CUDA SSD Streaming
 
 V4.1 CUDA starts with text inference on a single DGX Spark. Test on

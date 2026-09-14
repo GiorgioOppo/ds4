@@ -56,19 +56,69 @@ SSD-streaming path.
 
 ## DeepSeek V4.1 Flash
 
-The ROCm 10.0 build supports calibrated V4.1 Flash Q2 text and vision on `gfx1151`. A single 128 GB system was tested with SSD streaming, including a 94 GiB expert/staging cache at 16K text context and in image/state checks. Engram tables remain disk-backed even when expert weights are resident. Cache admission depends on available memory, context size and concurrent sessions. Automatic sizing remains conservative; 94 GiB is a tested manual setting, not a universal maximum. The GPU GTT limit shares physical RAM with the OS and is not itself the usable cache budget.
+- ROCm 10.0 supports calibrated V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/USB4STREAM/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed in every mode.
+- Tested SSD configuration: 128 GB Framework Desktop, 16-core Strix Halo engineering sample `100-000001243-50_Y`, Radeon `gfx1151`; Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs) holds the model.
+- Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`; TuneD **`accelerator-performance`**, workload watcher with maximum fans. Existing boot flags: the [GTT/TTM settings above](#gpu-visible-memory), plus `pci=realloc pcie_aspm=off`; their individual effects were not isolated.
 
-```sh
+### SSD performance
+
+Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images; 92 GiB expert/staging cache. One run per row, startup excluded; **tokens/s**:
+
+| Prompt tokens | Allocated context | Generated tokens | Prefill | Decode |
+|---:|---:|---:|---:|---:|
+| 16,384 | 18,432 | 128 | 258.31 | 8.81 |
+| 65,536 | 262,144 | 128 | 234.50 | 8.82 |
+| 16,384 | 18,432 | 512 | 256.81 | 9.05 |
+
+- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs, including 512 outputs. Minimum usable RAM: 13.9 GiB; no OOM or sampled model swap. The 16K/128 run records 126 host zram swap-out pages; the other two record zero. These are not cold-cache or zero-swap results.
+- 262,144-token allocation and actual 65,536-token use passed; populated 256K and retrieval quality were not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
+- Six image/state cases pass separately in resident and SSD modes. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
+
+### Run text or vision
+
+```bash
 make strix-halo ROCM_ARCH=gfx1151
 ./download_model.sh ds41f-q2
-./ds4 --rocm -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming --ssd-streaming-cache-experts 92GB --ctx 262144
+./download_model.sh ds41f-vision
+MODEL=gguf/DeepSeek-V4.1-Flash-Q2.gguf
+VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
+
+# CLI, text
+./ds4 --rocm -m "$MODEL" --ssd-streaming \
+  --ssd-streaming-cache-experts 92GB --ctx 262144
+
+# HTTP server, text and images; --vision takes the matching sidecar.
+./ds4-server --rocm -m "$MODEL" --vision "$VISION" \
+  --ssd-streaming --ssd-streaming-cache-experts 92GB --ctx 262144 \
+  --batched-session 1 --host 127.0.0.1 --port 8080
 ```
 
-The larger-context configuration above allocated 262,144 tokens and completed a real 65,536-token text prompt plus 128 greedy outputs on the 128 GB SSD system. The same test passes in resident mode, with all 129,280 frontier logits and the printed continuation identical. This validates 256K allocation and 64K use; populated 256K inference and retrieval quality were not tested. The tested 92 GiB cache leaves at least 14.10 GiB RAM available at this context allocation. Other workloads and image inputs may need a smaller cache.
+For a machine with sufficient RAM for resident experts, omit both SSD options. Keep `--vision` for image requests and set `--ctx` to the required allocation. See [image request examples](MODELS.md#vision).
 
-Use the matching V4.1 vision sidecar with `--vision FILE`. See [models and vision](MODELS.md#deepseek-v41-flash) for downloads and [qualification results](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151) for output quality, numerical drift and memory limitations. Resident text and vision inference were also tested on upcoming 192 GB hardware; performance results will be released soon.
+### Reproduce SSD measurements
 
-For two-machine resident V4.1 inference, see [ROCm clustering](CLUSTERING_ROCM.md): exact coordinator/worker commands for TCP, USB4STREAM and RoCE, including device setup and the tested USB driver fix.
+Run one configuration per process; preserve the CSV, full frontier files and printed output. The timing input is the repository's `speed-bench/promessi_sposi.txt`.
+
+```bash
+tuned-adm active    # Expect accelerator-performance during the workload
+tuned-adm verify
+MODEL=/absolute/path/DeepSeek-V4.1-Flash-Q2.gguf
+DEPTH=16384
+ALLOC=18432
+GEN=128
+# Other rows: DEPTH=65536 ALLOC=262144 GEN=128
+#             DEPTH=16384 ALLOC=18432  GEN=512
+
+DS4_METAL_CB_TIMES=1 ./ds4-bench --backend rocm -m "$MODEL" \
+  --ssd-streaming --ssd-streaming-cache-experts 92GB \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start "$DEPTH" --ctx-max "$DEPTH" --ctx-alloc "$ALLOC" \
+  --gen-tokens "$GEN" --show-output --csv "ssd-$DEPTH-$GEN.csv" \
+  --dump-frontier-logits-dir "ssd-frontiers-$DEPTH-$GEN"
+```
+
+- `DS4_METAL_CB_TIMES` is scoped to this command and prints the measured prefill time window on ROCm too. No tuning override is needed.
+- Check profile/fan readiness during the measured interval; save revision/build flags, model filename/size and existing provenance, cache/KV configuration, actual prompt/output counts, and memory/swap/OOM counters. Do not substitute HTTP timings for this native table.
 
 ## GLM 5.3 Flash
 

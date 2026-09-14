@@ -176,19 +176,67 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## Measured performance
 
-Two 128 GB Strix Halo machines, ROCm 10.0, Q2 weights, context allocation 69,632, greedy generation of 128 tokens (127 steady), no DSpark or images. Values are **prefill / decode tokens/s**.
+- Two Framework Desktop systems, 128 GB each, 16-core Strix Halo / `gfx1151`; coordinator Ryzen AI Max+ 395, worker engineering sample `100-000001243-50_Y`.
+- Model drives: coordinator SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4); worker Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs). Engram remains disk-backed.
+- TCP/RoCE: Intel E810-C QSFP NICs, 100 Gb/s link, MTU 9000. Coordinator NIC negotiated PCIe 3.0 ×4; worker PCIe 4.0 ×4. USB4STREAM: one 40 Gb/s cable link with the interrupt-readback patch above.
+- Existing boot settings include `pci=realloc pcie_aspm=off`, in addition to the [GPU-visible memory settings](STRIX_HALO.md#gpu-visible-memory). Their individual performance effect was not isolated.
+- Linux `7.2.5-100.fc43.x86_64`, ROCm 10.0 SDK (`10.0.0-4`, HIP `7.15.26333`). TuneD `accelerator-performance`; automatic workload watcher held maximum fans through the measured intervals. Profile/fan readiness was checked on both peers.
+- Same Q2 file, 69,632 allocated context, fresh full prefix, 128 fixed greedy outputs (127 steady), no DSpark or images. Native `ds4-bench`; one run per cell; startup and a 256-token/128-output warmup excluded. Values are **prefill / decode tokens/s**.
 
-| Populated context | TCP, 100 GbE | USB4STREAM, 40 Gb/s | RoCE RC, 100 GbE |
-|---|---:|---:|---:|
-| 1,024: 768-token append | 72.29 / 6.92 | 69.54 / 7.08 | 71.62 / 6.97 |
-| 8,192: full prefix | 247.59 / 6.69 | 232.39 / 6.72 | 247.53 / 6.74 |
-| 16,384: full prefix | 259.44 / 6.35 | 244.31 / 6.39 | 259.07 / 6.40 |
-| 65,536: full prefix | 228.31 / 5.07 | 215.83 / 5.06 | 228.01 / 5.12 |
+| Prompt tokens | TCP, 100 GbE | USB4STREAM, 40 Gb/s | RoCE RC, 100 GbE |
+|---:|---:|---:|---:|
+| 8,192 | 244.27 / 14.03 | 230.29 / 14.40 | 245.93 / 14.66 |
+| 16,384 | 259.05 / 13.86 | 242.99 / 14.17 | 259.89 / 14.38 |
+| 65,536 | 227.38 / 13.65 | 215.82 / 13.78 | 228.70 / 14.03 |
 
-- Native `ds4-bench` measurements; one matched run per cell. The 1K case excludes its initial 256-token frontier. The deeper cases use the native timing loop with an excluded 256-token/128-output warmup, then a fresh session before measuring the complete prefix. The warmup adapter does not change engine objects or the measured loop.
-- Both peers passed continuous fan/profile readiness checks. All frontier logits and printed continuations matched across transports at each depth. No OOM; minimum usable RAM 34.1 GiB. Host swap activity and some sampled process swap were nonzero.
-- USB4STREAM used the temporary interrupt-readback patch described above. These physical-link/configuration results are not a universal protocol ranking.
-- V4.1 CED activates about 8B parameters/token during prefill and 16B during decode. Full long prefixes reach the decoder-suffix optimization; short appends may not. [Model architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
-- Short decode traces show roughly 86 ms/token in local kernels and 22 ms/token in guarded reductions on each peer. RoCE reduces coordinator wait from roughly 26 to 22 ms/token, but this wait also includes peer readiness and CPU scheduling. Faster networking alone does not double decode throughput. Traces include profiler overhead and are separate from the table.
-- The 64K trace confirms CED: all 20 encoder layers process 65,536 tokens; decoder work totals only 24,150 layer-rows. Local kernels account for 79–83% of the traced prefill window.
-- Deep decode slows mainly in indexer scoring: about 1 ms/token at 1K grows to 52–54 ms/token at 64K, while main attention remains about 5 ms and network wait does not grow. Indexer kernels and guarded-reduction launch sizing are the first optimization targets; no speedup from those changes is claimed here.
+- A separate 16,384-prefix /512-output RoCE run measures **258.09 prefill /14.65 decode tok/s** (511 steady:14.66), with the same complete frontier and128-output prefix. Reproduce with `--gen-tokens 512`.
+- All 129,280 frontier logits and printed continuations match across transports at each depth. No OOM; minimum usable RAM 33.6 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
+- Current 16K profiles attribute about 48–49 ms/token to local kernels, 1.53 ms to guarded reductions, 8–9 ms to waits and 14–15 ms to gaps. Waits include peer readiness and CPU scheduling; faster networking alone does not double decode throughput. Profiled windows include instrumentation overhead and are separate from the table.
+- V4.1 CED uses about 8B active parameters/token in prefill and 16B in decode. Full prefixes exercise the decoder-suffix optimization; short appends can follow a different schedule. [Architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
+- Results apply to these drives, NIC attachment, profile and USB patch. Other providers/controllers and long-term production endurance remain unqualified.
+
+### Reproduce the table
+
+Build the ordinary engine on both peers. On the coordinator, build the included TP-only warmup adapter; it links the existing engine objects and leaves `ds4-bench` untouched:
+
+```bash
+make strix-halo ROCM_ARCH=gfx1151
+bash speed-bench/build-rocm-v41-warmup.sh  # Coordinator only
+
+tuned-adm active                        # Expect accelerator-performance during the workload
+tuned-adm verify                        # Verify the applied profile
+```
+
+Set this in both terminals after the relevant device setup above:
+
+```bash
+MODEL=/absolute/path/DeepSeek-V4.1-Flash-Q2.gguf
+COORD=10.99.0.1                         # Coordinator address on the selected link
+TRANSPORT=rdma                         # tcp, usb4stream, or rdma
+USBDEV=/dev/tbstream1
+DEV=rocep194s0                          # This host's active verbs device
+GID=1                                  # This host's matching RoCE v2 GID
+LINK=(--tensor-parallel --transport "$TRANSPORT")
+case "$TRANSPORT" in
+  usb4stream) LINK+=(--usb4stream-device "$USBDEV") ;;
+  rdma) LINK+=(--rdma-device "$DEV" --rdma-port 1 --rdma-gid-index "$GID") ;;
+esac
+```
+
+```bash
+# Coordinator: repeat separately with DEPTH=8192, 16384, 65536.
+DEPTH=16384
+./ds4-bench-warm --backend rocm -m "$MODEL" \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start "$DEPTH" --ctx-max "$DEPTH" --ctx-alloc 69632 \
+  --gen-tokens 128 --show-output --csv "tp-$TRANSPORT-$DEPTH.csv" \
+  --dump-frontier-logits-dir "frontiers-$TRANSPORT-$DEPTH" \
+  --role coordinator --listen "$COORD" 19475 "${LINK[@]}"
+
+# Worker: start for each coordinator run.
+./ds4 --rocm -m "$MODEL" --ctx 69632 \
+  --role worker --coordinator "$COORD" 19475 "${LINK[@]}"
+```
+
+- The adapter warms 256 prefix tokens and 128 decode steps, then creates a fresh session before the unchanged native measured loop. A separate short process is not the same warmup procedure.
+- Preserve the CSV, full frontier files, printed continuation, revision/build flags, model identity, profile/fan readings and swap/OOM counters. Compare timing only after verifying the intended profile and cooling; no image-conditioned prefill timings.
