@@ -38,10 +38,80 @@ static void monotonic(void) {
     assert(largest.prefill_cap == INT_MAX && largest.total_bytes > previous);
 }
 
+static void streaming_staging(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
+    /* Metadata only: Q2 trunk down stores 768 columns, although the logical
+     * FFN width is 640. The differently quantized MTP layer uses that logical
+     * width directly. No model payload or GPU allocation is needed. */
+    ds4_tensor gate = { .type = DS4_TENSOR_IQ2_XXS, .ndim = 3, .dim = {2560, 640, 512} };
+    ds4_tensor down = { .type = DS4_TENSOR_Q2_K, .ndim = 3, .dim = {768, 2560, 512} };
+    ds4_tensor mtp_gate = { .type = DS4_TENSOR_Q4_K, .ndim = 3, .dim = {2560, 640, 512} };
+    ds4_tensor mtp_down = { .type = DS4_TENSOR_MXFP4, .ndim = 3, .dim = {640, 2560, 512} };
+    ds4_weights w = {0};
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const bool predictor = il == DS4_N_LAYER - 1u;
+        w.layer[il].ffn_gate_exps = w.layer[il].ffn_up_exps = predictor ? &mtp_gate : &gate;
+        w.layer[il].ffn_down_exps = predictor ? &mtp_down : &down;
+    }
+    const uint64_t trunk = UINT64_C(1489920) * 512u;
+    const uint64_t predictor = UINT64_C(2713600) * 512u;
+    uint64_t bytes = 0;
+    assert(qwen4_streaming_staging_bytes(&w, true, &bytes));
+    assert(bytes == 2u * trunk && bytes == UINT64_C(1525678080));
+    assert(bytes >= predictor);  /* even no-address full-layer fallback fits */
+    assert(2u * predictor - bytes == UINT64_C(1253048320));
+    assert(qwen4_streaming_staging_bytes(&w, false, &bytes) && bytes == 2u * trunk);
+
+    /* Disabled MTP must not inspect absent predictor tensors. A main-only
+     * file has the same reserve with no predictor layer in its shape. */
+    w.layer[48].ffn_down_exps = NULL;
+    assert(qwen4_streaming_staging_bytes(&w, false, &bytes) && bytes == 2u * trunk);
+    assert(!qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 0);
+    g_ds4_shape.n_layer = 48;
+    g_ds4_shape.n_nextn_predict = 0;
+    assert(qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 2u * trunk);
+    g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
+    w.layer[48].ffn_down_exps = &mtp_down;
+
+    /* A larger off-size predictor makes the conservative full-layer fallback
+     * dominate. It remains reserved even though normal MTP selects only ten. */
+    mtp_gate.dim[1] *= 2u;
+    mtp_down.dim[1] *= 2u;
+    assert(qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 2u * predictor);
+    assert(qwen4_streaming_staging_bytes(&w, false, &bytes) && bytes == 2u * trunk);
+    mtp_gate.dim[1] /= 2u;
+    mtp_down.dim[1] /= 2u;
+
+    /* A smaller expert population can make two compact windows dominate;
+     * include all three address tables for both in-flight lifetimes. */
+    g_ds4_shape.n_expert = 16;
+    g_ds4_shape.n_expert_used = 10;
+    assert(qwen4_streaming_staging_bytes(&w, true, &bytes));
+    assert(bytes == 2u * (UINT64_C(2713600) * 10u + 3u * 16u * sizeof(uint64_t)));
+    assert(bytes > UINT64_C(2713600) * 16u);
+    g_ds4_shape.n_expert_used = 17;
+    assert(!qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 0);
+    g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
+
+    /* Saturated totals cannot wrap into a small admissible cache reserve;
+     * invalid per-expert products fail before any budget is returned. */
+    ds4_tensor huge = { .type = DS4_TENSOR_Q8_0, .ndim = 3,
+                       .dim = {32, UINT64_MAX / 102u, 512} };
+    w.layer[0].ffn_gate_exps = w.layer[0].ffn_up_exps = w.layer[0].ffn_down_exps = &huge;
+    assert(qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == UINT64_MAX);
+    huge.dim[1] = UINT64_MAX;
+    assert(!qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 0);
+    assert(!qwen4_streaming_staging_bytes(NULL, true, &bytes) && bytes == 0);
+    assert(!qwen4_streaming_staging_bytes(&w, true, NULL));
+    g_ds4_shape = saved;
+}
+
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
     monotonic();
+    streaming_staging();
 
     /* Independent allocation lower bounds for the shipped 49-layer shape:
      * 36 GDN layers, 48 value heads, 128x128 state, three convolution rows;
@@ -82,6 +152,6 @@ int main(void) {
     g_ds4_shape = DS4_SHAPE_QWEN4_MINI;
     monotonic();
     g_ds4_shape = saved;
-    puts("Qwen memory: bounded workspace, recurrent/MTP reserves and monotonic budgets OK");
+    puts("Qwen memory: bounded workspace, recurrent/MTP staging and monotonic budgets OK");
     return 0;
 }

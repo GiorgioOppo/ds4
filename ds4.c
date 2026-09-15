@@ -70329,11 +70329,46 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
            opt->distributed.role == DS4_DISTRIBUTED_NONE;
 }
 
+/* Keep two full trunk windows for prefill. Predictor prefix catch-up only
+ * builds KV; draft and chain MoE consume one row (N_EXPERT_USED experts).
+ * Compact staging also owns three full expert-ID address tables.
+ *
+ * Retain one full predictor layer for the no-gpuAddress/older-Metal fallback
+ * and any multirow diagnostic caller. The streamed MoE wrapper drains prior
+ * commands and releases their transient buffers before allocating weights;
+ * the address fallback releases compact payloads before allocating the full
+ * layer. Thus a full predictor fallback cannot overlap earlier staging. */
+static DS4_MAYBE_UNUSED bool qwen4_streaming_staging_bytes(
+        const ds4_weights *weights, bool mtp, uint64_t *bytes_out) {
+    if (!bytes_out) return false;
+    *bytes_out = 0;
+    if (!weights || DS4_N_LAYER == 0 || DS4_N_LAYER > DS4_MAX_LAYER ||
+        DS4_N_NEXTN_PREDICT >= DS4_N_LAYER || DS4_N_EXPERT == 0 ||
+        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_N_EXPERT) return false;
+    const uint32_t trunk_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t layers = mtp ? DS4_N_LAYER : trunk_layers;
+    const uint64_t addresses = ds4_mul_sat_u64(DS4_N_EXPERT, 3u * sizeof(uint64_t));
+    uint64_t staging = 0;
+    for (uint32_t il = 0; il < layers; il++) {
+        uint64_t expert = 0;
+        if (!streaming_layer_routed_expert_bytes(&weights->layer[il], &expert)) return false;
+        const uint64_t full = ds4_mul_sat_u64(expert, DS4_N_EXPERT);
+        uint64_t window = ds4_mul_sat_u64(full, 2u);
+        if (il >= trunk_layers) {
+            const uint64_t compact = ds4_add_sat_u64(
+                ds4_mul_sat_u64(expert, DS4_N_EXPERT_USED), addresses);
+            window = ds4_mul_sat_u64(compact, 2u);
+            if (window < full) window = full;
+        }
+        if (staging < window) staging = window;
+    }
+    *bytes_out = staging;
+    return true;
+}
+
 #ifdef DS4_HAS_QWEN4_METAL
-/* Qwen keeps the dense/GDN/HC weights mapped and stages routed weights in
- * owned buffers. Reserve the largest active layer, including the differently
- * quantized MTP layer when enabled, before sizing the persistent expert cache.
- * Two windows cover a previous in-flight layer and its successor. */
+/* Dense/GDN/HC weights stay mapped; bound routed staging before assigning the
+ * remaining working set to the persistent expert cache. */
 static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache) {
     if (!e->ssd_streaming) return true;
     const uint64_t gib = UINT64_C(1073741824);
@@ -70345,18 +70380,11 @@ static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bo
     }
     uint64_t budget = host / 8u * 7u;
     if (recommended / 8u * 7u < budget) budget = recommended / 8u * 7u;
-    uint64_t statics = 0, expert_bytes = 0, max_experts = 0, largest_layer = 0;
+    uint64_t statics = 0, expert_bytes = 0, max_experts = 0, staging = 0;
     if (!weights_streaming_non_routed_bytes(&e->weights, &statics) ||
         !ds4_streaming_routed_expert_bytes(&e->weights, &expert_bytes) ||
-        !ds4_streaming_cacheable_expert_count(&e->weights, &max_experts, NULL)) return false;
-    const uint32_t layers = DS4_N_LAYER - (e->glm_mtp ? 0u : DS4_N_NEXTN_PREDICT);
-    for (uint32_t il = 0; il < layers; il++) {
-        uint64_t bytes = 0;
-        if (!streaming_layer_routed_expert_bytes(&e->weights.layer[il], &bytes)) return false;
-        bytes = ds4_mul_sat_u64(bytes, DS4_N_EXPERT);
-        if (bytes > largest_layer) largest_layer = bytes;
-    }
-    const uint64_t staging = ds4_mul_sat_u64(largest_layer, 2u);
+        !ds4_streaming_cacheable_expert_count(&e->weights, &max_experts, NULL) ||
+        !qwen4_streaming_staging_bytes(&e->weights, e->glm_mtp, &staging)) return false;
     const uint64_t fixed = ds4_add_sat_u64(ds4_add_sat_u64(statics, e->vision_model.size),
         ds4_add_sat_u64(graph_bytes, ds4_add_sat_u64(staging, 2u * gib)));
     if (fixed >= budget || budget - fixed < expert_bytes) {
