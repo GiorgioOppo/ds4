@@ -14,9 +14,9 @@ COORD=10.99.0.1       # Coordinator's address on the selected link
 CTX=16384
 ```
 
-## TCP over Ethernet
+## TCP over Ethernet or USB4
 
-- Working Ethernet/IP connection; coordinator TCP port 9911 reachable from the worker.
+- Working Ethernet/IP connection; coordinator TCP port 9911 reachable from the worker. USB4 Ethernet (`thunderbolt_net`) works with the same commands: set `COORD` to the coordinator's USB IP address.
 - No verbs packages or USB stream device required.
 
 ```bash
@@ -186,15 +186,36 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | Prompt tokens | TCP, 100 GbE | USB4STREAM, 40 Gb/s | RoCE RC, 100 GbE |
 |---:|---:|---:|---:|
-| 8,192 | 244.27 / 14.03 | 230.29 / 14.40 | 245.93 / 14.66 |
-| 16,384 | 259.05 / 13.86 | 242.99 / 14.17 | 259.89 / 14.38 |
-| 65,536 | 227.38 / 13.65 | 215.82 / 13.78 | 228.70 / 14.03 |
+| 8,192 | 375.02 / 14.35 | 340.56 / 14.34 | 372.02 / 14.64 |
+| 16,384 | 412.62 / 13.95 | 374.76 / 14.20 | 410.44 / 14.40 |
+| 65,536 | 434.16 / 13.70 | 396.84 / 13.76 | 431.55 / 14.10 |
 
-- Two separate 16,384-prefix /512-output RoCE runs measure **258.09 /14.65** and **258.43 /14.77 tok/s** (511 steady:14.66 /14.78). Complete frontiers and all512 outputs match between runs. Reproduce with `--gen-tokens 512`.
-- All 129,280 frontier logits and printed continuations match across transports at each depth. No OOM; minimum usable RAM 33.6 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
-- Current 16K profiles attribute about 48–49 ms/token to local kernels, 1.53 ms to guarded reductions, 8–9 ms to waits and 14–15 ms to gaps. Waits include peer readiness and CPU scheduling; faster networking alone does not double decode throughput. Profiled windows include instrumentation overhead and are separate from the table.
+- Longer continuation, 16,384 prompt / 512 generated tokens: TCP **411.53 / 14.01**, USB4STREAM **375.56 / 14.29**, RoCE **405.17 / 14.41** prefill/decode tokens/s. Reproduce with `--gen-tokens 512`.
+- All 129,280 frontier logits and printed continuations match across transports at each depth, including 512 outputs. No OOM; minimum usable RAM across the final transport checks: 32.9 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
+- RoCE device logs and hardware send counters confirm RDMA payloads on both peers. Its TCP control connection is intentional; similar decode rates do not indicate TCP fallback.
 - V4.1 CED uses about 8B active parameters/token in prefill and 16B in decode. Full prefixes exercise the decoder-suffix optimization; short appends can follow a different schedule. [Architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
 - Results apply to these drives, NIC attachment, profile and USB patch. Other network adapters and USB controllers have not been tested. Long-running production use has not been tested.
+
+### Appending to an existing prompt
+
+Same hardware, allocation and warmup; one live session, no generation between frontiers. Values time only the newly appended tokens, in tokens/s.
+
+| Existing → final tokens | Added tokens | TCP, 100 GbE | USB4STREAM | RoCE |
+|---:|---:|---:|---:|---:|
+| 4,096 → 8,192 | 4,096 | 219.61 | 201.04 | 218.78 |
+| 8,192 → 16,384 | 8,192 | 359.70 | 329.44 | 355.86 |
+| 57,344 → 65,536 | 8,192 | 314.92 | 292.18 | 313.65 |
+
+### TCP over the same USB4 cable
+
+| Transport | 16K prefill | Decode, 128 outputs |
+|---|---:|---:|
+| TCP over USB4 Ethernet | 371.48 | 12.84 |
+| USB4STREAM | 374.76 | 14.20 |
+
+- USB4STREAM is optional. Plain TCP over USB4 works with the TCP commands above and the USB IP address. The USB4STREAM setup and stream device are unnecessary for TCP.
+- This single comparison observed less than 1% prefill difference and 10.6% faster decode with USB4STREAM. Identical inputs, allocation, binaries, warmup and outputs; both peers' USB routes and byte counters checked. The Ethernet NIC carried no model payload.
+- TCP recorded 20 USB receive errors on the coordinator. Both runs used the same patched controller; this comparison does not establish stock-kernel behavior or repeatability of the speed difference.
 
 ### Reproduce the table
 
@@ -241,3 +262,18 @@ DEPTH=16384
 
 - The adapter warms 256 prefix tokens and 128 decode steps, then creates a fresh session before the unchanged native measured loop. A separate short process is not the same warmup procedure.
 - Preserve the CSV, full frontier files, printed continuation, revision/build flags, model identity, active power profile and swap/OOM counters. Verify the active power profile before comparing timings; no image-conditioned prefill timings.
+
+For the append table, keep the worker command and replace the coordinator command with:
+
+```bash
+# 4K → 8K → 16K, no generated tokens between appends
+./ds4-bench-warm --backend rocm -m "$MODEL" \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 4096 --ctx-max 16384 --step-mul 2 --ctx-alloc 69632 \
+  --gen-tokens 0 --csv "append-$TRANSPORT.csv" \
+  --dump-frontier-logits-dir "append-frontiers-$TRANSPORT" \
+  --role coordinator --listen "$COORD" 19475 "${LINK[@]}"
+# For 56K → 64K: --ctx-start 57344 --ctx-max 65536 --step-mul 1 --step-incr 8192
+```
+
+For the USB TCP comparison, run the fresh 16K command twice with `COORD` set to the USB IP address on both machines: first `TRANSPORT=tcp`, then `TRANSPORT=usb4stream`. Recreate `LINK` using the case block each time. Check `ip route get "$COORD"` on the worker and `ip -s link show thunderbolt0` on both peers; use your actual USB interface name.

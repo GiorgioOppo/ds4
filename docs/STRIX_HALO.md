@@ -62,18 +62,17 @@ SSD-streaming path.
 
 ### SSD performance
 
-Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images; 92 GiB expert/staging cache. One run per row, startup excluded; **tokens/s**:
+Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images; 92 GiB expert/staging cache. One run per row, startup and a separate GPU readiness warmup excluded; **tokens/s**:
 
 | Prompt tokens | Allocated context | Generated tokens | Prefill | Decode |
 |---:|---:|---:|---:|---:|
-| 16,384 | 18,432 | 128 | 258.31 | 8.81 |
-| 65,536 | 262,144 | 128 | 234.50 | 8.82 |
-| 16,384 | 18,432 | 512 | 256.81 | 9.05 |
-| 16,384 | 18,432 | 512 (repeat) | 256.63 | 9.34 |
+| 16,384 | 69,632 | 128 | 302.12 | 8.68 |
+| 65,536 | 69,632 | 128 | 350.56 | 8.49 |
 
-- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs, including 512 outputs. Minimum usable RAM: 13.9 GiB; no OOM or sampled model swap. Host zram swap-out pages in table order: 126, 0, 0, 3. These are not cold-cache or zero-swap results.
-- 262,144-token allocation and actual 65,536-token use passed; populated 256K and retrieval quality were not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
-- Six image/state cases pass separately in resident and SSD modes. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
+- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs. Minimum usable RAM: 15.1 GiB; no OOM. Host zram swap-out pages in table order: 0, 0. No cold-cache claim; other qualification runs recorded nonzero host swap.
+- The tuned Engram matrix path requires hipBLASLt 100401, revision `8d1ae90e`; other library versions retain the existing fallback and may have different prefill performance.
+- Actual prompts reach 65,536 tokens; populated 256K was not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
+- Six resident image/state cases and two focused SSD cases (photo and screenshot) pass on this source. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
 
 ### Run text or vision
 
@@ -86,11 +85,11 @@ VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
 
 # CLI, text
 ./ds4 --rocm -m "$MODEL" --ssd-streaming \
-  --ssd-streaming-cache-experts 92GB --ctx 262144
+  --ssd-streaming-cache-experts 92GB --ctx 69632
 
 # HTTP server, text and images; --vision takes the matching sidecar.
 ./ds4-server --rocm -m "$MODEL" --vision "$VISION" \
-  --ssd-streaming --ssd-streaming-cache-experts 92GB --ctx 262144 \
+  --ssd-streaming --ssd-streaming-cache-experts 92GB --ctx 69632 \
   --batched-session 1 --host 127.0.0.1 --port 8080
 ```
 
@@ -105,10 +104,9 @@ tuned-adm active    # Expect accelerator-performance during the workload
 tuned-adm verify
 MODEL=/absolute/path/DeepSeek-V4.1-Flash-Q2.gguf
 DEPTH=16384
-ALLOC=18432
+ALLOC=69632
 GEN=128
-# Other rows: DEPTH=65536 ALLOC=262144 GEN=128
-#             DEPTH=16384 ALLOC=18432  GEN=512
+# Other row: DEPTH=65536 ALLOC=69632 GEN=128
 
 DS4_METAL_CB_TIMES=1 ./ds4-bench --backend rocm -m "$MODEL" \
   --ssd-streaming --ssd-streaming-cache-experts 92GB \
