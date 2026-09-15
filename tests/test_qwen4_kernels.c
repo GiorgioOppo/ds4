@@ -2766,9 +2766,9 @@ static double hc_norm_median7(const double *samples) {
 
 typedef struct {
     arena_t *arena;
-    bool hc;
+    bool hc, down;
     uint32_t E, F, T, NE, slots, shared_type;
-    uint64_t gate, up, shared_gate, shared_up;
+    uint64_t gate, up, shared_gate, shared_up, down_weights, shared_down;
     ds4_gpu_tensor *x, *low, *selected, *out;
 } m1_reuse_case;
 
@@ -2776,6 +2776,9 @@ static int m1_reuse_dispatch(const m1_reuse_case *c) {
     arena_t *a = c->arena;
     if (c->hc) return ds4_gpu_qwen4_hc_gate_mix_tensor(c->out, c->x, c->low,
         a->base, a->size, c->up, 1u, c->T, c->E, 4u, c->F);
+    if (c->down) return ds4_gpu_qwen4_moe_down_tensor(c->out, c->x, c->selected,
+        a->base, a->size, c->down_weights, 10u, c->NE, c->T, c->slots,
+        c->F, c->E, c->shared_down, c->shared_type);
     return ds4_gpu_qwen4_moe_mid_tensor(c->out, c->x, c->selected,
         a->base, a->size, c->gate, c->up, 16u, c->NE, c->T, c->slots,
         c->E, c->F, c->shared_gate, c->shared_up, c->shared_type);
@@ -2800,7 +2803,7 @@ static double m1_reuse_batch(const m1_reuse_case *c, uint32_t mode, uint32_t cal
  * overwritten, so repeating a dispatch does not change the next one's work. */
 static void m1_reuse_compare(m1_reuse_case *c, bool benchmark) {
     const uint64_t n = c->hc ? (uint64_t)c->T * c->E :
-        (uint64_t)c->T * (c->slots + (c->shared_type != UINT32_MAX)) * c->F;
+        (uint64_t)c->T * (c->slots + (c->shared_type != UINT32_MAX)) * (c->down ? c->E : c->F);
     const uint64_t guard = 17u, total = n + 2u * guard;
     const float sentinel = 127.25f;
     ds4_gpu_tensor *storage = upload(NULL, total);
@@ -2809,7 +2812,7 @@ static void m1_reuse_compare(m1_reuse_case *c, bool benchmark) {
     float *reference = NULL;
     char label[128];
     snprintf(label, sizeof(label), "%s E=%u %s=%u T=%u shared=%u",
-        c->hc ? "HC F16 reuse" : "IQ2 mid reuse", c->E, c->hc ? "rank" : "F", c->F, c->T,
+        c->hc ? "HC F16 reuse" : c->down ? "Q2 down reuse" : "IQ2 mid reuse", c->E, c->hc ? "rank" : "F", c->F, c->T,
         !c->hc && c->shared_type != UINT32_MAX);
     for (uint32_t mode = 0; mode < (c->hc ? 3u : 2u); mode++) {
         m1_reuse_select(c->hc, mode);
@@ -2874,7 +2877,8 @@ static void test_m1_reuse(arena_t *a, bool benchmark, const char *only) {
     }
     printf("M1 reuse screen: explicit generic vs automatic (device-dependent) kernels%s\n",
            benchmark ? "; timing includes CPU encoding and final GPU wait" : "");
-    if (!only || strcmp(only, "hc") != 0) {
+    const bool all = !only || strcmp(only, "1") == 0;
+    if (all || strcmp(only, "iq2") == 0) {
         const uint32_t rows[] = {640u, 641u};
         for (uint32_t shape = 0; shape < 2u; shape++) {
             m1_reuse_case c = { .arena = a, .E = 2560u, .F = rows[shape], .NE = 12u, .slots = 10u };
@@ -2898,7 +2902,33 @@ static void test_m1_reuse(arena_t *a, bool benchmark, const char *only) {
             ds4_gpu_tensor_free(c.selected); ds4_gpu_tensor_free(c.x);
         }
     }
-    if (!only || strcmp(only, "iq2") != 0) {
+    if (all || strcmp(only, "q2") == 0) {
+        const uint32_t rows[] = {2560u, 2561u};
+        for (uint32_t shape = 0; shape < 2u; shape++) {
+            m1_reuse_case c = { .arena = a, .down = true, .E = rows[shape], .F = 640u,
+                .NE = 12u, .slots = 10u };
+            double *shadow;
+            /* The physical last block has random nonzero values beyond the
+             * 640 activation columns; both row kernels must ignore them. */
+            c.down_weights = arena_q2_K(a, (uint64_t)c.NE * c.E, 768u, &shadow, 0.05f); free(shadow);
+            c.shared_down = arena_q8_0(a, c.E, c.F, &shadow, 0.05f); free(shadow);
+            const uint64_t nx = 3u * (c.slots + 1u) * c.F;
+            float *x = rand_vec(nx, 1.0f);
+            for (uint64_t i = 0; i < nx; i++) x[i] *= i % 7u == 0u ? 8.0f : i % 7u == 1u ? 0.125f : 1.0f;
+            c.x = upload(x, nx); free(x);
+            int32_t selected[30];
+            for (uint32_t t = 0; t < 3u; t++) for (uint32_t s = 0; s < c.slots; s++)
+                selected[t * c.slots + s] = (int32_t)((t * 7u + s * 5u) % c.NE);
+            c.selected = ds4_gpu_tensor_alloc(sizeof(selected));
+            require_ok(c.selected && ds4_gpu_tensor_write(c.selected, 0, selected, sizeof(selected)), "Q2 reuse selected IDs");
+            for (c.T = 1u; c.T <= 3u; c.T++) for (uint32_t shared = 0; shared < 2u; shared++) {
+                c.shared_type = shared ? 8u : UINT32_MAX;
+                m1_reuse_compare(&c, benchmark && shape == 0u && shared != 0u);
+            }
+            ds4_gpu_tensor_free(c.selected); ds4_gpu_tensor_free(c.x);
+        }
+    }
+    if (all || strcmp(only, "hc") == 0) {
         const uint32_t widths[] = {33u, 2560u};
         for (uint32_t shape = 0; shape < 2u; shape++) {
             m1_reuse_case c = { .arena = a, .hc = true, .E = widths[shape], .F = 320u };
@@ -3385,7 +3415,7 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
 
 int main(void) {
     /* A focused path avoids the full suite's large arena and dispatch bench.
-     * ONLY accepts 1 (both), iq2 or hc; BENCH=1 adds paired resident timings. */
+     * ONLY accepts 1 (all), iq2, q2 or hc; BENCH=1 adds paired resident timings. */
     const char *reuse_only = getenv("DS4_TEST_QWEN4_M1_REUSE_ONLY");
     const char *reuse_bench = getenv("DS4_TEST_QWEN4_M1_REUSE_BENCH");
     const char *mtp_only = getenv("DS4_TEST_QWEN4_MTP_OPT_ONLY");

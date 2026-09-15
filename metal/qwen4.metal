@@ -2671,6 +2671,62 @@ kernel void kernel_qwen4_moe_down(
     }
 }
 
+/* Q2_K NR2 down rows reuse each activation load across two independent
+ * accumulators. Keep the generic lane mapping, block/element order and SIMD
+ * reduction, including the unread 128-element weight padding at width 640. */
+kernel void kernel_qwen4_moe_down_q2k(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *down_base,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *part,
+        device const char *sh_down,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = qwen4_moe_slot(args, tgpig.y, tgpig.z), tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const uint64_t pair = (uint64_t)tok * n_out + slot;
+    device const float *m = mid + pair * args.in_dim;
+    if (slot == args.n_slots) {
+        for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+            const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes,
+                                          m, args.shared_type, args.in_dim, tiisg);
+            if (tiisg == 0) part[pair * args.out_rows + r] = v;
+        }
+        return;
+    }
+    device const char *db = qwen4_expert_base(down_base,
+        (uint)selected[(uint64_t)tok * args.n_slots + slot], args.expert_bytes);
+    const uint group = tiisg / 2u, l = (tiisg % 2u) * 8u;
+    const uint q_base = 32u * (group / 8u) + 16u * (group & 1u);
+    const uint shift = ((group / 2u) & 3u) * 2u;
+    float acc[2] = {0.0f, 0.0f};
+    for (uint ib = 0; ib < 3u; ib++) {
+        const uint column = ib * 256u + group * 16u + l;
+        if (column >= 640u) continue;
+        float y[8];
+        for (uint i = 0; i < 8u; i++) y[i] = m[column + i];
+        for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
+            device const uchar *blk = (device const uchar *)(db +
+                (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 84u);
+            const float d = (float)(*(device const half *)(blk + 80));
+            const float dmin = (float)(*(device const half *)(blk + 82));
+            const uint sc = blk[group];
+            const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
+            device const uchar *qs = blk + 16u + q_base + l;
+            for (uint i = 0; i < 8u; i++) acc[r] += (ds * (float)((qs[i] >> shift) & 3u) - dm) * y[i];
+        }
+    }
+    for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
+        const float v = simd_sum(acc[r]);
+        if (tiisg == 0) part[pair * args.out_rows + row0 + r] = v;
+    }
+}
+
 /* MXFP4 routed down rows with four blocks per lane requested before the
  * accumulation chain.  The shipped qwen4_row_dot loop for type 39 compiles
  * to s = t0*y0 + t1*y1 + t2*y16 + t3*y17 (left to right), acc += s*d; that
@@ -3091,6 +3147,7 @@ kernel void kernel_qwen4_moe_mm_mid(
     const uint rb = block.x, e = tgpig.y;
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
+    if (!count) return;
     uint work_count = count, work_start = 0;
     if (qwen4_moe_tail_base) {
         const uint remainder = count % qwen4_moe_tail_base;
@@ -3215,6 +3272,7 @@ kernel void kernel_qwen4_moe_mm_down(
     const uint rb = block.x, e = tgpig.y;
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
+    if (!count) return;
     uint work_count = count, work_start = 0;
     if (qwen4_moe_tail_base) {
         const uint remainder = count % qwen4_moe_tail_base;
@@ -3391,6 +3449,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
     const uint e = tgpig.y;
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
+    if (!count) return;
     /* tails: with tail_base 64 the 64-token tiles keep the full tiles and the
      * 32-token kernel takes a remainder of at most 32 tokens */
     uint work_count = count, work_start = 0;
@@ -3549,6 +3608,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
     const uint e = tgpig.y;
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
+    if (!count) return;
     /* tails: with tail_base 64 the 64-token tiles keep the full tiles and the
      * 32-token kernel takes a remainder of at most 32 tokens */
     uint work_count = count, work_start = 0;

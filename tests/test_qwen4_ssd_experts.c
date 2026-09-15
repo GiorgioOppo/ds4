@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 /* Real SSD reads with a sparse 512-expert file. Only 24 experts contain data;
@@ -29,7 +30,7 @@ typedef struct { ds4_gpu_tensor *base, *view; uint64_t n; } guarded;
  * alone cannot prove selected-only reads: reading a hole succeeds with zeros. */
 static pthread_mutex_t probe_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct {
-    int enabled, fd, empty_fd, violation;
+    int enabled, fd, empty_fd, violation, fail_projection, require_gate_up_first;
     uint32_t inflight;
     uint64_t offset[3], stride[3], bytes, calls, coverage[3][E];
     unsigned char selected[E];
@@ -63,6 +64,16 @@ ssize_t ds4_test_pread(int fd, void *dst, size_t bytes, off_t offset) {
         pthread_mutex_unlock(&probe_mutex);
         errno = EIO; return -1;
     }
+    if (projection == 2 && probe.require_gate_up_first) {
+        for (unsigned e = 0; e < E; e++) if (probe.selected[e]) {
+            if (probe.coverage[0][e] != probe.stride[0] ||
+                probe.coverage[1][e] != probe.stride[1]) probe.violation = 1;
+        }
+    }
+    if (projection == probe.fail_projection) {
+        pthread_mutex_unlock(&probe_mutex);
+        errno = EIO; return -1;
+    }
     probe.inflight++;
     pthread_mutex_unlock(&probe_mutex);
     const ssize_t got = pread(fd, dst, bytes, offset);
@@ -87,6 +98,7 @@ static void probe_begin(const weights *w, const int32_t *ids, uint64_t n, int fd
     need(!probe.enabled && !probe.inflight, "read probe idle");
     memset(&probe, 0, sizeof(probe));
     probe.fd = fd; probe.empty_fd = empty_fd; probe.enabled = 1;
+    probe.fail_projection = -1;
     probe.offset[0] = w->table.gate_offset; probe.offset[1] = w->table.up_offset;
     probe.offset[2] = w->table.down_offset;
     probe.stride[0] = probe.stride[1] = w->table.gate_expert_bytes;
@@ -235,6 +247,24 @@ static int project(const weights *w, uint32_t T, int streamed,
         E, T, S, S, D, F, T) &&
         ds4_gpu_qwen4_moe_mm_down_tensor(part, mid, lists, counts,
         a->model_map, a->model_size, a->down_offset, w->down_type, E, T, S, S, F, D, T);
+}
+
+static int project_split(const weights *w, uint32_t T, uint32_t slots, int shared,
+                         int streamed, ds4_gpu_tensor *mid, ds4_gpu_tensor *part,
+                         ds4_gpu_tensor *x, ds4_gpu_tensor *ids,
+                         ds4_gpu_tensor *lists, ds4_gpu_tensor *counts) {
+    if (!lists) return project_rows(w, T, slots, shared, streamed, mid, part, x, ids);
+    need(slots == S && !shared, "routed-only MM split shape");
+    return project(w, T, streamed, mid, part, x, ids, lists, counts);
+}
+
+/* The automatic prefill overlap currently targets M1 Max. Other devices
+ * still run these numerical and I/O cases, but have no prefix on read failure. */
+static int mm_overlap_expected(void) {
+    char brand[128] = {0}; size_t bytes = sizeof(brand);
+    need(sysctlbyname("machdep.cpu.brand_string", brand, &bytes, NULL, 0) == 0,
+         "read MM overlap device policy");
+    return strstr(brand, "M1 Max") != NULL;
 }
 
 /* Both arms use the same row/MM arithmetic and the same final reduction/HC.
@@ -413,20 +443,30 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
     check_case_impl(w, T, route, good_fd, empty_fd, fail_first, warm_probe, 0);
 }
 
-/* Exercise slot masks with real cache hits. The read allowlist contains only
- * missing unique experts, so duplicate slots cannot cause duplicate I/O.
+/* Exercise row masks and MM count partitions with real cache hits. The read
+ * allowlist contains only missing experts, so slots cannot duplicate I/O.
  * On read failure, completed resident/shared mid rows prove that the early
  * GPU dispatch actually ran; missing rows and final reduction must remain untouched. */
 static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int shared,
                             uint32_t seed_count, int duplicates, int fail_first,
                             int good_fd, int empty_fd) {
     enum { MAX_SLOTS = 16, INJ = HC * DS4_QWEN4_HC_CHUNKS * HC };
-    need(T >= 1 && T <= 3 && slots <= MAX_SLOTS && slots >= 4 && seed_count <= 4, "split fixture shape");
-    const uint32_t unique = slots - (duplicates ? 3u : 0u), stride = slots + shared;
-    const uint32_t budget = slots > BUDGET ? slots : BUDGET;
-    int32_t ids[3 * MAX_SLOTS], seeds[4], missing[MAX_SLOTS];
+    const int mm = T > 8;
+    need(slots <= MAX_SLOTS && slots >= 4 &&
+         (mm ? T <= 128 && slots == S && !shared && !duplicates && (seed_count == 0 || seed_count == 12) :
+               T >= 1 && T <= 3 && seed_count <= 4), "split fixture shape");
+    const uint32_t unique = mm ? 24u : slots - (duplicates ? 3u : 0u), stride = slots + shared;
+    const uint32_t budget = unique > BUDGET ? unique : BUDGET;
+    int32_t *ids = malloc((size_t)T * slots * sizeof(*ids)), seeds[24], missing[24];
     unsigned char cached[E] = {0};
-    float x[3 * D], mix[3 * MAX_SLOTS], r[3 * D * HC], inj[3 * INJ], shared_gate[3] = {0.375f, -0.125f, 0.5f};
+    float *x = malloc((size_t)T * D * sizeof(*x)), *mix = malloc((size_t)T * slots * sizeof(*mix));
+    float *r = malloc((size_t)T * D * HC * sizeof(*r)), *inj = malloc((size_t)T * INJ * sizeof(*inj));
+    float *shared_gate = malloc((size_t)T * sizeof(*shared_gate));
+    need(ids && x && mix && r && inj && shared_gate, "split host inputs");
+    for (uint32_t t = 0; t < T; t++) {
+        const float values[] = {0.375f, -0.125f, 0.5f};
+        shared_gate[t] = values[t % 3u];
+    }
     rng = 0x5618u + slots * 3u + w->gate_type;
     for (uint32_t i = 0; i < T * D; i++) x[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
     for (uint32_t i = 0; i < T * D * HC; i++) r[i] = ((int)(random_u32() % 257) - 128) / 256.f;
@@ -434,7 +474,16 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
     for (uint32_t i = 0; i < seed_count; i++) { seeds[i] = active[2 * i]; cached[seeds[i]] = 1; }
     for (uint32_t t = 0; t < T; t++) for (uint32_t s = 0; s < slots; s++) {
         uint32_t e = s % unique;
-        if (t == 1 && seed_count) {
+        if (mm) {
+            /* Eight hot experts coexist with small tails. Past row 32,
+             * concentrate the remaining slots so T128 still has 1..8 tails.
+             * Distinct IDs within each token keep all counts <= list_cap. */
+            e = s < 8u ? s : t < 33u ? 8u + (2u * t + s - 8u) % 16u : s;
+            /* T33 keeps eight counts at 33 to exercise automatic NT1.
+             * Other batches also contain all-missing/all-resident rows. */
+            if (T != 33u && t == 1u && seed_count) e = 2u * s + 1u;
+            if (T != 33u && t == 2u && seed_count) e = 2u * s;
+        } else if (t == 1 && seed_count) {
             /* This row has no routed residents; its empty prefix mask must
              * skip all slots when there is no shared expert. */
             while (cached[active[e]]) e = (e + 1u) % unique;
@@ -447,20 +496,31 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         mix[t * slots + s] = (s + 1.f) / (slots * (slots + 1.f) / 2.f);
     }
     guarded inputs[] = {output(T * D), output(T * slots), output(T * slots), output(T), output(T * INJ)};
-    const void *host[] = {x, ids, mix, &shared_gate, inj};
+    const void *host[] = {x, ids, mix, shared_gate, inj};
     float *input_copy[5];
     for (unsigned i = 0; i < 5; i++) {
         reset(inputs + i);
         need(ds4_gpu_tensor_write(inputs[i].view, 0, host[i], inputs[i].n * 4), "split guarded input");
         input_copy[i] = read_output(inputs + i);
     }
+    guarded routing[2] = {{0}, {0}};
+    float *routing_copy[2] = {NULL, NULL};
+    if (mm) {
+        routing[0] = output((uint64_t)E * T); routing[1] = output(E);
+        reset(routing); reset(routing + 1);
+        need(ds4_gpu_qwen4_moe_build_lists_tensor(routing[0].view, routing[1].view,
+             inputs[1].view, T, slots, E, T), "split GPU lists");
+        for (unsigned i = 0; i < 2; i++) routing_copy[i] = read_output(routing + i);
+        check_mm_lists(ids, T, 4, routing_copy[0], routing_copy[1]);
+    }
+    ds4_gpu_tensor *lists = routing[0].view, *counts = routing[1].view;
     guarded outputs[] = {output((uint64_t)T * stride * F), output((uint64_t)T * stride * D), output(T * D), output(T * D * HC)};
     const char *stages[] = {"split mid", "split down", "split reduce", "split HC"};
     float *reference[4];
     for (unsigned i = 0; i < 4; i++) reset(outputs + i);
     need(ds4_gpu_tensor_write(outputs[3].view, 0, r, T * D * HC * sizeof(float)), "split reference residual");
-    need(ds4_gpu_begin_commands() && project_rows(w, T, slots, shared, 0,
-         outputs[0].view, outputs[1].view, inputs[0].view, inputs[1].view), "split resident reference");
+    need(ds4_gpu_begin_commands() && project_split(w, T, slots, shared, 0,
+         outputs[0].view, outputs[1].view, inputs[0].view, inputs[1].view, lists, counts), "split resident reference");
     need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, inputs[2].view,
          shared ? inputs[3].view : NULL, NULL, outputs[3].view, inputs[4].view,
          T, slots, stride, D, HC) && ds4_gpu_end_commands(), "split reference reduce");
@@ -471,27 +531,38 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
     need(ds4_gpu_set_model_fd(good_fd), "split source fd");
     if (seed_count) need(ds4_gpu_stream_expert_cache_seed_experts(&w->table, seeds, NULL, seed_count), "split cache seed");
     need(ds4_gpu_stream_expert_cache_current_count() == seed_count, "split exact initial cache");
-    if (fail_first) {
+    for (unsigned failure = 0; failure < (fail_first == 2 ? 4u : !!fail_first); failure++) {
         uint32_t n_missing = 0;
         for (uint32_t i = 0; i < unique; i++) if (!cached[active[i]]) missing[n_missing++] = active[i];
         for (unsigned i = 0; i < 4; i++) reset(outputs + i);
         need(ds4_gpu_tensor_write(outputs[3].view, 0, r, T * D * HC * sizeof(float)), "split failure residual");
-        need(ds4_gpu_set_model_fd(empty_fd) && ds4_gpu_begin_commands(), "split failed-read begin");
+        need(ds4_gpu_set_model_fd(fail_first == 2 ? good_fd : empty_fd) &&
+             ds4_gpu_begin_commands(), "split failed-read begin");
         probe_begin(w, missing, n_missing, good_fd, empty_fd);
-        need(!project_rows(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
-                          inputs[0].view, inputs[1].view), "split read failure");
+        if (fail_first == 2) {
+            pthread_mutex_lock(&probe_mutex);
+            probe.fail_projection = 2;
+            probe.require_gate_up_first = mm_overlap_expected();
+            pthread_mutex_unlock(&probe_mutex);
+        }
+        need(!project_split(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
+                            inputs[0].view, inputs[1].view, lists, counts), "split read failure");
         need(ds4_gpu_commands_active() && ds4_gpu_end_commands(), "split failure drains and preserves batch");
         const read_stats reads = probe_end(0, 0);
-        need(reads.calls && !reads.bytes, "split attempted missing reads on empty fd");
+        need(reads.calls && reads.bytes == (fail_first == 2 ?
+             (uint64_t)n_missing * 2u * w->table.gate_expert_bytes : 0u),
+             "split failure consumes only complete gate/up or no payload");
+        const int prefix = !mm || mm_overlap_expected();
         for (unsigned stage = 0; stage < 2; stage++) {
             const uint32_t dim = stage ? D : F;
             float *got = read_output(outputs + stage);
             for (uint32_t t = 0; t < T; t++) for (uint32_t s = 0; s < stride; s++) {
                 const uint64_t off = GUARD + ((uint64_t)t * stride + s) * dim;
-                if (s == slots || cached[ids[t * slots + s]])
+                if (prefix && (s == slots || cached[ids[t * slots + s]] ||
+                               (stage == 0 && mm && fail_first == 2)))
                     exact("completed early mid/down slot", reference[stage] + off, got + off, dim);
                 else for (uint32_t i = 0; i < dim; i++)
-                    need(!memcmp(got + off + i, &poison, 4), "missing mid/down untouched on failure");
+                    need(!memcmp(got + off + i, &poison, 4), "unavailable projection untouched on failure");
             }
             exact("failed prefix leading guard", reference[stage], got, GUARD);
             exact("failed prefix trailing guard", reference[stage] + GUARD + outputs[stage].n,
@@ -519,8 +590,8 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         need(ds4_gpu_tensor_write(outputs[3].view, 0, r, T * D * HC * sizeof(float)), "split reset residual");
         need(ds4_gpu_begin_commands(), "split projection begin");
         probe_begin(w, missing, n_missing, good_fd, empty_fd);
-        need(project_rows(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
-                          inputs[0].view, inputs[1].view), "split retry/warm projection");
+        need(project_split(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
+                           inputs[0].view, inputs[1].view, lists, counts), "split retry/warm projection");
         need(ds4_gpu_commands_active(), "split projection batch ownership");
         need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, inputs[2].view,
              shared ? inputs[3].view : NULL, NULL, outputs[3].view, inputs[4].view,
@@ -540,9 +611,15 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         exact("split frozen input and guards", input_copy[i], got, inputs[i].n + 2 * GUARD);
         free(got); free(input_copy[i]); free_output(inputs + i);
     }
+    if (mm) for (unsigned i = 0; i < 2; i++) {
+        float *got = read_output(routing + i);
+        exact("split frozen lists/counts and guards", routing_copy[i], got, routing[i].n + 2 * GUARD);
+        free(got); free(routing_copy[i]); free_output(routing + i);
+    }
     for (unsigned i = 0; i < 4; i++) { free(reference[i]); free_output(outputs + i); }
-    printf("PASS Qwen SSD split T%u %u/%u slots=%u shared=%d seeded=%u unique=%u retry=%d: exact all stages, missing-only %llu bytes, warm0\n",
-           T, w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes);
+    free(ids); free(x); free(mix); free(r); free(inj); free(shared_gate);
+    printf("PASS Qwen SSD split T%u %s %u/%u slots=%u shared=%d seeded=%u unique=%u retry=%d: exact all stages, missing-only %llu bytes, warm0\n",
+           T, mm ? "MM" : "rows", w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes);
 }
 
 int main(void) {
@@ -632,6 +709,23 @@ int main(void) {
         check_split_one(formats, T, 10, 1, 0, 0, 1, fileno(file), fileno(empty));
         check_split_one(formats + 1, T, 16, 1, 4, 0, 1, fileno(file), fileno(empty));
         check_split_one(formats + 2, T, 10, 1, 4, 0, 1, fileno(file), fileno(empty));
+    }
+    check_split_one(formats, 29, S, 0, 12, 0, 1, fileno(file), fileno(empty));
+    check_split_one(formats, 33, S, 0, 12, 0, 1, fileno(file), fileno(empty));
+    check_split_one(formats, 128, S, 0, 12, 0, 1, fileno(file), fileno(empty));
+    check_split_one(formats, 128, S, 0, 12, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats, 33, S, 0, 0, 0, 1, fileno(file), fileno(empty));
+    check_split_one(formats + 1, 33, S, 0, 12, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats + 2, 29, S, 0, 12, 0, 0, fileno(file), fileno(empty));
+    /* Gate/up completion must precede down reads on the enabled device.
+     * Other GPUs keep the single read batch and may stop before all gate/up
+     * tasks finish. Repeated failure also checks reservation cleanup. */
+    for (uint32_t f = 0; mm_overlap_expected() && f < 3; f++) {
+        const uint32_t shapes[] = {29, 33, 128};
+        for (uint32_t i = 0; i < 3; i++) {
+            check_split_one(formats + f, shapes[i], S, 0, 0, 0, 2, fileno(file), fileno(empty));
+            check_split_one(formats + f, shapes[i], S, 0, 12, 0, 2, fileno(file), fileno(empty));
+        }
     }
     ds4_gpu_cleanup(); munmap(map, bytes); fclose(empty); fclose(file);
     puts("PASS Qwen SSD: cache, exact selected-only reads, full-selection fallback and retry");

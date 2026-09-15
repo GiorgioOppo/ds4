@@ -644,6 +644,7 @@ test-qwen4-kernels: $(QWEN4_KERNEL_TEST)
 
 test-qwen4-q2: $(QWEN4_KERNEL_TEST) tests/test_qwen4_moe_mm_specialize
 	DS4_TEST_QWEN4_MV_EXACT=1 ./$(QWEN4_KERNEL_TEST)
+	DS4_TEST_QWEN4_M1_REUSE_ONLY=q2 ./$(QWEN4_KERNEL_TEST)
 	./tests/test_qwen4_moe_mm_specialize
 
 # DS4_QWEN4_SNAPSHOT=<HF checkpoint dir> DS4_QWEN4_MMPROJ=<mmproj.gguf> DS4_QWEN4_IMAGE=<image>
