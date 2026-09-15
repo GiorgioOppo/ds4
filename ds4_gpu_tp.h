@@ -53,6 +53,15 @@ void ds4_gpu_tp_keepalive_pause(int paused);
 void ds4_gpu_tp_set_attn_head_split(int enabled);
 
 #if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* Split the bulk arrival from its wait so independent compute may overlap. */
+int ds4_gpu_tp_big_gate_overlap_supported(void);
+int ds4_gpu_tp_big_gate_begin(uint32_t layer, uint32_t rows,
+                            const ds4_gpu_tensor *out_t,
+                            ds4_gpu_tensor *in_t, uint64_t bytes);
+int ds4_gpu_tp_big_gate_join(uint32_t layer, uint32_t rows,
+                           ds4_gpu_tensor *in_t, uint64_t bytes);
+/* Fail the gate and drain GPU users before releasing private scratch. */
+void ds4_gpu_tp_big_gate_abort(void);
 /* Host-coherent slab allocation; views preserve host/device aliases. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_coherent(uint64_t bytes);
 /* Release the queue slot after reduction; skip peer data after failure. */

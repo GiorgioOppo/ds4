@@ -19,6 +19,9 @@ struct rocm_tp_state {
     bool active = false, started = false;
     uint64_t seq = 0, posted = 0, pending = 0, timeout_ticks = 0;
     uint32_t pending_count = 0;
+    bool pending_deferred = false;
+    void *pending_big_in = nullptr;
+    uint64_t pending_big_bytes = 0;
     ds4_gpu_tensor *slab = nullptr, *flags = nullptr;
     ds4_gpu_tensor *big_out = nullptr, *big_in = nullptr;
     rocm_tp_shared *host = nullptr, *device = nullptr;
@@ -157,7 +160,7 @@ extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) { g_r
 extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled) { (void)enabled; }
 extern "C" int ds4_gpu_tp_decode_split_flush_safe(void) { return 0; }
 
-static int rocm_tp_enqueue(rocm_tp_job job, uint32_t count) {
+static int rocm_tp_enqueue(rocm_tp_job job, uint32_t count, bool defer_wait = false) {
     if (!g_rocm_tp.active || g_rocm_tp.pending || ds4_gpu_tp_failed() || g_rocm_tp.seq == UINT64_MAX)
         return rocm_tp_fail();
     const uint64_t seq = g_rocm_tp.seq + 1;
@@ -170,10 +173,11 @@ static int rocm_tp_enqueue(rocm_tp_job job, uint32_t count) {
     job.seq = seq;
     g_rocm_tp.jobs[slot] = job;
     rocm_tp_arrive<<<1, 1>>>(g_rocm_tp.device, slot, seq);
-    rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks);
+    if (!defer_wait) rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks);
     if (!cuda_ok(cudaGetLastError(), "TP gate enqueue")) return rocm_tp_fail();
     g_rocm_tp.seq = g_rocm_tp.pending = seq;
     g_rocm_tp.pending_count = count;
+    g_rocm_tp.pending_deferred = defer_wait;
     pthread_mutex_lock(&g_rocm_tp_mutex);
     __atomic_store_n(&g_rocm_tp.posted, seq, __ATOMIC_RELEASE);
     pthread_cond_signal(&g_rocm_tp_cond);
@@ -206,11 +210,51 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
     rocm_tp_copy<<<256, 256>>>(g_rocm_tp.device, (float *)in_t->ptr, (const float *)g_rocm_tp.big_in->ptr, bytes / 4);
     return cuda_ok(cudaGetLastError(), "TP receive enqueue") || rocm_tp_fail();
 }
+extern "C" int ds4_gpu_tp_big_gate_begin(uint32_t layer, uint32_t rows,
+        const ds4_gpu_tensor *out_t, ds4_gpu_tensor *in_t, uint64_t bytes) {
+    if (!g_rocm_tp.active || g_rocm_tp.pending || !g_rocm_tp.big || ds4_gpu_tp_failed() || layer >= 40u ||
+        !rows || rows > UINT32_MAX / 5120u || bytes != (uint64_t)rows * 20480u || !out_t || !in_t ||
+        bytes > out_t->bytes || bytes > in_t->bytes) return rocm_tp_fail();
+    if (!g_rocm_tp.big_out || g_rocm_tp.big_out->bytes < bytes) {
+        if (!ds4_gpu_synchronize() || ds4_gpu_tp_failed()) return rocm_tp_fail();
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc_coherent(bytes);
+        ds4_gpu_tensor *rx = ds4_gpu_tensor_alloc_coherent(bytes);
+        if (!tx || !rx) { ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(rx); return rocm_tp_fail(); }
+        ds4_gpu_tensor_free(g_rocm_tp.big_out); ds4_gpu_tensor_free(g_rocm_tp.big_in);
+        g_rocm_tp.big_out = tx; g_rocm_tp.big_in = rx;
+    }
+    rocm_tp_copy<<<256, 256>>>(g_rocm_tp.device, (float *)g_rocm_tp.big_out->ptr, (const float *)out_t->ptr, bytes / 4);
+    if (!rocm_tp_enqueue({0, bytes, layer, rows, 2, g_rocm_tp.big_out->host_ptr, g_rocm_tp.big_in->host_ptr}, rows * 5120u, true)) return 0;
+    g_rocm_tp.pending_big_in = in_t->ptr;
+    g_rocm_tp.pending_big_bytes = bytes;
+    return 1;
+}
+extern "C" int ds4_gpu_tp_big_gate_join(uint32_t layer, uint32_t rows,
+        ds4_gpu_tensor *in_t, uint64_t bytes) {
+    const uint64_t seq = g_rocm_tp.pending;
+    if (!g_rocm_tp.active || !seq || !g_rocm_tp.pending_deferred ||
+        !in_t || !in_t->ptr || in_t->ptr != g_rocm_tp.pending_big_in ||
+        bytes != g_rocm_tp.pending_big_bytes || bytes > in_t->bytes ||
+        rows > UINT32_MAX / 5120u || rows * 5120u != g_rocm_tp.pending_count ||
+        ds4_gpu_tp_failed()) return rocm_tp_fail();
+    const unsigned slot = (unsigned)((seq - 1) % ROCM_TP_QUEUE);
+    const rocm_tp_job &job = g_rocm_tp.jobs[slot];
+    if (job.seq != seq || job.kind != 2 || job.layer != layer || job.arg != rows ||
+        job.bytes != bytes) return rocm_tp_fail();
+    rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks);
+    rocm_tp_copy<<<256, 256>>>(g_rocm_tp.device, (float *)in_t->ptr,
+                            (const float *)g_rocm_tp.big_in->ptr, bytes / 4);
+    if (!cuda_ok(cudaGetLastError(), "TP deferred receive")) return rocm_tp_fail();
+    g_rocm_tp.pending_deferred = false;
+    g_rocm_tp.pending_big_in = nullptr;
+    g_rocm_tp.pending_big_bytes = 0;
+    return 1;
+}
 extern "C" int ds4_gpu_tp_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
                                      const ds4_gpu_tensor *b, uint32_t n) {
     const uint64_t seq = g_rocm_tp.pending;
     const uint64_t bytes = (uint64_t)n * 4;
-    if (!g_rocm_tp.active || !seq || !out || !a || !b || n != g_rocm_tp.pending_count ||
+    if (!g_rocm_tp.active || !seq || g_rocm_tp.pending_deferred || !out || !a || !b || n != g_rocm_tp.pending_count ||
         bytes > out->bytes || bytes > a->bytes || bytes > b->bytes || ds4_gpu_tp_failed()) return rocm_tp_fail();
     const unsigned slot = (unsigned)((seq - 1) % ROCM_TP_QUEUE);
     /* Avoid coherent guard loads from idle workgroups on scalar payloads.
@@ -220,4 +264,12 @@ extern "C" int ds4_gpu_tp_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     rocm_tp_release<<<1, 1>>>(g_rocm_tp.device, slot, seq);
     g_rocm_tp.pending = 0;
     return cuda_ok(cudaGetLastError(), "TP guarded reduction") || rocm_tp_fail();
+}
+
+extern "C" int ds4_gpu_tp_big_gate_overlap_supported(void) {
+    return ds4_rocm_is_gfx1151();
+}
+extern "C" void ds4_gpu_tp_big_gate_abort(void) {
+    rocm_tp_fail();
+    (void)ds4_gpu_synchronize();
 }

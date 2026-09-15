@@ -41547,6 +41547,42 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+#ifdef DS4_ROCM_BUILD
+/* The CED encoder already replicates shared experts. Only defer that work;
+ * keep the routed rank0+rank1 reduction and final routed+shared addition. */
+static bool ds41_moe_batch_overlap(ds41_gpu_graph *g, const ds4_model *m,
+                                   const ds4_layer_weights *l, uint32_t il,
+                                   uint32_t count) {
+    ds41_prefill_row *b = &g->batch;
+    ds4_gpu_tensor *peer = b->q;
+    const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
+    if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
+        !ds41_route_batch(g, m, l, count) ||
+        !ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
+            b->norm, count, g->tp_rank)) return false;
+    if (!ds4_gpu_tp_big_gate_begin(il, count, b->routed, peer, bytes)) {
+        ds4_gpu_tp_big_gate_abort();
+        return false;
+    }
+    /* low/x hold shared scratch/output; block holds the routed partial and
+     * q is dead until the receive. norm survives both expert computations. */
+    const bool ok =
+        ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
+        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true) &&
+        ds4_gpu_tp_big_gate_join(il, count, peer, bytes) &&
+        ds4_gpu_tp_add_tensor(b->routed, g->tp_rank ? peer : b->routed,
+            g->tp_rank ? b->routed : peer, count * DS4_N_EMBD);
+    if (!ok) ds4_gpu_tp_big_gate_abort();
+    return ok;
+}
+#endif
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner) {
@@ -42456,6 +42492,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
+#ifdef DS4_ROCM_BUILD
+                if (il < 20u && g->tp_world == 2u && count >= 32u && count <= 2048u &&
+                    ds4_gpu_tp_big_gate_overlap_supported())
+                    ok = ds41_moe_batch_overlap(g, m, &w->layer[il], il, count);
+                else
+#endif
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
