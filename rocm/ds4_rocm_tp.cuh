@@ -83,6 +83,32 @@ static __global__ void rocm_tp_add(rocm_tp_shared *s, unsigned slot, uint64_t se
 static __global__ void rocm_tp_release(rocm_tp_shared *s, unsigned slot, uint64_t seq) {
     __hip_atomic_store(&s->slots[slot].consumed, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
+static bool rocm_tp_fused_scalar_gate(void) { return g_deepseek41_model; }
+static __global__ void rocm_tp_wait_add_release(rocm_tp_shared *s, unsigned slot,
+        uint64_t seq, uint64_t ticks, float *out, const float *a, const float *b, uint32_t n) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        ok = 0;
+        const uint64_t start = wall_clock64();
+        while (!rocm_tp_aborted(s)) {
+            const uint64_t done = __hip_atomic_load(
+                    &s->slots[slot].done, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+            if (done == seq) { ok = 1; break; }
+            if (done > seq || wall_clock64() - start >= ticks) {
+                __hip_atomic_store(&s->abort, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                break;
+            }
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+    if (ok)
+        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) out[i] = a[i] + b[i];
+    __syncthreads();
+    if (threadIdx.x == 0)
+        __hip_atomic_store(&s->slots[slot].consumed, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
 static void rocm_tp_pause(unsigned *spins) {
     if (++*spins < 100) { sched_yield(); return; }
     const struct timespec delay = {0, 10000};
@@ -173,7 +199,8 @@ static int rocm_tp_enqueue(rocm_tp_job job, uint32_t count, bool defer_wait = fa
     job.seq = seq;
     g_rocm_tp.jobs[slot] = job;
     rocm_tp_arrive<<<1, 1>>>(g_rocm_tp.device, slot, seq);
-    if (!defer_wait) rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks);
+    if (!defer_wait && !(job.kind == 0 && rocm_tp_fused_scalar_gate()))
+        rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks);
     if (!cuda_ok(cudaGetLastError(), "TP gate enqueue")) return rocm_tp_fail();
     g_rocm_tp.seq = g_rocm_tp.pending = seq;
     g_rocm_tp.pending_count = count;
@@ -260,8 +287,13 @@ extern "C" int ds4_gpu_tp_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     /* Avoid coherent guard loads from idle workgroups on scalar payloads.
      * The grid-stride loop preserves full coverage for larger batches. */
     const uint32_t blocks = n / 256u + (n % 256u != 0u);
-    rocm_tp_add<<<blocks < 256u ? blocks : 256u, 256>>>(g_rocm_tp.device, slot, seq, (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
-    rocm_tp_release<<<1, 1>>>(g_rocm_tp.device, slot, seq);
+    if (n == 5120u && g_rocm_tp.jobs[slot].kind == 0 && rocm_tp_fused_scalar_gate()) {
+        rocm_tp_wait_add_release<<<1, 1024>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks,
+                (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+    } else {
+        rocm_tp_add<<<blocks < 256u ? blocks : 256u, 256>>>(g_rocm_tp.device, slot, seq, (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+        rocm_tp_release<<<1, 1>>>(g_rocm_tp.device, slot, seq);
+    }
     g_rocm_tp.pending = 0;
     return cuda_ok(cudaGetLastError(), "TP guarded reduction") || rocm_tp_fail();
 }
