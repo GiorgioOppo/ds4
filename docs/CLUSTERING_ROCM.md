@@ -182,23 +182,23 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - TCP/RoCE: Intel E810-C QSFP NICs, 100 Gb/s link, MTU 9000. Coordinator NIC negotiated PCIe 3.0 ×4; worker PCIe 4.0 ×4. USB4STREAM: one 40 Gb/s cable link with the interrupt-readback patch above.
 - Existing boot settings include `pci=realloc pcie_aspm=off`, in addition to the [GPU-visible memory settings](STRIX_HALO.md#gpu-visible-memory). Their individual performance effect was not isolated.
 - Linux `7.2.5-100.fc43.x86_64`, ROCm 10.0 SDK (`10.0.0-4`, HIP `7.15.26333`). TuneD `accelerator-performance`, fans at maximum speed on both machines.
-- Same Q2 file, 69,632 allocated context, fresh full prefix, 128 fixed greedy outputs (127 steady), no DSpark or images. Native `ds4-bench`; one run per cell; startup and a 256-token/128-output warmup excluded. Values are **prefill / decode tokens/s**.
+- Same Q2 file, 69,632 allocated context, fresh full prefix, fixed greedy outputs, no DSpark or images. Native `ds4-bench`; startup and a 256-token/128-output warmup excluded. One run per cell; values are **prefill / decode tokens/s**.
 
-| Prompt tokens | TCP, 100 GbE | USB4STREAM, 40 Gb/s | RoCE RC, 100 GbE |
-|---:|---:|---:|---:|
-| 8,192 | 375.02 / 14.35 | 340.56 / 14.34 | 372.02 / 14.64 |
-| 16,384 | 412.62 / 13.95 | 374.76 / 14.20 | 410.44 / 14.40 |
-| 65,536 | 434.16 / 13.70 | 396.84 / 13.76 | 431.55 / 14.10 |
+| Prompt tokens | Generated tokens | TCP, 100 GbE | USB4STREAM, 40 Gb/s | RoCE RC, 100 GbE |
+|---:|---:|---:|---:|---:|
+| 1,024 | 128 | 123.54 / 15.42 | 121.03 / 15.48 | 123.80 / 15.94 |
+| 16,384 | 512 | 412.94 / 15.59 | 378.55 / 15.63 | 410.54 / 15.94 |
+| 65,536 | 128 | 432.83 / 14.96 | 398.33 / 14.90 | 431.85 / 15.33 |
 
-- Longer continuation, 16,384 prompt / 512 generated tokens: TCP **411.53 / 14.01**, USB4STREAM **375.56 / 14.29**, RoCE **405.17 / 14.41** prefill/decode tokens/s. Reproduce with `--gen-tokens 512`.
-- All 129,280 frontier logits and printed continuations match across transports at each depth, including 512 outputs. No OOM; minimum usable RAM across the final transport checks: 32.9 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
+- A second RoCE 16K/512 run measured **408.25 / 15.92** prefill/decode tokens/s.
+- All 129,280 frontier logits and complete printed continuations match across transports at each depth. No OOM; minimum usable RAM across the nine cells: 32.9 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
 - RoCE device logs and hardware send counters confirm RDMA payloads on both peers. Its TCP control connection is intentional; similar decode rates do not indicate TCP fallback.
 - V4.1 CED uses about 8B active parameters/token in prefill and 16B in decode. Full prefixes exercise the decoder-suffix optimization; short appends can follow a different schedule. [Architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
 - Results apply to these drives, NIC attachment, profile and USB patch. Other network adapters and USB controllers have not been tested. Long-running production use has not been tested.
 
 ### Appending to an existing prompt
 
-Same hardware, allocation and warmup; one live session, no generation between frontiers. Values time only the newly appended tokens, in tokens/s.
+Separately recorded measurements of the unchanged prefill path: same hardware, allocation and warmup; one live session, no generation between frontiers. Values time only the newly appended tokens, in tokens/s.
 
 | Existing → final tokens | Added tokens | TCP, 100 GbE | USB4STREAM | RoCE |
 |---:|---:|---:|---:|---:|
@@ -208,14 +208,14 @@ Same hardware, allocation and warmup; one live session, no generation between fr
 
 ### TCP over the same USB4 cable
 
-| Transport | 16K prefill | Decode, 128 outputs |
+| Transport | 16K prefill | Decode, 512 outputs |
 |---|---:|---:|
-| TCP over USB4 Ethernet | 371.48 | 12.84 |
-| USB4STREAM | 374.76 | 14.20 |
+| TCP over USB4 Ethernet | 369.07 | 13.89 |
+| USB4STREAM | 378.55 | 15.63 |
 
 - USB4STREAM is optional. Plain TCP over USB4 works with the TCP commands above and the USB IP address. The USB4STREAM setup and stream device are unnecessary for TCP.
-- This single comparison observed less than 1% prefill difference and 10.6% faster decode with USB4STREAM. Identical inputs, allocation, binaries, warmup and outputs; both peers' USB routes and byte counters checked. The Ethernet NIC carried no model payload.
-- TCP recorded 20 USB receive errors on the coordinator. Both runs used the same patched controller; this comparison does not establish stock-kernel behavior or repeatability of the speed difference.
+- This single comparison observed 12.5% faster decode with USB4STREAM; prefill differed by 2.6%. Identical inputs, allocation, binaries, warmup and outputs; both peers' USB routes and byte counters checked.
+- TCP USB receive-error increases: coordinator 0, worker 24. Both runs used the patched controller; this comparison does not establish stock-kernel behavior or repeatability of the speed difference.
 
 ### Reproduce the table
 
@@ -246,12 +246,13 @@ esac
 ```
 
 ```bash
-# Coordinator: repeat separately with DEPTH=8192, 16384, 65536.
+# Coordinator: 16K/512; use DEPTH=1024 or 65536 with GEN=128 for the other rows.
 DEPTH=16384
+GEN=512
 ./ds4-bench-warm --backend rocm -m "$MODEL" \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start "$DEPTH" --ctx-max "$DEPTH" --ctx-alloc 69632 \
-  --gen-tokens 128 --show-output --csv "tp-$TRANSPORT-$DEPTH.csv" \
+  --gen-tokens "$GEN" --show-output --csv "tp-$TRANSPORT-$DEPTH.csv" \
   --dump-frontier-logits-dir "frontiers-$TRANSPORT-$DEPTH" \
   --role coordinator --listen "$COORD" 19475 "${LINK[@]}"
 

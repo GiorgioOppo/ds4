@@ -66,10 +66,10 @@ Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images
 
 | Prompt tokens | Allocated context | Generated tokens | Prefill | Decode |
 |---:|---:|---:|---:|---:|
-| 16,384 | 69,632 | 128 | 302.12 | 8.68 |
-| 65,536 | 69,632 | 128 | 350.56 | 8.49 |
+| 16,384 | 69,632 | 512 | 301.23 | 9.73 |
+| 65,536 | 69,632 | 128 | 350.03 | 9.08 |
 
-- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs. Minimum usable RAM: 15.1 GiB; no OOM. Host zram swap-out pages in table order: 0, 0. No cold-cache claim; other qualification runs recorded nonzero host swap.
+- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs. Minimum usable RAM: 12.25 GiB; no OOM. Host zram swap-out pages in table order: 0, 0. No cold-cache claim; other qualification runs recorded nonzero host swap.
 - The tuned Engram matrix path requires hipBLASLt 100401, revision `8d1ae90e`; other library versions retain the existing fallback and may have different prefill performance.
 - Actual prompts reach 65,536 tokens; populated 256K was not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
 - Six resident image/state cases and two focused SSD cases (photo and screenshot) pass on this source. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
@@ -105,7 +105,7 @@ tuned-adm verify
 MODEL=/absolute/path/DeepSeek-V4.1-Flash-Q2.gguf
 DEPTH=16384
 ALLOC=69632
-GEN=128
+GEN=512
 # Other row: DEPTH=65536 ALLOC=69632 GEN=128
 
 DS4_METAL_CB_TIMES=1 ./ds4-bench --backend rocm -m "$MODEL" \
