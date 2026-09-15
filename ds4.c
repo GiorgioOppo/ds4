@@ -73181,6 +73181,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* Reuse the existing half-logit frames for V4.1 on CUDA as well. */
     e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4
+#ifdef DS4_ROCM_BUILD
+        || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41
+#endif
 #ifndef DS4_ROCM_BUILD
         || (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA)
 #endif
