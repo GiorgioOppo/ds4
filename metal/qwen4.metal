@@ -2231,16 +2231,18 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_type;
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
-    uint32_t slot_mask;    /* mid only: zero executes all slots, including shared */
+    uint32_t slot_mask[3]; /* per-token routed/shared slots for SSD split passes */
+    uint32_t masked_tokens; /* zero disables masking; an empty enabled row skips all slots */
 };
 
 /* SSD split launches compact the grid, but all addressing keeps the original
  * routed/shared slot. Resident specializations eliminate this remapping. */
-static inline uint qwen4_moe_mid_slot(constant ds4_metal_args_qwen4_moe &args,
-                                      uint grid_slot) {
+static inline uint qwen4_moe_slot(constant ds4_metal_args_qwen4_moe &args,
+                                  uint grid_slot, uint token) {
     if (is_function_constant_defined(qwen4_expert_addresses) && qwen4_expert_addresses) {
-        uint mask = args.slot_mask;
-        if (mask) {
+        if (args.masked_tokens) {
+            if (token >= args.masked_tokens || token >= 3u) return 0xffffffffu;
+            uint mask = args.slot_mask[token];
             for (uint i = 0; i < grid_slot && mask; i++) mask &= mask - 1u;
             return mask ? ctz(mask) : 0xffffffffu;
         }
@@ -2429,7 +2431,7 @@ kernel void kernel_qwen4_moe_mid(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
-    const uint slot = qwen4_moe_mid_slot(args, tgpig.y);
+    const uint slot = qwen4_moe_slot(args, tgpig.y, tgpig.z);
     const uint tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint nr = is_function_constant_defined(qwen4_mv_rows) ? qwen4_mv_rows : 2u;
@@ -2472,7 +2474,7 @@ kernel void kernel_qwen4_moe_mid_iq2(
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
     constexpr uint NR = 2;
-    const uint slot = qwen4_moe_mid_slot(args, tgpig.y), tok = tgpig.z;
+    const uint slot = qwen4_moe_slot(args, tgpig.y, tgpig.z), tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
     if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
@@ -2557,7 +2559,7 @@ kernel void kernel_qwen4_moe_mid_q4k(
         ushort3 ntg [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint slot = qwen4_moe_mid_slot(args, tgpig.y), tok = tgpig.z;
+    const uint slot = qwen4_moe_slot(args, tgpig.y, tgpig.z), tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint row0 = (tgpig.x * (ntg.x / 32) + (uint)sgitg) * NR;
     if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
@@ -2647,7 +2649,7 @@ kernel void kernel_qwen4_moe_down(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
-    const uint slot = tgpig.y;
+    const uint slot = qwen4_moe_slot(args, tgpig.y, tgpig.z);
     const uint tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint nr = is_function_constant_defined(qwen4_mv_rows) ? qwen4_mv_rows : 2u;
@@ -2697,7 +2699,7 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
-    const uint slot = tgpig.y;
+    const uint slot = qwen4_moe_slot(args, tgpig.y, tgpig.z);
     const uint tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint nr = is_function_constant_defined(qwen4_mv_rows) ? qwen4_mv_rows : 2u;

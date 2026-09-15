@@ -240,8 +240,9 @@ static int project(const weights *w, uint32_t T, int streamed,
 /* Both arms use the same row/MM arithmetic and the same final reduction/HC.
  * Prefill's shared dense expert is outside this routed-only API. Decode also
  * checks the shared slot, including mixed Q8/MXFP4 weights and its reduction. */
-static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd,
-                       int empty_fd, int fail_first, int warm_probe) {
+static void check_case_impl(const weights *w, uint32_t T, unsigned route, int good_fd,
+                            int empty_fd, int fail_first, int warm_probe,
+                            uint32_t reuse_seed_count) {
     const int mm = T > 8;
     const int compare_mm = mm && T <= 128 && w->gate_type == 16 && w->down_type == 10;
     char *saved_mm_env[5] = {NULL, NULL, NULL, NULL, NULL};
@@ -326,6 +327,28 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
     const unsigned runs = compare_mm ? 6 : warm_probe ? 3 : 2;
     read_stats reads[6] = {{0}};
     for (unsigned run = 0; run < runs; run++) {
+        if (run == 1 && reuse_seed_count) {
+            /* Seed only after the independent resident oracle. The next SSD
+             * call must evict 24 same-size entries for its disjoint route2
+             * union, exercising the plan beyond the older 16-entry bound. */
+            need(reuse_seed_count == 24 && route == 2 && warm_probe && !fail_first,
+                 "full-cache reuse fixture shape");
+            int32_t seeds[24];
+            for (uint32_t i = 0; i < reuse_seed_count; i++) {
+                seeds[i] = (int32_t)(32u + i);
+                for (uint64_t j = 0; j < sn; j++) need(seeds[i] != ids[j], "reuse seed is unselected");
+            }
+            ds4_gpu_set_streaming_expert_cache_budget(reuse_seed_count);
+            ds4_gpu_set_streaming_expert_cache_expert_bytes(
+                2 * w->table.gate_expert_bytes + w->table.down_expert_bytes);
+            need(ds4_gpu_stream_expert_cache_current_count() == 0, "reuse seed starts empty");
+            probe_begin(w, seeds, reuse_seed_count, good_fd, empty_fd);
+            need(ds4_gpu_stream_expert_cache_seed_experts(&w->table, seeds, NULL,
+                 reuse_seed_count), "prime disjoint full cache");
+            (void)probe_end(1, 0);
+            need(ds4_gpu_stream_expert_cache_current_count() == reuse_seed_count,
+                 "reuse cache full before selected batch");
+        }
         /* Preserve the independent generic resident reference. Low-bit MM runs
          * default SSD cold -> old NT4 SSD on these same buffers, followed by
          * NT1/grid4 -> default -> NT1/grid4. This covers both automatic tile
@@ -344,7 +367,8 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
         need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, gw,
             mm ? NULL : gsg, NULL, outputs[3].view, ginj, T, S, stride, D, HC), "reduce and HC");
         need(ds4_gpu_end_commands(), "projection batch drain");
-        reads[run] = probe_end(run && !warm_probe, run == 0 || warm);
+        reads[run] = probe_end(run && (!warm_probe || (reuse_seed_count && run == 1)),
+                               run == 0 || warm);
         for (unsigned i = 0; i < 4; i++) {
             float *got = read_output(outputs + i);
             if (!run) reference[i] = got;
@@ -356,8 +380,9 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
             free(got);
         }
         const uint32_t cached = ds4_gpu_stream_expert_cache_current_count();
-        need(cached <= BUDGET, "bounded cache count");
+        need(cached <= (reuse_seed_count ? reuse_seed_count : BUDGET), "bounded cache count");
         if (run && warm_probe) need(cached >= S, "selected experts cached");
+        if (run && reuse_seed_count) need(cached == reuse_seed_count, "full selected union remains cached");
     }
     need(ds4_gpu_set_model_fd(good_fd), "restore input fd");
     float *read_x = malloc(xn * 4); int32_t *read_ids = malloc(sn * 4);
@@ -383,29 +408,45 @@ static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd
     free(x); free(mix); free(r); free(inj); free(sg); free(ids); free(read_x); free(read_ids);
 }
 
+static void check_case(const weights *w, uint32_t T, unsigned route, int good_fd,
+                       int empty_fd, int fail_first, int warm_probe) {
+    check_case_impl(w, T, route, good_fd, empty_fd, fail_first, warm_probe, 0);
+}
+
 /* Exercise slot masks with real cache hits. The read allowlist contains only
  * missing unique experts, so duplicate slots cannot cause duplicate I/O.
  * On read failure, completed resident/shared mid rows prove that the early
- * GPU dispatch actually ran; missing rows and down must remain untouched. */
-static void check_split_one(const weights *w, uint32_t slots, int shared,
+ * GPU dispatch actually ran; missing rows and final reduction must remain untouched. */
+static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int shared,
                             uint32_t seed_count, int duplicates, int fail_first,
                             int good_fd, int empty_fd) {
     enum { MAX_SLOTS = 16, INJ = HC * DS4_QWEN4_HC_CHUNKS * HC };
-    need(slots <= MAX_SLOTS && slots >= 4 && seed_count <= 4, "split fixture shape");
+    need(T >= 1 && T <= 3 && slots <= MAX_SLOTS && slots >= 4 && seed_count <= 4, "split fixture shape");
     const uint32_t unique = slots - (duplicates ? 3u : 0u), stride = slots + shared;
     const uint32_t budget = slots > BUDGET ? slots : BUDGET;
-    int32_t ids[MAX_SLOTS], seeds[4], missing[MAX_SLOTS];
+    int32_t ids[3 * MAX_SLOTS], seeds[4], missing[MAX_SLOTS];
     unsigned char cached[E] = {0};
-    float x[D], mix[MAX_SLOTS], r[D * HC], inj[INJ], shared_gate = 0.375f;
+    float x[3 * D], mix[3 * MAX_SLOTS], r[3 * D * HC], inj[3 * INJ], shared_gate[3] = {0.375f, -0.125f, 0.5f};
     rng = 0x5618u + slots * 3u + w->gate_type;
-    for (uint32_t i = 0; i < D; i++) x[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
-    for (uint32_t i = 0; i < D * HC; i++) r[i] = ((int)(random_u32() % 257) - 128) / 256.f;
-    for (uint32_t i = 0; i < INJ; i++) inj[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
-    for (uint32_t s = 0; s < slots; s++) {
-        ids[s] = active[s % unique]; mix[s] = (s + 1.f) / (slots * (slots + 1.f) / 2.f);
-    }
+    for (uint32_t i = 0; i < T * D; i++) x[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
+    for (uint32_t i = 0; i < T * D * HC; i++) r[i] = ((int)(random_u32() % 257) - 128) / 256.f;
+    for (uint32_t i = 0; i < T * INJ; i++) inj[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
     for (uint32_t i = 0; i < seed_count; i++) { seeds[i] = active[2 * i]; cached[seeds[i]] = 1; }
-    guarded inputs[] = {output(D), output(slots), output(slots), output(1), output(INJ)};
+    for (uint32_t t = 0; t < T; t++) for (uint32_t s = 0; s < slots; s++) {
+        uint32_t e = s % unique;
+        if (t == 1 && seed_count) {
+            /* This row has no routed residents; its empty prefix mask must
+             * skip all slots when there is no shared expert. */
+            while (cached[active[e]]) e = (e + 1u) % unique;
+        } else if (t == 2 && seed_count) {
+            /* All resident: its empty suffix mask must leave the completed
+             * mid/down outputs untouched while the other rows finish. */
+            e = 2u * (s % seed_count);
+        }
+        ids[t * slots + s] = active[e];
+        mix[t * slots + s] = (s + 1.f) / (slots * (slots + 1.f) / 2.f);
+    }
+    guarded inputs[] = {output(T * D), output(T * slots), output(T * slots), output(T), output(T * INJ)};
     const void *host[] = {x, ids, mix, &shared_gate, inj};
     float *input_copy[5];
     for (unsigned i = 0; i < 5; i++) {
@@ -413,16 +454,16 @@ static void check_split_one(const weights *w, uint32_t slots, int shared,
         need(ds4_gpu_tensor_write(inputs[i].view, 0, host[i], inputs[i].n * 4), "split guarded input");
         input_copy[i] = read_output(inputs + i);
     }
-    guarded outputs[] = {output((uint64_t)stride * F), output((uint64_t)stride * D), output(D), output(D * HC)};
+    guarded outputs[] = {output((uint64_t)T * stride * F), output((uint64_t)T * stride * D), output(T * D), output(T * D * HC)};
     const char *stages[] = {"split mid", "split down", "split reduce", "split HC"};
     float *reference[4];
     for (unsigned i = 0; i < 4; i++) reset(outputs + i);
-    need(ds4_gpu_tensor_write(outputs[3].view, 0, r, sizeof(r)), "split reference residual");
-    need(ds4_gpu_begin_commands() && project_rows(w, 1, slots, shared, 0,
+    need(ds4_gpu_tensor_write(outputs[3].view, 0, r, T * D * HC * sizeof(float)), "split reference residual");
+    need(ds4_gpu_begin_commands() && project_rows(w, T, slots, shared, 0,
          outputs[0].view, outputs[1].view, inputs[0].view, inputs[1].view), "split resident reference");
     need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, inputs[2].view,
          shared ? inputs[3].view : NULL, NULL, outputs[3].view, inputs[4].view,
-         1, slots, stride, D, HC) && ds4_gpu_end_commands(), "split reference reduce");
+         T, slots, stride, D, HC) && ds4_gpu_end_commands(), "split reference reduce");
     for (unsigned i = 0; i < 4; i++) reference[i] = read_output(outputs + i);
 
     ds4_gpu_set_streaming_expert_cache_budget(budget);
@@ -434,29 +475,35 @@ static void check_split_one(const weights *w, uint32_t slots, int shared,
         uint32_t n_missing = 0;
         for (uint32_t i = 0; i < unique; i++) if (!cached[active[i]]) missing[n_missing++] = active[i];
         for (unsigned i = 0; i < 4; i++) reset(outputs + i);
-        need(ds4_gpu_tensor_write(outputs[3].view, 0, r, sizeof(r)), "split failure residual");
+        need(ds4_gpu_tensor_write(outputs[3].view, 0, r, T * D * HC * sizeof(float)), "split failure residual");
         need(ds4_gpu_set_model_fd(empty_fd) && ds4_gpu_begin_commands(), "split failed-read begin");
         probe_begin(w, missing, n_missing, good_fd, empty_fd);
-        need(!project_rows(w, 1, slots, shared, 1, outputs[0].view, outputs[1].view,
+        need(!project_rows(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
                           inputs[0].view, inputs[1].view), "split read failure");
         need(ds4_gpu_commands_active() && ds4_gpu_end_commands(), "split failure drains and preserves batch");
         const read_stats reads = probe_end(0, 0);
         need(reads.calls && !reads.bytes, "split attempted missing reads on empty fd");
-        float *mid = read_output(outputs);
-        for (uint32_t s = 0; s < stride; s++) {
-            const uint64_t off = GUARD + (uint64_t)s * F;
-            if (s == slots || cached[ids[s]]) exact("completed early mid slot", reference[0] + off, mid + off, F);
-            else for (uint32_t i = 0; i < F; i++) need(!memcmp(mid + off + i, &poison, 4), "missing mid untouched on failure");
-        }
-        free(mid);
-        for (unsigned stage = 1; stage < 3; stage++) {
+        for (unsigned stage = 0; stage < 2; stage++) {
+            const uint32_t dim = stage ? D : F;
             float *got = read_output(outputs + stage);
-            for (uint64_t i = 0; i < outputs[stage].n + 2 * GUARD; i++)
-                need(!memcmp(got + i, &poison, 4), "down/reduce untouched on read failure");
+            for (uint32_t t = 0; t < T; t++) for (uint32_t s = 0; s < stride; s++) {
+                const uint64_t off = GUARD + ((uint64_t)t * stride + s) * dim;
+                if (s == slots || cached[ids[t * slots + s]])
+                    exact("completed early mid/down slot", reference[stage] + off, got + off, dim);
+                else for (uint32_t i = 0; i < dim; i++)
+                    need(!memcmp(got + off + i, &poison, 4), "missing mid/down untouched on failure");
+            }
+            exact("failed prefix leading guard", reference[stage], got, GUARD);
+            exact("failed prefix trailing guard", reference[stage] + GUARD + outputs[stage].n,
+                  got + GUARD + outputs[stage].n, GUARD);
             free(got);
         }
+        float *reduced = read_output(outputs + 2);
+        for (uint64_t i = 0; i < outputs[2].n + 2 * GUARD; i++)
+            need(!memcmp(reduced + i, &poison, 4), "reduce untouched on read failure");
+        free(reduced);
         float *residual = read_output(outputs + 3);
-        exact("residual unchanged on read failure", r, residual + GUARD, D * HC); free(residual);
+        exact("residual unchanged on read failure", r, residual + GUARD, T * D * HC); free(residual);
         /* Existing cache cleanup may retire the whole layer after I/O failure.
          * The retry must account for those formerly hot experts becoming misses. */
         const uint32_t left = ds4_gpu_stream_expert_cache_current_count();
@@ -469,15 +516,15 @@ static void check_split_one(const weights *w, uint32_t slots, int shared,
         for (uint32_t i = 0; i < unique; i++) if (!cached[active[i]]) missing[n_missing++] = active[i];
         need(ds4_gpu_set_model_fd(run ? empty_fd : good_fd), "split retry/warm fd");
         for (unsigned i = 0; i < 4; i++) reset(outputs + i);
-        need(ds4_gpu_tensor_write(outputs[3].view, 0, r, sizeof(r)), "split reset residual");
+        need(ds4_gpu_tensor_write(outputs[3].view, 0, r, T * D * HC * sizeof(float)), "split reset residual");
         need(ds4_gpu_begin_commands(), "split projection begin");
         probe_begin(w, missing, n_missing, good_fd, empty_fd);
-        need(project_rows(w, 1, slots, shared, 1, outputs[0].view, outputs[1].view,
+        need(project_rows(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
                           inputs[0].view, inputs[1].view), "split retry/warm projection");
         need(ds4_gpu_commands_active(), "split projection batch ownership");
         need(ds4_gpu_qwen4_moe_reduce_tensor(outputs[2].view, outputs[1].view, inputs[2].view,
              shared ? inputs[3].view : NULL, NULL, outputs[3].view, inputs[4].view,
-             1, slots, stride, D, HC) && ds4_gpu_end_commands(), "split retry/warm reduce");
+             T, slots, stride, D, HC) && ds4_gpu_end_commands(), "split retry/warm reduce");
         const read_stats reads = probe_end(1, !n_missing);
         if (!run) first = reads;
         for (unsigned i = 0; i < 4; i++) {
@@ -494,8 +541,8 @@ static void check_split_one(const weights *w, uint32_t slots, int shared,
         free(got); free(input_copy[i]); free_output(inputs + i);
     }
     for (unsigned i = 0; i < 4; i++) { free(reference[i]); free_output(outputs + i); }
-    printf("PASS Qwen SSD split T1 %u/%u slots=%u shared=%d seeded=%u unique=%u retry=%d: exact all stages, missing-only %llu bytes, warm0\n",
-           w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes);
+    printf("PASS Qwen SSD split T%u %u/%u slots=%u shared=%d seeded=%u unique=%u retry=%d: exact all stages, missing-only %llu bytes, warm0\n",
+           T, w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes);
 }
 
 int main(void) {
@@ -560,6 +607,8 @@ int main(void) {
             check_case(w, T, 3, fileno(file), fileno(empty), 0, 0);
         }
     }
+    check_case_impl(formats, 128, 2, fileno(file), fileno(empty), 0, 1, 24);
+    puts("PASS Qwen SSD full-cache reuse: 24 disjoint victims, missing-only reads, warm0");
     /* A different-size MTP layer must use owned reads without replacing the
      * trunk's slab class. The old trunk selection must still hit with no fd. */
     ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
@@ -569,14 +618,21 @@ int main(void) {
     check_case(formats + 1, 3, 0, fileno(file), fileno(empty), 0, 0);
     need(ds4_gpu_set_model_fd(fileno(empty)), "trunk retained after off-size MTP");
     check_case(formats, 2, 0, fileno(file), fileno(empty), 0, 1);
-    check_split_one(formats, 10, 1, 0, 0, 1, fileno(file), fileno(empty));
-    check_split_one(formats, 10, 1, 4, 0, 1, fileno(file), fileno(empty));
-    check_split_one(formats, 10, 1, 4, 1, 0, fileno(file), fileno(empty));
-    check_split_one(formats, 10, 0, 4, 0, 1, fileno(file), fileno(empty));
-    check_split_one(formats, 10, 0, 4, 0, 0, fileno(file), fileno(empty));
-    check_split_one(formats, 10, 0, 0, 0, 0, fileno(file), fileno(empty));
-    check_split_one(formats + 1, 10, 1, 4, 0, 0, fileno(file), fileno(empty));
-    check_split_one(formats + 1, 16, 1, 4, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats, 1, 10, 1, 0, 0, 1, fileno(file), fileno(empty));
+    check_split_one(formats, 1, 10, 1, 4, 0, 1, fileno(file), fileno(empty));
+    check_split_one(formats, 1, 10, 1, 4, 1, 0, fileno(file), fileno(empty));
+    check_split_one(formats, 1, 10, 0, 4, 0, 1, fileno(file), fileno(empty));
+    check_split_one(formats, 1, 10, 0, 4, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats, 1, 10, 0, 0, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats + 1, 1, 10, 1, 4, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats + 1, 1, 16, 1, 4, 0, 0, fileno(file), fileno(empty));
+    for (uint32_t T = 2; T <= 3; T++) {
+        check_split_one(formats, T, 10, 1, 4, 0, 1, fileno(file), fileno(empty));
+        check_split_one(formats, T, 10, 0, 4, 1, 1, fileno(file), fileno(empty));
+        check_split_one(formats, T, 10, 1, 0, 0, 1, fileno(file), fileno(empty));
+        check_split_one(formats + 1, T, 16, 1, 4, 0, 1, fileno(file), fileno(empty));
+        check_split_one(formats + 2, T, 10, 1, 4, 0, 1, fileno(file), fileno(empty));
+    }
     ds4_gpu_cleanup(); munmap(map, bytes); fclose(empty); fclose(file);
     puts("PASS Qwen SSD: cache, exact selected-only reads, full-selection fallback and retry");
     return 0;
