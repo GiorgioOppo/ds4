@@ -222,6 +222,16 @@ test-metal-ssd-experts: tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts --q4
 	./tests/test_metal_ssd_experts --mxfp4
 
+tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/test_metal_ssd_reuse: tests/test_metal_ssd_reuse.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-metal-ssd-reuse
+test-metal-ssd-reuse: tests/test_metal_ssd_reuse
+	./tests/test_metal_ssd_reuse
+
 tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 
@@ -1053,6 +1063,7 @@ clean:
 	rm -f tests/test_qwen4_mtp_prefill
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
+	rm -f tests/test_metal_ssd_reuse
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_cuda

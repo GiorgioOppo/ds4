@@ -15479,6 +15479,116 @@ retry:
     return 1;
 }
 
+typedef struct {
+    uint32_t layer, expert, hotness;
+    uint64_t last_used;
+} ds4_gpu_stream_expert_reuse_candidate;
+
+typedef struct {
+    ds4_gpu_stream_expert_reuse_candidate candidates[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t count, next;
+} ds4_gpu_stream_expert_reuse_plan;
+
+/* The final ID tie follows the single-victim scan's layer/expert traversal. */
+static int ds4_gpu_stream_expert_reuse_compare(const void *av, const void *bv) {
+    const ds4_gpu_stream_expert_reuse_candidate *a = av, *b = bv;
+    if (a->hotness != b->hotness) return a->hotness < b->hotness ? -1 : 1;
+    if (a->last_used != b->last_used) return a->last_used < b->last_used ? -1 : 1;
+    if (a->layer != b->layer) return a->layer < b->layer ? -1 : 1;
+    return a->expert < b->expert ? -1 : a->expert > b->expert;
+}
+
+static void ds4_gpu_stream_expert_reuse_heap_down(ds4_gpu_stream_expert_reuse_plan *p,
+                                                  uint32_t root) {
+    for (;;) {
+        uint32_t child = root * 2u + 1u;
+        if (child >= p->count) return;
+        if (child + 1u < p->count && ds4_gpu_stream_expert_reuse_compare(
+                &p->candidates[child], &p->candidates[child + 1u]) < 0) child++;
+        if (ds4_gpu_stream_expert_reuse_compare(&p->candidates[root], &p->candidates[child]) >= 0) return;
+        const ds4_gpu_stream_expert_reuse_candidate swap = p->candidates[root];
+        p->candidates[root] = p->candidates[child]; p->candidates[child] = swap;
+        root = child;
+    }
+}
+
+/* Plan at most one layer's misses in O(cache entries * log(misses)), then
+ * consume victims in the old scan order. Planning never evicts or retains a
+ * buffer: a later allocation/read failure cannot evict unused candidates. */
+static int ds4_gpu_stream_expert_cache_plan_reuse(
+        ds4_gpu_stream_expert_reuse_plan *p, uint32_t n_needed,
+        uint32_t protect_layer, const int32_t *protect_ids, uint32_t n_protect,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    p->count = p->next = 0;
+    if (!n_needed || n_needed > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        ds4_gpu_stream_expert_cache_on_service_thread()) return 0;
+    const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
+    const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
+    int inflight = 0;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+            if (!ds4_gpu_stream_expert_cache_entry_reusable(e, gate_expert_bytes, down_expert_bytes)) continue;
+            if (ds4_gpu_stream_expert_cache_entry_inflight(e)) { inflight = 1; continue; }
+            if (ds4_gpu_stream_expert_cache_entry_protected(layer, expert,
+                    protect_layer, protect_ids, n_protect)) continue;
+            const ds4_gpu_stream_expert_reuse_candidate c = {
+                layer, expert, g_stream_expert_cache_route_hotness[layer][expert], e->last_used,
+            };
+            /* Match the old scan's initial (UINT32_MAX, UINT64_MAX) bounds. */
+            if (c.hotness == UINT32_MAX && c.last_used == UINT64_MAX) continue;
+            if (p->count < n_needed) {
+                uint32_t at = p->count++;
+                p->candidates[at] = c;
+                while (at && ds4_gpu_stream_expert_reuse_compare(
+                        &p->candidates[(at - 1u) / 2u], &p->candidates[at]) < 0) {
+                    const uint32_t parent = (at - 1u) / 2u;
+                    p->candidates[at] = p->candidates[parent]; p->candidates[parent] = c;
+                    at = parent;
+                }
+            } else if (ds4_gpu_stream_expert_reuse_compare(&c, &p->candidates[0]) < 0) {
+                p->candidates[0] = c;
+                ds4_gpu_stream_expert_reuse_heap_down(p, 0);
+            }
+        }
+    }
+    /* Completion could make an older victim available between allocations.
+     * Qwen enters after synchronization; other states retain the old waits. */
+    if (inflight) p->count = 0;
+    else qsort(p->candidates, p->count, sizeof(p->candidates[0]), ds4_gpu_stream_expert_reuse_compare);
+    if (timing) ds4_gpu_stream_expert_timing_note_reuse_scan(
+        DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
+        ds4_gpu_now_ms() - t0);
+    return p->count != 0;
+}
+
+static int ds4_gpu_stream_expert_cache_take_planned_reuse(
+        ds4_gpu_stream_expert_reuse_plan *p, uint32_t protect_layer,
+        const int32_t *protect_ids, uint32_t n_protect,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        ds4_gpu_stream_expert_reusable_buffers *reuse) {
+    if (!reuse) return 0;
+    *reuse = (ds4_gpu_stream_expert_reusable_buffers){0};
+    if (p->next >= p->count) return 0;
+    const ds4_gpu_stream_expert_reuse_candidate *c = &p->candidates[p->next];
+    const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[c->layer][c->expert];
+    if (!ds4_gpu_stream_expert_cache_entry_reusable(e, gate_expert_bytes, down_expert_bytes) ||
+        e->last_used != c->last_used || g_stream_expert_cache_route_hotness[c->layer][c->expert] != c->hotness ||
+        ds4_gpu_stream_expert_cache_entry_protected(c->layer, c->expert, protect_layer, protect_ids, n_protect)) {
+        p->count = p->next;
+        return 0;
+    }
+    const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
+    const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
+    ds4_gpu_stream_expert_cache_clear_entry_internal(c->layer, c->expert, 1, 1, reuse);
+    if (timing) ds4_gpu_stream_expert_timing_note_reuse_clear(ds4_gpu_now_ms() - t0);
+    p->next++;
+    if (!reuse->gate_buffer || !reuse->up_buffer || !reuse->down_buffer) return 0;
+    g_stream_expert_cache_buffer_reuses += ds4_gpu_stream_expert_buffer_object_count(
+        reuse->gate_buffer, reuse->up_buffer, reuse->down_buffer);
+    return 1;
+}
+
 static uint32_t ds4_gpu_stream_expert_cache_take_reusable_batch(
         uint32_t                                n_needed,
         uint32_t                                protect_layer,
@@ -17512,6 +17622,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const uint32_t cache_budget =
             ds4_gpu_stream_expert_cache_configured_budget();
         uint32_t reserved_entries = g_stream_expert_cache_entry_count;
+        ds4_gpu_stream_expert_reuse_plan reuse_plan = {0};
+        bool reuse_plan_attempted = false;
+        bool reuse_plan_ready = false;
 
         for (uint32_t u = 0; u < unique_count; u++) {
             const uint32_t expert = (uint32_t)unique_ids[u];
@@ -17557,8 +17670,36 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             /* The worker pool reads this entire batch below. Serial read-ahead
              * here waits for the same pages before parallel I/O can begin. */
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-            const int prepared =
-                ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
+            int prepared = 0;
+            /* Qwen's owned-buffer batch can need all 512 experts. Plan its
+             * evictions once, retaining the scalar path for mapped batches,
+             * live target replacement, and allocation/wait recovery. */
+            if (!allow_mapped_overflow && force_reuse &&
+                !g_stream_expert_cache[layer][expert].valid) {
+                if (!reuse_plan_attempted) {
+                    reuse_plan_attempted = true;
+                    reuse_plan_ready = ds4_gpu_stream_expert_cache_plan_reuse(
+                        &reuse_plan, unique_count - u, layer, unique_ids,
+                        unique_count, gate_expert_bytes, down_expert_bytes);
+                }
+                ds4_gpu_stream_expert_reusable_buffers reuse = {0};
+                if (reuse_plan_ready && ds4_gpu_stream_expert_cache_take_planned_reuse(
+                        &reuse_plan, layer, unique_ids, unique_count,
+                        gate_expert_bytes, down_expert_bytes, &reuse)) {
+                    gate_bufs[n_loads] = reuse.gate_buffer;
+                    up_bufs[n_loads] = reuse.up_buffer;
+                    down_bufs[n_loads] = reuse.down_buffer;
+                    gate_inners[n_loads] = reuse.gate_inner;
+                    up_inners[n_loads] = reuse.up_inner;
+                    down_inners[n_loads] = reuse.down_inner;
+                    prepared = 1;
+                }
+            }
+            if (!prepared) {
+                /* A fallback may change the eviction set; do not reuse a
+                 * previous plan after a wait or allocation-pressure eviction. */
+                reuse_plan_ready = false;
+                prepared = ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
                                                                  expert,
                                                                  layer,
                                                                  unique_ids,
@@ -17572,6 +17713,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                                  &gate_inners[n_loads],
                                                                  &up_inners[n_loads],
                                                                  &down_inners[n_loads]);
+            }
             if (load_timing) {
                 ds4_gpu_stream_expert_timing_note_prepare_buffer(
                         ds4_gpu_now_ms() - buffer_t0);
