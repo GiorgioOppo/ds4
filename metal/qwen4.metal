@@ -3011,7 +3011,8 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
 
 /* dequantize 16 consecutive values (quarters q0 and q0 + 1 of block b, q0
  * even): the K-quant scales are unpacked once and the nibbles read as one
- * 16-byte word; other types take two 8-value steps */
+ * 16-byte word; IQ2XXS shares the header and reads four-byte grid slices;
+ * other types take two 8-value steps */
 template <typename D>
 static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uint type, threadgroup D *dst) {
     if (type == 12) {
@@ -3039,6 +3040,35 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
         device const uint *qs = (device const uint *)(blk + 16 + 32u * (group / 8u) + 16u * (group & 1u));
         const uint shift = ((group / 2u) & 3u) * 2u;
         for (uint i = 0; i < 16; i++) dst[i] = (D)(ds * (float)((qs[i >> 2] >> (8u * (i & 3u) + shift)) & 3u) - dm);
+        return;
+    }
+    if (type == 16) {
+        const uint sb = b / 8, ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 66);
+        const float d = (float)(*(device const half *)blk);
+        /* A GGUF IQ2 block is only two-byte aligned, including alternating
+         * 66-byte superblocks. Read the shared 32-value header with its true
+         * alignment rather than repeating two independent stage8 decodes. */
+        const packed_ushort4 header = *(device const packed_ushort4 *)(blk + 2 + 8 * ib32);
+        const uint aux_g = (uint)header.x | ((uint)header.y << 16);
+        const uint aux_s = (uint)header.z | ((uint)header.w << 16);
+        const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
+        const uint grid_pair = aux_g >> (8 * q0);
+        const uint sign_pair = aux_s >> (7 * q0);
+#pragma unroll
+        for (uint h = 0; h < 2; h++) {
+            const uint code = (grid_pair >> (8 * h)) & 0xFFu;
+            const uint signs = ds4_metal_ksigns_iq2xs[(sign_pair >> (7 * h)) & 127u];
+            /* The codebook is ulong-aligned. Each four-byte slice is aligned
+             * for uchar4, so these loads never overread a grid entry. Keep
+             * dl * grid * sign and the final D conversion exactly as stage8. */
+            constant const uchar4 *grid = (constant const uchar4 *)(ds4_metal_iq2xxs_grid + code);
+            const uchar4 lo = grid[0], hi = grid[1];
+#pragma unroll
+            for (uint i = 0; i < 4; i++) dst[h * 8 + i] = (D)(dl * (float)lo[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
+#pragma unroll
+            for (uint i = 0; i < 4; i++) dst[h * 8 + 4 + i] = (D)(dl * (float)hi[i] * ((signs >> (i + 4)) & 1u ? -1.0f : 1.0f));
+        }
         return;
     }
     qwen4_mm_stage8(row, b, q0, type, dst);
