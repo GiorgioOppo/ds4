@@ -48396,6 +48396,7 @@ enum {
     QWEN4_K_ATTN_MM,
     QWEN4_K_MOE_MID,
     QWEN4_K_MOE_MID_IQ2,
+    QWEN4_K_MOE_MID_IQ2_NR1,
     QWEN4_K_MOE_MID_Q4K,
     QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
@@ -48487,6 +48488,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_mm",
     "kernel_qwen4_moe_mid",
     "kernel_qwen4_moe_mid_iq2",
+    "kernel_qwen4_moe_mid_iq2_nr1",
     "kernel_qwen4_moe_mid_q4k",
     "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
@@ -48639,7 +48641,7 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
     @autoreleasepool {
         const bool addresses = g_qwen4_stream_weights && g_qwen4_stream_weights->addresses;
         const bool q4_mid = kernel == QWEN4_K_MOE_MID_Q4K || kernel == QWEN4_K_MOE_MID_Q4K_NR1;
-        const bool iq2_mid = kernel == QWEN4_K_MOE_MID_IQ2;
+        const bool iq2_mid = kernel == QWEN4_K_MOE_MID_IQ2 || kernel == QWEN4_K_MOE_MID_IQ2_NR1;
         const bool q2_down = kernel == QWEN4_K_MOE_DOWN_Q2K;
         id<MTLComputePipelineState> pipeline = nil;
         if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF || q4_mid || iq2_mid || q2_down) {
@@ -49530,18 +49532,23 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const uint32_t nsg = q4k ?
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) :
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
-    const uint32_t rows_per_tg = nr * nsg;
-    /* IQ2 gate and up reuse the same eight input values across both rows.
-     * Preserve the NR2 mapping, including the existing SSD slot masks. */
+    /* Identify the established IQ2 NR2 fast path before considering
+     * the narrower single-row dispatch policy below. */
     const bool iq2 = weight_type == 16u && nr == 2u &&
         ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE") != 0 &&
         ds4_gpu_device_name_contains("M1 Max");
-    const int kernel = iq2 ? QWEN4_K_MOE_MID_IQ2 : !q4k ? QWEN4_K_MOE_MID :
-        nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
     /* Masked dispatches compact only the grid. The kernel restores original
      * slot indices, so shared placement and output strides stay unchanged. */
     const uint32_t dispatch_slots = qwen4_moe_dispatch_slots(&args, n_out);
     if (!dispatch_slots) return 1;
+    /* M1 Max IQ2: spread the measured single-token, wide-slot shape over
+     * one row per SIMD group. Small resident/missing passes retain NR2.
+     * Keep explicit generic-specialization settings on their existing path. */
+    const bool iq2_nr1 = iq2 && !specialize && nsg == 4u &&
+        n_tokens == 1u && in_dim == 2560u && ff_dim == 640u && dispatch_slots >= 8u;
+    const uint32_t rows_per_tg = (iq2_nr1 ? 1u : nr) * nsg;
+    const int kernel = iq2_nr1 ? QWEN4_K_MOE_MID_IQ2_NR1 : iq2 ? QWEN4_K_MOE_MID_IQ2 :
+        !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, dispatch_slots, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);

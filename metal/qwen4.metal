@@ -2457,9 +2457,10 @@ kernel void kernel_qwen4_moe_mid(
     }
 }
 
-/* IQ2XXS gate/up input reuse, two output rows per SIMD group.  Each lane
+/* IQ2XXS gate/up input reuse, one or two rows per SIMD group. Each lane
  * keeps the generic dot's eight-value part and ordered dl * part additions;
  * only independent rows and projections share the activation loads. */
+template <uint NR>
 kernel void kernel_qwen4_moe_mid_iq2(
         constant ds4_metal_args_qwen4_moe & args,
         device const char *gate_base,
@@ -2473,7 +2474,6 @@ kernel void kernel_qwen4_moe_mid_iq2(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
-    constexpr uint NR = 2;
     const uint slot = qwen4_moe_slot(args, tgpig.y, tgpig.z), tok = tgpig.z;
     const uint n_out = args.n_slots + args.has_shared;
     const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
@@ -2481,11 +2481,41 @@ kernel void kernel_qwen4_moe_mid_iq2(
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     const uint64_t mid_base = ((uint64_t)tok * n_out + slot) * args.out_rows;
     if (slot == args.n_slots) {
-        for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
-            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
-            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
-            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
-            if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+        if (args.shared_type == 8u) {
+            // Same Q8 lane mapping, block order, four-term expression and
+            // final SIMD sums as two qwen4_row_dot calls; share only x loads.
+            const short ix = tiisg / 8, it = tiisg % 8;
+            const uint nb = args.in_dim / 32u;
+            for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+                const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+                device const char *gr = sh_gate + off;
+                device const char *ur = sh_up + off;
+                float sumg = 0.0f, sumu = 0.0f;
+                for (uint ib = (uint)ix; ib < nb; ib += 4) {
+                    device const char *bg = gr + (uint64_t)ib * 34;
+                    device const char *bu = ur + (uint64_t)ib * 34;
+                    device const float *y = xt + ib * 32 + (uint)it * 2;
+                    const float dg = (float)(*(device const half *)bg);
+                    const float du = (float)(*(device const half *)bu);
+                    device const char *qg = bg + 2 + it * 2;
+                    device const char *qu = bu + 2 + it * 2;
+                    const float y0 = y[0], y1 = y[1], y16 = y[16], y17 = y[17];
+                    sumg += dg * (y0 * (float)qg[0] + y1 * (float)qg[1] +
+                                  y16 * (float)qg[16] + y17 * (float)qg[17]);
+                    sumu += du * (y0 * (float)qu[0] + y1 * (float)qu[1] +
+                                  y16 * (float)qu[16] + y17 * (float)qu[17]);
+                }
+                const float g = simd_sum(sumg);
+                const float u = simd_sum(sumu);
+                if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+            }
+        } else {
+            for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+                const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+                const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
+                const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+                if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+            }
         }
         return;
     }
@@ -2540,6 +2570,16 @@ kernel void kernel_qwen4_moe_mid_iq2(
         if (tiisg == 0) mid[mid_base + row0 + r] = qwen4_silu(g) * u;
     }
 }
+
+#define QWEN4_MOE_MID_IQ2_INSTANCE(NR_, NAME_) \
+template [[host_name(NAME_)]] \
+kernel void kernel_qwen4_moe_mid_iq2<NR_>(constant ds4_metal_args_qwen4_moe &, \
+        device const char *, device const char *, device const int32_t *, device const float *, \
+        device float *, device const char *, device const char *, uint3, ushort, ushort, ushort3);
+QWEN4_MOE_MID_IQ2_INSTANCE(2, "kernel_qwen4_moe_mid_iq2")
+QWEN4_MOE_MID_IQ2_INSTANCE(1, "kernel_qwen4_moe_mid_iq2_nr1")
+#undef QWEN4_MOE_MID_IQ2_INSTANCE
+
 
 /* Q4_K gate/up input reuse with the original qwen4_row_dot lane mapping
  * and accumulation order.  Each lane still visits every block in order and
