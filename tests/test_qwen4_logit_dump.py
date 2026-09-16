@@ -13,6 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--backend", choices=("metal", "cuda"))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     out = args.output or Path(tempfile.mkdtemp(prefix="qwen-logit-dump-"))
@@ -33,13 +34,13 @@ def main():
     env = os.environ.copy()
     env["DS4_QWEN4_GPU"] = "1"
     env["DS4_QWEN4_FT_LIST"] = str(manifest)
-    result = subprocess.run(
-        [str(root / "ds4"), "--metal", "-m", str(args.model.resolve()),
-         "--ctx", "256",
-         "--first-token-test", "-p", "hello"], cwd=root, env=env,
-        capture_output=True, timeout=300)
-    (out / "stdout").write_bytes(result.stdout)
-    (out / "stderr").write_bytes(result.stderr)
+    print(f"Logit dump diagnostics: {out}", flush=True)
+    with (out / "stdout").open("wb") as stdout, (out / "stderr").open("wb") as stderr:
+        result = subprocess.run(
+            [str(root / "ds4"), *(["--" + args.backend] if args.backend else []), "-m", str(args.model.resolve()),
+             "--ctx", "256",
+             "--first-token-test", "-p", "hello"], cwd=root, env=env,
+            stdout=stdout, stderr=stderr, timeout=300)
     assert result.returncode == 0, f"dump failed; see {out}"
     for length in lengths:
         all_rows = np.fromfile(out / f"all-{length}.bin", dtype=np.float32)

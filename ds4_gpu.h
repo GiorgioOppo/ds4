@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "ds4_qwen4_vision.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -635,8 +636,8 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-#if defined(__APPLE__)
-/* Qwen prefill: bounded Q8 unpack defaults on for M3 Ultra. */
+#if !defined(DS4_ROCM_BUILD)
+/* Qwen projections preserve FP32 activations on both GPU backends. */
 int ds4_gpu_qwen4_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -3469,18 +3470,6 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
-#define DS4_QWEN4_VISION_LAYERS 27
-typedef struct {
-    uint64_t ln1_w, ln1_b, qkv_w, qkv_b, out_w, out_b, ln2_w, ln2_b, up_w, up_b, down_w, down_b;
-    uint32_t qkv_type, out_type, up_type, down_type;
-} ds4_qwen4_vision_layer_weights;
-typedef struct {
-    uint64_t patch_w0, patch_w1, patch_b, pos_embd, post_ln_w, post_ln_b, mm0_w, mm0_b, mm2_w, mm2_b;
-    uint32_t mm0_type, mm2_type, patch_type;
-    uint32_t n_embd, n_ff, n_head, n_patch, n_merge, n_pos_side, n_out;
-    float eps;
-    ds4_qwen4_vision_layer_weights layer[DS4_QWEN4_VISION_LAYERS];
-} ds4_qwen4_vision_weights;
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the
  * resampled position embedding [n_patches][n_embd]; out receives
  * [n_patches/4][n_out].  Weights are read from the mapped mmproj GGUF. */

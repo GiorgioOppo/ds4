@@ -140,6 +140,8 @@ typedef struct {
 
 typedef struct {
     double logprob;
+    unsigned char *bytes;
+    int len;
     api_alt *alts;
     int n_alts;
     int cap_alts;
@@ -306,6 +308,7 @@ static void api_alt_free(api_alt *alt) {
 }
 
 static void api_pos_free(api_pos *pos) {
+    free(pos->bytes);
     for (int i = 0; i < pos->n_alts; i++) api_alt_free(&pos->alts[i]);
     free(pos->alts);
     memset(pos, 0, sizeof(*pos));
@@ -418,6 +421,13 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
         p++;
         if (strcmp(key, "logprob") == 0) {
             if (!json_number(&p, &pos->logprob)) return false;
+        } else if (strcmp(key, "bytes") == 0) {
+            free(pos->bytes);
+            pos->bytes = NULL;
+            pos->len = 0;
+            p = json_ws(p);
+            if (strncmp(p, "null", 4) == 0) p += 4;
+            else if (!json_bytes_array(&p, &pos->bytes, &pos->len)) return false;
         } else if (strcmp(key, "top_logprobs") == 0) {
             if (!api_parse_alt_array(&p, pos)) return false;
         } else {
@@ -480,10 +490,32 @@ static bool api_ref_load(const char *path, api_ref *ref) {
     return ok;
 }
 
+/* Equal token counts do not establish equal token boundaries. In particular,
+ * some APIs replace partial UTF-8 token bytes with replacement characters. */
+static bool api_ref_matches_target(ds4_engine *engine, const api_ref *ref,
+                                   const ds4_tokens *target) {
+    if (ref->n_pos != target->len) return false;
+    for (int i = 0; i < target->len; i++) {
+        const api_pos *pos = &ref->pos[i];
+        if (!pos->bytes || pos->len <= 0) return false;
+        size_t len = 0;
+        char *text = ds4_token_text(engine, target->v[i], &len);
+        bool same = text && len == (size_t)pos->len &&
+                    !memcmp(text, pos->bytes, len);
+        free(text);
+        if (!same) return false;
+    }
+    return true;
+}
+
 static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
     if (!alt || !alt->bytes || alt->len <= 0) return -1;
     for (int i = 0; i < alt->len; i++) {
         if (alt->bytes[i] == 0) return -1;
+        /* A provider may have lost the original bytes of a split Unicode
+         * token. Do not mistake its replacement character for a token ID. */
+        if (i + 2 < alt->len && alt->bytes[i] == 0xef &&
+            alt->bytes[i + 1] == 0xbf && alt->bytes[i + 2] == 0xbd) return -1;
     }
     char *text = malloc((size_t)alt->len + 1);
     if (!text) die("out of memory");
@@ -907,6 +939,10 @@ int main(int argc, char **argv) {
                         "%s warning: API token count %d != local target tokens %d; "
                         "API logprob agreement skipped\n",
                         id, ref.n_pos, target.len);
+            } else if (!api_ref_matches_target(engine, &ref, &target)) {
+                fprintf(stderr,
+                        "%s warning: API output bytes do not match local token boundaries; "
+                        "API logprob agreement skipped\n", id);
             } else {
                 api_aligned = true;
             }

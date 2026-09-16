@@ -9,14 +9,19 @@ int main(int argc, char **argv) {
         return 2;
     }
     ds4_engine *engine = NULL;
-    ds4_engine_options opt = {.model_path = argv[1], .backend = DS4_BACKEND_METAL,
-        .glm_mtp = true, .prefill_chunk = 8};
+    ds4_engine_options opt = {.model_path = argv[1],
+#ifdef __APPLE__
+        .backend = DS4_BACKEND_METAL,
+#else
+        .backend = DS4_BACKEND_CUDA,
+#endif
+        .glm_mtp = true, .prefill_chunk = 32};
     assert(ds4_engine_open(&engine, &opt) == 0);
     assert(ds4_engine_is_qwen4(engine) && engine->model.ngram_tensor);
     ds4_tokens prompt = {0};
     ds4_encode_chat_prompt(engine, NULL, "Count from one to ten.", DS4_THINK_NONE, &prompt);
     char error[256] = {0};
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 4; mode++) {
         ds4_session *live = NULL, *control = NULL;
         ds4_tokens frontier = {0};
         ds4_session_snapshot snapshot = {0};
@@ -34,7 +39,10 @@ int main(int argc, char **argv) {
         int token = ds4_session_argmax(live);
         const int fd = engine->model.ngram_fd;
         engine->model.ngram_fd = INT_MAX;
-        if (mode == 0) {
+        if (mode == 3) {
+            for (int i = 0; i < 32; i++) ds4_tokens_push(&frontier,token);
+            assert(ds4_session_sync(live,&frontier,error,sizeof(error)) != 0);
+        } else if (mode == 0) {
             ds4_tokens_push(&frontier, token);
             assert(ds4_session_sync(live, &frontier, error, sizeof(error)) != 0);
         } else if (mode == 1) {

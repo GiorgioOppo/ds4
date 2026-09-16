@@ -934,7 +934,7 @@ static void test_v41_tool_syntax(void) {
 /* Model-backed regression: save an unsynchronizable transcript, then rebuild
  * it in a larger context using the normal stripped-session loader. */
 static int test_full_context_save(const char *model) {
-    ds4_engine_options opt = {.model_path = model, .backend = DS4_BACKEND_METAL,
+    ds4_engine_options opt = {.model_path = model, .backend = default_backend(),
         .context_size = 512, .power_percent = 100};
     agent_config cfg = {.gen = {.ctx_size = 256}, .non_interactive = true};
     agent_worker w = {.cfg = &cfg, .initialized = true, .user_activity = true,
