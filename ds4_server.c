@@ -10019,6 +10019,9 @@ struct server_slot {
     bool decode_in_flight;
     bool decode_done;
     int decode_token;
+    bool decode_speculative;
+    int decode_accepted[2];
+    int decode_accepted_count;
     int decode_rc;
     char decode_err[160];
 };
@@ -10142,6 +10145,7 @@ struct server {
     pthread_mutex_t model_mu;
     pthread_cond_t model_cv;
     bool model_busy;
+    bool qwen4_batch_mtp;
     bool model_stopping;
     int decode_pending;
     int active_generations;
@@ -13079,8 +13083,10 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
     return true;
 }
 
-static int server_eval_token(server *s, server_slot *slot, int token,
-                             char *err, size_t errlen) {
+static int server_eval_tokens(server *s, server_slot *slot, int token,
+                              bool speculative, int accepted[2], int *n_accepted,
+                              char *err, size_t errlen) {
+    *n_accepted = 0;
     if (!s || !slot) return 1;
     if (!s->batched_mode) {
         if (g_stop_requested || slot_job_cancelled(slot)) {
@@ -13092,6 +13098,7 @@ static int server_eval_token(server *s, server_slot *slot, int token,
         pthread_mutex_lock(&s->inference_mu);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
         pthread_mutex_unlock(&s->inference_mu);
+        if (rc == 0) { accepted[0] = token; *n_accepted = 1; }
         return rc;
     }
 
@@ -13109,6 +13116,8 @@ static int server_eval_token(server *s, server_slot *slot, int token,
         return 1;
     }
     slot->decode_token = token;
+    slot->decode_speculative = speculative;
+    slot->decode_accepted_count = 0;
     slot->decode_rc = 1;
     slot->decode_err[0] = '\0';
     slot->decode_done = false;
@@ -13138,8 +13147,18 @@ static int server_eval_token(server *s, server_slot *slot, int token,
                  (slot->decode_err[0] ? slot->decode_err : "decode interrupted"));
     }
     slot->decode_done = false;
+    if (rc == 0) {
+        *n_accepted = slot->decode_accepted_count;
+        memcpy(accepted, slot->decode_accepted, (size_t)*n_accepted * sizeof(int));
+    }
     pthread_mutex_unlock(&s->model_mu);
     return rc;
+}
+
+static int server_eval_token(server *s, server_slot *slot, int token,
+                             char *err, size_t errlen) {
+    int accepted[2], count;
+    return server_eval_tokens(s, slot, token, false, accepted, &count, err, errlen);
 }
 
 static long server_decode_coalesce_us(void) {
@@ -13164,6 +13183,8 @@ static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
+    int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
+    int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
@@ -13194,17 +13215,21 @@ static void *decode_worker_main(void *arg) {
         }
         if (s->model_stopping && s->decode_pending == 0) break;
 
-        int count = 0;
-        for (int i = 0; i < s->slot_count; i++) {
-            server_slot *slot = &s->slots[i];
-            if (!slot->decode_pending) continue;
-            slot->decode_pending = false;
-            slot->decode_in_flight = true;
-            s->decode_pending--;
-            members[count] = slot;
-            items[count].session = slot->session;
-            items[count].token = slot->decode_token;
-            count++;
+        int count = 0, plain_count = 0;
+        /* Keep sampled/exact requests out of the greedy speculative group. */
+        for (int speculative = 0; speculative <= 1; speculative++) {
+            for (int i = 0; i < s->slot_count; i++) {
+                server_slot *slot = &s->slots[i];
+                if (!slot->decode_pending || slot->decode_speculative != (bool)speculative) continue;
+                slot->decode_pending = false;
+                slot->decode_in_flight = true;
+                s->decode_pending--;
+                members[count] = slot;
+                items[count].session = slot->session;
+                items[count].token = slot->decode_token;
+                count++;
+            }
+            if (!speculative) plain_count = count;
         }
         if (count == 0) continue;
         s->model_busy = true;
@@ -13213,8 +13238,17 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_sessions_eval_batch(items, count,
-                                         batch_err, sizeof(batch_err));
+        int rc = plain_count ? ds4_sessions_eval_batch(items, plain_count,
+                                         batch_err, sizeof(batch_err)) : 0;
+        for (int i = 0; i < plain_count; i++) {
+            accepted[i][0] = items[i].token;
+            n_accepted[i] = 1;
+        }
+        if (rc == 0 && count > plain_count)
+            rc = ds4_sessions_eval_batch_speculative_argmax(items + plain_count, count - plain_count,
+                    accepted + plain_count, n_accepted + plain_count, batch_err, sizeof(batch_err));
+        if (rc != 0)
+            for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
@@ -13229,6 +13263,10 @@ static void *decode_worker_main(void *arg) {
             server_slot *slot = members[i];
             slot->decode_in_flight = false;
             slot->decode_rc = rc;
+            if (rc == 0) {
+                slot->decode_accepted_count = n_accepted[i];
+                memcpy(slot->decode_accepted, accepted[i], (size_t)n_accepted[i] * sizeof(int));
+            }
             if (rc != 0) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
                          batch_err[0] ? batch_err : "batched decode failed");
@@ -13240,6 +13278,8 @@ static void *decode_worker_main(void *arg) {
     pthread_mutex_unlock(&s->model_mu);
     free(members);
     free(items);
+    free(accepted);
+    free(n_accepted);
     return NULL;
 }
 
@@ -13807,6 +13847,14 @@ decode_again:
                     err, sizeof(err));
             }
             if (ntok < 0) {
+                finish = "error";
+                break;
+            }
+        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+                   max_tokens - completion >= 2 && !j->req.ignore_eos &&
+                   (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            if (server_eval_tokens(s, slot, token, true, toks, &ntok, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
@@ -15237,11 +15285,17 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
                m.raw_cap,
                m.comp_cap);
     if (session_count > 1) {
+        /* Only the caches repeat per slot.  Where the model shares one prefill
+         * workspace across slots, the transients are paid once instead. */
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        const double caches = (double)(m.raw_bytes + m.compressed_bytes);
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: %d resident sessions request at least %.2f GiB of context buffers",
+                   "ds4-server: %d resident sessions request at least %.2f GiB of "
+                   "context buffers, or %.2f GiB when the model shares one prefill "
+                   "workspace",
                    session_count,
-                   (double)m.total_bytes * (double)session_count /
-                       (1024.0 * 1024.0 * 1024.0));
+                   (double)m.total_bytes * (double)session_count / gib,
+                   (caches * (double)session_count + (double)m.scratch_bytes) / gib);
     }
 }
 static void server_close_resources(server *s) {
@@ -15680,6 +15734,8 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
+                       ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -15735,7 +15791,7 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
-        if (ds4_engine_has_mtp(engine)) {
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }

@@ -21,10 +21,12 @@ typedef struct {
     uint64_t expert_bytes;
     uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
     uint32_t slot_mask[3], masked_tokens;
+    uint32_t list_cap, pad0;
 } moe_args;
-_Static_assert(sizeof(moe_args)==64, "production MoE argument ABI");
+_Static_assert(sizeof(moe_args)==72, "production MoE argument ABI");
 _Static_assert(offsetof(moe_args,expert_bytes)==24, "expert stride alignment");
 _Static_assert(offsetof(moe_args,masked_tokens)==60, "slot mask ABI");
+_Static_assert(offsetof(moe_args, list_cap) == 64, "grouped list capacity ABI");
 typedef struct { uint32_t tokens, rows, slots; } shape;
 static const shape kShapes[]={{1,1,1},{2,7,2},{3,9,10},{1,2560,10},{3,2561,10}};
 static const NSUInteger kOffset=512; /* Covers a wrongly read 128-float input tail. */

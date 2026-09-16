@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Metal vision execution with HF using identical GGUF weights.
+"""Compare GPU vision execution with HF using identical GGUF weights.
 
 Also report GGUF-versus-original HF quantization quality separately. The default
 0.99 threshold gates implementation parity; quality retains the same threshold
@@ -177,7 +177,7 @@ def main():
                       "grid": grid, "shape": list(actual.shape),
                       "implementation": compare(actual, quant, grid, quant_grid, args.min_cos),
                       "quantization_quality": compare(quant, original, quant_grid, original_grid, args.min_cos),
-                      "metal_vs_original": compare(actual, original, grid, original_grid, args.min_cos)}
+                      "gpu_vs_original": compare(actual, original, grid, original_grid, args.min_cos)}
             results.append(result)
             print(json.dumps(result), flush=True)
     report = {"snapshot": args.snapshot, "mmproj": args.mmproj,

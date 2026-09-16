@@ -128,7 +128,7 @@ allocations add to the main weights, but the n-gram table is not mapped or
 preloaded. Keep the GGUF on a fast local SSD.
 The larger `qwen38-q4k` target uses 165.11 GiB on disk and 69.74 GiB for
 resident weights, before runtime buffers.
-This model runs on Metal.
+This model runs on Metal and single-GPU CUDA, including DGX Spark.
 The script links `ds4flash.gguf` to the combined GGUF:
 
 ```sh

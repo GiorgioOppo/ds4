@@ -6,9 +6,13 @@ exercise the paths that have historically regressed: Metal graph inference,
 CUDA, ROCm, SSD streaming, distributed execution, disk KV cache, server APIs, and the
 agent TUI/tool state machine.
 
-Do not run multiple huge model processes at the same time.  Record the commit,
-hardware, GGUF file, context size, and any non-default flags for every manual
-run.
+Keep this file procedural: commands, pass/fail criteria, safety constraints and
+reproducible reference measurements. Put per-run results, failed experiments,
+retries and investigation notes in a separate QA report, not here.
+
+Do not run multiple huge model processes at the same time. Record the commit,
+hardware, GGUF checksum, prompt, context size and non-default flags for every
+manual run. Report skipped checks and unresolved failures explicitly.
 
 Preferred release test hosts:
 
@@ -194,10 +198,8 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   average NLL `0.458030488`, first-token match `89/100`, and average greedy
   prefix `7.37`; Q4 is `0.299917952`, `90/100`, and `9.66`. These are fresh
   GLM-5.3 Z.AI FP8 continuations and must not be replaced by GLM 5.2 fixtures.
-  The Q4 layout with Q8 KDA projections, embedding, and output head scored
-  `0.300804038`, `90/100`, and `9.48` on M3 Ultra. Its paired BF16-layout
-  control scored `0.300477636`, `90/100`, and `9.48`; the Q8 layout won 54 of
-  100 cases despite its `0.109%` higher aggregate NLL.
+  For the Q4 layout with Q8 KDA projections, embedding, and output head,
+  the M3 Ultra reference is `0.300804038`, `90/100`, and `9.48`.
 - For GLM 5.3 attention changes, also run the eight long Z.AI FP8 cases.
   First run `python3 gguf-tools/quality-testing/render_glm_references.py
   gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long`, then
@@ -206,9 +208,9 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   before scoring the answer. Every prompt crosses the 2,051-token boundary.
   Compare the default path against the scalar control on the same fixture.
   Z.AI supplies no output logprobs; do not report zero logprob-error columns
-  as API parity. The historical 100-case numbers above use a no-thinking
+  as API parity. The 100-case reference numbers above use a no-thinking
   prefix and are not directly comparable to rendered-prefix scores.
-- Run the same GLM fixture for reduced-precision GLM release files.  The Q2
+- Run the GLM 5.2 fixture for reduced-precision GLM 5.2 release files. The Q2
   routed reference is lower quality but should stay near first-token match
   `92/100`, API top-1 agreement about `0.890`, and API pair-order agreement
   about `0.800` unless the quantization changed deliberately.
@@ -300,13 +302,10 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
   `DS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the Metal MoE stage profiler and
   record the selected-expert footprint or stage timing in the DSpark log.
-- On Metal, benchmark at least one predictable code continuation and one
-  deliberately unpredictable prose continuation at temperature 1. For the
-  128-token M5 Max hash-table prompt, ordinary sampling measured
-  41.71/44.49/44.73 t/s and opportunistic DSpark measured
-  47.15/49.08/48.19 t/s, a median gain of about 8.3%. A surreal-prose control
-  measured 44.46 t/s ordinary and 41.66 t/s opportunistic. DSpark remains
-  opt-in because prompts with little useful speculation can still be slower.
+- On Metal, benchmark predictable code and deliberately unpredictable prose at
+  temperature 1. Compare ordinary, opportunistic and exact-sampled decoding;
+  inspect output quality and acceptance as well as throughput. Low acceptance
+  can make speculation slower than ordinary decode.
 
 ### Session Microbatching And Metal TP
 
@@ -438,9 +437,7 @@ substitute for this matrix.
   partial split or hanging.
   The released GLM 5.2 IQ2_XXS file keeps `indexer.proj.weight` in FP32. Its
   loader and Metal graph must accept that established layout; GLM 5.3 may use
-  its quantized or BF16 indexer projection instead. A short exact-output smoke
-  on the current two-M5 RDMA setup returned `GLM52_OK` with 108.63 GiB planned
-  per rank.
+  its quantized or BF16 indexer projection instead.
 - With explicit permission for the current QA pass, run one resident GLM Q2
   prompt, a long-context prompt, integrated GLM MTP, and concurrent server
   requests on the eight-GPU CUDA host. Use ordinary eight-GPU layer placement
@@ -499,17 +496,9 @@ block. A GLM 5.2 pass does not cover these paths.
   SSD streaming, backend, or prefill chunk size. Padding IDs must be masked,
   including in batched prefill. Do not restore the 2.75 GiB expanded per-head
   K/V cache as a presumed quality fix.
-  The complete Q2 fixture on the compact Metal graph scored NLL `0.458177271`,
-  first-token agreement `90/100`, and average greedy prefix `7.390`, matching
-  the accepted release band. Fresh Z.AI FP8 long-context controls also favored
-  compact attention: weighted NLL was `0.539823254` versus `0.820997888` for
-  expanded K/V over 24 synthetic cases, and `0.808160860` versus `0.820309487`
-  over 12 natural source-context cases. These historical measurements used
-  the old 4K cutoff; they are not evidence that it matches the reference graph.
 - At 100K on an M5 Max, require the compact Q2 plan to remain near 94.09 GiB:
   89.87 GiB model, 1.11 GiB compact history, and 3.11 GiB fixed graph buffers.
-  An 8,192-token one-shot control on the same graph reached 479.09 prefill and
-  29.89 steady decode t/s. Repeat the continuation fixture after changing the
+  Repeat the continuation fixture after changing the
   compact cache type, absorbed projections, FlashAttention staging, or the
   crossover; numerical similarity to the old expanded graph is not the gate.
 - On this 128 GB M3 Max, run the resident Q2 through the generic non-NAX Metal
@@ -519,14 +508,13 @@ block. A GLM 5.2 pass does not cover these paths.
   bounded SSD-streaming cache; never try to make it fully resident.
 - On one M5 Max, run resident Q2 with a prompt whose actionable instruction
   begins after token 4096. The model must recover the tail instruction and
-  complete a tool or exact-output task. A short coherent continuation at token
-  4109 is not sufficient: it previously missed a broken sparse selector.
+  complete a tool or exact-output task. A short coherent continuation alone
+  is not a sparse-selector correctness check.
 - Run physical Q4 50/50 TP over the explicit TB5 RDMA devices. Graduate context
   allocation through 10K, 25K, and 50K, checking both ranks before advancing.
-  The original 50K Q4 run reported 102.20 GiB per rank. Correct accounting for
-  the dynamically allocated mHC/KDA prefill workspace adds about 0.44 GiB, so
-  the expected plan is about 102.64 GiB per rank; record the exact new value on
-  the next run. It remains below the fixed 110 GiB ceiling. Swap must not grow
+  Include mHC/KDA prefill workspace in the memory plan; the 50K reference is
+  about 102.64 GiB per rank. Keep the plan within each host's admitted budget.
+  Swap must not grow
   from idle, SSH must stay responsive, and both roles must exit cleanly.
 - The 25K gate must place a read/edit/test task after a long inert archive and
   include one harmless tool failure that the agent must recover from. The 50K
@@ -537,8 +525,8 @@ block. A GLM 5.2 pass does not cover these paths.
   on IT. A TCP fallback does not satisfy this gate. Keep Q2 and Q4 in
   `~/ds4/gguf` on both hosts after testing.
 - Run ordinary greedy decode, opportunistic MTP, and `--mtp-exact-sampling`.
-  Greedy MTP must preserve the accepted continuation and provide a measured
-  gain; the current short Q2 control improved from 34.21 to 41.97 t/s.
+  Check continuation quality, accepted/rejected drafts and measured speed;
+  ordinary decode must remain available for low-acceptance prompts.
 - After directional-steering changes, verify that a zero `45 x 4096` GLM vector
   is output-identical to the unsteered CLI for both FFN and attention hooks. A
   46-row file must be rejected with the expected 737,280-byte size. Build a
@@ -566,8 +554,7 @@ block. A GLM 5.2 pass does not cover these paths.
   `DS4_TEST_LOGIT_TOLERANCE=0.001`: row-batched reductions may differ from the
   serial launch order, but every selected token must match and the maximum
   full-logit delta must remain below that bound. Also run the serial rollback
-  with zero tolerance. The current four- and eight-session Q2 maxima are both
-  `0.0001297`; the current six-step two-session RDMA maximum is `0.000175238`. Past
+  with zero tolerance. Past
   2051, require the exact ordered fallback until a sparse native batch oracle
   proves full-vocabulary correctness.
 - Exercise every pool remainder at the dense-to-sparse boundary with prompts
@@ -577,8 +564,7 @@ block. A GLM 5.2 pass does not cover these paths.
   batched-reduction logit differences are acceptable only when the official
   continuation and long-task gates remain in band. Build each prompt against
   `--dump-tokens`; word counts are not a valid substitute for rendered-token
-  counts. The current `.180` CUDA reference returned exactly `BOUNDARY_OK` at
-  all five frontiers.
+  counts.
 - Run the session snapshot test across the sparse boundary:
   `DS4_TEST_MODEL=/path/to/GLM-5.3-Flash-Q2.gguf
   DS4_TEST_SNAPSHOT_PROMPT=/path/to/a-4k-plus-prompt.txt
@@ -588,27 +574,18 @@ block. A GLM 5.2 pass does not cover these paths.
 - Repeat that command with `DS4_TEST_GLM_MTP=1`. The test must replay 16
   integrated-MTP cycles across the snapshot, including both one- and two-token
   outcomes, and match every committed token plus the final top-eight logits.
-  The M5 Max reference produced 10 one-token cycles, 6 two-token cycles, and
-  22 committed tokens without a verifier failure. It then synced back to the
-  original long prompt, reproduced its top-eight logits within `1e-6`, and
-  completed four more MTP cycles. The current `.180` CUDA run produced 5
-  one-token and 11 two-token outcomes, committed 27 tokens, and also passed.
+  Then sync back to the original long prompt, reproduce its top-eight logits
+  within `1e-6`, and complete further MTP cycles on the reused session.
 - Measure continued prefill as actual appends to one live session, not only as
   a single cold prompt. On an M5 Max, run:
   `./ds4-bench -m /path/to/GLM-5.3-Flash-Q2.gguf --metal
   --prompt-file /path/to/a-25k-prompt.txt --ctx-start 4096 --ctx-max 12288
   --ctx-alloc 16384 --step-incr 2048 --gen-tokens 0 --csv /tmp/glm53.csv`.
-  The current 2K append results are 452.56, 423.74, 409.79, and 396.72 t/s at
-  4K, 6K, 8K, and 10K resident prefixes. A warmed first append below 350 t/s
-  requires investigation. The serial rollback control measured 29.68 t/s.
-  On `.180` CUDA, the current 4K, 6K, and 8K append results are 522.66, 506.20,
-  and 502.50 t/s.
-- Keep the 33987-token Q4 TP agent run as the final long-state gate. The old
-  serial sparse path took about 24 minutes to reach its first tool call. The
-  batched path processed a 34023-token initial suffix in 109.846 seconds
-  (309.74 t/s), completed the full read/edit/test task in 178.93 seconds, and
-  used explicit RDMA. A faster result must still pass the tail task, fixture
-  inspection, and official-continuation gates.
+  Repeat on CUDA and compare each append with a matched control. Record
+  latency as well as throughput; test small tool-result appends too.
+- Run the final Q4 TP coding task with at least 30K live prompt tokens over
+  explicit RDMA. Require the tail instruction, read/edit/test task, independent
+  code checks and prefix reuse to pass without premature compaction.
 - On one DGX Spark, run Q2 through CUDA and repeat the primitive, official
   continuation, 4,096-4,100 boundary, continued-prefill, snapshot, MTP, server,
   and coding-agent gates. Validate independently on `.180` and `.181`; they are
@@ -807,147 +784,36 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   otherwise its large-payload fallback replays the prefix and changes the cache
   state before the append. Record which restoration method was used.
 
-September 6 focused SSD pass, 128 GB M5 Max only: GLM 5.3 Flash Q4_K
-(177.77 GiB) and DeepSeek Flash Vision Exp MXFP4 (145.26 GiB). Automatic
-budgets and existing prefill chunk sizes were used, without speculation.
-The following are three-run medians; the final GLM prefill variant was
-repeated after the interleaved cache-policy comparison.
+### SSD Performance References
 
-| Workload | Prefill before / after | Generation before / after |
+Use these only with the same model, cache budget, prompt and restoration
+method. Measure first-decode latency after each append as well as steady speed.
+The full-GLM references use `GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf` on
+M5 Max, a 16K context and a 35.36 GiB expert cache with snapshot restoration:
+
+| Workload | Prefill | Generation |
 | --- | ---: | ---: |
-| GLM, initial 2K, 128 output tokens | 111.73 / 121.28 t/s | 6.11 / 11.85 t/s |
-| GLM, 1K append, 128 output tokens | 83.33 / 104.43 t/s | 7.11 / 14.89 t/s |
-| DeepSeek, initial 8K, 64 output tokens | 285.12 / 296.59 t/s | 7.21 / 7.91 t/s |
-| DeepSeek, 4K append, 64 output tokens | 257.07 / 259.44 t/s | 9.42 / 11.58 t/s |
+| Initial 8K, 16 output tokens | about 91 t/s | about 3.7 t/s |
+| 4K append, 16 output tokens | about 84 t/s | about 4.0 t/s |
 
-All compared full logits were exact: GLM at 2K/3K and 8K/12K, DeepSeek at
-8K/12K. Matching official-continuation subsets were also identical: GLM
-24 cases, 2,963 tokens, NLL `0.309656938`; DeepSeek Vision Exp 12 cases,
-768 tokens, NLL `0.163628345`. These are not complete 100-case quality passes.
-Automatic, cold, one-slot and 500 GiB-hint GLM checks preserved exact logits.
-The one-slot run was shortened after direct reads took about 31 seconds per
-token. The oversized hint was safely reduced but decoded at only 0.36 t/s;
-automatic sizing remains the practical default. Denying just the static lock
-passed; denying all memory locks failed cleanly in the expert cache.
+For short appends, use the code-audit prompt, 1024 initial tokens, an 8K
+allocation, a 66 GB cache hint (61.35 GiB effective), forced snapshot restore
+and 64 greedy output tokens at each frontier:
 
-The initial full non-Flash GLM Q2 check exposed a pre-existing correctness
-bug: compact dense prefill omitted its RoPE score. Flash has no RoPE score and
-could not reveal it. The corrected dispatch passes the independent attention
-oracle and a real-model comparison with the general attention path: all
-154,880 logits match and the complete archive question returns gamma. This
-is separate from the output-identical cache changes. No matching full GLM 5.3
-official-continuation suite was available; do not use Flash vectors to sign
-off that checkpoint.
+| Added tokens | Append latency | Generation afterward |
+| ---: | ---: | ---: |
+| 16 | 2.9 s, three-run median | 5.11 t/s |
+| 43 | 5.4 s, single run | 5.34 t/s |
+| 114 | 8.7 s, single run | 5.39 t/s |
 
-Real Pi coding sessions passed with both larger-than-RAM Flash models above:
-read, edit, write, warning-strict C builds, test execution, an intentional
-missing-file error and recovery, then another edit/test round. Independent
-exhaustive C oracles passed. The DeepSeek and GLM conversations reached
-7,360 and 7,111 tokens; every tool-result continuation reused its full live
-prefix. Pi's subsequent compaction requests correctly rebuilt shorter prompts.
-Separate 4.6K-4.8K tool-history checks returned GREEN on replay and BLUE after
-editing the tool result, matching a fresh server. These earlier-prefix replays
-required rebuilds: GLM reported a 4,615-token match but rebuilt its recurrent
-state in about 40 seconds; DeepSeek rebuilt the compressed history. Do not
-count a reported matched prefix as saved computation without checking this log.
-No OOM, GPU reset or memory-pressure termination occurred in the initial pass. It did not
-test M3, CUDA, ROCm, physical TP, vision or speculative SSD decoding.
+Compare with `DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR=1` as
+an ablation, requiring identical full logits and generated text. Keep cache
+misses/application read bytes separate from measured physical SSD traffic.
 
-The follow-up retained a larger automatic DeepSeek cache (86.20 GiB on these
-hosts), bounded preload priorities, and the correct aging clock for GLM's
-first routed layer. A same-cache coding comparison reduced DeepSeek expert
-read bytes from 94.65 to 78.18 GiB and raised initial generation from 18.49
-to 19.83 t/s; continued generation was neutral at 24.62/24.55 t/s. These are
-application read counts, not a measurement of physical SSD traffic.
-
-Later single-run comparisons, with unchanged precision and prompt chunks:
-
-| Workload | Prefill before / after | Generation before / after |
-| --- | ---: | ---: |
-| DeepSeek MXFP4, 8K, 128 output tokens | 280.97 / 299.87 t/s | 10.42 / 11.90 t/s |
-| DeepSeek MXFP4, 4K append, 128 output tokens | 261.40 / 263.32 t/s | 16.15 / 19.34 t/s |
-| Full GLM Q2, 8K, 16 output tokens | 63.23 / 90.70 t/s | 2.93 / 3.69 t/s |
-| Full GLM Q2, 4K append, 16 output tokens | 61.56 / 84.31 t/s | 3.85 / 3.96 t/s |
-
-Full GLM used the same 35.36 GiB expert cache, 16K context, and snapshot
-restoration in both runs. Its 512-token append also improved from 14.64 to
-26.01 t/s with the larger cache. Every compared full logit at 8K/12K is exact;
-Flash Q4's 2K/3K logits remain exact too. The earlier matching official subsets
-remain unchanged after the DeepSeek cache-policy update.
-
-Bounded Metal model views fix a separate memory problem: single spans used
-to retain earlier layers. Two old-mapping/control runs with a 61.35 GiB cache
-were stopped by the external guard for swap growth, without a reboot or GPU
-reset. The corrected full-GLM 8K/12K run completed with no new swap and at
-least 15.41 GiB available. It decoded 64 tokens at 5.79/5.94 t/s; that run
-replayed the prefix before appending. At the smaller cache, the snapshot-based
-comparison above improved minimum available memory from 11.11 to 27.87 GiB.
-These successful runs do not erase the failed controls.
-
-The final Flash Q4 MTP snapshot check passed at 3,778 prompt tokens: 16 replayed
-cycles, 12 single-token and four double-token outcomes, identical committed
-tokens and restored top logits, followed by four context-reuse cycles.
-Its real Pi coding task passed again with automatic cache sizing and an
-independent C oracle. Model-free frontend, agent, session-state, TP-command,
-SSD-cache, attention and eight-expert eviction/mapping tests passed on M5.
-
-Additional Metal API validation found two independent issues: managed-storage
-notifications on shared buffers, and GLM attention scratch lengths that were
-not multiples of 16 bytes. The notifications were removed and the scratch
-allocations padded without changing the computed values. Irregular-length
-attention tests pass against the numerical oracle with validation enabled.
-Validated real Pi coding sessions now pass for Flash Q4 and DeepSeek Vision
-Exp MXFP4, reaching 7.2K and 7.6K context with independent C oracles. Minimum
-available memory was 13.21 and 7.40 GiB, respectively, with no swap growth.
-The validated Flash MTP snapshot test also passes. These runs overlapped a
-model download, so their elapsed times are not performance references.
-
-Full GLM short-append cache checks used the code-audit prompt, 1,024 initial
-tokens, an 8K allocation, a 66 GB cache hint (61.35 GiB effective), forced
-snapshot restoration and 64 greedy output tokens at each frontier. The control
-set `DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR=1`.
-All 154,880 logits and complete generated text matched in every pair.
-
-| Append | Time before / after | Generation afterward | Repetitions |
-| --- | ---: | ---: | --- |
-| 16 tokens | 30.8 / 2.9 s | 4.09 / 5.11 t/s | Three-run medians |
-| 43 tokens | 34.4 / 5.4 s | 4.00 / 5.34 t/s | One pair |
-| 114 tokens | 34.9 / 8.7 s | 3.90 / 5.39 t/s | One pair |
-
-The 16-token runs' initial prefill medians were 55.92/55.16 t/s and initial
-generation 4.14/3.78 t/s; do not claim a general decode improvement from the
-post-append result. No run grew swap or raised memory pressure; minimum
-available memory across these runs was 15.05 GiB. These performance tests
-ran after the model download and checksum verification had finished.
-
-The full GLM Q2 Pi retry on IT passed with Metal API validation and automatic
-cache sizing (69.51 GiB). It read the project, fixed the function, wrote tests,
-corrected its own test expectation and case count, and passed both its 726-case
-test and the independent C oracle. The session reached 8,416 tokens; ordinary
-tool-result turns reused their complete live prefixes, while Pi's final
-compaction correctly started a new 273-token prompt. The complete task took
-795.58 seconds, with at least 11.40 GiB available and no swap growth or API
-validation error. This is a workflow result, not a paired speed benchmark.
-Full GLM's validated MTP snapshot check also passed at 3,778 prompt tokens:
-16 replayed cycles committed the same 20 tokens and restored the same top
-logits, followed by four context-reuse cycles. Minimum available memory was
-15.01 GiB with the 61.35 GiB cache, without swap growth.
-The final full-model 8K/12K snapshot regression preserved every logit from
-the earlier reference. With the smaller 35.36 GiB cache it measured 94.81/91.08
-t/s prefill and 3.62/3.81 t/s generation (16 tokens), with at least 27.88 GiB
-available and no swap growth. The reference ran on the other M5, so this is
-a correctness and memory regression check, not a new paired speed claim.
-
-The earlier US full non-Flash GLM Pi task did NOT pass: after several successful
-tool calls, a reader stalled inside `pread` near 5.2K context. The external
-guard timed out. Kernel stacks later showed the terminated server still
-waiting in APFS `cluster_read_ext`; an independent process could not even
-open the same GGUF (`apfs_io_lock_exclusive`). Available memory recovered,
-but killing the processes did not clear the filesystem wait. The cause is
-not established. The IT coding pass does not resolve this US failure: clear
-the filesystem wait and repeat the US test before signing off that host.
-No reboot was performed without permission; an unrelated Claude session
-was still running there.
+A stuck `pread`, unopenable GGUF or filesystem wait surviving cancellation is
+not a passing timeout test. Stop inference, check the filesystem independently
+and repeat the task only after the host is healthy. Do not increase timeouts
+or count a pass on another host as resolving that failure.
 
 ## 8. CUDA / DGX Spark
 
@@ -1249,26 +1115,10 @@ clients.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
-September 6 focused tool-call QA passed with resident Flash 0731 Q2 + DSpark
-and GLM 5.3 Flash Q2 + MTP on the GB10 Spark, using 8K contexts. Pi completed
-read/write/edit/build/test loops in default and exact-sampling modes for both
-models. Direct ds4-agent tasks also passed, preserving literal HTML entities
-through file creation and editing. Independent 1,650-case clamp checks passed
-for each generated program. OpenAI streaming/nonstreaming, Anthropic and
-Responses tool-result continuations passed; output-limit and client-stop
-cases returned no fabricated complete call. Disconnected tool streams were
-followed by valid replies in under a second. Metal and CUDA frontend builds
-were warning-free; model-free frontend, CPU ASan/UBSan, session-state and TP
-command tests passed.
-
-This is not full-model or full-backend release sign-off. The reported full
-GLM 5.3 Q4 failure on a 512 GB Ultra was not reproduced with its exact weights,
-prompt and request settings. Capture raw output, source revision, output
-budget and stop reason before attributing `unterminated tool call` to inference
-quality or memory. Adversarial live prompts asking both models to copy literal
-thinking/tool-end tags were not copied faithfully: traces showed the models
-changed the text before parsing. Deterministic parser/stream tests preserve
-those markers, but that does not establish model-level copying accuracy.
+For an unterminated tool call, capture raw model output, source revision,
+output budget and stop reason before blaming inference, parsing or memory.
+Literal-marker copying needs both deterministic parser tests and real-model
+checks: the model can change the text before the parser sees it.
 
 ## 13. ds4-agent
 
@@ -1319,14 +1169,11 @@ The agent is the most stateful component.  Test it manually, not only by build.
   back to sampled prose. Require the tool to execute, the final answer to be
   valid, and DSpark stats to show zero verifier errors and no unexplained
   replay fallbacks (see the bounded-prefix exception in section 9).
-  Run the opportunistic default and `--mtp-exact-sampling`. The M5 Max
-  opportunistic smoke created, compiled, and ran a C program printing
-  `OPPORTUNISTIC_OK`, accepting 196 of 235 draft tokens.
+  Run the opportunistic default and `--mtp-exact-sampling`.
 - After message-format changes, run `make test-session-state`. Text-only
   observations through the multimodal API must equal ordinary message tokens
   for Flash, PRO and GLM, including closing-wrapper escaping. They must not
-  require a vision model. A rejection here once masqueraded as context
-  exhaustion after even a tiny shell result; increasing context cannot fix it.
+  require a vision model.
   Rendering/image-observation errors must be reported directly without
   compacting the conversation as though it had run out of context.
 - Bash tools:
@@ -1341,27 +1188,9 @@ The agent is the most stateful component.  Test it manually, not only by build.
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
 
-September 8 focused regression pass on M5 Max IT, using GLM 5.3 Flash Q2 and
-DeepSeek Flash Vision Exp mixed Q2/Q4 with their vision encoders:
-
-- Both models passed the image-prefix suite and Pi editing tasks through Chat
-  Completions, Responses and Anthropic. Changed, removed and reordered images
-  invalidated the old prefix; unchanged images reused their encoder output.
-- At 56,035 GLM and 53,615 DeepSeek initial prompt tokens, adding each image
-  retained the entire old frontier. Final short follow-ups took 0.252 and
-  0.281 seconds respectively, with 58,268 and 54,442 cached tokens.
-- Forced 4K/8K compaction passed real tool tasks and an 80-function compiled
-  code oracle, including thinking, GLM MTP and DeepSeek DSpark. A partial write
-  had no side effects before retry and then produced all 300 expected lines.
-  Full older-session restore, cancelled compaction, images across compaction,
-  queued input and subsequent editing also passed.
-- Frontend/session unit tests, terminal PTY tests and ASan/UBSan-instrumented
-  frontend tests passed. Builds were warning-free. This was not a full release
-  matrix: CUDA, ROCm, TP and the reported 100K M3 Ultra setup were not tested.
-- A separate DSpark stop-boundary rewind can still force a prefix rebuild.
-  The same short prose/tool test reproduced identical rebuilds with both the
-  old and fixed agents. Do not mistake compaction correctness for fixing this
-  pre-existing speculative-cache performance limitation.
+Check speculative stop-boundary rewinds separately from compaction. Record
+any required prefix rebuild and its latency; a successful compaction test
+does not establish that speculative cache reuse is efficient.
 
 ## 14. Download Script And Model Files
 
@@ -1397,171 +1226,56 @@ tests, record aggregate and per-session decode speed.
   decode is a release blocker unless the change and tradeoff are documented.
 - Keep the complete `ds4-bench` CSV. A single short-prompt average is not enough
   to detect a context-dependent regression.
+- For speculative decoding, retain the generated text and draft-acceptance
+  statistics. Repetition loops can inflate throughput; a faster bad answer is
+  not a win. Separate changed continuation/acceptance from kernel cost using
+  matched teacher-forced ordinary-decode measurements. Test code and prose.
 - Compare startup time and peak memory as well as tokens per second when model
   loading, caches, streaming, or temporary arenas changed.
 - Run the backend-specific batch tests in sections 4 and 8. Fast single-session
   decode does not substitute for aggregate multi-session throughput.
 
-September 5 ROCm attention review, GLM 5.3 Flash Q2, Promessi Sposi, 8,192
-allocated context and 32 generated tokens (one matched before/after run):
+### CUDA And ROCm References
 
-| Workload | Previous build | Corrected default | Corrected scalar control |
-| --- | ---: | ---: | ---: |
-| Initial 4,096-token prefill | 80.65 t/s | 76.15 t/s | 33.81 t/s |
-| 2,048-token append after 4,096 | 21.45 t/s | 67.28 t/s | 20.92 t/s |
-| Decode at 6,144 | 11.70 t/s | 11.68 t/s | 11.69 t/s |
+Use the corrected GLM 5.3 sparse-attention boundary at 2051 tokens. Do not
+compare larger prompts against old dense-to-4096 measurements. On Strix Halo,
+GLM 5.3 Flash Q2 with Promessi Sposi, 8192 allocated context and 32 generated
+tokens has these reference points: initial 4096 prefill about 77 t/s, a 2048
+append about 68 t/s, decode at 6144 about 11.7 t/s. Repeat as three-run medians.
+The rendered long Z.AI fixture references are NLL 0.661721610 on ROCm and
+0.680093110 on CUDA, both 6/8 first-token matches. Use section 3's template.
 
-The previous build incorrectly used dense attention through 4,096 tokens.
-The corrected graph switches after 2,051, following the pool selection rule;
-its 5.6% initial-prefill cost must not be mistaken for timing noise. Older GLM
-measurements above this boundary used the old graph. Continued prefill improves
-about 3.2x over corrected scalar attention; decode is unchanged. Repeat these
-measurements as three-run medians for release sign-off.
+For Flash 0731 Q2 on ROCm, record cold and warm first-request costs separately.
+Reference warm 2K prefill/append is about 207 t/s and 4K decode about 14.7 t/s;
+required-buffer admission precedes optional weight expansion. Include that
+expansion in startup-to-first-response timing rather than hiding it in warmup.
+The matching 100-case reference is NLL 0.398181736, 56/100 first-token matches.
 
-The complete stored GLM fixture is unchanged on ROCm: NLL `0.462125091`,
-first-token matches `90/100`, mean greedy prefix `7.320`. CUDA scored
-`0.461783551`, `90/100`, and `7.490`. These short prompts do not test the
-corrected boundary. Independent attention tests pass on Metal, CUDA and ROCm;
-whole-model warm/cold continued prefill passes on CUDA and ROCm. CUDA also
-passes snapshot/MTP restore and reuse with a 2,771-token prompt. Fresh
-long-context scoring now uses eight September 5 Z.AI FP8 references, covering
-roughly 3K-7.3K prompt tokens and 740 answer tokens. Use the official low-effort
-template and returned reasoning as the prefix; the provider requires reasoning.
-Do not compare these answers against the no-thinking template.
+Single-Spark resident Flash 0731 Q2, Promessi Sposi, 9216 allocated context,
+128 teacher-forced decode tokens, three-run medians:
 
-| GLM Q2 long-reference path | NLL | First-token matches | Mean greedy prefix |
-| --- | ---: | ---: | ---: |
-| ROCm corrected default | 0.661721610 | 6/8 | 2.500 |
-| ROCm old dense-cutoff control | 0.661579639 | 6/8 | 2.500 |
-| ROCm corrected scalar control | 0.674282960 | 6/8 | 2.500 |
-| CUDA corrected default | 0.680093110 | 6/8 | 2.500 |
+| Context | Prefill | Decode |
+| ---: | ---: | ---: |
+| 2048 | 823.49 t/s | 19.25 t/s |
+| 4096 | 899.89 t/s | 16.22 t/s |
+| 8192 | 931.17 t/s | 15.97 t/s |
 
-The old-cutoff control retains the other correctness fixes. Its 0.021% NLL
-difference is neutral (four case wins each). The corrected fast path is 1.86%
-better than scalar on this set (six case wins versus two). This is focused
-regression evidence, not a broad quality claim or API-logit parity: the API
-returned no logprobs and may normalize reasoning whitespace. All runs completed
-with at least 11.3 GiB usable RAM. CUDA's complete long-fixture TSV is identical
-before and after the Q8 scratch change below.
+Single-Spark DSpark references use matched 0731 Q2 weights, 4096 allocated
+context, prefill chunk 512 and 256 output tokens. Use the C hash-table and
+unpredictable-prose prompts and sampling settings below:
 
-The matched Flash 0731 Q2 ROCm fixture also has unchanged scores in all 100
-cases: NLL `0.398181736`, first-token matches `56/100`, mean prefix `5.170`.
-One paired timing run measured initial 2K prefill at `180.73/181.40` t/s,
-a 2K append at `207.67/207.69` t/s, and 4K decode at `14.69/14.69` t/s.
-Those timings predate the final memory-policy fixes. The subsequent DSpark
-startup exhausted pinned memory: Linux's apparent availability included about
-13.2 GiB of CMA pages that these allocations cannot use. After the reboot,
-allocation checks exclude CMA, optional Q8 expansion is deferred until required
-buffers exist, and tightly sized model arenas remove 13.38 GiB of wasted GLM
-capacity. Do not reuse the earlier unadjusted memory minima as safety evidence.
+| Workload | Ordinary decode | DSpark |
+| --- | ---: | ---: |
+| C hash table, temperature 0 | 19.72 t/s | 31.41 t/s |
+| C hash table, temperature 1 | 19.53 t/s | 29.98 t/s |
+| Unpredictable prose, temperature 1 | 19.53 t/s | 18.81 t/s |
 
-The final build passed both complete 100-case fixtures with the same scores,
-GLM snapshot/MTP/reuse at 2,771 prompt tokens, three identical finite vision
-encodes, and strict two-session full-logit checks for GLM and Flash. All five
-DSpark cases completed in greedy, opportunistic and exact-sampling modes with
-zero verifier errors. Greedy outputs matched ordinary decode. One sampled
-five-of-six commit used the documented one-token prefix extension. DSpark
-kept at least 7.97 GiB usable; this is not a claim that it beats ordinary
-decode on every prompt. GLM 5.2 SSD smokes passed with automatic sizing, a
-500 GiB hint reduced to fit, and the one-expert per-layer fallback. There was
-no new OOM, GPU reset or reboot during these final tests.
+Temperature 1 here uses opportunistic sampling, not exact sampling. Repeat
+live-frontier sweeps at 2K/4K/8K as well; high short-code acceptance does not
+establish a general speedup. Use the six-token scorer and continued-state
+oracles in section 8 when changing small-batch CUDA kernels.
 
-Final GLM timing was 77.33 t/s initial 4K prefill, 68.22 t/s for the 2K append,
-and 11.74 t/s decode at 6K. Flash's initial 2K prefill was 154.81 t/s, about
-15% below the earlier build; its append and 4K decode remained 207.18 and
-14.68 t/s. Deferring optional cache construction moves work to the first
-request. A separate same-engine test of three fresh sessions measured
-168.63/207.41/206.90 t/s with byte-identical full logits, after 18.35 seconds
-of engine startup. Record this cold-request cost; warm results alone do not
-establish unchanged startup-to-first-response latency. These focused runs do
-not replace the three-run release medians.
-
-September 5 DGX Spark, fully resident Flash 0731 Q2, no speculative decoding:
-three interleaved medians per build after warmup, 128 teacher-forced decode
-tokens, Promessi Sposi, 9,216 allocated context. Reusing aligned Q8 scratch
-removes per-call pool allocations without changing the computation.
-
-| Context | Previous decode | Q8 scratch reuse | Gain | Prefill before / after |
-| --- | ---: | ---: | ---: | ---: |
-| 2,048 | 17.90 t/s | 19.25 t/s | 7.5% | 823.06 / 823.49 t/s |
-| 4,096 | 15.23 t/s | 16.22 t/s | 6.5% | 898.69 / 899.89 t/s |
-| 8,192 | 15.01 t/s | 15.97 t/s | 6.4% | 931.53 / 931.17 t/s |
-
-Full prefill and post-decode logits matched exactly at all three frontiers.
-All 100 Flash-0731 continuation scores were also identical: NLL `0.404714573`,
-first-token matches `55/100`, mean prefix `4.890`. The Q8 scratch test covers
-24 shapes, missing/undersized scratch, and graph replay with changing inputs;
-Compute Sanitizer memcheck reported zero errors. This is a single-GPU result,
-not a claim about multi-GPU speed or speculative acceptance.
-The final CUDA and ROCm builds were warning-free; ROCm attention, KDA and memory
-admission tests passed after removing the unused Q8 matvec kernels.
-
-September 6 DGX Spark DSpark checks use the matching Flash 0731 Q2 target and
-0731 support file, fully resident. Three interleaved runs per variant, 256
-generated tokens, 4,096 allocated context, prefill chunk 512, and the same C
-hash-table/prose prompts and sampling settings as the M5 comparisons below:
-
-| Workload | Ordinary decode | Previous DSpark | New DSpark |
-| --- | ---: | ---: | ---: |
-| C hash table, temperature 0 | 19.72 t/s | 23.44 t/s | 31.41 t/s |
-| C hash table, temperature 1 | 19.53 t/s | 25.03 t/s | 29.98 t/s |
-| Unpredictable prose, temperature 1 | 19.53 t/s | 18.16 t/s | 18.81 t/s |
-
-Temperature 1 uses the existing opportunistic policy, not exact sampling.
-Coding improves 59%/54% over ordinary decode and 34%/20% over previous DSpark.
-Low-acceptance prose still favors ordinary decoding. The defaults batch the
-seed with useful longer drafts and use existing aligned kernels for small Q8
-and IQ2/Q2 batches. No new enabling switches or production kernels are needed.
-A separate three-run paired ablation gives `30.46/28.65` t/s for the expert
-dispatch alone at temperature 0/1 and `31.39/30.08` with the Q8 dispatch too,
-an additional 3.1%/5.0%. The retained commits are `df80a87d`, `f6c169f8`,
-`45f54e9d` and `2803820d`; the agent observation fix is `558cd343`.
-Single paired checks at 400/800-token limits on the same greedy C prompt give
-`19.73/19.62` t/s ordinary versus `33.00/33.16` t/s new DSpark, with zero
-verifier errors or replays. Keep these separate from the three-run medians.
-The live Promessi Sposi sweep (128 generated tokens, 9,216 allocated context,
-chunk 512) has low draft acceptance: at 2K/4K/8K, total generation is
-`19.24/16.26/15.97` t/s ordinary, `18.12/15.44/15.11` with seed batching
-disabled on the new kernels, and `18.48/16.24/15.67` with the new defaults.
-The disabled-seed control is not the old executable. Initial/continued prefill
-is roughly `625/660/650` t/s in these runs, with no material change. This
-single paired sweep confirms working continued contexts, not a universal
-DSpark speedup. Retain the complete CSVs, including first-cycle latency.
-
-The normal 100-case continuation TSV remains
-byte-identical to the control above. With six-token prefill chunks, control and
-candidate NLL are `0.422579437` and `0.424830442` (+0.533%); first-token matches
-are `50/51`, mean greedy prefixes `5.050/5.260`, and top-token agreement
-`86.21/86.42%`. Cases favor the candidate/control `48/52`. A paired case bootstrap
-gives a 95% interval of `[-0.00702, 0.01153]` for the NLL/token difference.
-This is mixed numerical variation, not bit-exact inference or evidence of a
-quality improvement. Do not hide the slightly higher loss behind the better
-greedy agreement.
-
-The 54 Q8 scratch/graph cases and the tiny IQ2/Q2 expert tests pass, including
-different gate/up weights and exact batched-versus-single-row comparisons.
-Compute Sanitizer memcheck, racecheck and synccheck report zero errors.
-Two- and six-session server-prefill/decode oracles pass 24 steps with
-byte-identical full logits versus separate sessions. Greedy, opportunistic,
-exact-sampling and forced-partial fixtures pass all five prompts with zero
-verifier errors. CUDA retains five intermediate prefixes, eliminating replay
-in these ordinary partial-accept cases. The continued-state oracle passes two
-128-token phases at each of the 127/2047/4095/8191-token frontiers; worst
-serial-target argmax gaps are `0.026638/0.254242/0/0.249626`, within the existing
-verifier bound. Minimum usable RAM during these checks was 8.82 GiB, excluding
-CMA. These are single-Spark checks, not a new multi-GPU or all-backend sign-off.
-
-Both opportunistic and exact DSpark agent runs created a C clamp function,
-compiled and ran its tests, edited the degenerate-interval cases, then compiled
-and ran again. An independent exhaustive check of small integer ranges passed
-for both generated programs. Draft acceptance was `875/1017` and `431/504`,
-respectively, with zero verifier errors or replay fallbacks. The first attempt
-stopped after announcing a directory inspection; a fresh-cache retry exposed
-the text-only tool-observation rejection described in section 8. After fixing
-that shared helper, both complete tasks passed. The helper's CPU regression
-also passed AddressSanitizer and UndefinedBehaviorSanitizer. Do not count the
-failed attempts as passing runs or attribute the context error to insufficient
-RAM.
+### Metal Kernel And Speculation Gates
 
 For M5 dense-kernel changes, run `MTL_DEBUG_LAYER=1 make test-metal-dense-mpp`.
 It checks Q8 decode and Q4_0/Q4_K prefill against exactly representable CPU
@@ -1589,11 +1303,9 @@ speed-bench/metal_decode_schedule_bench -m "$MODEL" \
 ```
 
 Here `control` is the default fast path; `candidate` disables packing.
-Require exact logits and no decode regression. On M5 Max, Flash Vision Exp
-Q2 measured 734.40 versus 711.89 t/s at 2K; mixed Q2/Q4 measured 615.01
-versus 604.62 t/s for a 4K append to 12K. Decode was unchanged. These are
-interleaved sustained measurements, not cold-run peaks. Packing is an M5
-resident-prefill optimization; it does not claim pre-M5 or streaming gains.
+Require exact logits and no decode regression. Packing is an M5
+resident-prefill optimization; test streaming and conventional kernels
+separately when their dispatch or shared buffers change.
 
 For Metal DSpark changes, test matching 0731 and Vision Exp target/drafter
 pairs. Run the acceptance fixture at temperature 0, at temperature 1 with
@@ -1616,59 +1328,44 @@ worse than the previous DSpark path. It does not promise to beat ordinary
 decode on every prompt. Run the six-session full-logit batch oracle too,
 since a six-row verifier shares routed kernels with session batching.
 
-September 4 M5 measurements, 256 generated tokens, 4096 allocated context:
+M5 DSpark reference medians, 256 generated tokens, 4096 allocated context:
 
-| Model and prompt | Previous DSpark | Default DSpark |
-| --- | ---: | ---: |
-| 0731 Q2, C hash table, temperature 0 | 55.71 t/s | 62.95 t/s |
-| 0731 Q2, C hash table, temperature 1 | 50.95 t/s | 61.58 t/s |
-| Vision Exp mixed Q2/Q4, C hash table, temperature 0 | 41.65 t/s | 48.86 t/s |
-| Vision Exp mixed Q2/Q4, C hash table, temperature 1 | 43.56 t/s | 47.24 t/s |
+| Model and prompt | DSpark |
+| --- | ---: |
+| 0731 Q2, C hash table, temperature 0 | 62.95 t/s |
+| 0731 Q2, C hash table, temperature 1 | 61.58 t/s |
+| Vision Exp mixed Q2/Q4, C hash table, temperature 0 | 48.86 t/s |
+| Vision Exp mixed Q2/Q4, C hash table, temperature 1 | 47.24 t/s |
 
-These are three-run medians, alternating schedules with the matching drafter,
-`--nothink --top-p 0.95 --min-p 0.05 --seed 12345`. The prompt is:
-"Write a complete C hash table implementation with string keys, insert, find,
-delete, and a test main. Output only C code."
+Use the matching drafter and `--nothink --top-p 0.95 --min-p 0.05 --seed 12345`.
+The C prompt is: "Write a complete C hash table implementation with string keys,
+insert, find, delete, and a test main. Output only C code."
 
 For two-M5 TP, test the MXFP4 and mixed Q2/Q4 Vision Exp models with their
 matching drafter. Use the same sampling settings and 256-token C prompt above,
 plus the prompt "Write an unpredictable surreal scene with constantly changing
-imagery and no repeated phrases." September 5 measurements (two repetitions,
-reversed order on the second; both hosts on RDMA, 50/50 residency):
+imagery and no repeated phrases." Reference means of two reversed-order runs,
+explicit RDMA and 50/50 residency:
 
-| Model and prompt | Previous TP DSpark | Default TP DSpark |
-| --- | ---: | ---: |
-| MXFP4, C hash table, temperature 0 | 41.09 t/s | 50.76 t/s |
-| MXFP4, C hash table, temperature 1 | 41.47 t/s | 48.15 t/s |
-| MXFP4, prose, temperature 1 | 38.62 t/s | 45.99 t/s |
-| Mixed Q2/Q4, C hash table, temperature 0 | 40.60 t/s | 49.52 t/s |
-| Mixed Q2/Q4, C hash table, temperature 1 | 41.74 t/s | 46.36 t/s |
-| Mixed Q2/Q4, prose, temperature 1 | 37.64 t/s | 44.16 t/s |
+| Model and prompt | TP DSpark |
+| --- | ---: |
+| MXFP4, C hash table, temperature 0 | 50.76 t/s |
+| MXFP4, C hash table, temperature 1 | 48.15 t/s |
+| MXFP4, prose, temperature 1 | 45.99 t/s |
+| Mixed Q2/Q4, C hash table, temperature 0 | 49.52 t/s |
+| Mixed Q2/Q4, C hash table, temperature 1 | 46.36 t/s |
+| Mixed Q2/Q4, prose, temperature 1 | 44.16 t/s |
 
-Plain MXFP4 TP measured 53.19/50.93 t/s on that C prompt at temperature 0/1.
-These DSpark gains are relative to previous DSpark, not a claim that speculation
-always beats ordinary decode or that two hosts deliver twice the speed.
+Ordinary MXFP4 TP reference on the C prompt is 53.19/50.93 t/s at temperature
+0/1. Speculation need not beat ordinary decode on every prompt.
 
 Also compare ordinary MXFP4 TP with and without
 `DS4_METAL_DISABLE_ROUTED_MPP_PACKED=1`, using Promessi Sposi at 2K/4K/8K/16K
 live frontiers. Repeat in reversed order and compare full frontier logits.
-September 5 adjacent controls suggested roughly 3-5% faster prefill, but both
-paths slowed during sustained runs; 16K results were variable. Five of six
-runs were byte-identical at every frontier. One late control differed from
-another control at 8K/16K (maximum 0.163/0.167, unchanged argmax), so investigate
-reproducibility before attributing a difference to a new kernel.
-The final adjacent old/new 2K/4K/8K runs measured 813.53/683.68/707.97 versus
-888.45/703.16/691.96 prefill t/s; steady decode was 52.39/47.31/46.12 versus
-52.33/47.38/46.29 t/s, with byte-identical frontier logits. This confirms
-unchanged ordinary decode, not a uniform prefill gain at every context.
-
-With DSpark, the continued-context 2K/4K/8K check measured 44.03/41.88/41.76
-generation t/s versus 40.22/37.47/36.20 before these changes. All three prompt
-frontiers matched the ordinary baseline byte-for-byte. The first 20 cases of
-the checkpoint-matched Vision Exp continuation scorer were also byte-identical:
-1280 target tokens, average NLL 0.179928298, first-token matches 19/20,
-average common prefix 17 tokens. These are focused comparisons, not a full
-100-case quality pass.
+Investigate fresh-process variability with GPU/CPU clocks, temperature and
+concurrent activity recorded. Require repeatable controls before attributing
+small differences to a kernel. Include the matching official-continuation
+fixture, not just a timing prompt.
 
 Require `MTL_DEBUG_LAYER=1 make test-metal-moe-prefill` on both M5s. This covers
 packed MXFP4 prefill, both expert-ownership halves, tiny batches and the actual
@@ -1689,72 +1386,36 @@ DS4_DSPARK_SCHEDULER=0 DS4_DSPARK_SPEC_LOG=1 \
 This checks committed tokens against serial target logits at 127- and
 4095-token prefixes, then appends to each live speculative cache. Require
 six-token commits and exercise partial prefixes, including five of six tokens.
-The test uses the existing verifier oracle's 2.0-logit near-argmax bound; the
-September 5 MXFP4 maxima were 0 and 0.0984. Also run the acceptance checks with
+The test uses the verifier oracle's 2.0-logit near-argmax bound. Also run the acceptance checks with
 `--mtp-exact-sampling` and with forced low-confidence proposals. Both ranks must
 exit cleanly, with no verifier errors or unexplained replay fallbacks.
 Exact sampling under TP still intentionally replays partially rejected blocks;
 those replays are expected, and seed batching must remain disabled in this mode.
-One September 5 two-session run failed at the initial RDMA big-gate barrier.
-Both ranks exited cleanly; instrumented and ordinary retries, plus four- and
-six-session runs, passed. The cause was not established. Keep transport failures
-in the record even when reruns pass; do not hide them by increasing timeouts.
+Record transport failures even if retries pass; investigate them rather than
+hiding them by increasing timeouts.
 
 Repeat the physical TP session oracle with two, four and six sessions. Do not
 set `DS4_TEST_SKIP_MIXED`: ordinary decode and the mixed continued-prefill step
-must both match full serial logits exactly. A regression once left the final
-TP residual update deferred in mixed mode, producing a maximum logit difference
-of 23.7409 despite choosing the same next token. Testing only argmax misses it.
-After flushing that update before the output head, September 5 MXFP4 TP tests
-passed exactly at all three session counts; mixed Q2/Q4 passed at six sessions
-both in TP and on a single host.
+must both match full serial logits exactly. Check that the final TP residual
+update is flushed before the output head; argmax agreement alone cannot catch
+a stale residual. Test mixed Q2/Q4 on both one host and physical TP.
 
-Do not discard slow runs as noise: separate-process tests sometimes varied
-by about 20%, including ordinary decoding. Vision Exp prose showed slower
-outliers; matched GPU-monitored reruns measured about 41.1 versus 38.4 t/s,
-and alternating within one loaded engine measured 40.4 versus 36.7 t/s
-(medians after warm-up).
-Investigate fresh-process variability separately from kernel cost. Ordinary
-decoding still wins on this low-acceptance prompt.
+### Other Hardware References
 
-These are the last known good observations available when this gate was added.
-They are reference points for matching hardware and workloads, not performance
-claims across different models or contexts.
+These are comparison points for the stated model and workload, not portable
+throughput promises. Establish a fresh matched baseline where the checkpoint,
+prompt or settings are unavailable. Model-specific sections give additional
+context sweeps and memory limits.
 
 | System and backend | Model and workload | Prefill | Decode |
 | --- | --- | ---: | ---: |
-| MacBook Pro M3 Max 128 GB, Metal | Flash q2, 11,709-token prompt | 250.11 t/s | 21.47 t/s |
-| MacBook Pro M3 Max 128 GB, Metal | Flash 0731 q2, opportunistic temperature-1 128-token code prompt | - | 29.16 t/s ordinary; 28.18 t/s DSpark |
-| MacBook Pro M5 Max 128 GB, Metal | Flash q2, 11,707-token prompt | 463.44 t/s | 25.90 t/s |
-| MacBook Pro M5 Max 128 GB, Metal | Flash 0731 q2, opportunistic temperature-1 128-token code prompt | - | 44.49 t/s ordinary median; 48.19 t/s DSpark median |
-| Mac Studio M3 Ultra 512 GB, Metal | Flash q2, 11,709-token prompt | 468.03 t/s | 27.39 t/s |
-| Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
-| Mac Studio M3 Ultra 512 GB, Metal | GLM 5.3 Flash Q4 with Q8 KDA/head, 2,048-token prompt | 437.62 t/s | 24.74 t/s |
-| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token prefill and 256-token teacher-forced decode | about 214 t/s | about 16.7 t/s |
-| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, resident short prompt | 86.68 t/s | 34.45 t/s; 41.97 t/s greedy MTP |
-| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 8,192-token compact-attention prompt | 479.09 t/s | 29.89 t/s steady |
-| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 full Q2, SSD streaming with 16 GiB expert budget; 463-token prefill / forced 64-token decode | 12.59 t/s median | 6.14 t/s median |
-| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, short prompt | 29.06 t/s | 32.70 t/s |
-| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 24,988/49,948-token long prompts | 424.80 / 421.75 t/s | 29.50 / 28.10 t/s |
-| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, 10,819-token prompt | 468.97 t/s | 22.85 t/s |
-| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q4, 34,023-token agent prefill suffix | 309.74 t/s | full coding task: 178.93 s wall |
-| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 2/4/8 resident decode sessions | - | 54.49 / 73.96 / 86.17 aggregate rows/s |
-| DGX Spark GB10, CUDA | GLM 5.3 Flash Q2, 2,048-token prefill and 16-token decode | 531.39 t/s | 14.35 t/s at 2,048 context |
-| DGX Spark GB10, CUDA | GLM 5.3 Flash Q2, live-session 4K/6K/8K continued prefills | 522.66 / 506.20 / 502.50 t/s | - |
-| DGX Spark GB10, CUDA | GLM 5.3 Flash Q2, strict two-session 24-step oracle | - | 16.5 aggregate rows/s; byte-exact full logits |
-| DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
-| DGX Spark GB10, CUDA | Flash q2 DSpark, 64-token C fixture | - | 24.48 t/s direct; 13.93 t/s replay predecessor |
-| DGX Spark GB10, CUDA | pre-0731 Flash q2, exact-sampled 128-token code prompt | - | 18.17 t/s ordinary; 18.30 t/s DSpark |
-| DGX Spark GB10, CUDA | pre-0731 Flash q2, opportunistic temperature-1 128-token code prompt | - | 18.32 t/s ordinary; 18.43 t/s DSpark |
-| Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 17.27 t/s; FP32 rollback 9.70 t/s |
-| Strix Halo gfx1151, ROCm | Flash IQ2 resident, 4,096-token context | - | 14.82 t/s; FP32 rollback 8.76 t/s |
-| Strix Halo gfx1151, ROCm | GLM 5.3 Flash Q2 resident, 64-token prompt and 128-token decode | 47.18 t/s median | 14.25 t/s median steady; 8.64 t/s FP32 rollback |
-| Strix Halo gfx1151, ROCm | GLM 5.3 Flash Q2 resident, 4,096-token prefill | 80.08 t/s; scalar-attention rollback 23.35 t/s | - |
-| Strix Halo gfx1151, ROCm | Flash IQ2 DSpark, 64-token C fixture | - | 11.40 t/s direct; 9.77 t/s replay predecessor; 16.70 t/s ordinary |
-| Strix Halo gfx1151, ROCm | Flash 0731 IQ2, exact-sampled 128-token code prompt | - | 16.55 t/s ordinary; 12.68 t/s DSpark |
-| Strix Halo gfx1151, ROCm | Flash 0731 IQ2, temperature-1 128-token code prompt | - | 16.26 t/s ordinary; 12.28 t/s opportunistic; 13.52 t/s exact |
-| 8x L40S, CUDA TP | Flash q4, 2,048-token prefill benchmark | 1,524.84 t/s | 46.93 t/s |
-| 8x L40S, CUDA TP | Flash q4, 16-row decode oracle | - | 126.0 aggregate t/s |
+| M3 Ultra 512 GB, Metal | GLM 5.3 Flash Q4 with Q8 KDA/head, 2048-token prompt | 437.62 t/s | 24.74 t/s |
+| Two M5 Max, Metal RDMA TP | GLM 5.2 IQ2_XXS, 4096-token prefill, 256 teacher-forced decode tokens | about 214 t/s | about 16.7 t/s |
+| M5 Max, Metal | GLM 5.3 full Q2 SSD, 16 GiB expert budget, section 7 commands | 12.59 t/s median | 6.14 t/s median |
+| DGX Spark, CUDA | GLM 5.3 Flash Q2, 2048-token prefill, 16 decode tokens | 531.39 t/s | 14.35 t/s |
+| Strix Halo, ROCm | Flash 0731 IQ2, temperature-1 128-token code prompt | - | 16.26 ordinary; 12.28 opportunistic; 13.52 exact t/s |
+| 8x L40S, CUDA TP | Flash Q4, 2048-token prefill benchmark | 1524.84 t/s | 46.93 t/s |
+| 8x L40S, CUDA TP | Flash Q4, 16-row decode oracle | - | 126.0 aggregate t/s |
 
 The 8x L40S values are retained from the last recorded run on `192.168.60.250`.
 They are historical references only: never connect to that host or interrupt
@@ -1824,7 +1485,7 @@ the long sparse-boundary tests; neither substitutes for the other.
   wired memory and swap independently of the engine's planned allocation;
   retained Metal residency sets can otherwise escape its accounting.
   `tests/test_metal_moe_prefill --ssd-address` checks the IQ2/Q2 address kernel
-  across row counts that previously overflowed an unused narrow thread index.
+  across small and large row counts, checking index widths and output bounds.
   Compare short/long, initial/continued prefill with the same cache budget on
   the same host. Include first-token latency and steady decoding after prefill;
   a faster prefill that leaves a cold expert cache can lose overall.
@@ -1943,228 +1604,52 @@ the long sparse-boundary tests; neither substitutes for the other.
 - Unsupported backends, pipeline and speculative modes must fail explicitly until
   their V4.1 implementation is validated; an older graph/drafter is not a fallback.
 
-Historical September 10 focused V4.1 pass, implementation at `e4a7c0e1`, on the two
-128 GiB M5 Max hosts only. Source revision
-`df42c109f1defefcbfcedbe7d905718a12266e40`; routed gate/up IQ2_XXS, down Q2_K,
-attention/shared/head Q8_0, native disk-only FP8 Engram tables. Both GGUFs
-are 340.598 GiB, of which 188.833 GiB is Engram data. The calibrated artifact
-is `DeepSeek-V4.1-Flash-IQ2_XXS-Q2_K-imatrix.gguf`, SHA-256
-`1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`.
-The 8,192-token calibration observed 14,922 of 15,360 experts (97.15%);
-unobserved experts retain the bootstrap fallback. Both source/payload audits
-passed, including native Engram rows and source-reencoded expert samples.
+#### Metal Reference Checks
 
-The general 100-case fixture contains 2,994 teacher-forced API output tokens.
-All three runs used Metal API validation and 4,096 allocated context; SSD
-quality runs used a 64 GiB expert-cache budget.
+The calibrated Q2 main weights occupy about 151.8 GiB, Q4 about 294.15 GiB;
+188.8 GiB of Engram remains disk-only. Validate the release artifacts with
+the converter/payload and download checks above, not old bootstrap filenames.
 
-| Weights and execution | Average NLL | API top-token agreement | Target logprob MAE |
-| --- | ---: | ---: | ---: |
-| Bootstrap, single-Mac SSD | 0.395514736 | 2692/2994 (89.91%) | 0.248143951 |
-| Calibrated, single-Mac SSD | 0.364576009 | 2697/2994 (90.08%) | 0.227531809 |
-| Calibrated, two-Mac RDMA TP | 0.366961107 | 2699/2994 (90.15%) | 0.228669737 |
+Compare against the corresponding stored fixture and execution schedule:
 
-Calibration lowers NLL by 7.82% on this set; top-token agreement is effectively
-unchanged. Whole-prompt paired resampling gives a 95% interval of
-`[-0.05563, -0.00745]` for the calibrated-minus-bootstrap NLL difference.
-This supports the calibrated artifact, not universal superiority or bit-exact
-API parity. The initial five-case subset had worse calibrated NLL, which is
-why the broader comparison was required. TP uses a different reduction order;
-real-weight partition tests and the independent API scores both pass.
+| Model / execution | Fixture | Mean NLL | API top-token agreement |
+| --- | --- | ---: | ---: |
+| Q2, M5 SSD | General 100 | 0.364576009 | 2697/2994 |
+| Q2, M3 Ultra resident batched prefill | General 100 | 0.365680596 | 2705/2994 |
+| Q2, Metal TP | General 100 | 0.361471738 | 2699/2994 |
+| Q4, M5 SSD | General 100 | 0.246523256 | 2896/2994 |
+| Q4, M3 Ultra resident | General 100 | 0.252409161 | 2896/2994 |
+| Q4, M5 SSD | Long 9, 8K/16K/32K | 0.335651410 | 542/576 |
+| Q4, M3 Ultra resident | Long 9, 8K/16K/32K | 0.328760094 | 538/576 |
+| Q2, M3 Ultra resident | Extended 6, 64K/96K | 0.558586149 | 327/384 |
+| Q2, Metal TP | Extended 6, 64K/96K | 0.560655370 | 328/384 |
+| Q4, M3 Ultra resident | Extended 6, 64K/96K | 0.366465846 | 360/384 |
 
-Bootstrap SSD and TP passed all 17 short/boundary cases, including every
-retrieval through 16,385 tokens. Calibrated SSD and TP passed cases 000-013
-plus 016; the calibrated 16,383/16,384 cases were not separately repeated.
-Real-weight incremental prefill and snapshot restoration preserved exact
-next-token logits at all twelve tested boundaries through 16,385. Native
-agent coding passed with `--think-level 25`; real HTTP read/edit/test loops
-passed Chat, Responses replay/live-tail and Anthropic, including reversed
-parallel tool results. A bootstrap SSD coding task began with 18,379 tokens
-and reused its live prefix on every follow-up. Independent tests passed
-without edits to the test files.
+These are reference scores, not claims of bit-identical cross-backend quality.
+Different prefill schedules and hardware can change rounding and expert routes.
+Compare paired case scores on the same schedule, including the long fixtures;
+unchanged top-token totals alone do not rule out a loss increase. A release
+calibration must record coverage and retain the fallback for unobserved experts.
 
-Production-mode calibrated benchmarks used `speed-bench/promessi_sposi.txt`,
-4,096 allocated context, 512-token prefill intervals and 128 greedy output
-tokens per frontier, without speculation or API validation. These are single
-sweeps, not three-run release medians. SSD used automatic cache sizing.
+- For Q4 native batches through eight rows, retain the 0.0002 full-logit
+  bound against scalar controls. Test the consumed fused outputs rather than
+  optional gate/up scratch that a fused kernel need not write. Keep exact
+  companion-isolation and cache-state checks separate from scalar parity.
+- Keep the warm-SSD matrix-prefill threshold at 1024 tokens when at least
+  half the experts fit unless a new threshold passes the nine long and six
+  extended official fixtures. A speed win at 512 tokens is not sufficient.
+- During Q4 SSD tests, verify that persistent full-expert tables cannot retain
+  whole layers outside the cache budget. Start with a guarded 32 GiB cache,
+  then increase only after wired memory and swap remain bounded. Planned
+  allocation alone is insufficient evidence of safe physical residency.
+- Repeat the explicit non-Metal-4 control when investigating M5 versus M3
+  scores. Test residency, prefill geometry and kernel arithmetic separately;
+  do not infer a transport or SSD error from cross-hardware logits alone.
 
-| Context frontier | SSD prefill / decode | RDMA TP prefill / decode |
-| --- | ---: | ---: |
-| 512 | 14.18 / 16.42 t/s | 25.87 / 25.85 t/s |
-| 1024 | 17.21 / 16.61 t/s | 26.65 / 25.72 t/s |
-| 1536 | 17.30 / 16.70 t/s | 26.54 / 25.63 t/s |
-| 2048 | 17.16 / 16.35 t/s | 26.59 / 25.58 t/s |
-
-These baseline runs used token-by-token prefill, before the layer-major SSD
-schedule was added. Automatic SSD allocation planned about 92.5 GiB total, including
-a 75.97 GiB expert cache. US swap grew to about 641 MiB during its agent run,
-then remained bounded and decreased during benchmarking. TP held about
-80.7 GiB per rank. No OOM, watchdog reset or reboot occurred.
-
-Warning-free Metal builds, frontend sanitizer checks, shared kernel/cache tests
-and focused older Flash/GLM continuation regressions passed. This is not full
-release sign-off: no M3, larger-Mac residency, CUDA, ROCm or pipeline execution
-was tested. Physical V4.1 TP cancellation/recovery was not specifically run;
-single-host cancellation and shared transport protocol tests do not replace it.
-At that revision, V4.1 vision, DSpark and native session batching were unsupported.
-
-September 12 completion pass, Metal only; numerical qualifications are recorded below:
-
-- Q2 full residency was exercised on a 512 GiB M3 Ultra. Its short official
-  scores match the single-host SSD aggregates above. The main model occupies
-  about 151.8 GiB; the 188.8 GiB Engram tables remain disk-only.
-  Mixed-size prefill, cache/history, progress, snapshot and next-decode checks
-  pass through 130,062 tokens on that Ultra, with no swap used. The bounded
-  64 GiB-cache SSD counterpart passes through 113,678 tokens on M5 Max.
-- Resident and SSD vision prompt tests pass, as does physical two-Mac RDMA
-  vision. Independent BF16 encoder comparisons across four fixtures have cosine
-  similarity 0.999677 through 0.999907. Six resident server image questions and
-  the image-prefix cache suite pass. These are focused tests, not a vision benchmark.
-- Physical TP cancellation/reuse passes on V4.1, older Flash and GLM. Rebuilt
-  continuation logits are exact, with the same connection retained.
-- Native SSD agent compaction/save/recovery checks pass at 4K and 64K on M5
-  Max. The long coding turn retained 54,884 tokens; all 80 generated C functions
-  compiled and passed an independent value check. Save/restore resumed tools
-  with the cached prefix, and oversized-input rejection remained recoverable.
-- Native vision-agent SSD checks pass at short and long context on M5 Max.
-  The long run began with 53,945 tokens and reached 55,738, using a 73,728-token
-  window. Both image-based code edits passed the independent oracle, and all
-  six tool continuations reused the prefix without compaction. Planned memory
-  was 102.32 GiB; the host reported about 1 MiB of swap afterward.
-- Native decode isolation passes at 2/4/8 rows on the Ultra and 2/8 on RDMA,
-  including two sessions at 64K on both. Eight-row, 64-step full-logit controls
-  differ by at most 1.15e-5; intermediate layer-state comparisons are exact.
-  Small expert kernels pass the consumed-output oracle at rows 1-9, and the
-  batch output head passes scalar and independent double-reference checks.
-- Resident native batches score the extended six-case set at NLL 0.558586174
-  (two rows) and 0.558586151 (eight), versus scalar 0.558586149. API top-token
-  agreement stays 327/384. TP native two-row scoring matches scalar aggregates:
-  short NLL 0.361471746 versus 0.361471738, 2699/2994 top tokens; extended
-  0.560655391 versus 0.560655370, 328/384. Complete manifests, finite values
-  and count consistency were checked before comparing scores.
-- Balanced timings without validation: Ultra two-row decode 34.1 versus
-  19.7 aggregate t/s serial; eight-row 44.2 versus 19.9. Physical TP reaches
-  36.1/40.7/45.7 aggregate t/s for 3/4/8 rows, versus about 30.8 serial.
-  Two-row TP batching measured 29.0 versus 30.8 and is therefore not the
-  default. These are balanced focused runs, not release-wide medians.
-- Native mixed batches (1-7 prefix rows, eight total rows) pass complete-logit,
-  invalid-input and subsequent-decode checks on the Ultra and physical TP.
-  The Ultra long variant crosses 16K, 32K and 64K boundaries; maximum logit
-  differences are 7.63e-6 on the Ultra and 5.73e-6 on TP. At 64K, seven prefix
-  rows plus one decoder took 0.249 seconds versus 0.507 for serialized work.
-  That timing was collected under validation, not as a release benchmark.
-- Resident small prefills now batch from eight tokens. A 128-token append
-  measured 0.74 versus 6.24 seconds on the Ultra. Official 100-case NLL is
-  0.365680596 versus 0.364576009, with a paired 95% interval spanning zero
-  (-0.00513 to 0.00766); API top-token agreement is 2705 versus 2697/2994.
-  Continued-128 long scoring similarly shows no established regression;
-  the two 64K/96K control cases improve target NLL. Complete-state checks
-  were repeated through 130,062 tokens after this scheduling change.
-- Real Pi image/code tasks pass Chat, Responses and Anthropic, with prefix
-  reuse after both images. Eight-slot JSON/SSE identical short-prompt tests
-  pass after cancelled requests. Mixed-length identical-pair tests pass with
-  a fixed 2048-token prefill quantum; the default variable-geometry run is
-  not bit-identical and is not reported as an exact-output pass.
-- Native-agent generation interruption and immediate same-session tool
-  recovery pass on M5 SSD streaming. Physical cancellation/reuse was repeated
-  with protocol 12 on V4.1, older Flash and GLM. Older Flash Vision Experimental
-  with its matching DSpark passes 512 TP target tokens with zero logit gap;
-  GLM Flash Q4 retains its ten-case NLL 0.319056979 baseline.
-- Earlier accepted RDMA timing reached 1111.30 t/s for 32K prefill,
-  1083.48 t/s for continued prefill and 30.13 t/s for short-context decode.
-  These supersede the token-by-token baseline table, but are not new release
-  medians. Keep cold-start loading and cache handoff in subsequent comparisons.
-- The first Q4 SSD scorer rebooted M5 US with a 92-second watchdog timeout:
-  wired memory reached about 123.4 GiB despite only 76.69 GiB planned. The
-  shared PRO/Q4 indirect expert-table path retained whole-layer residency
-  outside the bounded cache. Full-table dispatch is now resident-only; SSD
-  uses the selected-expert cache. The admission test fails on the old code
-  and passes with the fix. Six-expert Q4/MXFP4 eviction/batch/release checks and
-  the existing IQ2 suite pass under validation on M5 Max and M3 Ultra.
-  A guarded 32 GiB-cache Q4 continuation passes with 31/32 API top tokens,
-  about 30 GiB wired and no swap. The subsequent 64 GiB-cache Q4 scorer
-  passes all 100 short prompts and nine 8K/16K/32K prompts: NLL 0.246523256
-  and 0.335651410, API top-token agreement
-  2896/2994 and 542/576. Short target-logprob MAE is 0.070084928 versus Q2's
-  0.227531809; the paired short NLL difference interval is [-0.14129, -0.09452].
-  Full result tables pass manifest, finite-value and count checks. Wired memory
-  stayed bounded and swap remained zero. The reboot is not erased by the
-  passing rerun.
-- Calibrated Q2, Q4 and the vision encoder are published in
-  `antirez/deepseek-v4.1-flash-gguf`. Q4 contains 294.15 GiB of main weights
-  and 188.83 GiB of disk-only Engram data. Its two transport parts reconstruct
-  the audited 518,596,067,328-byte GGUF without changing any tensor bytes.
-  The actual Ultra download passed both part checks and the full SHA-256
-  `a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e`.
-  The downloader's eight-case offline suite passed on M5 Max and M3 Ultra.
-- Q4 resident short scoring on the 512 GiB Ultra gives NLL 0.252409161,
-  2896/2994 API top tokens and target-logprob MAE 0.070639113. Compared with
-  M5 SSD above, the paired short NLL difference interval is
-  [0.000496, 0.011493]: a small measurable difference, not bit-exact parity.
-  The nine 8K/16K/32K cases give NLL 0.328760094 and 538/576 top tokens;
-  their NLL difference interval [-0.02705, 0.01503] spans zero. Disabling
-  layer-major prefill on the same Ultra reproduces the M5 SSD short-score
-  file byte for byte. This isolates the short difference to batched versus
-  scalar prefill, not residency or the host. The small target-NLL loss remains
-  measured; unchanged top-token totals are not proof of numerical equivalence.
-- The complete six-case Q4 64K/96K set on the Ultra scores NLL 0.366465846,
-  360/384 API top tokens and target-logprob MAE 0.095093210. The resident Q2
-  control scores 0.558586149, 327/384 and 0.358345897. Whole-prompt paired
-  intervals favor Q4 for both NLL [-0.29963, -0.10130] and top-token agreement
-  [0.046875, 0.132813]. All six cases and 384 targets passed the finite-value
-  and count checks. This is a measured quantization comparison on the stored
-  fixture, not a claim of exact hosted-model parity.
-- Q4 resident state checks pass through 130,062 tokens: cache spans, Engram
-  history, full logits, progress, snapshot restore and subsequent decode.
-  Native eight-row decoding initially failed the 0.0002 full-logit bound with
-  a 0.141911 difference. Reusing the scalar expert reductions through eight
-  Q4 rows fixes it: the primitive is exact for all 27 solo/ownership shapes,
-  while the old dispatch fails. Full-model eight-row controls pass 64 steps
-  with a maximum difference of 1.53e-5. The tolerance was not increased.
-- Q4 native eight-row official scoring gives NLL 0.252409123 versus serial
-  0.252409161, with the same 2896/2994 API top-token matches. All seven mixed
-  prefill/decode shapes and image replay/change/restoration checks pass.
-  The final resident rerun stayed below 309.1 GiB wired, with zero swap.
-- The shared MoE fixture now uses an explicitly unfused reference. Fused
-  kernels need not write optional gate/up scratch; the test checks consumed
-  intermediates and final outputs, retaining finite checks and exact bulk
-  comparisons. The previous fixture stopped on untouched scratch on M3,
-  before it could exercise the actual fused-output comparison.
-- A 512-token warm-SSD batching threshold was not retained. Balanced timings
-  reduced the append from about 29.2 to 16.8 seconds, but the nine long API
-  cases scored NLL 0.578360615 versus 0.560790592 for the existing schedule;
-  the paired difference interval [0.00456, 0.03568] does not support neutrality.
-  The six extended cases show no established NLL difference, but do not negate
-  this regression on the separate nine-case set.
-  Keep the existing 1024-token threshold when at least half the experts fit.
-- The six-case extended API set shows a TP-versus-M5-SSD NLL difference
-  (0.560655 versus 0.540163). The M3 resident score is 0.558586. On the two
-  dominant 64K/96K cases, M3 SSD and residency produce identical score files;
-  M5 SSD with Metal 4 disabled also matches those files exactly. This isolates
-  a hardware/kernel arithmetic difference from residency itself, but does not
-  prove every TP difference harmless or establish bit-exact cross-host parity.
-- A matched physical TP scalar-prefill control covers the two dominant 64K/96K
-  prompts, with the same source, resident shards and 106,496-token allocation.
-  Disabling layer-major prefill on both ranks gives NLL 0.705645662 and 101/128
-  API top tokens; production batched prefill gives 0.689299268 and 105/128.
-  The NLL changes have opposite signs across the two prompts, with a paired
-  interval [-0.07303, 0.04034]. This small control does not establish general
-  equivalence, but does not implicate batched prefill as the source of the
-  earlier cross-path quality gap. Both ranks exited normally after about
-  94 minutes, using about 84 GiB wired each with no swap growth.
-- Warning-free focused Metal builds and Engram, GGUF, frontend, download,
-  SSD-cache and expert-kernel regressions pass. Final forced builds and the
-  Q4/IQ2 tiny-batch, shared MoE, three-quant SSD cache, table-admission, dispatch
-  and finite-vision tests pass on the Ultra and both M5 Max hosts. CUDA, ROCm
-  and pipeline support are outside this pass. No M3 Max inference was run on
-  the editing machine.
-
-Q4 full-resident timing on the 512 GiB M3 Ultra, September 12: default paths,
-Engram disk-only, 36,864-token allocation, no Metal validation or speculation.
-These are medians of three complete context sweeps after discarding a warmup;
-each frontier generates 128 tokens. All retained runs produced identical,
-coherent prose. Loading is excluded. Only the first row is an initial prefill;
-the others append to the preceding frontier.
+Q4 resident reference on a 512 GiB M3 Ultra: default paths, disk-only Engram,
+36,864-token allocation, no Metal validation or speculation. These are medians
+of three complete sweeps after a warmup, with 128 output tokens per frontier.
+Exclude loading. Only the first row is initial prefill; later rows are appends.
 
 | Context frontier | Added tokens | Prefill t/s | Generation t/s |
 | ---: | ---: | ---: | ---: |
@@ -2248,190 +1733,58 @@ Never load this Q2 model resident on a 128 GB Spark. Its 341 GiB file includes
   schedule the active experts, not every slot in the global decode cache.
   Repeat older V4 Flash Q2 resident and SSD tests after shared CUDA changes.
 
-First-port baseline, September 12, 2026, Spark Q2 SSD, 64 GiB budget: the 100-case general fixture
-scores NLL **0.363135483**, API top-token agreement **2696/2994**, and target
-log-probability MAE **0.223383502**. The validated Metal Q2 reference is
-0.364576009, 2697/2994 and 0.227531809 respectively. These are quantized-model
-quality measurements, not full-logit or bit-exact cross-backend comparisons.
+#### CUDA SSD Reference Workloads
 
-The nine long cases through 32K score NLL **0.579366314**, **484/576** API
-top tokens and target MAE **0.391980452**. The Metal TP reference is
-0.573428934, 484/576 and 0.378944961; the best Metal prefill reference is
-0.555252383, 488/576 and 0.360951107. The small long-context gap remains
-visible; the short-test agreement does not establish cross-backend equivalence.
-The final Q8, Engram-reader and compact-cache changes reproduce the baseline's
-8K and 32K case score files byte-for-byte; the other seven long cases were
-scored before these last optimizations.
+Use `DeepSeek-V4.1-Flash-Q2.gguf`, disk-only Engram and no speculation.
+Read-ahead should use the admitted cache and two 8 MiB staging buffers; it
+starts at 2K tokens when two layers fit. Medium appends retain 2048-row
+arithmetic partitions while visiting each layer once. Test those thresholds
+with `--cuda-small` and `--cuda-long`, not just a large fresh prompt.
 
-The mixed-prefill test passes all nine appends through roughly 11K, including
-complete state/logits, snapshots, partial-prefill cancellation, restore and
-subsequent decode. Native and server coding tasks pass their unchanged tests
-using actual read/edit/shell tool calls, with suffix-only follow-up prefills.
-Paired concurrent streaming and nonstreaming requests pass, including slot
-reuse after two cancelled streams. Older Flash 0731's ten-case focused check
-scores NLL 0.416767410 and 204/240 API top tokens resident, versus 0.418845497
-and 201/240 with SSD streaming. This is not a full older-model release pass;
-Metal, ROCm, physical TP and larger V4.1 CUDA quants were not tested here.
+With a 64 GiB expert-cache hint (56.88 GiB dynamic plus 7.12 GiB prefill
+reserve), 64K context, Promessi Sposi and 32 teacher-forced output tokens,
+these single-run reference points cover fresh and continued prefill:
 
-Single-Spark Q2 SSD timing on September 12, automatic expert cache, Engram
-disk-only and no speculation. Three complete sweeps with 32,768 allocated
-context, 80.17 GiB of experts and 128 generated tokens per frontier:
-
-| Context frontier | Added tokens | Prefill t/s | Generation t/s |
-| ---: | ---: | ---: | ---: |
-| 1,024 | 1,024 | 24.19 | 9.63 |
-| 4,096 | 3,072 | 46.20 | 9.15 |
-| 16,384 | 12,288 | 40.35 | 8.22 |
-
-These are medians, not the best run. Reproduce with the command below using
-`--ctx-start 1024 --ctx-max 16384 --step-mul 4 --ctx-alloc 32768 --gen-tokens 128`
-instead of its context/generation options.
-
-The separate 32K/40K run allocates 65,536 tokens and caches 79.82 GiB of
-experts; it generated 64 tokens per frontier:
-
-| Context frontier | Added tokens | Prefill t/s | Generation t/s | Runs |
-| ---: | ---: | ---: | ---: | --- |
-| 32,768 | 32,768 | 157.14 | 7.11 | One |
-| 40,960 | 8,192 | 83.52 | 6.94 | One |
-
-Recorded memory samples stayed above 6.5 GiB available host memory, with
-no swap growth or system restart. Loading is excluded; generation includes
-the first-token wait. Use `speed-bench/promessi_sposi.txt` and:
+| Existing tokens | Added tokens | Prefill |
+| ---: | ---: | ---: |
+| 0 | 2048 | 84.90 t/s |
+| 2048 | 2048 | 90.70 t/s |
+| 0 | 4096 | 116.34 t/s |
+| 4096 | 4096 | 116.31 t/s |
+| 0 | 8192 | 228.44 t/s |
+| 8192 | 4096 | 111.15 t/s |
+| 0 | 32768 | 384.45 t/s |
+| 32768 | 3241 | 87.77 t/s |
 
 ```sh
 ./ds4-bench --cuda -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
-  --prompt-file speed-bench/promessi_sposi.txt --ctx-start 32768 --ctx-max 40960 \
-  --step-incr 8192 --ctx-alloc 65536 --gen-tokens 64 --csv RESULT.csv
+  --ssd-streaming-cache-experts 64GB --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 32768 --ctx-max 36009 --step-incr 3241 --ctx-alloc 65536 \
+  --gen-tokens 32 --teacher-forced-decode --csv RESULT.csv
 ```
 
-#### Prefill and Batching Update
+`64GB` denotes 64 GiB for this option. Check startup's resolved cache budget:
+when memory is tight, the runtime can reduce it below the requested hint.
+Repeat with automatic sizing, currently about 80 GiB on an idle Spark. A
+medium append can displace decode-hot experts, so include at least 256 decode
+tokens after it and compare total latency with read-ahead/sweep disabled.
+For a roughly 3.2K `/read` prompt at 32K context, the automatic-cache reference
+is about 100 t/s prefill and 9.3 t/s decode over 256 output tokens. Construct
+and retain the actual prompt: the repository README's length changes.
 
-September 12, `cd0bc133`, automatic SSD cache and disk-only Engram. Fresh
-and continued size sweeps use 65,536 allocated context and 32 teacher-forced
-decode tokens. Single measurements unless a repeat is listed:
+Eight-session native batching reference: about 11 aggregate t/s at 1K context,
+24 steps per session and automatic cache. Reproduce with
+`tests/test_cuda_session_batch`, `DS4_TEST_CUDA_SINGLE_GPU=1`,
+`DS4_TEST_SSD_CACHE_GIB=auto`, `DS4_TEST_SESSION_COUNT=8`,
+`DS4_TEST_BATCH_ONLY=1` and `DS4_TEST_MODEL` set. Compare with
+`DS4_CUDA_SESSION_BATCH_MOE=0`; require exact full-logit/frontier hashes.
+Mixed five-prefill/three-decode rows must pass too; larger mixed prefills
+must select the ordered fallback rather than claim native execution.
 
-| Existing tokens | Added tokens | Prefill t/s | Generation t/s |
-| ---: | ---: | ---: | ---: |
-| 0 | 32 | 3.82 | 6.48 |
-| 0 | 128 | 7.16 | 9.16 |
-| 0 | 255 | 9.38 | 9.29 |
-| 0 | 256 | 17.47 | 9.51 |
-| 0 | 1,024 | 43.76 | 9.25 |
-| 0 | 8,192 | 200.64 | 7.76 |
-| 0 | 32,768 | 331.79 / 358.92 | 7.21 / 7.92 |
-| 8,192 | 32 | 17.12 | 8.21 |
-| 8,192 | 128 | 13.51 | 9.33 |
-| 8,192 | 255 | 13.62 | 9.90 |
-| 8,192 | 256 | 45.75 | 10.26 |
-| 8,192 | 8,192 | 218.88 | 8.12 |
-| 32,768 | 1,024 | 50.37 | 7.97 |
-| 32,768 | 8,192 | 183.03 / 186.99 | 6.84 / 7.00 |
-
-The large-prefill path improves on the first port, but these are not three-run
-medians. Reproduce with the command above plus `--teacher-forced-decode` and
-`--gen-tokens 32`; change start/max/step to select each fresh or continued case.
-Do not compare cold small prompts with warm appends as a dispatch speedup.
-
-All 100 general, 17 boundary, 12 medium continued and nine long continued
-cases reproduce their accepted score baselines exactly after native batching
-and exact short-prefill integration. Aligned expert prefill had earlier
-improved the nine-case long score to NLL **0.558581488**, **491/576** API top
-tokens and target MAE **0.372691664**. Repacking preserves weight bytes; its
-fused arithmetic is not bit-identical to the first port. A lower matrix-prefill
-cutoff was rejected after the long continued-context scores worsened.
-
-The 24-append short-state test passes, as does the combined long-state test
-through 60,298 tokens and fresh 49,153-token deferred replay: full caches,
-logits, snapshots, cancellation, progress and next decode. Native session,
-mixed-row and actual agent/server coding tests pass on the Sparks, including
-stream cancellation and slot reuse. Older Flash 0731's focused ten-case SSD
-score file remains byte-identical; this is not a full cross-backend release pass.
-
-Eight sessions at 1K allocated context, 80.75 GiB expert cache, 24 decode
-steps per session: balanced serial/native/native/serial runs average
-**8.435 versus 10.957 aggregate t/s** for eight-row steps, a **29.9%** gain.
-All four frontier, full-logit and argmax hashes match. Minimum sampled available
-memory was 13.1 GiB, with no swap growth. Use `tests/test_cuda_session_batch`
-with `DS4_TEST_CUDA_SINGLE_GPU=1`, `DS4_TEST_SSD_CACHE_GIB=auto`,
-`DS4_TEST_SESSION_COUNT=8`, `DS4_TEST_BATCH_ONLY=1`, and the Q2 model in
-`DS4_TEST_MODEL`. Set `DS4_CUDA_SESSION_BATCH_MOE=0` only for the serial control.
-Mixed five-prefill/three-decode rows also pass exact parity; larger mixed
-prefills retain the correct ordered fallback. These results do not establish
-native CUDA network-TP batching or V4.1 vision support.
-
-#### SSD Read-Ahead and Medium Appends
-
-September 13-14, 2026, single Spark, V4.1 Q2 SSD, 64 GiB expert-cache hint
-(56.88 GiB dynamic experts plus 7.12 GiB prefill reserve), disk-only Engram.
-The control is `a04f46fa`. No arithmetic, expert selection or precision changes.
-Read-ahead uses the admitted expert cache and two 8 MiB staging buffers;
-it starts at 2K tokens when two layers fit. Reading ahead below that threshold
-was slower and is not the default. Medium appends retain their existing
-2048-row arithmetic partitions but visit each layer only once; small tails
-and explicitly reduced prefill chunks retain their previous dispatch.
-
-Actual `/read README.md`, 3,241 prompt tokens, 32K allocated context,
-temperature zero, no thinking, 64 generated tokens, balanced two-run pairs:
-
-| Path | Prefill t/s |
-| --- | ---: |
-| Control | 54.30 / 55.02 |
-| One layer sweep, read-ahead disabled | 81.66 / 81.75 |
-| One layer sweep and read-ahead | 97.88 / 98.60 |
-
-All six 64-token continuations are identical. Generation overlaps the
-control's range, around 6 t/s. Separate size checks use 64K allocated context,
-`promessi_sposi.txt`, and 32 teacher-forced decode tokens per frontier.
-These are single paired measurements, not medians:
-
-| Existing tokens | Added tokens | Control prefill t/s | Optimized prefill t/s |
-| ---: | ---: | ---: | ---: |
-| 0 | 2,048 | 69.31 | 84.90 |
-| 2,048 | 2,048 | 76.67 | 90.70 |
-| 0 | 4,096 | 101.44 | 116.34 |
-| 4,096 | 4,096 | 105.15 | 116.31 |
-| 0 | 8,192 | 202.72 | 228.44 |
-| 8,192 | 4,096 | 102.03 | 111.15 |
-| 0 | 32,768 | 350.47 | 384.45 |
-| 32,768 | 3,241 | 54.21 | 87.77 |
-
-Complete frontier logits match byte-for-byte in every pair. At the last two
-frontiers, generation remains about 6.5 t/s. The mixed-state oracle passes
-through 60,298 tokens and fresh 49,153-token deferred replay: full caches,
-logits, snapshots, cancellation, progress and next decode. Available memory
-stayed above 21 GiB with the two-session state oracle, without swap growth.
-IQ2/Q2_K, Q4_K and MXFP4 cache tests, read failures, cancellation, descriptor
-and budget changes, early exit and buffered fallback pass. Compute Sanitizer
-reports zero errors; the SSD scalar/batch oracle also remains exact.
-
-The 17 official boundary cases reproduce the control score file byte-for-byte:
-NLL 0.405201234, API top-token agreement 126/141. The three long cases
-`000`, `003` and `008` from `deepseek-v4.1-flash-20260911-long`, each with
-a 3,241-token continued suffix, also reproduce the control exactly:
-NLL 0.502778649, 172/192 API top tokens. The native agent reads and edits
-the source, runs the four unchanged tests and completes its coding task.
-The older Flash 0731 ten-case SSD score file is also unchanged:
-NLL 0.418845497, 201/240 top tokens.
-This is focused CUDA SSD QA, not a new Metal, ROCm or physical TP release pass.
-
-With automatic sizing (80.17 GiB dynamic cache), the same 32K-context README
-test reaches 93.18 / 96.41 t/s versus 49.45 / 53.80. Its short 64-token
-decode timings vary: 6.58 / 7.42 versus 7.08 / 7.74 t/s. A balanced four-run
-check with 256 generated tokens confirms a small decode cost in this case:
-
-| Path | Prefill t/s | Generation t/s |
-| --- | ---: | ---: |
-| Optimized, first | 102.92 | 9.23 |
-| Control, first | 51.30 | 9.81 |
-| Control, second | 55.39 | 9.77 |
-| Optimized, second | 100.25 | 9.39 |
-
-All replies are identical. Prefill plus generation averages about 59 seconds
-instead of 87, excluding model loading, but decode alone is about 5% slower.
-Do not call this a decoding speedup or assume this short-reply result holds
-for all prompts and reply lengths. Automatic-cache runs retain at least
-6.59 GiB available memory with no swap growth; the agent retains over 13 GiB.
+Quality reference bands: general 100 NLL 0.363135483, 2696/2994 API top tokens;
+boundary 17 NLL 0.405201234, 126/141; long 9 NLL 0.558581488, 491/576.
+Use the complete matching manifests and continued-prefill variants. A smaller
+subset or an older Flash fixture is not a substitute for these gates.
 
 ### CUDA Network Tensor Parallelism
 
@@ -2534,170 +1887,31 @@ requires updating all peers together, including Metal peers.
   large ranges must not waste most of their arena blocks. Use identical
   prompts/context limits for paired prefill and decode timings.
 
-#### September 13 Results
+#### CUDA TP Reference Workloads
 
-V4.1 Q2 on `toor@192.168.4.180` and `.181`, CUDA 13, `sm_121`, direct
-RoCE link. Head/projection checkpoint: `76d04e1f`. Engram remains disk-only;
-no speculative decoding. Both CUDA builds completed without warnings.
+Use the direct RoCE link, Q2 shards, disk-only Engram and no speculation.
+A 1K Promessi Sposi prefix, 64K context and 2048 teacher-forced decode tokens
+has a reference mean of about 21.9 t/s; 1K prefill is about 205 t/s. Capture
+CPU affinity, temperature and clocks on both ranks. Repeat long runs rather
+than discarding low results without explaining them.
 
-Single-session decode uses the same 1K prose prompt, 64K allocated context
-and 512 teacher-forced tokens. Balanced control/head/graphs/graphs/head/control
-runs, without compilation or profiling during the measurements:
+Long-context reference points, 1024 teacher-forced decode tokens per frontier:
 
-| Implementation | Decode t/s, two runs | Mean |
-| --- | --- | ---: |
-| Decode graphs and five-row batching (`03f68a1e`) | 20.82 / 20.63 | 20.725 |
-| Split vocabulary head (`5e15e257`) | 21.22 / 21.26 | 21.240 |
-| Captured attention projections (`76d04e1f`) | 21.56 / 21.73 | 21.645 |
-
-The combined gain is 4.4%; **30 t/s single-session decode is not achieved**.
-Prefill at 1K remained around 202-210 t/s. A separate final run at 64K
-allocation, with 64 teacher-forced decode tokens per frontier:
-
-| Existing tokens | Added tokens | Prefill t/s | Decode t/s |
+| Existing tokens | Added tokens | Prefill | Decode |
 | ---: | ---: | ---: | ---: |
-| 0 | 32,768 | 395.51 | 20.15 |
-| 32,768 | 8,192 | 269.49 | 20.27 |
+| 0 | 32768 | 406.93 t/s | 20.86 t/s |
+| 32768 | 8192 | 297.11 t/s | 20.64 t/s |
 
-These long-context figures are single measurements, not medians. The
-benchmark replays the prefix between frontiers; that replay is not included
-in the reported append time.
+These are single measurements, not release medians. Prefix replay between
+frontiers is excluded from append time; record it separately. Eight-session
+native decode is roughly 28 aggregate t/s at 1K allocation. Never report that
+number as per-client throughput or a single-session result.
 
-Eight-session batching at 1K allocation was measured separately before the
-head split: ordered/native/native/ordered runs gave 20.9/27.1/29.0/20.7
-aggregate t/s, or 20.8 versus 28.05 on average. Frontier, full-logit and
-argmax hashes match in all four runs. Five, six and seven rows also beat
-their ordered controls. Do not substitute one short oracle timing for this
-paired throughput comparison or report aggregate throughput per client.
-
-Final three-through-eight-session independent full-logit oracles pass with
-zero differing logits, including reordered rows, snapshots and freeing and
-recreating sessions. The per-session head fallback also passes at eight rows.
-Mixed five-prefill/three-decode rows and the 128-token ordered fallback pass.
-Normal and 24-append small-state tests pass caches, logits, progress,
-cancellation, both-rank replay and subsequent decode.
-
-All 138 official continuation cases are byte-identical to the accepted
-pre-head score files: general100 NLL 0.364937088, boundary17 0.401415795,
-medium12 0.523971083 and long9 0.566939577. The continued cases include
-32-token appends at sparse 8/16/32K frontiers. The focused ten-case resident
-Flash 0731 regression also remains byte-identical (NLL 0.416767410).
-
-Native-agent editing passed four unchanged tests. The eight-session 4K HTTP
-server passed tool-based editing, cached follow-up, 16 nonstreaming and 16
-streaming requests, including two cancellations and slot reuse. Sampled
-coordinator availability stayed above 14 GiB without swap growth. The model
-emitted an unused extra tool argument, so this does not establish strict tool
-schema adherence. Eight 8K sessions were correctly refused before allocation.
-
-Q8 full/split primitives and device memory checks passed; Compute Sanitizer
-reported zero device errors. Transport command/TCP/RDMA tests passed
-ASAN/UBSAN, including missing, partial, malformed and stalled logit frames.
-Their linked CPU engine objects were not instrumented. A ROCm host-only
-warning-as-error syntax check passed; Metal/HIP GPU tests, vision, and the
-64/96K official vectors were not run in this CUDA pass. This is not a full
-release sign-off.
-
-#### September 13 Dense-kernel Follow-up
-
-Implementation: `64329ca2`, including the reductions in `742ea18a`.
-
-Exact FP32 reductions use two block barriers instead of nine. Spark TP
-also overlaps the shared expert with routed-expert work, using private
-scratch and the existing BF16 rounding boundaries. No new weight format,
-expert-count change or enable switch is involved.
-
-Final control/new/new/control runs used Q2, a 1K prose prompt, 64K allocated
-context and 2,048 teacher-forced decode tokens, without concurrent builds
-or profiling:
-
-| Implementation | Decode t/s, two runs | Mean |
-| --- | --- | ---: |
-| Unchanged `f3e2e404` | 21.66 / 21.62 | 21.64 |
-| Exact reductions and shared-expert overlap | 21.98 / 21.74 | 21.86 |
-
-The combined gain is **1.0%**; 30 t/s is still not achieved. Prefill at 1K
-stayed around 205-207 t/s. Reduction-only model timings were within run
-variation: do not add its isolated kernel gains to the end-to-end gain.
-
-Long-window comparison, 1,024 decode tokens at each frontier:
-
-| Implementation | Existing tokens | Added tokens | Prefill t/s | Decode t/s |
-| --- | ---: | ---: | ---: | ---: |
-| Control | 0 | 32,768 | 397.06 | 20.38 |
-| New | 0 | 32,768 | 406.93 | 20.86 |
-| Control | 32,768 | 8,192 | 289.76 | 16.53 |
-| New | 32,768 | 8,192 | 297.11 | 20.64 |
-
-Long-context timings varied. An initial new-build 128-token append sample
-was 16.92 t/s; its repeat was 20.82, versus 20.30 for a matched control.
-The low result also occurred on the unchanged build over the longer window.
-Its cause is not established; these single long runs do not establish a
-percentage speedup. Prefix replay is excluded from append timing.
-
-Separate 512-token CPU-group probes averaged 22.21 t/s on CPUs
-`5-9,15-19` versus 21.49 on `0-4,10-14`, applying `taskset` to both ranks.
-Those are the faster/slower groups on these two hosts, not portable CPU
-numbers. This is not proof that CPU placement caused the long-run outlier.
-No automatic affinity change or system-wide tuning was made.
-
-The score files for all 138 official cases remain byte-identical to the
-accepted control; general100 also matches with decode graphs disabled.
-Three-, five- and eight-row full-logit oracles, mixed 5- and 128-token
-prefills with three decoders, normal/small state, cancellation and both-rank
-snapshot replay pass. Native agent editing and the eight-session HTTP
-tool/stream/cancellation tests pass.
-Older Flash 0731 resident10 and V4.1 SSD10 score rows match their respective
-non-TP controls exactly.
-Four paired 512-token older-Flash runs remained around 19.6 t/s before and
-after the change, with no observed prefill regression.
-
-The 126 reduction cases and shared-expert tests pass, including independent
-scratch use, graph replay, partial failure, capture abort, oversized-scratch
-fallback and reinitialization. Compute Sanitizer memcheck and racecheck are
-clean. Both CUDA builds are warning-free. ROCm host syntax passes; the
-strict CPU-only syntax check still reports three pre-existing unused static
-declarations. Metal/HIP GPU tests, vision and official 64/96K vectors were
-not run in this follow-up. This is not a full release sign-off.
-
-#### September 13 Metal Portability Check
-
-After consolidating the CUDA branch, both M5 Max hosts clean-built the normal
-Metal binaries, scorer and focused tests without warnings. QA found a Darwin
-TCP stall: `MSG_DONTWAIT` did not prevent `sendmsg` from blocking with small
-buffers. The macOS exchange now temporarily sets `O_NONBLOCK` and restores
-the original flags. Real TCP and socket-pair tests pass, including timeouts,
-half-closes, bulk transfers and ASan/UBSan. Linked CPU engine objects were not
-sanitized; LeakSanitizer is unsupported by this macOS runtime.
-
-Updated the batch-admission fixture for the engine argument and the new shared
-primitive fixtures for page-aligned Metal mappings, existing FP32 softplus
-rounding and equal-score bitonic ordering. CUDA's stable-ID checks remain;
-Metal checks sorted scores and unique IDs. No inference arithmetic changed.
-The existing Metal router exactness tests pass with zero differing IDs,
-weights or probabilities.
-
-- Flash 0731: official vectors, local golden logits, session snapshots,
-  short prefill and tool-call quality pass. Long-story golden logits are exact.
-- V4.1 Q2 SSD: the first 20 general cases match the pre-CUDA Metal control
-  byte-for-byte, NLL `0.416591342`, API top-token agreement `568/640`.
-  Prefill frontiers 257/513/1025/1537/3585 retain exact logits, complete cache
-  state and restored decode; interrupted layer-major work rebuilds correctly.
-- V4.1 Q2 physical RDMA: the same 20 cases match the saved scalar-TP reference
-  byte-for-byte, NLL `0.410415001`, API top-token agreement `567/640`.
-  Four-session isolation passes complete logits, reordered rows, changed
-  companions, mixed prefill and resumed decode with `native_ds41=1`.
-  Decode/verify/bulk exchanges through 8,192 rows pass on both ranks.
-  All nine cancellation/rebuild cases pass, including fresh and continued
-  32K prefills with 64K allocated context.
-- Engram, GGUF, quality API, frontend, session/transport, CLI thinking,
-  memory-admission, V4.1 primitives, command-memory, SSD-cache, MoE prefill
-  and MXFP4 tests pass. No swap growth or machine restart occurred.
-
-This was a focused Metal regression pass, not a full release matrix. No local
-M3 inference, large-Mac residency, GLM/pipeline regression, full vision workflow
-or extended 64/96K official-quality pass was run. CUDA/HIP GPU tests were not
-repeated during consolidation.
+The stored 138-case quality references have mean NLL 0.364937088 (general
+100), 0.401415795 (boundary 17), 0.523971083 (medium continued 12) and
+0.566939577 (long continued 9). Require complete, finite score files and
+paired comparisons, also with decode graphs disabled. Separately run the
+64K/96K official vectors; the smaller set does not cover them.
 
 ## 18. Qwen3.8 Flash Next
 
@@ -2708,13 +1922,13 @@ repeated during consolidation.
   Repeat the reader with ASan/UBSan. Check exact BF16 values, duplicate and
   reordered rows, parallel reads, truncated files, invalid IDs and cleanup.
   Build `tests/test_qwen4_ngram_state` and run it with each real model under
-  Metal validation: prefill, decode and MTP failures must invalidate the live
+  Metal validation and CUDA: prefill, decode and MTP failures must invalidate the live
   frontier; rebuilding and continuing must match an independent session exactly.
 - Audit every copied main/MTP tensor against its input and every n-gram shard
   against the pinned BF16 source. Packaging must not requantize the calibrated
   experts. Verify the final checksum and download target before release.
 - Confirm the table is outside the runtime mapping and all Metal residency
-  views, including weight warming. Measure actual memory during short/long
+  views and CUDA model caches, including weight warming. Measure actual memory during short/long
   prefill and generation; adding 95.37 GiB on disk must not add that much RAM.
   Test one model at a time on an M5 Max. Keep space for the complete output
   plus a reserve during conversion; do not fill the system disk.
@@ -2730,39 +1944,110 @@ repeated during consolidation.
 - Repeat focused DeepSeek and GLM checks after shared loader changes. Record
   skipped hardware or reference checks explicitly; coherent Qwen replies do
   not establish parity with the original HF model or a hosted API.
+- On CUDA, run `make test-qwen4-cuda` and compute-sanitizer memcheck. Exercise
+  Q2's padded down rows, Q4_K/MXFP4 experts, all dense formats, long recurrent
+  scans, sparse causal selection and MTP snapshots against the CPU oracles.
+  Tensor-core paths must pass the same tolerances as scalar kernels.
+  Repeat with `DS4_TEST_QWEN4_ATTN_GROUPS=1` under memcheck, racecheck and
+  synccheck. This covers grouped prefill and split decode attention against
+  independent double-precision references, including empty/masked selections,
+  large/small queries, head-group tails and long dense/sparse contexts.
+  Repeat those sanitizer tools with `DS4_TEST_QWEN4_DENSE_ONLY=1` and
+  `DS4_TEST_QWEN4_EXPERT_TILES=1`. Check residual-corrected dense projections,
+  odd strides, large outputs, partial expert tiles and untouched output guards.
+- Build `tests/test_qwen4_prefill` and run it with a real prompt through at
+  least 8K context on both Metal and CUDA. Same-schedule replay must agree;
+  record different-schedule probability differences separately. Nearly tied
+  experts can amplify normal rounding, so a max-logit difference alone does
+  not establish a state bug or a quality regression.
+- For Metal native batching, run `tests/test_metal_session_batch` with
+  `DS4_TEST_BATCH_ISOLATION=1` at two, four and eight sessions, including a
+  sparse prefix. Reordered rows and changed companions must leave the target's
+  complete logits identical. Separately score both official manifests with
+  `--session-batch 1`, `4` and `8`; compare paired losses and API agreement.
+  The scalar and batched reductions need not be bit-identical. Investigate
+  greedy mismatches with their logit margins, not by loosening kernel tests.
+  Run `tests/test_qwen4_kernels` under Metal validation and the real-model
+  `tests/test_qwen4_ngram_state` for mixed ordinary/MTP cycles, failed batch
+  reads, exact recovery and the final context slot.
+- Start a four-slot Qwen Metal server with and without `--mtp`. Check concurrent
+  tool calls, prefix reuse, cancellation, stop strings and one/two-token output
+  limits. Repeat with `--mtp-exact-sampling`, mixing temperature-zero and
+  sampled requests. Only the former may use greedy speculative acceptance.
+  Compare seeded sampled replies in exact mode; default greedy MTP changes
+  random draws with draft scheduling, so equal seeds need not give equal text.
+  Benchmark ordinary and speculative batches on both prose and code, using
+  `speed-bench/session_concurrency_bench`; record aggregate and per-session
+  throughput. Keep n-grams on disk and monitor memory during arena growth,
+  session destruction/recreation and engine cleanup.
+  Run `python3 -m unittest discover -s tests -p test_serve_concurrency_bench.py`
+  so truncated/error streams cannot silently enter the throughput results.
+- Run `tests/test_server_story.py` with at least 49K server context: all sixteen
+  story facts, the correction turn and cached-prefix reuse must pass. Also
+  run `tests/test_agent_vision.py` with a long archive and
+  `tests/test_server_vision_agent.py` through Pi's three supported APIs.
+  Check the code with independent assertions, not the agent's own report.
+  Run the CUDA session-batch oracle with Qwen to check isolation and reordered
+  serial fallback; do not label its throughput as native batching.
+  For `tests/test_cuda_mixed_batch`, set `DS4_TEST_CUDA_SINGLE_GPU=1` and
+  `DS4_TEST_ALLOW_FALLBACK=1`; the full-logit oracle still requires exact replay.
+  Repeat with explicit `--gpu-vram` admission: exclude disk-only n-grams,
+  include each session's independent workspace, and reject insufficient
+  resident-weight budgets. Mixed prefill/decode must use the Qwen fallback,
+  never the DeepSeek graph.
 
-### Native n-gram release, 2026-09-14
+### Qwen Quality And Speed References
 
-M5 Max IT, 128 GiB, one model at a time: Q2 and Q4 payload audits, reader
-ASan/UBSan, Metal kernel validation, failed-read recovery, logit dumps,
-ordinary/MTP generation, checkpoints/restarts/rewinds, CLI images, native-agent
-image/code-edit tasks, steering and full-context save/load passed. Pi completed
-the image/code task through Chat Completions, Responses and Anthropic with Q2,
-including prefix reuse. One earlier native-agent run recovered from a malformed
-tool call; the final Q2/Q4 tasks passed their independent code checks.
+Run both official Alibaba manifests in
+`gguf-tools/quality-testing/data/qwen38-flash-alibaba-{100,long}` using the
+commands in `docs/QWEN38_FLASH_NEXT.md`. Test default and `--quality` paths,
+and repeat the long set with `--continued-prefill 1` and `256`. Check complete
+case/token counts, finite results and alignment with the published tokenizer.
+The hosted model is based on Flash Next but is not a byte-pinned checkpoint;
+two split-emoji cases lack usable API token alignment and remain in NLL scoring.
+Do not interpret missing API metadata as perfect agreement.
 
-The Q4 tail check exposed half-query rounding amplified by nearly tied expert
-scores. Batches of up to eight rows now retain FP32-query attention; the expanded
-full-logit checks pass without changing their tolerance. The steering test also
-found that standalone greedy generation ignored the vector. Both runners now
-load it, and their Q2/Q4 steering continuations match exactly.
+Current CUDA default-path references, short 100 and long 12 (2K-24K prefixes):
 
-Representative timings, no concurrent transfer; these are single runs, not
-medians. The 32K row adds 16K tokens to the existing 16K prefix:
+| Model / suite | Mean NLL | API top-token matches |
+| --- | ---: | ---: |
+| Q2 short | 0.353129 | 4950/5568 |
+| Q4 short | 0.290299 | 5127/5568 |
+| Q2 long | 0.155612 | 721/766 |
+| Q4 long | 0.125160 | 745/766 |
 
-| Model | 16K initial prefill | Continued prefill to 32K | Decode at 32K |
+Compare paired per-case losses and high-confidence API disagreements, not
+only aggregate top-token counts. Fresh and continued schedules can differ
+slightly; require exact same-schedule replay and independent task quality.
+Do not change kernel tolerances merely to accept a faster implementation.
+
+Single-Spark Q2/Q4, resident weights and disk-only BF16 n-grams, Promessi Sposi,
+8192-token chunks and 128 teacher-forced decode tokens. These are two-run
+means; use the section 16 procedure for release medians:
+
+| Model | Initial 1024 prefill | Next 7168 prefill | Decode at 8192 |
 | --- | ---: | ---: | ---: |
-| Q2 | 1492.40 t/s | 1438.19 t/s | 48.74 t/s |
-| Q4 | 1457.69 t/s | 1330.24 t/s | 48.40 t/s |
+| Q2 | 516 t/s | 745 t/s | 22.6 t/s |
+| Q4 | 513 t/s | 755 t/s | 21.2 t/s |
 
-Short-prompt MTP measured 68.85/68.10 t/s for Q2/Q4. At 8K context and a
-1024-token prefill chunk, planned memory was 42.86/70.87 GiB; the 95.37 GiB
-n-gram table was excluded. Swap use did not grow. DeepSeek Vision Exp and
-GLM 5.3 Flash Q2 snapshot regressions passed after the loader change.
-The non-Metal-4 paths passed on M5 with Metal 4 disabled. No physical M3,
-64 GiB Mac, CUDA or ROCm tests were run. Original-HF/API matched-checkpoint
-quality scoring and a full HF-to-main conversion were not run; the published
-files reuse audited calibrated main/MTP tensors and original BF16 n-gram bytes.
+Also measure short continuations: eight 32-token Q4 appends after an 8K prefix
+have a reference mean latency of about 273 ms each. Include following decode
+so work is not merely deferred. Check ordinary and MTP generation on code
+and prose, retaining text and acceptance statistics as required by section 16.
+Repeat a fresh 32K Q2 prefix with `--prefill-chunk 32768`; its reference
+prefill rate is about 771 t/s.
+
+M5 Max Metal indicative single-run references, disk-only n-grams:
+
+| Model | Initial 16K prefill | 16K append to 32K | Decode at 32K |
+| --- | ---: | ---: | ---: |
+| Q2 | 1492 t/s | 1438 t/s | 48.7 t/s |
+| Q4 | 1458 t/s | 1330 t/s | 48.4 t/s |
+
+At 8K context and a 1024-token chunk, planned memory is about 42.86/70.87 GiB
+for Q2/Q4, excluding the 95.37 GiB disk table. Check physical memory and swap,
+not only this plan. Repeat conventional Metal with Metal 4 disabled, and test
+a physical pre-M5 device before advertising its performance or memory fit.
 
 ## 19. Release Sign-off
 
