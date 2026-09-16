@@ -21341,10 +21341,18 @@ static int ds4_gpu_matmul_f16_tensor_impl(
             ds4_gpu_warn_mpp_fallback();
         }
 
+        /* HC-down produces only 320 channels. A smaller tile raises the
+         * M1 Max grid from 20 to 80 groups at T=128, preserving the K32
+         * accumulation order. Leave other devices and larger batches on
+         * the generic tile until their parallelism tradeoff is measured. */
+        const bool hc_down = in_dim == 10240u && out_dim == 320u &&
+            n_tok > 8u && n_tok <= 128u && ds4_gpu_device_name_contains("M1 Max");
+        const NSUInteger tile_rows = hc_down ? 32u : 64u;
+        const NSUInteger tile_tokens = hc_down ? 16u : 32u;
         const bool bc_inp = (in_dim % 32u) != 0;
-        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f16_f32", bc_inp, bc_out);
+        const bool bc_out = (out_dim % tile_rows) != 0 || (n_tok % tile_tokens) != 0;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mm_pipeline(
+            hc_down ? "kernel_qwen4_hc_down_mm_f16" : "kernel_mul_mm_f16_f32", bc_inp, bc_out);
         if (!pipeline) return 0;
 
         ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
@@ -21355,11 +21363,11 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
-                                              ((NSUInteger)out_dim + 63u) / 64u,
+        [enc setThreadgroupMemoryLength:(hc_down ? 3072u : bc_out ? 8192u : 6144u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + tile_tokens - 1u) / tile_tokens,
+                                              ((NSUInteger)out_dim + tile_rows - 1u) / tile_rows,
                                               1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(hc_down ? 64u : 128u, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor matmul")) return 0;
@@ -48836,16 +48844,21 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         b[2] = b[1];
         b[4] = b[3];
     }
-    /* Reuse wins at the measured large prefill shape. Decode and MTP keep
-     * the original chunk parallelism, including with an explicit override. */
+    /* Reuse wins for the measured M1 Max F16 chunks and large M3/M5
+     * prefills. Decode and MTP keep the original chunk parallelism,
+     * including with an explicit override. */
     bool reuse = false;
     if (n_tokens > 2u) {
         const char *reuse_env = getenv("DS4_QWEN4_HC_NORM_REUSE");
         if (reuse_env != NULL && strcmp(reuse_env, "1") == 0) {
             reuse = true;
         } else if (reuse_env == NULL || strcmp(reuse_env, "0") != 0) {
-            reuse = n_tokens >= 8192u && n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
-                    (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_apple_silicon());
+            const bool m1_prefill = weight_type == 1u && n_tokens >= 48u && n_tokens <= 256u &&
+                                   ds4_gpu_device_name_contains("M1 Max");
+            const bool large_prefill = n_tokens >= 8192u &&
+                (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_apple_silicon());
+            reuse = n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
+                    (m1_prefill || large_prefill);
         }
     }
     const int kernel = reuse
@@ -48888,12 +48901,14 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
                             : prefetch ? QWEN4_K_HC_GATE_MIX_F16_PF
                             : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
                                        QWEN4_K_HC_GATE_MIX_Q8);
-    /* More independent output rows share the activated inputs in MTP.
-     * Keep the per-row lane mapping and reduction order unchanged. */
+    /* More independent output rows share the activated inputs in MTP and
+     * the M1 Max single-token mixer. Each SIMD still owns exactly one row
+     * with the original lane mapping and reduction order. */
     const uint32_t default_nsg = n_embd == 2560u && n_rank == 320u &&
         ds4_gpu_device_name_contains("M3 Ultra") ? 16u : 4u;
     const uint32_t nsg = pair ?
-        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u) : 4u;
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u)
+        : reuse && n_tokens == 1u && n_embd == 2560u ? 16u : 4u;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
                           MTLSizeMake((n_embd + nsg - 1u) / nsg, pair ? 1u : n_tokens, 1), MTLSizeMake(nsg * 32u, 1, 1),
                           (pair || reuse) ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);

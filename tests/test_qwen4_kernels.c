@@ -1942,6 +1942,13 @@ static void test_hc_norm_reuse(arena_t *a) {
                                    shapes[shape][2], shapes[shape][3]);
         }
     }
+    /* M1 Max uses serial RMS reuse for the measured F16 prefill range.
+     * Pin both boundaries and the regular chunk/tail sizes against the
+     * forced original kernel, including every injection partial. */
+    const uint32_t m1_tokens[] = {47u, 48u, 63u, 128u, 256u, 257u};
+    for (uint32_t i = 0; i < sizeof(m1_tokens) / sizeof(m1_tokens[0]); i++) {
+        test_hc_norm_reuse_case(a, 1u, 2560u, 4u, m1_tokens[i], 4u);
+    }
     /* Full outputs around the automatic threshold: the last case uses
      * reuse by default on M3 Ultra, while other devices retain the old path.
      * Each also compares explicit off/on, so both kernels run on every device. */
