@@ -176,6 +176,10 @@ tests/test_qwen4_moe_mm_specialize: tests/test_qwen4_moe_mm_specialize.o $(CORE_
 test-qwen4-moe-mm-specialize: tests/test_qwen4_moe_mm_specialize
 	./tests/test_qwen4_moe_mm_specialize
 
+.PHONY: test-qwen4-moe-mm-compact
+test-qwen4-moe-mm-compact:
+	python3 tests/test_qwen4_moe_mm_compact.py --sanitize
+
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 

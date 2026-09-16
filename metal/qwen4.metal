@@ -2881,7 +2881,15 @@ struct ds4_metal_args_qwen4_moe_mm {
     uint32_t tiles_per_launch;
     uint32_t tail_base; /* host binds the same value to function constant 905 */
     uint32_t expert_major; /* grid x = tile * row_blocks + row_block, z = 1 */
+    uint32_t n_active_expert; /* zero retains original expert IDs in grid.y */
+    uint32_t active_expert[512]; /* copied inline by the encoder; no CPU pointer */
 };
+static_assert(sizeof(ds4_metal_args_qwen4_moe_mm) == 2112u, "Qwen MM host/Metal argument layout");
+
+static inline uint qwen4_moe_mm_expert(constant ds4_metal_args_qwen4_moe_mm &args, uint grid_expert) {
+    if (!args.n_active_expert) return grid_expert;
+    return grid_expert < args.n_active_expert ? args.active_expert[grid_expert] : args.n_expert;
+}
 
 /* Threadgroup -> (row block, first tile).  Expert-major order keeps one
  * expert's tiles adjacent so its rows are reused from cache; the K loop and
@@ -3144,7 +3152,7 @@ kernel void kernel_qwen4_moe_mm_mid(
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint TT = QWEN4_MM_TOKS * NT;
     const uint2 block = qwen4_moe_mm_block(args, tgpig);
-    const uint rb = block.x, e = tgpig.y;
+    const uint rb = block.x, e = qwen4_moe_mm_expert(args, tgpig.y);
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
     if (!count) return;
@@ -3269,7 +3277,7 @@ kernel void kernel_qwen4_moe_mm_down(
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint TT = QWEN4_MM_TOKS * NT;
     const uint2 block = qwen4_moe_mm_block(args, tgpig);
-    const uint rb = block.x, e = tgpig.y;
+    const uint rb = block.x, e = qwen4_moe_mm_expert(args, tgpig.y);
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
     if (!count) return;
@@ -3446,7 +3454,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
     uint rb, tile0;
     if (args.expert_major) { const uint n_rb = (args.out_rows + NR0 - 1u) / NR0; rb = tgpig.x % n_rb; tile0 = tgpig.x / n_rb; }
     else { rb = tgpig.x; tile0 = tgpig.z; }
-    const uint e = tgpig.y;
+    const uint e = qwen4_moe_mm_expert(args, tgpig.y);
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
     if (!count) return;
@@ -3605,7 +3613,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
     uint rb, tile0;
     if (args.expert_major) { const uint n_rb = (args.out_rows + NR0 - 1u) / NR0; rb = tgpig.x % n_rb; tile0 = tgpig.x / n_rb; }
     else { rb = tgpig.x; tile0 = tgpig.z; }
-    const uint e = tgpig.y;
+    const uint e = qwen4_moe_mm_expert(args, tgpig.y);
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
     if (!count) return;
