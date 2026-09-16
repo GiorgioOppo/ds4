@@ -87,6 +87,8 @@ help:
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make test-qwen4-kernels  Run the Qwen3.8 Metal kernel tests"
+	@echo "  make test-metal-q8-reduction  Compare Q8 reduction kernels on Metal"
+	@echo "  make check-metal-q8-reduction  Compile Q8 reduction tests without GPU dispatch"
 	@echo "  make test-qwen4-q2       Check exact low-bit decode and prefill tile parity"
 	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
@@ -179,6 +181,16 @@ test-qwen4-moe-mm-specialize: tests/test_qwen4_moe_mm_specialize
 .PHONY: test-qwen4-moe-mm-compact
 test-qwen4-moe-mm-compact:
 	python3 tests/test_qwen4_moe_mm_compact.py --sanitize
+
+tests/test_metal_q8_reduction: tests/test_metal_q8_reduction.m
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-q8-reduction check-metal-q8-reduction
+test-metal-q8-reduction: tests/test_metal_q8_reduction
+	./tests/test_metal_q8_reduction
+
+check-metal-q8-reduction: tests/test_metal_q8_reduction
+	./tests/test_metal_q8_reduction --compile-only
 
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
@@ -1096,6 +1108,7 @@ clean:
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_vision
+	rm -f tests/test_metal_q8_reduction
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc

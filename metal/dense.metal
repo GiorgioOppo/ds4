@@ -112,6 +112,51 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
+// Q8's single-use reduction keeps the same two simd_sum stages and the
+// same positive-zero lanes as helper_mv_reduce_and_write. Each SIMD group
+// publishes only its own partial; padding is supplied in registers instead
+// of clearing shared memory before a separate barrier. Only group 0 needs
+// the final reduction. No caller may reuse this scratch before another
+// threadgroup barrier: the other groups can finish before group 0 reads it.
+template<short NR0>
+static inline void helper_q8_mv_reduce_and_write(
+        device float * dst_f32,
+        float sumf[NR0],
+        const int r0,
+        const int ne01,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem) {
+    constexpr short NW = N_SIMDWIDTH;
+    const short NSG = FC_mul_mv_nsg;
+    threadgroup float * partials = (threadgroup float *) shmem;
+
+    for (short row = 0; row < NR0; ++row) {
+        sumf[row] = simd_sum(sumf[row]);
+        if (NSG > 1 && tiisg == 0) {
+            partials[NW*row + sgitg] = sumf[row];
+        }
+    }
+
+    if (NSG > 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sgitg == 0) {
+        for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+            // Preserve the second reduction even for NSG=1, including its
+            // positive-zero padding rather than directly storing sumf.
+            float value = 0.0f;
+            if (NSG == 1) {
+                if (tiisg == 0) value = sumf[row];
+            } else if (tiisg < NSG) {
+                value = partials[NW*row + tiisg];
+            }
+            const float tot = simd_sum(value);
+            if (tiisg == 0) dst_f32[r0 + row] = tot;
+        }
+    }
+}
+
 template<short NR0, typename args_t>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
@@ -159,16 +204,24 @@ void kernel_mul_mv_q8_0_f32_impl(
     device const float * yb = y + ib0*QK8_0 + il*NQ;
 
     for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
+        // Same eight FP32 operands and accumulation order. Packed float4
+        // also permits tensor views with only scalar alignment. Q8 quant
+        // addresses stay 2-byte aligned at the 34-byte block stride.
+        const float4 y0 = float4(((device const packed_float4 *)yb)[0]);
+        const float4 y1 = float4(((device const packed_float4 *)yb)[1]);
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
+            yl[i] = y0[i];
+            yl[i + 4] = y1[i];
         }
 
         for (short row = 0; row < NR0; row++) {
-            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            device const char2 * qs2 = (device const char2 *)(ax[row][ib].qs + il*NQ);
 
             float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                sumq += qs[i] * yl[i];
+            FOR_UNROLL (short i = 0; i < NQ / 2; ++i) {
+                const char2 q = qs2[i];
+                sumq += q.x * yl[2*i];
+                sumq += q.y * yl[2*i + 1];
             }
 
             sumf[row] += sumq*ax[row][ib].d;
@@ -179,7 +232,7 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_q8_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
