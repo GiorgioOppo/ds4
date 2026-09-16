@@ -1023,6 +1023,22 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
 }
 
+/* A query needs sparse selection only after its complete four-token blocks
+ * exceed the budget. Share this boundary between query preparation and its
+ * consumer so a chunk crossing it cannot omit an indexer query. */
+static uint32_t qwen4_attention_dense_rows(uint32_t pos0, uint32_t n_tokens, uint32_t k_blocks) {
+    const uint64_t sparse_pos = ((uint64_t)k_blocks + 1u) * 4u - 1u;
+    if ((uint64_t)pos0 >= sparse_pos) return 0;
+    const uint64_t n_dense = sparse_pos - pos0;
+    return n_dense < n_tokens ? (uint32_t)n_dense : n_tokens;
+}
+
+static bool qwen4_attention_needs_index_query(uint32_t pos0, uint32_t n_tokens,
+                                             uint32_t k_blocks, bool mtp, bool cache_only) {
+    return !cache_only && n_tokens != 0u &&
+           (mtp || qwen4_attention_dense_rows(pos0, n_tokens, k_blocks) < n_tokens);
+}
+
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -58192,9 +58208,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     const uint32_t ratio = 4u;
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
-    const uint32_t clast = cpos0 + cT - 1u;
-    const uint32_t n_dense = clast < sparse_pos ? cT : (sparse_pos > cpos0 ? sparse_pos - cpos0 : 0u);
+    const uint32_t n_dense = qwen4_attention_dense_rows(cpos0, cT, g->k_blocks);
     if (n_dense > 0 &&
         !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
                                           g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
@@ -58237,27 +58251,33 @@ static bool qwen4_graph_attention_cache(ds4_qwen4_gpu_graph *g, const ds4_model 
                                   uint32_t il, uint32_t pos0, uint32_t T, bool cache_only) {
     const uint32_t ratio = 4u;
     const uint32_t last = pos0 + T - 1u;
+    /* Dense attention does not consume indexer queries. Continue projecting
+     * and pooling every key for later sparse rows. Crossing chunks retain the
+     * full query projection and its original batch shape and rounding; MTP
+     * keeps its existing query preparation. */
+    const bool need_iq = qwen4_attention_needs_index_query(pos0, T, g->k_blocks,
+                                                         g->mtp_R != NULL, cache_only);
     {
         /* Historical predictor rows need keys and values only. Keep their
          * projection kernels and K normalization identical to a full step. */
         bool ok = cache_only || qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
         if (ok && qwen4_graph_fused(g, T)) {
-            ds4_gpu_tensor *outs[4] = { g->kp, g->vp, cache_only ? g->ik : g->iq, g->ik };
+            ds4_gpu_tensor *outs[4] = { g->kp, g->vp, need_iq ? g->iq : g->ik, g->ik };
             const uint64_t offs[4] = { l->attn_k->abs_offset, l->attn_v->abs_offset,
-                                       cache_only ? l->indexer_k_proj->abs_offset : l->indexer_q_proj->abs_offset,
+                                       need_iq ? l->indexer_q_proj->abs_offset : l->indexer_k_proj->abs_offset,
                                        l->indexer_k_proj->abs_offset };
             const uint32_t types[4] = { l->attn_k->type, l->attn_v->type,
-                                       cache_only ? l->indexer_k_proj->type : l->indexer_q_proj->type,
+                                       need_iq ? l->indexer_q_proj->type : l->indexer_k_proj->type,
                                        l->indexer_k_proj->type };
             const uint32_t rows[4] = { (uint32_t)l->attn_k->dim[1], (uint32_t)l->attn_v->dim[1],
-                                       (uint32_t)(cache_only ? l->indexer_k_proj->dim[1] : l->indexer_q_proj->dim[1]),
+                                       (uint32_t)(need_iq ? l->indexer_q_proj->dim[1] : l->indexer_k_proj->dim[1]),
                                        (uint32_t)l->indexer_k_proj->dim[1] };
-            ok = ds4_gpu_qwen4_multi_gemv_tensor(g->mixed, T, DS4_N_EMBD, cache_only ? 3u : 4u,
+            ok = ds4_gpu_qwen4_multi_gemv_tensor(g->mixed, T, DS4_N_EMBD, need_iq ? 4u : 3u,
                                                 outs, m->map, m->size, offs, types, rows) != 0;
         } else if (ok) {
             ok = qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
                  qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
-                 (cache_only || qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T)) &&
+                 (!need_iq || qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T)) &&
                  qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
         }
         if (!ok) return false;
@@ -58271,7 +58291,7 @@ static bool qwen4_graph_attention_cache(ds4_qwen4_gpu_graph *g, const ds4_model 
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                          l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
-                                         DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                                         DS4_N_HEAD_DIM, DS4_N_ROT, need_iq ? DS4_N_INDEXER_HEAD : 0u, DS4_N_INDEXER_HEAD_DIM,
                                          pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
         return false;
     }

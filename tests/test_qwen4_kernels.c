@@ -2458,10 +2458,12 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
 }
 
-/* The cache-only path must reproduce full attention preparation, including
- * half stores and three-axis RoPE, without touching neighboring cache rows. */
-static void test_mtp_cache_prep(arena_t *a) {
-    enum { H = 24, Hkv = 2, D = 256, Hi = 4, Di = 128, cap = 12, guard = 32 };
+/* Cache-only and dense-prefix preparation must reproduce the outputs they
+ * retain from full preparation, including half stores and three-axis RoPE,
+ * without touching neighboring cache rows or a skipped indexer query. */
+static void test_attention_cache_prep(arena_t *a) {
+    enum { H = 24, Hkv = 2, D = 256, Hi = 4, Di = 128, cap = 132, guard = 32 };
+    const uint32_t batches[] = {1u, 2u, 3u, 128u};
     double *shadow = NULL;
     const uint64_t gq = arena_f32(a, D, &shadow, .5f, 1.5f); free(shadow);
     const uint64_t gk = arena_f32(a, D, &shadow, .5f, 1.5f); free(shadow);
@@ -2479,7 +2481,8 @@ static void test_mtp_cache_prep(arena_t *a) {
     for (unsigned i = 0; i < 32u; i++) freq[i] = powf(10000000.f, -(float)i / 32.f) * .875f;
     for (unsigned rope = 0; rope < 2u; rope++) {
         ds4_gpu_qwen4_set_rope(rope ? freq : NULL, rope ? 32u : 0u, rope ? 1.125f : 1.f);
-        for (uint32_t T = 1u; T <= 3u; T++) {
+        for (unsigned batch = 0; batch < sizeof(batches) / sizeof(batches[0]); batch++) {
+            const uint32_t T = batches[batch];
             const uint64_t counts[5] = {T * H * 2u * D, T * Hkv * D, T * Hkv * D, T * Hi * Di, T * Di};
             float *input[5]; ds4_gpu_tensor *in[5];
             for (unsigned i = 0; i < 5u; i++) { input[i] = rand_vec(counts[i], 1.f); in[i] = upload(input[i], counts[i]); }
@@ -2524,6 +2527,36 @@ static void test_mtp_cache_prep(arena_t *a) {
                     require_ok(memcmp(got[i] + begin, seed[i] + begin, (size_t)(end - begin)) != 0,
                                "MTP cache rows actually written");
                 }
+                /* Reuse the full-prep oracle, but poison every destination
+                 * again so omitted or misnumbered writes cannot pass. */
+                const uint64_t q_count = (uint64_t)T * H * D;
+                const uint64_t iq_count = (uint64_t)T * Hi * Di;
+                const float sentinel = 127.25f;
+                float *want_q = download(q, q_count), *want_gate = download(gate, q_count);
+                require_ok(ds4_gpu_tensor_fill_f32(q, sentinel, q_count) &&
+                           ds4_gpu_tensor_fill_f32(gate, sentinel, q_count) &&
+                           ds4_gpu_tensor_fill_f32(iq, sentinel, iq_count), "dense-prefix output sentinels");
+                for (unsigned i = 0; i < 3u; i++)
+                    require_ok(ds4_gpu_tensor_write(back[1][i], 0, seed[i], cap * row_bytes[i] + 2u * guard),
+                               "reset dense-prefix cache and guards");
+                require_ok(ds4_gpu_begin_commands() &&
+                    ds4_gpu_qwen4_attn_prep_tensor(q, gate, cache[1][0], cache[1][1], iq, cache[1][2],
+                        in[0], in[1], in[2], in[3], in[4], pos3, a->base, a->size, gq, gk, giq,
+                        T, H, Hkv, D, 64u, 0u, Di, pos, cap, 10000000.f, 1.e-6f) &&
+                    ds4_gpu_end_commands(), "attention preparation with zero indexer heads");
+                float *got_q = download(q, q_count), *got_gate = download(gate, q_count);
+                float *got_iq = download(iq, iq_count);
+                check_exact_f32("dense-prefix Q full-prep oracle", got_q, want_q, q_count);
+                check_exact_f32("dense-prefix gate full-prep oracle", got_gate, want_gate, q_count);
+                for (uint64_t i = 0; i < iq_count; i++)
+                    require_ok(got_iq[i] == sentinel, "dense-prefix indexer query output stays untouched");
+                for (unsigned i = 0; i < 3u; i++) {
+                    const uint64_t bytes = cap * row_bytes[i] + 2u * guard;
+                    require_ok(ds4_gpu_tensor_read(back[1][i], 0, got[i], bytes), "dense-prefix cache read");
+                    require_ok(!memcmp(got[i], want[i], (size_t)bytes),
+                               "dense-prefix K/V/IK and guards match full prep bitwise");
+                }
+                free(got_iq); free(got_gate); free(got_q); free(want_gate); free(want_q);
             }
             require_ok(!ds4_gpu_qwen4_attn_cache_prep_tensor(cache[1][0], cache[1][0], cache[1][2],
                 in[1], in[2], in[4], pos3, a->base, a->size, gk, T, Hkv, D, 64u, Di, 3u, cap, 1.e7f, 1.e-6f),
@@ -2546,7 +2579,8 @@ static void test_mtp_cache_prep(arena_t *a) {
                 free(want[i]); free(got[i]); free(seed[i]);
             }
             ds4_gpu_tensor_free(iq); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(q);
-            printf("  MTP cache prep T=%u rope=%u: K/V/IK, mRoPE axes, guards and input immutability exact\n", T, rope);
+            printf("  Attention prep T=%u rope=%u: cache-only and zero-indexer-head outputs, guards and inputs exact\n",
+                   T, rope);
         }
     }
     uint32_t unchanged[cap][4];
@@ -3419,11 +3453,13 @@ int main(void) {
     const char *reuse_only = getenv("DS4_TEST_QWEN4_M1_REUSE_ONLY");
     const char *reuse_bench = getenv("DS4_TEST_QWEN4_M1_REUSE_BENCH");
     const char *mtp_only = getenv("DS4_TEST_QWEN4_MTP_OPT_ONLY");
+    const char *prep_only = getenv("DS4_TEST_QWEN4_ATTN_PREP_ONLY");
     const bool run_reuse = reuse_only && reuse_only[0] && strcmp(reuse_only, "0") != 0;
     const bool bench_reuse = reuse_bench && reuse_bench[0] && strcmp(reuse_bench, "0") != 0;
     const bool run_mtp = mtp_only && mtp_only[0] && strcmp(mtp_only, "0") != 0;
+    const bool run_prep = prep_only && prep_only[0] && strcmp(prep_only, "0") != 0;
     arena_t arena;
-    arena.size = (uint64_t)(run_reuse || bench_reuse || run_mtp ? 96u : 1536u) << 20;
+    arena.size = (uint64_t)(run_reuse || bench_reuse || run_mtp || run_prep ? 96u : 1536u) << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -3437,8 +3473,15 @@ int main(void) {
         munmap(arena.base, arena.size);
         return 0;
     }
+    if (run_prep) {
+        test_attention_cache_prep(&arena);
+        ds4_gpu_cleanup();
+        munmap(arena.base, arena.size);
+        puts("all Qwen attention preparation kernel tests passed");
+        return 0;
+    }
     if (run_mtp) {
-        test_mtp_cache_prep(&arena);
+        test_attention_cache_prep(&arena);
         test_mtp_project(&arena);
         test_mtp(&arena, 2560u, 4u);
         test_mtp(&arena, 64u, 4u);
@@ -3559,7 +3602,7 @@ int main(void) {
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
     printf("mtp\n");
-    test_mtp_cache_prep(&arena);
+    test_attention_cache_prep(&arena);
     test_mtp_project(&arena);
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
