@@ -92,7 +92,7 @@ static int small_gates(ds4_tp *tp, ds4_gpu_tensor *slab, ds4_gpu_tensor *x,
 
 int main(int argc, char **argv) {
     if (argc < 6 || argc > 9) {
-        fprintf(stderr, "usage: %s RANK COORDINATOR PORT tcp|usb4stream DEVICE [fail]\n", argv[0]);
+        fprintf(stderr, "usage: %s RANK COORDINATOR PORT tcp|rdma DEVICE [PORT GID] [fail]\n", argv[0]);
         return 2;
     }
     const int rank = atoi(argv[1]);
@@ -100,12 +100,11 @@ int main(int argc, char **argv) {
     ds4_tp_options opt = {.role = rank ? DS4_TP_WORKER : DS4_TP_LEADER,
         .listen_host = argv[2], .leader_host = argv[2],
         .listen_port = atoi(argv[3]), .leader_port = atoi(argv[3]),
-        .transport = !strcmp(argv[4], "usb4stream") ? DS4_TP_TRANSPORT_USB4STREAM : DS4_TP_TRANSPORT_TCP,
-        .usb4stream_device = !strcmp(argv[4], "usb4stream") ? argv[5] : NULL};
+        .transport = DS4_TP_TRANSPORT_TCP};
     const bool roce = !strcmp(argv[4], "rdma");
     const int base_argc = roce ? 8 : 6;
     if ((argc != base_argc && argc != base_argc + 1) ||
-        (!roce && strcmp(argv[4], "usb4stream") && strcmp(argv[4], "tcp"))) return 2;
+        (!roce && strcmp(argv[4], "tcp"))) return 2;
     if (roce) {
         opt.transport = DS4_TP_TRANSPORT_RDMA;
         opt.rdma_device = argv[5]; opt.rdma_port = atoi(argv[6]);

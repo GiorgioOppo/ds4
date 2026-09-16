@@ -56,7 +56,7 @@ SSD-streaming path.
 
 ## DeepSeek V4.1 Flash
 
-- ROCm 10.0 supports calibrated V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/USB4STREAM/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed in every mode.
+- ROCm 10.0 supports calibrated V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed in every mode.
 - Tested SSD configuration: 128 GB Framework Desktop, 16-core Strix Halo engineering sample `100-000001243-50_Y`, Radeon `gfx1151`; Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs) holds the model.
 - Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`; TuneD **`accelerator-performance`**, fans at maximum speed. Existing boot flags: the [GTT/TTM settings above](#gpu-visible-memory), plus `pci=realloc pcie_aspm=off`; their individual effects were not isolated.
 

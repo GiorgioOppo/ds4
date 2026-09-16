@@ -2208,8 +2208,8 @@ the others append to the preceding frontier.
 - SSD: 92 GiB cache, fresh 16K/64K with 69,632 allocated context and 512/128 outputs; complete frontiers and printed continuations match resident execution. Memory/swap results and exact commands are in [STRIX_HALO.md](docs/STRIX_HALO.md#ssd-performance).
 - Kernel checks cover production layouts, full outputs, independent FP64 references, tail rows, canaries, selection ties and nonfinite inputs. The V4.1 split-key decode attention path uses FP32 throughout; matrix instructions remain in the prefill paths. FP16 matrix paths accumulate in FP32; Engram packing checks representability and retains the FP32 fallback. Numerical differences are assessed with the official and practical results above.
 - ROCm/gfx1151/V4.1 guards preserve other model/backend paths. Shared CPU/CUDA/Metal code was checked with preprocessing comparisons; five frontends build/link/help checks and relevant memory/cache/Engram units pass. No fresh physical GLM, CUDA or Metal regression run is claimed.
-- Exactly two machines, each with its assigned experts in RAM; no cluster SSD streaming or DSpark. RoCE uses system-RAM staging. USB4STREAM needs the documented controller patch on the tested systems; plain TCP over USB4 also works. Long-running production endurance was not tested.
-- Performance, hardware/SSD/profile details and commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/USB4STREAM/RoCE](docs/CLUSTERING_ROCM.md#measured-performance), [USB patch/rollback](docs/USB4STREAM_KERNEL.md).
+- Exactly two machines, each with its assigned experts in RAM; no cluster SSD streaming or DSpark. RoCE uses system-RAM staging. Plain TCP over USB4 Ethernet also works. Long-running production endurance was not tested.
+- Performance, hardware/SSD/profile details and commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/RoCE](docs/CLUSTERING_ROCM.md#measured-performance).
 
 
 ### CUDA SSD Streaming

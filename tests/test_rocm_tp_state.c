@@ -51,7 +51,7 @@ static void progress(void *ud,const char *event,int current,int total) {
 }
 static bool cancelled(void *ud) {return ((interruption *)ud)->stopped;}
 int main(int argc,char **argv) {
-    if(argc!=8){fprintf(stderr,"usage: %s MODEL PROMPT OUT tcp|usb4stream|rdma DEVICE LISTEN PORT\n",argv[0]);return 2;}
+    if(argc!=8){fprintf(stderr,"usage: %s MODEL PROMPT OUT tcp|rdma DEVICE LISTEN PORT\n",argv[0]);return 2;}
     int rc=1;ds4_engine *engine=NULL;ds4_tp *tp=NULL;ds4_session *control=NULL,*subject=NULL;
     ds4_tokens prompt={0};ds4_session_snapshot snap={0},decoded={0};char *text=NULL;FILE *f=NULL;
     output=argv[3];
@@ -59,7 +59,6 @@ int main(int argc,char **argv) {
         .power_percent=100,.placement_session_count_hint=2};
     opt.tp=(ds4_tp_options){.requested=true,.role=DS4_TP_LEADER,.listen_host=argv[6],.listen_port=atoi(argv[7])};
     if(!strcmp(argv[4],"tcp"))opt.tp.transport=DS4_TP_TRANSPORT_TCP;
-    else if(!strcmp(argv[4],"usb4stream")){opt.tp.transport=DS4_TP_TRANSPORT_USB4STREAM;opt.tp.usb4stream_device=argv[5];}
     else if(!strcmp(argv[4],"rdma")){opt.tp.transport=DS4_TP_TRANSPORT_RDMA;opt.tp.rdma_device=argv[5];opt.tp.rdma_port=1;opt.tp.rdma_gid_index=1;opt.tp.rdma_gid_index_set=true;}
     else return 2;
     CHECK(mkdir(output,0700)==0);

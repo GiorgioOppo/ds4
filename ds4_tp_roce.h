@@ -118,7 +118,7 @@ static int tp_roce_connect(ds4_tp *tp,char *err,size_t errlen) {
     struct ds4_tp_roce *r=tp->roce;
     struct { uint64_t epoch; uint32_t qpn,psn,mtu; uint8_t gid[16]; uint32_t reserved; } mine={0},peer={0};
     mine.epoch=tp->epoch;mine.qpn=r->qp->qp_num;mine.psn=r->psn;mine.mtu=r->mtu;memcpy(mine.gid,&r->gid,16);
-    if(!ds4_tp_io_exchange(tp->data_fd,false,&mine,&peer,sizeof(mine),tp->gate_timeout_ms,&tp->failed)) goto fail;
+    if(!ds4_tp_io_exchange(tp->data_fd,&mine,&peer,sizeof(mine),tp->gate_timeout_ms,&tp->failed)) goto fail;
     if(peer.epoch!=mine.epoch || !peer.qpn || peer.qpn>0xffffffu || peer.psn>0xffffffu ||
        peer.mtu<IBV_MTU_256 || peer.mtu>IBV_MTU_4096 || peer.reserved) { errno=EPROTO; goto fail; }
     const uint8_t port=tp->opt.rdma_port?tp->opt.rdma_port:1;
@@ -193,7 +193,7 @@ static int tp_roce_exchange(ds4_tp *tp,const void *out,void *in,uint64_t bytes) 
             if(!tp_roce_prepare(tp,bytes-offset)) return 0;
             uint64_t mine[2]={r->window_id,offset},peer[2];
             double remaining=(deadline-tp_now_sec())*1000.0;
-            if(remaining<1 || !ds4_tp_io_exchange(tp->data_fd,false,mine,peer,sizeof(mine),(uint64_t)remaining,&tp->failed) || memcmp(mine,peer,sizeof(mine))) return 0;
+            if(remaining<1 || !ds4_tp_io_exchange(tp->data_fd,mine,peer,sizeof(mine),(uint64_t)remaining,&tp->failed) || memcmp(mine,peer,sizeof(mine))) return 0;
         }
     }
     return 1;

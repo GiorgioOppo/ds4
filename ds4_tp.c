@@ -21,7 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -208,8 +207,6 @@ struct ds4_tp {
     bool rdma_active;
 #ifdef DS4_TP_LINUX
     struct ds4_tp_roce *roce;
-    int stream_fd;
-    bool stream_active;
     uint64_t epoch;
 #endif
     uint32_t peer_ctx;
@@ -510,9 +507,7 @@ void ds4_tp_usage(FILE *fp) {
         "                              GLM diagnostic: prefill one token at a time.\n"
         "  --debug-hash <n>            Cross-check hidden state every n tokens.\n");
 #ifdef DS4_TP_LINUX
-    fprintf(fp, "  --rdma-port <1..255>        Linux RoCE port (default 1).\n"
-                "  --transport usb4stream     Use one configured bidirectional USB4 stream.\n"
-                "  --usb4stream-device <path> Select its /dev/tbstreamX device.\n");
+    fprintf(fp, "  --rdma-port <1..255>        Linux RoCE port (default 1).\n");
 #endif
 }
 
@@ -534,9 +529,6 @@ int ds4_tp_parse_cli_arg(
         if (!strcmp(v, "auto")) opt->transport = DS4_TP_TRANSPORT_AUTO;
         else if (!strcmp(v, "rdma")) opt->transport = DS4_TP_TRANSPORT_RDMA;
         else if (!strcmp(v, "tcp")) opt->transport = DS4_TP_TRANSPORT_TCP;
-#ifdef DS4_TP_LINUX
-        else if (!strcmp(v, "usb4stream")) opt->transport = DS4_TP_TRANSPORT_USB4STREAM;
-#endif
         else {
             tp_set_err(err, errlen, "invalid %s value: %s", arg, v);
             return DS4_TP_CLI_ERROR;
@@ -566,9 +558,6 @@ int ds4_tp_parse_cli_arg(
             return DS4_TP_CLI_ERROR;
         }
         opt->rdma_port = (int)value;
-    } else if (!strcmp(arg, "--usb4stream-device")) {
-        if (i + 1 >= argc) goto missing;
-        opt->usb4stream_device = argv[++i];
 #endif
     } else if (!strcmp(arg, "--tensor-parallel-token-prefill")) {
         opt->glm_token_prefill = true;
@@ -658,7 +647,7 @@ int ds4_tp_validate_engine_options(
 {
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
-            opt->tp.rdma_device || opt->tp.rdma_port || opt->tp.rdma_gid_index_set || opt->tp.usb4stream_device ||
+            opt->tp.rdma_device || opt->tp.rdma_port || opt->tp.rdma_gid_index_set ||
             opt->tp.glm_token_prefill || opt->tp.debug_hash != 0) {
             tp_set_err(err, errlen,
                        "tensor-parallel options require --tensor-parallel and --role");
@@ -696,11 +685,6 @@ int ds4_tp_validate_engine_options(
         (opt->ssd_streaming || opt->dspark || opt->glm_mtp ||
          (opt->mtp_path && opt->mtp_path[0]) || opt->cuda_tensor_parallel)) {
         tp_set_err(err, errlen, "V4.1 ROCm network TP requires resident weights without speculative drafting or local multi-GPU TP");
-        return 0;
-    }
-#else
-    if (opt->tp.transport == DS4_TP_TRANSPORT_USB4STREAM || opt->tp.usb4stream_device) {
-        tp_set_err(err, errlen, "USB4STREAM requires the V4.1 ROCm tensor-parallel backend");
         return 0;
     }
 #endif
@@ -2005,28 +1989,16 @@ static void tp_rdma_close(ds4_tp *tp) {
 /* Capability bits use the public transport enum; AUTO is a request, not a capability. */
 static int tp_linux_select(uint32_t request, uint32_t peer_request,
                            uint32_t caps, uint32_t peer_caps) {
-    if (request > DS4_TP_TRANSPORT_USB4STREAM ||
-        peer_request > DS4_TP_TRANSPORT_USB4STREAM) return -1;
+    if (request > DS4_TP_TRANSPORT_TCP ||
+        peer_request > DS4_TP_TRANSPORT_TCP) return -1;
     if (request && peer_request && request != peer_request) return -1;
     uint32_t chosen = request ? request : peer_request;
     uint32_t common = caps & peer_caps;
     if (chosen) return common & (1u << chosen) ? (int)chosen : -1;
     if (common & (1u << DS4_TP_TRANSPORT_RDMA)) return DS4_TP_TRANSPORT_RDMA;
-    if (common & (1u << DS4_TP_TRANSPORT_USB4STREAM)) return DS4_TP_TRANSPORT_USB4STREAM;
     return common & (1u << DS4_TP_TRANSPORT_TCP) ? DS4_TP_TRANSPORT_TCP : -1;
 }
 
-static int tp_linux_open_stream(const char *path) {
-    struct stat st;
-    if (stat(path, &st) < 0) return -1;
-    if (!S_ISCHR(st.st_mode)) { errno = ENODEV; return -1; }
-    int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) return -1;
-    if (fstat(fd, &st) < 0 || !S_ISCHR(st.st_mode)) {
-        close(fd); errno = ENODEV; return -1;
-    }
-    return fd;
-}
 #endif
 
 static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
@@ -2049,7 +2021,6 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     };
 #ifdef DS4_TP_LINUX
     uint32_t caps = (1u << DS4_TP_TRANSPORT_TCP) |
-        (tp->stream_fd >= 0 ? 1u << DS4_TP_TRANSPORT_USB4STREAM : 0u) |
         (rdma_ok ? 1u << DS4_TP_TRANSPORT_RDMA : 0u);
     mine.pad = (uint32_t)tp->opt.transport | (caps << 8);
     ssize_t nonce_bytes;
@@ -2064,7 +2035,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
            sizeof(mine.gate_slot_mask));
     ds4_tp_hello_fixed theirs;
 #ifdef DS4_TP_LINUX
-    if (!ds4_tp_io_exchange(tp->control_fd, false, &mine, &theirs,
+    if (!ds4_tp_io_exchange(tp->control_fd, &mine, &theirs,
                            offsetof(ds4_tp_hello_fixed, nonce), tp->timeout_sec * 1000u, &tp->failed)) {
 #else
     if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
@@ -2083,7 +2054,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         return 0;
     }
 #ifdef DS4_TP_LINUX
-    if (!ds4_tp_io_exchange(tp->control_fd, false, &mine.nonce, &theirs.nonce,
+    if (!ds4_tp_io_exchange(tp->control_fd, &mine.nonce, &theirs.nonce,
                            sizeof(mine.nonce), tp->timeout_sec * 1000u, &tp->failed)) {
         tp_set_err(err, errlen, "tp nonce exchange failed");
         return 0;
@@ -2137,12 +2108,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         return 0;
     }
     tp->rdma_active = selected == DS4_TP_TRANSPORT_RDMA;
-    tp->stream_active = selected == DS4_TP_TRANSPORT_USB4STREAM;
     tp->epoch = mine.nonce ^ theirs.nonce;
-    if (!tp->stream_active && tp->stream_fd >= 0) {
-        close(tp->stream_fd);
-        tp->stream_fd = -1;
-    }
 #else
     /* Transport decision: RDMA only when both sides can. */
     int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
@@ -2173,9 +2139,6 @@ int ds4_tp_create(
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
     tp->control_fd = -1;
     tp->data_fd = -1;
-#ifdef DS4_TP_LINUX
-    tp->stream_fd = -1;
-#endif
     atomic_init(&tp->failed, false);
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
@@ -2200,14 +2163,6 @@ int ds4_tp_create(
         char reason[256] = "RoCE allocation failed";
         rdma_ok = tp_roce_probe(tp, reason, sizeof(reason));
         if (!rdma_ok) fprintf(stderr, "ds4-tp: %s\n", reason);
-    }
-    if (opt->usb4stream_device &&
-        (opt->transport == DS4_TP_TRANSPORT_AUTO ||
-         opt->transport == DS4_TP_TRANSPORT_USB4STREAM)) {
-        tp->stream_fd = tp_linux_open_stream(opt->usb4stream_device);
-        if (tp->stream_fd < 0)
-            fprintf(stderr, "ds4-tp: USB4STREAM %s unavailable: %s\n",
-                    opt->usb4stream_device, strerror(errno));
     }
 #endif
     int listener = -1;
@@ -2264,15 +2219,8 @@ int ds4_tp_create(
     if (listener >= 0) close(listener);
     fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
-#ifdef DS4_TP_LINUX
-            tp->stream_active ? "usb4stream" :
-#endif
             tp->rdma_active ? "rdma" : "tcp",
             (unsigned long long)tp->gate_timeout_ms);
-#ifdef DS4_TP_LINUX
-    if (tp->stream_active)
-        fprintf(stderr, "ds4-tp: payload=%s; control/framing=TCP\n", opt->usb4stream_device);
-#endif
     *out = tp;
     return 1;
 fail:
@@ -2309,7 +2257,6 @@ void ds4_tp_free(ds4_tp *tp) {
 #endif
 #ifdef DS4_TP_LINUX
     tp_roce_close(tp);
-    if (tp->stream_fd >= 0) close(tp->stream_fd);
 #endif
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
@@ -2329,9 +2276,6 @@ void ds4_tp_detach_slab(ds4_tp *tp) {
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 const char *ds4_tp_transport_name(const ds4_tp *tp) {
-#ifdef DS4_TP_LINUX
-    if (tp->stream_active) return "usb4stream";
-#endif
     return tp->rdma_active ? "rdma" : "tcp";
 }
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
@@ -2363,22 +2307,14 @@ static int tp_linux_gate(ds4_tp *tp, uint32_t kind, uint32_t layer,
     if (tp->rdma_active && !tp_roce_prepare(tp, bytes)) goto fail;
     ds4_tp_linux_gate_header h = {DS4_TP_MAGIC, kind, layer, gate,
                                   tp->epoch, seq, bytes}, peer;
-    if (!ds4_tp_io_exchange(tp->data_fd, false, &h, &peer, sizeof(h),
+    if (!ds4_tp_io_exchange(tp->data_fd, &h, &peer, sizeof(h),
                            tp->gate_timeout_ms + grace_ms, &tp->failed)) goto fail;
     if (memcmp(&h, &peer, sizeof(h))) { errno = EPROTO; goto fail; }
-    /* The device also carries the epoch: leftover bytes from a previous
-     * connection must not be mistaken for a new partial. */
-    if (tp->stream_active) {
-        if (!ds4_tp_io_exchange(tp->stream_fd, true, &h, &peer, sizeof(h),
-                               tp->gate_timeout_ms, &tp->failed)) goto fail;
-        if (memcmp(&h, &peer, sizeof(h))) { errno = EPROTO; goto fail; }
-    }
     if (tp->rdma_active) {
         if (!tp_roce_exchange(tp, out, in, bytes)) goto fail;
         return 1;
     }
-    if (!ds4_tp_io_exchange(tp->stream_active ? tp->stream_fd : tp->data_fd,
-                           tp->stream_active, out, in, bytes,
+    if (!ds4_tp_io_exchange(tp->data_fd, out, in, bytes,
                            tp->gate_timeout_ms, &tp->failed)) goto fail;
     return 1;
 fail:

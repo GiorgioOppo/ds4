@@ -1,7 +1,7 @@
 #ifndef DS4_TP_IO_H
 #define DS4_TP_IO_H
 
-/* Both directions advance independently of socket or USB ring capacity. */
+/* Both directions advance independently of socket buffer capacity. */
 #include <errno.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -19,7 +19,7 @@ static double ds4_tp_io_now(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static int ds4_tp_io_exchange(int fd, bool device, const void *out, void *in,
+static int ds4_tp_io_exchange(int fd, const void *out, void *in,
         uint64_t bytes, uint64_t timeout_ms, const atomic_bool *cancelled) {
     if (fd < 0 || !out || !in || !bytes || !timeout_ms || bytes > SIZE_MAX) {
         errno = EINVAL;
@@ -37,16 +37,14 @@ static int ds4_tp_io_exchange(int fd, bool device, const void *out, void *in,
         bool progress = false;
         if (sent < bytes) {
             size_t n = bytes - sent > 2097152u ? 2097152u : (size_t)(bytes - sent);
-            ssize_t r = device ? write(fd, (const char *)out + sent, n) :
-                send(fd, (const char *)out + sent, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+            ssize_t r = send(fd, (const char *)out + sent, n, MSG_DONTWAIT | MSG_NOSIGNAL);
             if (r > 0) { sent += (uint64_t)r; progress = true; }
             else if (!r) { errno = EPIPE; goto fail; }
             else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) goto fail;
         }
         if (received < bytes) {
             size_t n = bytes - received > 2097152u ? 2097152u : (size_t)(bytes - received);
-            ssize_t r = device ? read(fd, (char *)in + received, n) :
-                recv(fd, (char *)in + received, n, MSG_DONTWAIT);
+            ssize_t r = recv(fd, (char *)in + received, n, MSG_DONTWAIT);
             if (r > 0) { received += (uint64_t)r; progress = true; }
             else if (!r) { errno = ECONNRESET; goto fail; }
             else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) goto fail;
@@ -66,8 +64,8 @@ static int ds4_tp_io_exchange(int fd, bool device, const void *out, void *in,
 fail:
     {
         int saved_errno = errno;
-        fprintf(stderr, "ds4-tp: %s I/O failed: sent=%llu received=%llu expected=%llu: %s\n",
-                device ? "device" : "socket", (unsigned long long)sent,
+        fprintf(stderr, "ds4-tp: socket I/O failed: sent=%llu received=%llu expected=%llu: %s\n",
+                (unsigned long long)sent,
                 (unsigned long long)received, (unsigned long long)bytes,
                 strerror(saved_errno));
         errno = saved_errno;

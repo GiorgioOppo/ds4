@@ -37,41 +37,39 @@ static void socket_pair(int fd[2]) {
 static void transfers(void) {
     const uint64_t sizes[] = {1, 3, 20480, 8*20480, 2*1024*1024-1,
                               2*1024*1024, 2*1024*1024+1, 7*1024*1024+3};
-    for (int device = 0; device <= 1; ++device) {
-        for (unsigned n = 0; n < sizeof(sizes)/sizeof(*sizes); ++n) {
-            int fd[2], stream[2];
-            socket_pair(fd); socket_pair(stream);
-            peer p[2] = {0};
-            for (unsigned rank = 0; rank < 2; ++rank) {
-                p[rank].tp = (ds4_tp){.data_fd=fd[rank], .stream_fd=stream[rank],
-                    .stream_active=device, .epoch=12345, .n_layer=40, .gate_timeout_ms=5000};
-                atomic_init(&p[rank].tp.failed, false);
-                p[rank].bytes=sizes[n]; p[rank].seq=7; p[rank].kind=3;
-                p[rank].out=malloc(sizes[n]); p[rank].in=malloc(sizes[n]+2);
-                assert(p[rank].out && p[rank].in);
-                memset(p[rank].in, 0xa5, sizes[n]+2);
-                ++p[rank].in;
-                for (uint64_t j=0; j<sizes[n]; ++j)
-                    p[rank].out[j]=(unsigned char)(j*31+rank*73);
-            }
-            /* Reuse the connection with a new sequence; no stale generation. */
-            for (int round=0; round<2; ++round) {
-                pthread_t worker;
-                assert(!pthread_create(&worker, NULL, exchange, &p[1]));
-                exchange(&p[0]); assert(!pthread_join(worker, NULL));
-                assert(p[0].ok && p[1].ok);
-                for (int rank=0;rank<2;++rank) {
-                    assert(!memcmp(p[rank].in, p[1-rank].out, sizes[n]));
-                    assert(p[rank].in[-1]==0xa5 && p[rank].in[sizes[n]]==0xa5);
-                    ++p[rank].seq;
-                }
-            }
+    for (unsigned n = 0; n < sizeof(sizes)/sizeof(*sizes); ++n) {
+        int fd[2];
+        socket_pair(fd);
+        peer p[2] = {0};
+        for (unsigned rank = 0; rank < 2; ++rank) {
+            p[rank].tp = (ds4_tp){.data_fd=fd[rank], .epoch=12345, .n_layer=40, .gate_timeout_ms=5000};
+            atomic_init(&p[rank].tp.failed, false);
+            p[rank].bytes=sizes[n]; p[rank].seq=7; p[rank].kind=3;
+            p[rank].out=malloc(sizes[n]); p[rank].in=malloc(sizes[n]+2);
+            assert(p[rank].out && p[rank].in);
+            memset(p[rank].in, 0xa5, sizes[n]+2);
+            ++p[rank].in;
+            for (uint64_t j=0; j<sizes[n]; ++j)
+                p[rank].out[j]=(unsigned char)(j*31+rank*73);
+        }
+        /* Reuse the connection with a new sequence; no stale generation. */
+        for (int round=0; round<2; ++round) {
+            pthread_t worker;
+            assert(!pthread_create(&worker, NULL, exchange, &p[1]));
+            exchange(&p[0]); assert(!pthread_join(worker, NULL));
+            assert(p[0].ok && p[1].ok);
             for (int rank=0;rank<2;++rank) {
-                free(p[rank].out); free(p[rank].in-1);
-                close(fd[rank]);close(stream[rank]);
+                assert(!memcmp(p[rank].in, p[1-rank].out, sizes[n]));
+                assert(p[rank].in[-1]==0xa5 && p[rank].in[sizes[n]]==0xa5);
+                ++p[rank].seq;
             }
         }
+        for (int rank=0;rank<2;++rank) {
+            free(p[rank].out); free(p[rank].in-1);
+            close(fd[rank]);
+        }
     }
+
 }
 
 static void failures(void) {
@@ -107,17 +105,14 @@ static void negotiation(void) {
             int selected=tp_linux_select(a,b,ac,bc);
             assert(selected==tp_linux_select(b,a,bc,ac));
             int expected=-1;
-            if (a<=3 && b<=3 && !(a && b && a!=b)) {
+            if (a<=2 && b<=2 && !(a && b && a!=b)) {
                 unsigned requested=a?a:b, common=ac&bc;
                 if (requested) expected=(common & (1u<<requested))?(int)requested:-1;
                 else if (common&2) expected=1;
-                else if (common&8) expected=3;
                 else if (common&4) expected=2;
             }
             assert(selected==expected);
         }
-    assert(tp_linux_open_stream("/nonexistent-ds4-tp-device")<0);
-    assert(tp_linux_open_stream("tests/test_tp_linux.c")<0);
 }
 
 typedef struct { ds4_tp tp; ds4_tp_identity id; int ok; char err[256]; } hello_peer;
@@ -131,14 +126,14 @@ static void handshakes(void) {
         int fd[2];socket_pair(fd);
         hello_peer p[2]={0};
         for (unsigned r=0;r<2;++r) {
-            p[r].tp.control_fd=fd[r];p[r].tp.stream_fd=-1;
+            p[r].tp.control_fd=fd[r];
             p[r].tp.timeout_sec=1;
             p[r].tp.opt.role=r?DS4_TP_WORKER:DS4_TP_LEADER;
             p[r].id=(ds4_tp_identity){.gguf_bytes=999,.model_id=41,.n_layer=40,
                 .n_embd=5120,.n_vocab=129280,.quant_bits=2,.ctx_size=8192};
         }
         if (mode==1) p[1].id.n_embd++;
-        if (mode==2) p[1].tp.opt.transport=DS4_TP_TRANSPORT_USB4STREAM;
+        if (mode==2) p[1].tp.opt.transport=DS4_TP_TRANSPORT_RDMA;
         if (mode>=3) {
             /* Reject legacy12 and CUDA/old-ROCm14 before reading a nonce or
              * backend-specific frames, even if the peer keeps the socket open. */
@@ -252,6 +247,6 @@ static void checkpoint_streams(void) {
 int main(void) {
     assert(DS4_TP_PROTOCOL_VERSION==15);
     negotiation(); handshakes(); transfers(); failures(); cancellation(); checkpoint_streams();
-    puts("Linux TP: negotiation, full-duplex TCP/device I/O, tails, canaries, generations and failures PASS");
+    puts("Linux TP: negotiation, full-duplex TCP I/O, tails, canaries, generations and failures PASS");
     return 0;
 }

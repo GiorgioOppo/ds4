@@ -1,5 +1,5 @@
 /* Manual, model-free two-host transport qualification. No GPU or GGUF access.
- * rank address port tcp|usb4stream device-or-dash */
+ * rank address port tcp|rdma device-or-dash [port gid-index] */
 #define DS4_ROCM_BUILD 1
 #include "../ds4_tp.c"
 
@@ -10,9 +10,7 @@ int main(int argc, char **argv) {
     ds4_tp_options opt={.role=rank?DS4_TP_WORKER:DS4_TP_LEADER,
         .listen_host=argv[2],.leader_host=argv[2],.listen_port=port,.leader_port=port};
     if (!strcmp(argv[4],"tcp")) opt.transport=DS4_TP_TRANSPORT_TCP;
-    else if (!strcmp(argv[4],"usb4stream")) {
-        opt.transport=DS4_TP_TRANSPORT_USB4STREAM;opt.usb4stream_device=argv[5];
-    } else if (!strcmp(argv[4],"rdma") && argc==8) {
+    else if (!strcmp(argv[4],"rdma") && argc==8) {
         opt.transport=DS4_TP_TRANSPORT_RDMA;opt.rdma_device=argv[5];
         opt.rdma_port=atoi(argv[6]);opt.rdma_gid_index=atoi(argv[7]);opt.rdma_gid_index_set=true;
     } else return 2;
