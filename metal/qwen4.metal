@@ -2732,10 +2732,34 @@ kernel void kernel_qwen4_moe_down_q2k(
     const uint64_t pair = (uint64_t)tok * n_out + slot;
     device const float *m = mid + pair * args.in_dim;
     if (slot == args.n_slots) {
-        for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
-            const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes,
-                                          m, args.shared_type, args.in_dim, tiisg);
-            if (tiisg == 0) part[pair * args.out_rows + r] = v;
+        if (args.shared_type == 8u) {
+            // Keep each Q8 row's lane mapping, block order, four-term
+            // expression and SIMD reduction; reuse m loads across rows.
+            const short ix = tiisg / 8, it = tiisg % 8;
+            const uint nb = args.in_dim / 32u;
+            float acc[2] = {0.0f, 0.0f};
+            for (uint ib = (uint)ix; ib < nb; ib += 4) {
+                device const float *y = m + ib * 32 + (uint)it * 2;
+                const float y0 = y[0], y1 = y[1], y16 = y[16], y17 = y[17];
+                for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
+                    device const char *b = sh_down +
+                        (uint64_t)(row0 + r) * args.shared_row_bytes + (uint64_t)ib * 34;
+                    const float d = (float)(*(device const half *)b);
+                    device const char *q = b + 2 + it * 2;
+                    acc[r] += d * (y0 * (float)q[0] + y1 * (float)q[1] +
+                                    y16 * (float)q[16] + y17 * (float)q[17]);
+                }
+            }
+            for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
+                const float v = simd_sum(acc[r]);
+                if (tiisg == 0) part[pair * args.out_rows + row0 + r] = v;
+            }
+        } else {
+            for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+                const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes,
+                                              m, args.shared_type, args.in_dim, tiisg);
+                if (tiisg == 0) part[pair * args.out_rows + r] = v;
+            }
         }
         return;
     }
@@ -2745,20 +2769,51 @@ kernel void kernel_qwen4_moe_down_q2k(
     const uint q_base = 32u * (group / 8u) + 16u * (group & 1u);
     const uint shift = ((group / 2u) & 3u) * 2u;
     float acc[2] = {0.0f, 0.0f};
-    for (uint ib = 0; ib < 3u; ib++) {
+    /* Complete blocks keep all lanes active; only the last block has
+     * 128 live values. No padded activation addresses are formed. */
+    for (uint ib = 0; ib < 2u; ib++) {
         const uint column = ib * 256u + group * 16u + l;
-        if (column >= 640u) continue;
-        float y[8];
-        for (uint i = 0; i < 8u; i++) y[i] = m[column + i];
+        /* Widen loads only; preserve the eight-element FP32 chain below.
+         * Packed types retain scalar activation and half-scale alignment. */
+        const packed_float4 y0 = *(device const packed_float4 *)(m + column);
+        const packed_float4 y1 = *(device const packed_float4 *)(m + column + 4u);
+        const float y[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
         for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
             device const uchar *blk = (device const uchar *)(db +
                 (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 84u);
-            const float d = (float)(*(device const half *)(blk + 80));
-            const float dmin = (float)(*(device const half *)(blk + 82));
+            const packed_half2 scales = *(device const packed_half2 *)(blk + 80);
+            const float d = (float)scales.x;
+            const float dmin = (float)scales.y;
             const uint sc = blk[group];
             const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
             device const uchar *qs = blk + 16u + q_base + l;
-            for (uint i = 0; i < 8u; i++) acc[r] += (ds * (float)((qs[i] >> shift) & 3u) - dm) * y[i];
+            const packed_uchar4 q0 = *(device const packed_uchar4 *)qs;
+            const packed_uchar4 q1 = *(device const packed_uchar4 *)(qs + 4u);
+            const uchar q[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+            for (uint i = 0; i < 8u; i++) acc[r] += (ds * (float)((q[i] >> shift) & 3u) - dm) * y[i];
+        }
+    }
+    if (tiisg < 16u) {
+        const uint ib = 2u;
+        const uint column = 512u + group * 16u + l;
+        /* Widen loads only; preserve the eight-element FP32 chain below.
+         * Packed types retain scalar activation and half-scale alignment. */
+        const packed_float4 y0 = *(device const packed_float4 *)(m + column);
+        const packed_float4 y1 = *(device const packed_float4 *)(m + column + 4u);
+        const float y[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
+        for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {
+            device const uchar *blk = (device const uchar *)(db +
+                (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 84u);
+            const packed_half2 scales = *(device const packed_half2 *)(blk + 80);
+            const float d = (float)scales.x;
+            const float dmin = (float)scales.y;
+            const uint sc = blk[group];
+            const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
+            device const uchar *qs = blk + 16u + q_base + l;
+            const packed_uchar4 q0 = *(device const packed_uchar4 *)qs;
+            const packed_uchar4 q1 = *(device const packed_uchar4 *)(qs + 4u);
+            const uchar q[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+            for (uint i = 0; i < 8u; i++) acc[r] += (ds * (float)((q[i] >> shift) & 3u) - dm) * y[i];
         }
     }
     for (uint r = 0; r < 2u && row0 + r < args.out_rows; r++) {

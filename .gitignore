@@ -93,3 +93,5 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /tests/test_metal_qwen4_hc
 /tests/test_metal_qwen4_moe_mid
+
+/tests/test_metal_qwen4_moe_down
