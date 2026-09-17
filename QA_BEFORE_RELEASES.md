@@ -1102,6 +1102,8 @@ clients.
   and streaming decode. Repeat across OpenAI chat, Responses, Anthropic, and
   completions. Abandoned work must stop at the next backend-safe boundary, and
   a valid request after each cancellation must complete normally.
+- For V4.1 concurrent serving, run `tests/test_server_batching.py --pairs 8 --workers 4 --output batching.json` with the server defaults, then repeat with `--stream --cancel-first 4` and `--same-prompt --case long-greedy`. Cover resident and SSD experts, cold and restored disk checkpoints, and a separately recorded `--mixed-prefill-quantum 2048` control. Preserve full responses and inspect actual slot overlap and chunk boundaries. Fixed-size diagnostic controls do not substitute for testing the defaults. Fixture groups named "batch" in official scoring do not test concurrent requests.
+- Set time limits from observed model loading, prefill, generation and queue duration. If a test is still progressing when its limit expires, preserve the attempt, increase or remove the inadequate limit and complete it; investigate a stalled test. Do not count partial assertions as a completed suite. For the vision-cache test, use `--timeout` and `--thinking-tokens` when the model needs more time or reasoning tokens, recording the settings and checking that answers finish normally.
 - For the repeatable chat-completions cancellation and slot-reuse gate, run
   `python3 tests/test_server_batching.py --url http://127.0.0.1:8000 --pairs 2
   --workers 4 --case short-sampled --max-tokens 12 --cancel-first 4`. Then run

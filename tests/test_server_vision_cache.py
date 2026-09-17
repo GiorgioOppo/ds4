@@ -21,6 +21,10 @@ def main():
     parser.add_argument("--append-only", action="store_true",
                         help="only run the long-prefix image append sequence")
     parser.add_argument("--thinking-only", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300,
+                        help="per-request timeout in seconds; allow for queued work")
+    parser.add_argument("--thinking-tokens", type=int, default=512,
+                        help="thinking output budget, including hidden reasoning")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -36,7 +40,8 @@ def main():
         previous_frontier = results[-1]["usage"]["total_tokens"] if expected_cache and results else 0
         body = {"model": args.model, "messages": history, "temperature": 0,
                 "reasoning_effort": "low" if thinking else "none",
-                "max_tokens": 512 if tools or thinking else 48, "stream": False}
+                "max_tokens": args.thinking_tokens if thinking else (512 if tools else 48),
+                "stream": False}
         if tools:
             body["tools"] = tools
         (args.output / (label + ".request.json")).write_text(json.dumps(body))
@@ -45,7 +50,7 @@ def main():
                                          headers={"Content-Type": "application/json"})
         started = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=300) as response:
+            with urllib.request.urlopen(request, timeout=args.timeout) as response:
                 reply = json.load(response)
         except urllib.error.HTTPError as exc:
             raise RuntimeError(exc.read().decode()) from exc
@@ -53,6 +58,7 @@ def main():
         usage = reply["usage"]
         cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
         result = {"label": label, "seconds": time.monotonic() - started, "usage": usage,
+                  "finish_reason": reply["choices"][0].get("finish_reason"),
                   "message": reply["choices"][0]["message"]}
         with results_lock:
             results.append(result)

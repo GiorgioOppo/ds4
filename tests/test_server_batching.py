@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import json
 import math
+from pathlib import Path
 import statistics
 import sys
 import threading
@@ -176,6 +177,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--nonce", default="")
+    parser.add_argument("--output", type=Path,
+                        help="save complete requests, responses and summary as JSON")
     parser.add_argument(
         "--same-prompt", action="store_true",
         help="send one identical prompt and seed in every request",
@@ -323,6 +326,12 @@ def main():
         ),
         "nonce": nonce,
     }
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({
+            "summary": summary, "metadata": metadata,
+            "requests": requests, "responses": results,
+        }, indent=2) + "\n")
     print(json.dumps(summary, sort_keys=True))
     return 0 if failures == 0 else 1
 
