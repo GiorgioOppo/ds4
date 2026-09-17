@@ -763,6 +763,8 @@ int main(int argc, char **argv) {
         .n_threads = 0,
         .context_size = ctx_size,
         .placement_ctx_hint = ctx_size,
+        .placement_session_count_hint = session_count,
+        .share_session_prefill_workspace = session_count > 1,
         .ssd_streaming_cache_experts = ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = ssd_streaming_preload_experts,

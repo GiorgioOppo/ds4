@@ -11533,6 +11533,7 @@ int ds4_gpu_synchronize(void) {
 }
 
 static void qwen4_nax_release_scratch(void);
+static void qwen4_batch_release_scratch(void);
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
@@ -11823,6 +11824,7 @@ void ds4_gpu_cleanup(void) {
         g_model_mapped_size = 0;
         g_model_mapped_max_tensor_bytes = 0;
         qwen4_nax_release_scratch();
+        qwen4_batch_release_scratch();
         ds4_gpu_tensor_tracking_reset();
         g_flash_attn_mask_bytes = 0;
         g_flash_attn_zero_mask_bytes = 0;
@@ -48128,6 +48130,8 @@ enum {
     QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_DOWN_MXFP4_PF,
+    QWEN4_K_MOE_MID_Q4K_GROUPED,
+    QWEN4_K_MOE_DOWN_MXFP4_GROUPED,
     QWEN4_K_MOE_REDUCE,
     QWEN4_K_HC_COMBINE_NORM,
     QWEN4_K_ARGMAX,
@@ -48157,6 +48161,22 @@ enum {
     QWEN4_K_MOE_MM_DOWN_NAXC64,
     QWEN4_K_ROWS_F32_TO_F16,
     QWEN4_K_DENSE_MM,
+    QWEN4_K_DENSE_MM_REDUCE,
+    QWEN4_K_BATCH_MM_Q8_T1,
+    QWEN4_K_BATCH_MM_Q8_T2,
+    QWEN4_K_GDN_SCAN_ROWS,
+    QWEN4_K_CONV_STREAM_ROWS,
+    QWEN4_K_GDN_SCAN_ROWS2,
+    QWEN4_K_CONV_STREAM_ROWS2,
+    QWEN4_K_ATTN_PREP_ROWS,
+    QWEN4_K_IDX_BLOCK_KEY_ROWS,
+    QWEN4_K_IDX_SCORE_ROWS,
+    QWEN4_K_IDX_SELECT_ROWS,
+    QWEN4_K_IDX_EXPAND_ROWS,
+    QWEN4_K_ATTN_DECODE_ROWS_NPT8,
+    QWEN4_K_ATTN_DECODE_ROWS_NPT4,
+    QWEN4_K_ATTN_MERGE_ROWS_NPT8,
+    QWEN4_K_ATTN_MERGE_ROWS_NPT4,
     QWEN4_K_HC_LO_ACT,
     QWEN4_K_HC_MIX_ROWS,
     QWEN4_K_VIS_PATCH_FINISH,
@@ -48215,6 +48235,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_down_mxfp4_pf",
+    "kernel_qwen4_moe_mid_q4k_grouped",
+    "kernel_qwen4_moe_down_mxfp4_grouped",
     "kernel_qwen4_moe_reduce",
     "kernel_qwen4_hc_combine_norm_f16",
     "kernel_qwen4_argmax",
@@ -48244,6 +48266,22 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_naxc64",
     "kernel_qwen4_rows_f32_to_f16",
     "kernel_qwen4_dense_mm",
+    "kernel_qwen4_dense_mm_reduce",
+    "kernel_qwen4_batch_mm_q8_t1",
+    "kernel_qwen4_batch_mm_q8_t2",
+    "kernel_qwen4_gdn_scan_rows",
+    "kernel_qwen4_conv_stream_rows",
+    "kernel_qwen4_gdn_scan_rows2",
+    "kernel_qwen4_conv_stream_rows2",
+    "kernel_qwen4_attn_prep_rows",
+    "kernel_qwen4_idx_block_key_rows",
+    "kernel_qwen4_idx_score_rows",
+    "kernel_qwen4_idx_select_rows",
+    "kernel_qwen4_idx_expand_rows",
+    "kernel_qwen4_attn_decode_rows_npt8",
+    "kernel_qwen4_attn_decode_rows_npt4",
+    "kernel_qwen4_attn_merge_rows_npt8",
+    "kernel_qwen4_attn_merge_rows_npt4",
     "kernel_qwen4_hc_lo_act",
     "kernel_qwen4_hc_mix_rows",
     "kernel_qwen4_vis_patch_finish",
@@ -48276,11 +48314,13 @@ static MTLSize qwen4_moe_mm_grid(uint32_t row_blocks, uint32_t n_expert, uint32_
 static id<MTLComputePipelineState> g_qwen4_pipelines[QWEN4_K_COUNT];
 #define QWEN4_ATTN_NSG 4
 #define QWEN4_ATTN_MAX_SPLITS 64
+#define QWEN4_ATTN_ROWS_MAX 64     /* decode batch rows the attention rows kernels take */
 
 typedef struct {
     uint32_t n_tokens, n_slots, in_dim, out_rows, weight_type, row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
+    uint32_t list_cap, pad0;
 } qwen4_moe_args;
 
 static bool qwen4_moe_mv_specialize(uint32_t type) {
@@ -48306,9 +48346,13 @@ static uint32_t qwen4_moe_mv_groups(uint32_t type) {
     return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u);
 }
 
-static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
-                          const qwen4_bind *binds, int n_binds,
-                          MTLSize grid, MTLSize tg, NSUInteger tg_mem) {
+/* resident: buffers the kernel reaches through GPU addresses rather than
+ * bindings (the decode batch's per-session caches); they are made resident
+ * for this dispatch. */
+static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len,
+                                   const qwen4_bind *binds, int n_binds,
+                                   MTLSize grid, MTLSize tg, NSUInteger tg_mem,
+                                   const qwen4_bind *resident, uint32_t n_resident) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = nil;
@@ -48395,10 +48439,22 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
             [enc setBuffer:binds[i].buf offset:binds[i].off atIndex:(NSUInteger)(i + 1)];
         }
         if (tg_mem) [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+        if (n_resident) {
+            id<MTLResource> res[QWEN4_ATTN_ROWS_MAX * 5u];
+            if (n_resident > sizeof(res) / sizeof(res[0])) return 0;
+            for (uint32_t i = 0; i < n_resident; i++) res[i] = resident[i].buf;
+            [enc useResources:res count:n_resident usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        }
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, qwen4_kernel_names[kernel]);
     }
+}
+
+static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
+                          const qwen4_bind *binds, int n_binds,
+                          MTLSize grid, MTLSize tg, NSUInteger tg_mem) {
+    return qwen4_dispatch_resident(kernel, args, args_len, binds, n_binds, grid, tg, tg_mem, NULL, 0u);
 }
 
 /* bytes of one hc mixer row of n elements: f16, f32 or q8_0 */
@@ -48690,6 +48746,179 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
                           MTLSizeMake(head_dim, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+static ds4_gpu_tensor *g_qwen4_gdn_slots;
+
+/* One decode step for every row of a batch against its own slot of the state
+ * pool.  The grid keeps the per-row kernel's shape and simd-group grouping, so
+ * each row's arithmetic is unchanged and the result is bit-identical; the rows
+ * merely share a dispatch long enough to reach steady state. */
+int ds4_gpu_qwen4_gdn_scan_rows_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state_pool,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const uint32_t *slots, uint32_t n_rows,
+        uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t state_stride, uint32_t qkv_stride, uint32_t out_stride) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (head_dim != 128u || n_rows == 0u || n_rows > 64u) return 0;
+
+    struct { uint32_t n_rows, n_k_head, n_v_head, head_dim, state_stride, qkv_stride, out_stride, pad0; } args =
+        { n_rows, n_k_head, n_v_head, head_dim, state_stride, qkv_stride, out_stride, 0 };
+
+    const uint64_t slot_bytes = (uint64_t)n_rows * sizeof(uint32_t);
+    if (!g_qwen4_gdn_slots) {
+        g_qwen4_gdn_slots = ds4_gpu_tensor_alloc(64u * sizeof(uint32_t));
+        if (!g_qwen4_gdn_slots) return 0;
+    }
+    if (ds4_gpu_tensor_write(g_qwen4_gdn_slots, 0, slots, slot_bytes) == 0) return 0;
+
+    qwen4_bind b[6];
+    if (!qwen4_bind_tensor(&b[0], qkv, (uint64_t)n_rows * qkv_stride * sizeof(float), "gdn rows qkv") ||
+        !qwen4_bind_tensor(&b[1], ga, (uint64_t)n_rows * n_v_head * sizeof(float), "gdn rows decay") ||
+        !qwen4_bind_tensor(&b[2], gb, (uint64_t)n_rows * n_v_head * sizeof(float), "gdn rows beta") ||
+        !qwen4_bind_tensor(&b[3], state_pool, 0, "gdn rows state pool") ||
+        !qwen4_bind_tensor(&b[4], out, (uint64_t)n_rows * out_stride * sizeof(float), "gdn rows output") ||
+        !qwen4_bind_tensor(&b[5], g_qwen4_gdn_slots, slot_bytes, "gdn rows slots")) {
+        return 0;
+    }
+    /* Simd groups own independent value rows, so their grouping changes the
+     * dispatch shape without touching a row's recurrent arithmetic. */
+    const uint32_t nsg = 1u;
+    return qwen4_dispatch(QWEN4_K_GDN_SCAN_ROWS, &args, sizeof(args), b, 6,
+                          MTLSizeMake((head_dim + 4u * nsg - 1u) / (4u * nsg), n_v_head, n_rows),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* One decode token per batch row, each against its own slot of the history
+ * pool; see kernel_qwen4_conv_stream_rows. */
+int ds4_gpu_qwen4_conv_stream_rows_tensor(
+        ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const uint32_t *slots, uint32_t n_rows, uint32_t n_channels,
+        uint32_t conv_kernel, uint32_t state_stride, uint32_t x_stride, int apply_silu) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_rows == 0u || n_rows > 64u || conv_kernel < 2u || conv_kernel > 4u) return 0;
+
+    struct { uint32_t n_rows, n_channels, conv_kernel, apply_silu, state_stride, x_stride, pad0, pad1; } args =
+        { n_rows, n_channels, conv_kernel, apply_silu ? 1u : 0u, state_stride, x_stride, 0, 0 };
+
+    const uint64_t slot_bytes = (uint64_t)n_rows * sizeof(uint32_t);
+    if (!g_qwen4_gdn_slots) {
+        g_qwen4_gdn_slots = ds4_gpu_tensor_alloc(64u * sizeof(uint32_t));
+        if (!g_qwen4_gdn_slots) return 0;
+    }
+    if (ds4_gpu_tensor_write(g_qwen4_gdn_slots, 0, slots, slot_bytes) == 0) return 0;
+
+    qwen4_bind b[4];
+    if (!qwen4_bind_tensor(&b[0], x, (uint64_t)n_rows * x_stride * sizeof(float), "conv rows x") ||
+        !qwen4_bind_tensor(&b[1], hist_pool, 0, "conv rows history pool") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset,
+                           (uint64_t)n_channels * conv_kernel * sizeof(float), "conv rows weight") ||
+        !qwen4_bind_tensor(&b[3], g_qwen4_gdn_slots, slot_bytes, "conv rows slots")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_CONV_STREAM_ROWS, &args, sizeof(args), b, 4,
+                          MTLSizeMake((n_channels + 255u) / 256u, n_rows, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* ---- GDN rows by address: one or two tokens per session ---------------- */
+
+static uint64_t qwen4_tensor_address(const ds4_gpu_tensor *t);
+
+typedef struct {
+    uint64_t state, hist, snap_state, snap_hist;
+    uint32_t row0, n_tok, pad0, pad1;
+} qwen4_gdn_row_entry;
+
+int ds4_gpu_qwen4_gdn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+                                 const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!rows || n_rows == 0u || n_rows > QWEN4_ATTN_ROWS_MAX) return 0;
+    qwen4_gdn_row_entry e[QWEN4_ATTN_ROWS_MAX];
+    for (uint32_t i = 0; i < n_rows; i++) {
+        e[i].state = qwen4_tensor_address(rows[i].state);
+        e[i].hist = qwen4_tensor_address(rows[i].hist);
+        e[i].snap_state = qwen4_tensor_address(rows[i].snap_state);
+        e[i].snap_hist = qwen4_tensor_address(rows[i].snap_hist);
+        if (!e[i].state || !e[i].hist || (rows[i].snap_state && !e[i].snap_state) ||
+            (rows[i].snap_hist && !e[i].snap_hist) || rows[i].n_tok == 0u || rows[i].n_tok > 2u) {
+            return 0;
+        }
+        e[i].row0 = rows[i].row0;
+        e[i].n_tok = rows[i].n_tok;
+        e[i].pad0 = e[i].pad1 = 0u;
+    }
+    return ds4_gpu_tensor_write(table, entry0 * sizeof(e[0]), e, (uint64_t)n_rows * sizeof(e[0]));
+}
+
+static uint32_t qwen4_gdn_rows_resident(qwen4_bind *out, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const ds4_gpu_tensor *ts[4] = { rows[i].state, rows[i].hist, rows[i].snap_state, rows[i].snap_hist };
+        for (int j = 0; j < 4; j++) {
+            if (!ts[j]) continue;
+            out[n].buf = ds4_gpu_tensor_buffer(ts[j]);
+            out[n].off = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+static bool qwen4_bind_gdn_rows(qwen4_bind *b, const ds4_gpu_tensor *table, uint64_t entry0, uint32_t n_rows) {
+    const uint64_t off = entry0 * sizeof(qwen4_gdn_row_entry);
+    if (!table || !ds4_gpu_tensor_buffer(table) ||
+        ds4_gpu_tensor_bytes(table) < off + (uint64_t)n_rows * sizeof(qwen4_gdn_row_entry)) {
+        fprintf(stderr, "ds4: Qwen3.8 GDN row table is missing or undersized\n");
+        return false;
+    }
+    b->buf = ds4_gpu_tensor_buffer(table);
+    b->off = ds4_gpu_tensor_offset(table) + (NSUInteger)off;
+    return true;
+}
+
+int ds4_gpu_qwen4_gdn_scan_rows2_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t qkv_stride, uint32_t out_stride) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (head_dim != 128u || n_rows == 0u || n_rows > QWEN4_ATTN_ROWS_MAX) return 0;
+    struct { uint32_t n_rows, n_k_head, n_v_head, head_dim, state_stride, qkv_stride, out_stride, pad0; } args =
+        { n_rows, n_k_head, n_v_head, head_dim, 0u, qkv_stride, out_stride, 0 };
+    qwen4_bind b[5], res[QWEN4_ATTN_ROWS_MAX * 4u];
+    if (!qwen4_bind_tensor(&b[0], qkv, (uint64_t)n_batch_rows * qkv_stride * sizeof(float), "gdn rows qkv") ||
+        !qwen4_bind_tensor(&b[1], ga, (uint64_t)n_batch_rows * n_v_head * sizeof(float), "gdn rows decay") ||
+        !qwen4_bind_tensor(&b[2], gb, (uint64_t)n_batch_rows * n_v_head * sizeof(float), "gdn rows beta") ||
+        !qwen4_bind_tensor(&b[3], out, (uint64_t)n_batch_rows * out_stride * sizeof(float), "gdn rows output") ||
+        !qwen4_bind_gdn_rows(&b[4], table, entry0, n_rows)) {
+        return 0;
+    }
+    const uint32_t nsg = 1u;
+    return qwen4_dispatch_resident(QWEN4_K_GDN_SCAN_ROWS2, &args, sizeof(args), b, 5,
+                                   MTLSizeMake((head_dim + 4u * nsg - 1u) / (4u * nsg), n_v_head, n_rows),
+                                   MTLSizeMake(32u * nsg, 1, 1), 0, res, qwen4_gdn_rows_resident(res, rows, n_rows));
+}
+
+int ds4_gpu_qwen4_conv_stream_rows2_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_channels, uint32_t conv_kernel, uint32_t x_stride, int apply_silu) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_rows == 0u || n_rows > QWEN4_ATTN_ROWS_MAX || conv_kernel < 2u || conv_kernel > 4u) return 0;
+    struct { uint32_t n_rows, n_channels, conv_kernel, apply_silu, state_stride, x_stride, pad0, pad1; } args =
+        { n_rows, n_channels, conv_kernel, apply_silu ? 1u : 0u, 0u, x_stride, 0, 0 };
+    qwen4_bind b[3], res[QWEN4_ATTN_ROWS_MAX * 4u];
+    if (!qwen4_bind_tensor(&b[0], x, (uint64_t)n_batch_rows * x_stride * sizeof(float), "conv rows x") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, weight_offset,
+                           (uint64_t)n_channels * conv_kernel * sizeof(float), "conv rows weight") ||
+        !qwen4_bind_gdn_rows(&b[2], table, entry0, n_rows)) {
+        return 0;
+    }
+    return qwen4_dispatch_resident(QWEN4_K_CONV_STREAM_ROWS2, &args, sizeof(args), b, 3,
+                                   MTLSizeMake((n_channels + 255u) / 256u, n_rows, 1), MTLSizeMake(256, 1, 1), 0,
+                                   res, qwen4_gdn_rows_resident(res, rows, n_rows));
+}
+
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
@@ -48977,14 +49206,11 @@ int ds4_gpu_qwen4_idx_expand_tensor(
 }
 
 /* keys per split of the partial-softmax decode path (DS4_QWEN4_ATTN_SPLIT_KEYS overrides) */
+/* Read per call, not cached, so an A/B harness can switch it per step. */
 static uint32_t qwen4_attn_split_keys(void) {
-    static uint32_t keys;
-    if (!keys) {
-        const char *env = getenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
-        const int v = env ? atoi(env) : 0;
-        keys = v > 0 ? (uint32_t)v : 32u;
-    }
-    return keys;
+    const char *env = getenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
+    const int v = env ? atoi(env) : 0;
+    return v > 0 ? (uint32_t)v : 32u;
 }
 
 uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
@@ -49069,6 +49295,229 @@ int ds4_gpu_qwen4_attn_decode_tensor(
                           MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+/* ---- decode batch: attention over rows ----
+ *
+ * The caches stay per session, so the rows kernels find each row's through
+ * a table of GPU addresses (one entry per row, staged per layer) and the
+ * dispatch makes those buffers resident.  Every kernel keeps the single-row
+ * arithmetic, so a row's outputs match the per-row dispatches bit for bit. */
+
+typedef struct {
+    uint64_t k_cache, v_cache, ik_cache, block_key, pos3;
+    uint32_t pos, n_blocks, use_sel, pad0;
+} qwen4_attn_row_entry;
+
+static uint64_t qwen4_tensor_address(const ds4_gpu_tensor *t) {
+    return t ? ds4_gpu_buffer_address(ds4_gpu_tensor_buffer(t), ds4_gpu_tensor_offset(t)) : 0u;
+}
+
+int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+                                  const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows, uint32_t ratio) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!rows || n_rows == 0u || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0u) return 0;
+    qwen4_attn_row_entry e[QWEN4_ATTN_ROWS_MAX];
+    for (uint32_t i = 0; i < n_rows; i++) {
+        e[i].k_cache = qwen4_tensor_address(rows[i].k_cache);
+        e[i].v_cache = qwen4_tensor_address(rows[i].v_cache);
+        e[i].ik_cache = qwen4_tensor_address(rows[i].ik_cache);
+        e[i].block_key = qwen4_tensor_address(rows[i].block_key);
+        e[i].pos3 = qwen4_tensor_address(rows[i].pos3);
+        if (!e[i].k_cache || !e[i].v_cache || !e[i].ik_cache || !e[i].block_key || !e[i].pos3) {
+            fprintf(stderr, "ds4: Qwen3.8 attention rows need GPU buffer addresses (macOS 13+)\n");
+            return 0;
+        }
+        e[i].pos = rows[i].pos;
+        e[i].n_blocks = (rows[i].pos + 1u) / ratio;
+        e[i].use_sel = rows[i].use_sel ? 1u : 0u;
+        e[i].pad0 = 0u;
+    }
+    return ds4_gpu_tensor_write(table, entry0 * sizeof(e[0]), e, (uint64_t)n_rows * sizeof(e[0]));
+}
+
+static bool qwen4_bind_rows(qwen4_bind *b, const ds4_gpu_tensor *table, uint64_t entry0, uint32_t n_rows) {
+    const uint64_t off = entry0 * sizeof(qwen4_attn_row_entry);
+    if (!table || !ds4_gpu_tensor_buffer(table) ||
+        ds4_gpu_tensor_bytes(table) < off + (uint64_t)n_rows * sizeof(qwen4_attn_row_entry)) {
+        fprintf(stderr, "ds4: Qwen3.8 attention row table is missing or undersized\n");
+        return false;
+    }
+    b->buf = ds4_gpu_tensor_buffer(table);
+    b->off = ds4_gpu_tensor_offset(table) + (NSUInteger)off;
+    return true;
+}
+
+static uint32_t qwen4_rows_resident(qwen4_bind *out, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const ds4_gpu_tensor *ts[5] = { rows[i].k_cache, rows[i].v_cache, rows[i].ik_cache,
+                                        rows[i].block_key, rows[i].pos3 };
+        for (int j = 0; j < 5; j++) { out[n].buf = ds4_gpu_tensor_buffer(ts[j]); out[n].off = 0; n++; }
+    }
+    return n;
+}
+
+int ds4_gpu_qwen4_attn_prep_rows_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *iq_out,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t n_idx_head, uint32_t idx_dim, float rope_base, float eps) {
+    /* The caller checks each row's position against its own cache; the
+     * kernel does not read cache_cap. */
+    struct {
+        uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
+        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+    } args = { n_rows, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, 0u, 0u,
+               rope_base, eps, 0, 1.0f, { 0 } };
+    qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
+    const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_rows * n_head_kv * head_dim * sizeof(float);
+    const uint64_t iq_bytes = (uint64_t)n_rows * n_idx_head * idx_dim * sizeof(float);
+    qwen4_bind b[12], res[QWEN4_ATTN_ROWS_MAX * 5u];
+    if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
+        idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > 64 || (n_rot % 2) != 0 ||
+        n_rot > idx_dim || n_head_kv == 0 || (n_head % n_head_kv) != 0) {
+        return 0;
+    }
+    if (!qwen4_bind_tensor(&b[0], qg, 2u * q_bytes, "attn rows q/gate projection") ||
+        !qwen4_bind_tensor(&b[1], kproj, kv_bytes, "attn rows k projection") ||
+        !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn rows v projection") ||
+        !qwen4_bind_tensor(&b[3], iq, iq_bytes, "indexer rows q projection") ||
+        !qwen4_bind_tensor(&b[4], ik, (uint64_t)n_rows * idx_dim * sizeof(float), "indexer rows k projection") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, (uint64_t)head_dim * sizeof(float), "attn q_norm") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, (uint64_t)head_dim * sizeof(float), "attn k_norm") ||
+        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, (uint64_t)idx_dim * sizeof(float), "indexer q_norm") ||
+        !qwen4_bind_tensor(&b[8], q_out, q_bytes, "attn rows q") ||
+        !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn rows gate") ||
+        !qwen4_bind_tensor(&b[10], iq_out, iq_bytes, "indexer rows q") ||
+        !qwen4_bind_rows(&b[11], table, entry0, n_rows)) {
+        return 0;
+    }
+    return qwen4_dispatch_resident(QWEN4_K_ATTN_PREP_ROWS, &args, sizeof(args), b, 12,
+                                   MTLSizeMake(n_head + n_head_kv + n_idx_head + 1u, n_rows, 1), MTLSizeMake(32, 1, 1), 0,
+                                   res, qwen4_rows_resident(res, rows, n_rows));
+}
+
+int ds4_gpu_qwen4_idx_block_key_rows_tensor(
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, float rope_base, float eps) {
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+             float rope_mscale; float rope_freq[32]; } args =
+        { 0u, n_rows, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+    qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
+    qwen4_bind b[2], res[QWEN4_ATTN_ROWS_MAX * 5u];
+    if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || idx_dim < 32 || idx_dim > 128 ||
+        (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float), "indexer k_norm") ||
+        !qwen4_bind_rows(&b[1], table, entry0, n_rows)) {
+        return 0;
+    }
+    return qwen4_dispatch_resident(QWEN4_K_IDX_BLOCK_KEY_ROWS, &args, sizeof(args), b, 2,
+                                   MTLSizeMake(n_rows, 1, 1), MTLSizeMake(32, 1, 1), 0,
+                                   res, qwen4_rows_resident(res, rows, n_rows));
+}
+
+int ds4_gpu_qwen4_idx_score_rows_tensor(
+        ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_block_stride, uint32_t n_idx_head, uint32_t idx_dim, uint32_t ratio) {
+    struct { uint32_t n_tokens, n_blocks, n_idx_head, idx_dim, pos0, ratio, pad0, pad1; } args =
+        { n_rows, n_block_stride, n_idx_head, idx_dim, 0u, ratio, 0, 0 };
+    const uint32_t n_tiles = (n_block_stride + 7u) / 8u;
+    qwen4_bind b[4], res[QWEN4_ATTN_ROWS_MAX * 5u];
+    if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || n_block_stride == 0 || ratio == 0 ||
+        n_idx_head * idx_dim > 512u || (idx_dim & 3u) != 0u ||
+        !qwen4_bind_tensor(&b[0], iq, (uint64_t)n_rows * n_idx_head * idx_dim * sizeof(float), "indexer rows q") ||
+        !qwen4_bind_tensor(&b[1], score, (uint64_t)n_rows * n_block_stride * sizeof(float), "indexer rows scores") ||
+        !qwen4_bind_tensor(&b[2], tile_max, (uint64_t)n_rows * n_tiles * sizeof(uint32_t), "indexer rows tile maxima") ||
+        !qwen4_bind_rows(&b[3], table, entry0, n_rows)) {
+        return 0;
+    }
+    return qwen4_dispatch_resident(QWEN4_K_IDX_SCORE_ROWS, &args, sizeof(args), b, 4,
+                                   MTLSizeMake((n_block_stride + 127) / 128, n_rows, 1), MTLSizeMake(128, 1, 1), 0,
+                                   res, qwen4_rows_resident(res, rows, n_rows));
+}
+
+int ds4_gpu_qwen4_idx_select_rows_tensor(
+        ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, const ds4_gpu_tensor *tile_max,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_block_stride, uint32_t top_k) {
+    struct { uint32_t n_tokens, n_blocks, top_k, pad0; } args = { n_rows, n_block_stride, top_k, 0 };
+    const uint32_t n_tiles = (n_block_stride + 7u) / 8u;
+    qwen4_bind b[4];
+    if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || top_k == 0 || top_k > n_block_stride ||
+        !qwen4_bind_tensor(&b[0], score, (uint64_t)n_rows * n_block_stride * sizeof(float), "indexer rows scores") ||
+        !qwen4_bind_tensor(&b[1], tile_max, (uint64_t)n_rows * n_tiles * sizeof(uint32_t), "indexer rows tile maxima") ||
+        !qwen4_bind_tensor(&b[2], sel, (uint64_t)n_rows * top_k * sizeof(int32_t), "rows selected blocks") ||
+        !qwen4_bind_rows(&b[3], table, entry0, n_rows)) {
+        return 0;
+    }
+    (void)rows;
+    return qwen4_dispatch(QWEN4_K_IDX_SELECT_ROWS, &args, sizeof(args), b, 4,
+                          MTLSizeMake(n_rows, 1, 1), MTLSizeMake(1024, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_idx_expand_rows_tensor(
+        ds4_gpu_tensor *sel_tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *sel_blocks,
+        const ds4_gpu_tensor *table, uint64_t entry0, uint32_t n_rows,
+        uint32_t n_sel_blocks, uint32_t ratio, uint32_t sel_stride) {
+    struct { uint32_t n_tokens, n_sel_blocks, ratio, pos0, sel_stride, pad0, pad1, pad2; } args =
+        { n_rows, n_sel_blocks, ratio, 0u, sel_stride, 0, 0, 0 };
+    qwen4_bind b[4];
+    if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || sel_stride < n_sel_blocks * ratio + ratio - 1u ||
+        !qwen4_bind_tensor(&b[0], sel_blocks, (uint64_t)n_rows * n_sel_blocks * sizeof(int32_t), "rows selected blocks") ||
+        !qwen4_bind_tensor(&b[1], sel_tokens, (uint64_t)n_rows * sel_stride * sizeof(int32_t), "rows selected tokens") ||
+        !qwen4_bind_tensor(&b[2], n_sel, (uint64_t)n_rows * sizeof(uint32_t), "rows selected counts") ||
+        !qwen4_bind_rows(&b[3], table, entry0, n_rows)) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_IDX_EXPAND_ROWS, &args, sizeof(args), b, 4,
+                          MTLSizeMake(n_rows, 1, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_attn_decode_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t sel_stride, float scale) {
+    /* Each row takes the splits the single-row dispatch gives its key count
+     * (see the kernel); the partials use the split cap as their stride. */
+    struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel, sel_stride; float scale;
+             uint32_t n_splits, keys_per_split, pad0, pad1; } args =
+        { n_rows, n_head, n_head_kv, head_dim, 0u, 0u, sel_stride, scale,
+          QWEN4_ATTN_MAX_SPLITS, qwen4_attn_split_keys(), 0, 0 };
+    const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
+    const uint64_t part_bytes = ds4_gpu_qwen4_attn_part_floats(n_rows, n_head, head_dim) * sizeof(float);
+    qwen4_bind b[7], res[QWEN4_ATTN_ROWS_MAX * 5u];
+    if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        n_head / n_head_kv > 12 || (head_dim != 128 && head_dim != 256) ||
+        !qwen4_bind_tensor(&b[0], q, q_bytes, "attn rows q") ||
+        !qwen4_bind_tensor(&b[1], gate, q_bytes, "attn rows gate") ||
+        !qwen4_bind_tensor(&b[2], sel_tokens, (uint64_t)n_rows * sel_stride * sizeof(int32_t), "rows selected tokens") ||
+        !qwen4_bind_tensor(&b[3], n_sel, (uint64_t)n_rows * sizeof(uint32_t), "rows selected counts") ||
+        !qwen4_bind_tensor(&b[4], out, q_bytes, "attn rows out") ||
+        !qwen4_bind_tensor(&b[5], part, part_bytes, "attn rows partials") ||
+        !qwen4_bind_rows(&b[6], table, entry0, n_rows)) {
+        return 0;
+    }
+    const bool npt8 = head_dim == 256u;
+    if (!qwen4_dispatch_resident(npt8 ? QWEN4_K_ATTN_DECODE_ROWS_NPT8 : QWEN4_K_ATTN_DECODE_ROWS_NPT4,
+                                 &args, sizeof(args), b, 7,
+                                 MTLSizeMake(QWEN4_ATTN_MAX_SPLITS, n_head_kv, n_rows),
+                                 MTLSizeMake(32 * QWEN4_ATTN_NSG, 1, 1), 0,
+                                 res, qwen4_rows_resident(res, rows, n_rows))) {
+        return 0;
+    }
+    qwen4_bind mb[4] = { b[5], b[1], b[4], b[6] };
+    return qwen4_dispatch(npt8 ? QWEN4_K_ATTN_MERGE_ROWS_NPT8 : QWEN4_K_ATTN_MERGE_ROWS_NPT4,
+                          &args, sizeof(args), mb, 4,
+                          MTLSizeMake(n_head, n_rows, 1), MTLSizeMake(head_dim, 1, 1), 0);
+}
+
 int ds4_gpu_qwen4_moe_mid_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
@@ -49083,7 +49532,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * ff_dim;
     qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert, 0u, 0u };
     qwen4_bind b[7];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || (has_shared && sh_row_bytes == 0) ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, experts_bytes, "moe gate experts") ||
@@ -49143,7 +49592,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0 };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u, 0u, 0u };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
         out_dim == 0 || (has_shared && sh_row_bytes == 0) ||
@@ -49168,6 +49617,66 @@ int ds4_gpu_qwen4_moe_down_tensor(
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
     return qwen4_dispatch(prefetch ? QWEN4_K_MOE_DOWN_MXFP4_PF : QWEN4_K_MOE_DOWN, &args, sizeof(args), b, 5,
                           MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* Decode batch over its distinct experts (kernel_qwen4_moe_mid_q4k_grouped):
+ * Q4_K gate/up, no shared slot, per-expert pair lists from
+ * ds4_gpu_qwen4_moe_build_lists_tensor.  Same grid as the per-token kernel;
+ * the pairs that do not own their expert return. */
+int ds4_gpu_qwen4_moe_mid_grouped_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim) {
+    if (weight_type != 12u || (in_dim % 256u) != 0) return 0;
+    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
+    const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
+    qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row_bytes, expert_bytes,
+                            0u, 0u, 0u, n_total_expert, list_cap, 0u };
+    qwen4_bind b[7];
+    if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || list_cap == 0 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_total_expert, "moe gate experts") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_total_expert, "moe up experts") ||
+        !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
+        !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
+        !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_slots * ff_dim * sizeof(float), "moe mid") ||
+        !qwen4_bind_tensor(&b[5], lists, (uint64_t)n_total_expert * list_cap * sizeof(int32_t), "moe lists") ||
+        !qwen4_bind_tensor(&b[6], counts, (uint64_t)n_total_expert * sizeof(int32_t), "moe counts")) {
+        return 0;
+    }
+    const uint32_t nsg = 2u, rows_per_tg = 2u * nsg;
+    return qwen4_dispatch(QWEN4_K_MOE_MID_Q4K_GROUPED, &args, sizeof(args), b, 7,
+                          MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_slots, n_tokens),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* The MXFP4 down rows of the same batch, on the same lists. */
+int ds4_gpu_qwen4_moe_down_grouped_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim) {
+    if (weight_type != 39u || (ff_dim % 32u) != 0) return 0;
+    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, ff_dim);
+    const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
+    qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
+                            0u, 0u, 0u, n_total_expert, list_cap, 0u };
+    qwen4_bind b[6];
+    if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || out_dim == 0 || list_cap == 0 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_total_expert, "moe down experts") ||
+        !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
+        !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_slots * ff_dim * sizeof(float), "moe mid") ||
+        !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_slots * out_dim * sizeof(float), "moe partial") ||
+        !qwen4_bind_tensor(&b[4], lists, (uint64_t)n_total_expert * list_cap * sizeof(int32_t), "moe lists") ||
+        !qwen4_bind_tensor(&b[5], counts, (uint64_t)n_total_expert * sizeof(int32_t), "moe counts")) {
+        return 0;
+    }
+    const uint32_t nsg = 4u, rows_per_tg = 2u * nsg;
+    return qwen4_dispatch(QWEN4_K_MOE_DOWN_MXFP4_GROUPED, &args, sizeof(args), b, 6,
+                          MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_slots, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
 }
 
@@ -49699,14 +50208,43 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
                           MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
+static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
+static uint64_t g_qwen4_dense_mm_partials_bytes;
+
+static void qwen4_batch_release_scratch(void) {
+    ds4_gpu_tensor_free(g_qwen4_dense_mm_partials);
+    ds4_gpu_tensor_free(g_qwen4_gdn_slots);
+    g_qwen4_dense_mm_partials = g_qwen4_gdn_slots = NULL;
+    g_qwen4_dense_mm_partials_bytes = 0;
+    for (unsigned i = 0; i < QWEN4_K_COUNT; i++) g_qwen4_pipelines[i] = nil;
+}
+
+/* Scratch for the k-split planes, allocated once and generously: the
+ * command buffer holds unretained references, so a scratch replaced while
+ * earlier dispatches of the same buffer still point at it is read after its
+ * release.  Growing it per request was what made wide splits look wrong. */
+static bool qwen4_dense_mm_partials_ensure(uint64_t bytes) {
+    if (g_qwen4_dense_mm_partials && g_qwen4_dense_mm_partials_bytes >= bytes) return true;
+    if (g_qwen4_dense_mm_partials) {
+        fprintf(stderr, "ds4: Qwen3.8 k-split scratch of %.1f MiB cannot grow to %.1f MiB mid-batch\n",
+                ds4_gpu_mib(g_qwen4_dense_mm_partials_bytes), ds4_gpu_mib(bytes));
+        return false;
+    }
+    const uint64_t grow = bytes > (64u << 20) ? bytes : (64u << 20);
+    g_qwen4_dense_mm_partials = ds4_gpu_tensor_alloc(grow);
+    if (!g_qwen4_dense_mm_partials) return false;
+    g_qwen4_dense_mm_partials_bytes = grow;
+    return true;
+}
+
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
     const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : weight_type == 1u ? in_dim * 2u :
                                qwen4_expert_row_bytes(weight_type, in_dim);
-    struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, pad0, pad1, pad2; } args =
-        { n_tokens, in_dim, out_rows, weight_type, row_bytes, 0, 0, 0 };
+    struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
+        { n_tokens, in_dim, out_rows, weight_type, row_bytes, 1, 0, 0 };
     qwen4_bind b[3];
     if (n_tokens == 0 || row_bytes == 0 || (weight_type != 0u && weight_type != 1u && weight_type != 8u) ||
         (weight_type == 8u && (in_dim % 32) != 0) || (in_dim % 8) != 0 || out_rows == 0) {
@@ -49720,8 +50258,87 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         !qwen4_bind_tensor(&b[2], out, (uint64_t)n_tokens * out_rows * sizeof(float), "dense mm output")) {
         return 0;
     }
-    return qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), b, 3,
-                          MTLSizeMake((out_rows + 31) / 32, (n_tokens + 31) / 32, 1), MTLSizeMake(128, 1, 1), 0);
+    /* A projection whose output is narrow gives this grid only a few
+     * threadgroups when the batch is a decode step; split k until the
+     * machine has work, then sum the planes.  A prefill chunk's token tiles
+     * already fill it, and its planes would not fit the scratch anyway.
+     * The split is chosen so the partials stay small and every threadgroup
+     * still walks enough k to amortize its staging. */
+    const uint32_t tiles = (out_rows + 31u) / 32u;
+    const uint32_t threadgroups = tiles * ((n_tokens + 31u) / 32u);
+    uint32_t n_split = 1u;
+    if (!ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
+        const uint32_t nk = (in_dim + 31u) / 32u;
+        const uint32_t target = 128u;
+        const uint32_t want = threadgroups >= target ? 1u : (target + threadgroups - 1u) / threadgroups;
+        n_split = want > nk / 4u ? (nk / 4u ? nk / 4u : 1u) : want;
+        if (n_split > 64u) n_split = 64u;
+    }
+    args.n_split = n_split;
+    if (n_split <= 1u) {
+        return qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), b, 3,
+                              MTLSizeMake(tiles, (n_tokens + 31) / 32, 1), MTLSizeMake(128, 1, 1), 0);
+    }
+
+    const uint64_t plane = (uint64_t)n_tokens * out_rows * sizeof(float);
+    if (!qwen4_dense_mm_partials_ensure(plane * n_split)) return 0;
+    qwen4_bind bp[3];
+    bp[0] = b[0];
+    bp[1] = b[1];
+    if (!qwen4_bind_tensor(&bp[2], g_qwen4_dense_mm_partials, plane * n_split, "dense mm partials")) {
+        return 0;
+    }
+    if (!qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), bp, 3,
+                        MTLSizeMake(tiles, (n_tokens + 31) / 32, n_split), MTLSizeMake(128, 1, 1), 0)) {
+        return 0;
+    }
+    qwen4_bind br[2];
+    br[0] = bp[2];
+    br[1] = b[2];
+    const uint64_t n = (uint64_t)n_tokens * out_rows;
+    return qwen4_dispatch(QWEN4_K_DENSE_MM_REDUCE, &args, sizeof(args), br, 2,
+                          MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* Decode batch of 8 or 16 rows against a Q8 matrix (kernel_qwen4_batch_mm_q8):
+ * the k-split gives narrow projections enough simdgroups, the partial planes
+ * are summed by kernel_qwen4_dense_mm_reduce. */
+int ds4_gpu_qwen4_batch_mm_q8_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
+    if ((n_tokens != 8u && n_tokens != 16u) || (in_dim % 32u) != 0 || (out_rows % 32u) != 0 || in_dim == 0) return 0;
+    const uint32_t row_bytes = (in_dim / 32u) * 34u;
+    const uint32_t nk = in_dim / 32u;
+    const uint32_t simdgroups = out_rows / 32u;
+    /* enough simdgroups to cover the machine several times over, no split
+     * shorter than four blocks */
+    const uint32_t target = 640u;
+    uint32_t n_split = simdgroups >= target ? 1u : (target + simdgroups - 1u) / simdgroups;
+    if (n_split > nk / 4u) n_split = nk / 4u ? nk / 4u : 1u;
+    if (n_split > 16u) n_split = 16u;
+    struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
+        { n_tokens, in_dim, out_rows, 8u, row_bytes, n_split, 0, 0 };
+    qwen4_bind b[3];
+    if (!qwen4_bind_weight(&b[0], model_map, model_size, weight_offset, (uint64_t)row_bytes * out_rows, "batch mm weight") ||
+        !qwen4_bind_tensor(&b[1], x, (uint64_t)n_tokens * in_dim * sizeof(float), "batch mm input") ||
+        !qwen4_bind_tensor(&b[2], out, (uint64_t)n_tokens * out_rows * sizeof(float), "batch mm output")) {
+        return 0;
+    }
+    const MTLSize grid = MTLSizeMake((out_rows + 127u) / 128u, 1, n_split);
+    const int kernel = n_tokens == 16u ? QWEN4_K_BATCH_MM_Q8_T2 : QWEN4_K_BATCH_MM_Q8_T1;
+    if (n_split <= 1u) {
+        return qwen4_dispatch(kernel, &args, sizeof(args), b, 3, grid, MTLSizeMake(128, 1, 1), 0);
+    }
+    const uint64_t plane = (uint64_t)n_tokens * out_rows * sizeof(float);
+    if (!qwen4_dense_mm_partials_ensure(plane * n_split)) return 0;
+    qwen4_bind bp[3] = { b[0], b[1] };
+    if (!qwen4_bind_tensor(&bp[2], g_qwen4_dense_mm_partials, plane * n_split, "batch mm partials")) return 0;
+    if (!qwen4_dispatch(kernel, &args, sizeof(args), bp, 3, grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+    qwen4_bind br[2] = { bp[2], b[2] };
+    const uint64_t n = (uint64_t)n_tokens * out_rows;
+    return qwen4_dispatch(QWEN4_K_DENSE_MM_REDUCE, &args, sizeof(args), br, 2,
+                          MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
 /* Vision tower (metal/qwen4_vision.metal). */

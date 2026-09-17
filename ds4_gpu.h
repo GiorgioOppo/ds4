@@ -281,6 +281,82 @@ static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+int ds4_gpu_qwen4_conv_stream_rows_tensor(
+        ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const uint32_t *slots, uint32_t n_rows, uint32_t n_channels,
+        uint32_t conv_kernel, uint32_t state_stride, uint32_t x_stride, int apply_silu);
+int ds4_gpu_qwen4_gdn_scan_rows_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state_pool,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const uint32_t *slots, uint32_t n_rows,
+        uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t state_stride, uint32_t qkv_stride, uint32_t out_stride);
+/* One row of a Qwen3.8 decode batch for the attention rows kernels: the
+ * session's caches for the layer, its rope positions, its token position and
+ * whether it attends through the block selection or densely. */
+typedef struct {
+    ds4_gpu_tensor *k_cache, *v_cache, *ik_cache, *block_key;
+    const ds4_gpu_tensor *pos3;
+    uint32_t pos;
+    int use_sel;
+} ds4_gpu_qwen4_attn_row;
+#define DS4_GPU_QWEN4_ATTN_ROW_BYTES 64u   /* one staged table entry */
+/* One session of a decode batch for the GDN rows kernels: its state and
+ * history, optional snapshots of both after its first token, its first row
+ * and its row count (one or two). */
+typedef struct {
+    ds4_gpu_tensor *state, *hist, *snap_state, *snap_hist;
+    uint32_t row0, n_tok;
+} ds4_gpu_qwen4_gdn_row;
+#define DS4_GPU_QWEN4_GDN_ROW_BYTES 48u
+int ds4_gpu_qwen4_gdn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+                                 const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows);
+int ds4_gpu_qwen4_gdn_scan_rows2_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t qkv_stride, uint32_t out_stride);
+int ds4_gpu_qwen4_conv_stream_rows2_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_channels, uint32_t conv_kernel, uint32_t x_stride, int apply_silu);
+int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+                                  const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows, uint32_t ratio);
+int ds4_gpu_qwen4_attn_prep_rows_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *iq_out,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t n_idx_head, uint32_t idx_dim, float rope_base, float eps);
+int ds4_gpu_qwen4_idx_block_key_rows_tensor(
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, float rope_base, float eps);
+int ds4_gpu_qwen4_idx_score_rows_tensor(
+        ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_block_stride, uint32_t n_idx_head, uint32_t idx_dim, uint32_t ratio);
+int ds4_gpu_qwen4_idx_select_rows_tensor(
+        ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, const ds4_gpu_tensor *tile_max,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_block_stride, uint32_t top_k);
+int ds4_gpu_qwen4_idx_expand_rows_tensor(
+        ds4_gpu_tensor *sel_tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *sel_blocks,
+        const ds4_gpu_tensor *table, uint64_t entry0, uint32_t n_rows,
+        uint32_t n_sel_blocks, uint32_t ratio, uint32_t sel_stride);
+int ds4_gpu_qwen4_attn_decode_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t sel_stride, float scale);
+int ds4_gpu_qwen4_batch_mm_q8_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
@@ -3439,6 +3515,18 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+int ds4_gpu_qwen4_moe_mid_grouped_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim);
+int ds4_gpu_qwen4_moe_down_grouped_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim);
 /* shared_gate NULL: no shared expert; shared NULL: the shared output is part
  * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
  * token in part. */

@@ -1993,6 +1993,28 @@ paired comparisons, also with decode graphs disabled. Separately run the
   record different-schedule probability differences separately. Nearly tied
   experts can amplify normal rounding, so a max-logit difference alone does
   not establish a state bug or a quality regression.
+- For Metal native batching, run `tests/test_metal_session_batch` with
+  `DS4_TEST_BATCH_ISOLATION=1` at two, four and eight sessions, including a
+  sparse prefix. Reordered rows and changed companions must leave the target's
+  complete logits identical. Separately score both official manifests with
+  `--session-batch 1`, `4` and `8`; compare paired losses and API agreement.
+  The scalar and batched reductions need not be bit-identical. Investigate
+  greedy mismatches with their logit margins, not by loosening kernel tests.
+  Run `tests/test_qwen4_kernels` under Metal validation and the real-model
+  `tests/test_qwen4_ngram_state` for mixed ordinary/MTP cycles, failed batch
+  reads, exact recovery and the final context slot.
+- Start a four-slot Qwen Metal server with and without `--mtp`. Check concurrent
+  tool calls, prefix reuse, cancellation, stop strings and one/two-token output
+  limits. Repeat with `--mtp-exact-sampling`, mixing temperature-zero and
+  sampled requests. Only the former may use greedy speculative acceptance.
+  Compare seeded sampled replies in exact mode; default greedy MTP changes
+  random draws with draft scheduling, so equal seeds need not give equal text.
+  Benchmark ordinary and speculative batches on both prose and code, using
+  `speed-bench/session_concurrency_bench`; record aggregate and per-session
+  throughput. Keep n-grams on disk and monitor memory during arena growth,
+  session destruction/recreation and engine cleanup.
+  Run `python3 -m unittest discover -s tests -p test_serve_concurrency_bench.py`
+  so truncated/error streams cannot silently enter the throughput results.
 - Run `tests/test_server_story.py` with at least 49K server context: all sixteen
   story facts, the correction turn and cached-prefix reuse must pass. Also
   run `tests/test_agent_vision.py` with a long archive and

@@ -48,6 +48,22 @@ Add `--mtp` for speculative decoding using the built-in MTP weights.
 `qwen3.8-flash-next-reasoner` aliases. Tool calls use the native
 `<tool_call><function=...><parameter=...>` format.
 
+On Metal, `ds4-server --batched-session N` decodes the slots together. Work that
+only reads weights runs once for the whole batch, while the delta-net
+recurrence, the attention caches and the n-gram convolution stay per session.
+The slots also share one prefill workspace, so an extra slot costs its caches
+rather than another few GiB of transients. As with the other natively batched
+models, grouping changes the order of floating point reductions, so a batched
+reply can differ from the same prompt decoded alone.
+Add `--mtp` to use batched speculative decoding as well. The server accepts
+matching greedy drafts by default, including at nonzero temperature. With
+`--mtp-exact-sampling`, sampled requests use ordinary batched decoding;
+temperature-zero requests can still speculate. Default greedy acceptance also
+means a seed need not reproduce a reply under a different batching schedule.
+Speculative batches above 16 sessions, images and steering use the ordered
+fallback. CUDA currently
+decodes sessions in order.
+
 Disk KV checkpoints include recurrent state. Rewinding to an earlier position
 replays the retained prefix on the next evaluation. The native context is
 262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for
@@ -138,9 +154,8 @@ the responses and diagnostics for inspection; it does not grade image content.
 The Metal and CUDA graphs accept Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and the original BF16 n-gram table.
-Tensor parallelism, pipeline execution, SSD expert streaming and native
-multi-session decode batching are not implemented for this model yet.
-The server keeps separate session state and decodes ready sessions in order.
+Tensor parallelism, pipeline execution and SSD expert streaming are not
+implemented for this model yet.
 ROCm is not supported. CPU code is a correctness reference, not a general
 inference backend.
 
