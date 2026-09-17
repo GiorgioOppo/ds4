@@ -85,7 +85,6 @@ use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing.
-DeepSeek V4.1 has an open concurrent-request repeatability issue observed with both ROCm and CUDA: identical seeded requests can produce different replies when traffic changes the prefill chunk sizes. The normal scheduling defaults are unchanged. `--mixed-prefill-quantum 2048` makes the busy interval match the idle interval and is a diagnostic workaround, not a root-cause fix. Longer intervals can improve prefill throughput but pause an already-generating reply for the duration of a prefill slice, especially with SSD experts. This option does not guarantee identical results across arbitrary cached histories or different chunk configurations.
 Session-batched serving uses ordinary target decoding, except Qwen3.8 on
 Metal, where `--mtp` also batches speculative decoding. Its
 `--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature
