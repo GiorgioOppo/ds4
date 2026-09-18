@@ -1,5 +1,8 @@
 /* Real-model one-shot/session parity with identical effective prefill chunks.
- * Usage: test_qwen4_generation MODEL [--ssd-streaming] [--chunk N --ctx N [--tokens N]]
+ * --prefill-reference compares automatic dispatch with the diagnostic
+ * legacy, unsplit prefill path, then uses automatic dispatch for both decodes.
+ * Usage: test_qwen4_generation MODEL [--ssd-streaming] [--prefill-reference]
+ *        [--chunk N --ctx N [--tokens N]]
  * SSD mode bounds the expert cache to 1024 entries. At most two graphs are
  * live; the public one-shot graph is released before numerical comparison. */
 #include "../ds4.c"
@@ -77,7 +80,8 @@ static void generation_logits(const float *direct, const float *session, uint32_
     exit(1);
 }
 
-static void generation_case(const char *model, bool streaming, uint32_t requested, int ctx, int tokens) {
+static void generation_case(const char *model, bool streaming, bool prefill_reference,
+                            uint32_t requested, int ctx, int tokens) {
     /* Compute the expected public behavior independently of the resolver
      * under test: an explicit request wins over the environment, then clamps. */
     const uint32_t cap = requested < (uint32_t)ctx ? requested : (uint32_t)ctx;
@@ -133,7 +137,14 @@ static void generation_case(const char *model, bool streaming, uint32_t requeste
     float *session_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     generation_need(direct_logits && session_logits, "allocate vocabulary comparisons");
     /* Match one-shot's omission of intermediate output heads. Session sync
-     * computes each head for its progress/checkpoint contract. */
+     * computes each head for its progress/checkpoint contract. The optional
+     * reference disables the two arithmetic changes implicated in prefill
+     * drift independently of the graph's automatic phase dispatch. */
+    if (prefill_reference) {
+        generation_need(setenv("DS4_QWEN4_DENSE_MM_LEGACY", "1", 1) == 0 &&
+                        setenv("DS4_QWEN4_NO_DENSE_MM_KSPLIT", "1", 1) == 0,
+                        "select legacy unsplit reference prefill");
+    }
     for (int pos = 0; pos < length;) {
         uint32_t rows = (uint32_t)(length - pos);
         if (rows > direct->cap_tokens) rows = direct->cap_tokens;
@@ -141,6 +152,11 @@ static void generation_case(const char *model, bool streaming, uint32_t requeste
             prompt.v + pos, rows, pos + (int)rows == length ? direct_logits : NULL, false),
             "direct prefill");
         pos += (int)rows;
+    }
+    if (prefill_reference) {
+        generation_need(unsetenv("DS4_QWEN4_DENSE_MM_LEGACY") == 0 &&
+                        unsetenv("DS4_QWEN4_NO_DENSE_MM_KSPLIT") == 0,
+                        "restore automatic dispatch for both decodes");
     }
 
     int emitted = 0;
@@ -171,8 +187,9 @@ static void generation_case(const char *model, bool streaming, uint32_t requeste
     }
     generation_need(emitted == one_shot.count, "same public and session greedy token count");
     printf("PASS Qwen generation requested=%u cap=%u ctx=%d prompt=%d chunks=%d tokens=%d: "
-           "%d complete vocabulary frontiers bit-exact (%s)\n", requested, cap, ctx, length,
-           one_shot.calls, emitted, GENERATION_STEPS + 1, streaming ? "SSD" : "resident");
+           "%d complete vocabulary frontiers bit-exact (%s%s)\n", requested, cap, ctx, length,
+           one_shot.calls, emitted, GENERATION_STEPS + 1, streaming ? "SSD" : "resident",
+           prefill_reference ? ", legacy unsplit prefill reference" : "");
     free(session_logits); free(direct_logits);
     qwen4_graph_free(direct); free(direct);
     if (streaming) engine->qwen4_session_bytes -= memory.total_bytes;
@@ -189,11 +206,12 @@ static int generation_number(const char *text, int low, int high) {
 }
 
 int main(int argc, char **argv) {
-    bool streaming = false;
+    bool streaming = false, prefill_reference = false;
     int chunk = 0, ctx = 0, tokens = 0;
     if (argc < 2) goto usage;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ssd-streaming")) streaming = true;
+        else if (!strcmp(argv[i], "--prefill-reference")) prefill_reference = true;
         else if (!strcmp(argv[i], "--chunk") && i + 1 < argc) {
             chunk = generation_number(argv[++i], 1, 65536);
             if (!chunk) goto usage;
@@ -207,24 +225,38 @@ int main(int argc, char **argv) {
     }
     if ((chunk == 0) != (ctx == 0)) goto usage;
     if (tokens && (!ctx || tokens > ctx - GENERATION_STEPS - 1)) goto usage;
+    /* An inherited diagnostic override could make both sides take the
+     * reference path and hide an automatic-dispatch regression. */
+    if (prefill_reference && (getenv("DS4_QWEN4_DENSE_MM_LEGACY") ||
+                             getenv("DS4_QWEN4_NO_DENSE_MM_KSPLIT"))) {
+        fputs("Qwen generation: --prefill-reference requires unsetting "
+              "DS4_QWEN4_DENSE_MM_LEGACY and DS4_QWEN4_NO_DENSE_MM_KSPLIT\n", stderr);
+        return 2;
+    }
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     char *saved = env ? strdup(env) : NULL;
     generation_need(!env || saved, "save prefill environment");
     generation_need(setenv("DS4_QWEN4_PREFILL_CHUNK", "32", 1) == 0, "set conflicting chunk fallback");
-    if (chunk) generation_case(argv[1], streaming, (uint32_t)chunk, ctx, tokens);
+    if (chunk) generation_case(argv[1], streaming, prefill_reference, (uint32_t)chunk, ctx, tokens);
+    else if (prefill_reference) {
+        generation_case(argv[1], streaming, true, 32u, 512, 29);
+        generation_case(argv[1], streaming, true, 128u, 1024, 575); /* four chunks + a 63-row tail */
+        generation_case(argv[1], streaming, true, 128u, 512, 256); /* two full chunks */
+    }
     else {
-        generation_case(argv[1], streaming, 32u, 512, 0);
-        generation_case(argv[1], streaming, 128u, 512, 0);
+        generation_case(argv[1], streaming, false, 32u, 512, 0);
+        generation_case(argv[1], streaming, false, 128u, 512, 0);
         /* An explicit chunk above the context must clamp to ctx, never fall
          * back to the conflicting environment value of 32. */
-        generation_case(argv[1], streaming, 512u, 256, 0);
+        generation_case(argv[1], streaming, false, 512u, 256, 0);
     }
     generation_need((saved ? setenv("DS4_QWEN4_PREFILL_CHUNK", saved, 1) :
         unsetenv("DS4_QWEN4_PREFILL_CHUNK")) == 0, "restore prefill environment");
     free(saved);
     return 0;
 usage:
-    fprintf(stderr, "usage: %s QWEN_GGUF [--ssd-streaming] [--chunk 1..65536 --ctx 16..32768 [--tokens N]]\n", argv[0]);
+    fprintf(stderr, "usage: %s QWEN_GGUF [--ssd-streaming] [--prefill-reference] "
+            "[--chunk 1..65536 --ctx 16..32768 [--tokens N]]\n", argv[0]);
     return 2;
 }
 #else

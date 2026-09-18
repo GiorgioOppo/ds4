@@ -128,7 +128,7 @@ static bool reference_mtp_input(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
     }
-    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
+    if (ok) ok = qwen4_gemv(g, g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
     for (uint32_t t = 0; t < T && ok; t++) {
         ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, t * hc * emb_bytes, hc * emb_bytes);
@@ -171,7 +171,7 @@ static bool reference_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
              (gathered ? ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head, (uint32_t)w->output->dim[0],
                                                                   head_rows, g->mixed) != 0
-                       : qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, head_rows));
+                       : qwen4_gemv_rows(g, g->logits, m, w->output, g->mixed, 1, head_rows));
     }
     g->R = R_save;
     if (ok && gpu_argmax) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp,
