@@ -96,3 +96,4 @@ __pycache__/
 /tests/test_metal_qwen4_moe_mid
 
 /tests/test_metal_qwen4_moe_down
+/tests/test_metal_q8_gemv_reference

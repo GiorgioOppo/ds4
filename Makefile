@@ -203,6 +203,16 @@ test-metal-q8-reduction: tests/test_metal_q8_reduction
 check-metal-q8-reduction: tests/test_metal_q8_reduction
 	./tests/test_metal_q8_reduction --compile-only
 
+tests/test_metal_q8_gemv_reference: tests/test_metal_q8_gemv_reference.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-q8-gemv-reference check-metal-q8-gemv-reference
+test-metal-q8-gemv-reference: tests/test_metal_q8_gemv_reference
+	./tests/test_metal_q8_gemv_reference
+
+check-metal-q8-gemv-reference: tests/test_metal_q8_gemv_reference
+	./tests/test_metal_q8_gemv_reference --compile-only
+
 tests/test_metal_qwen4_hc: tests/test_metal_qwen4_hc.m
 	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
 
@@ -1193,6 +1203,7 @@ clean:
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
 	rm -f speed-bench/session_concurrency_bench
 	rm -f tests/test_metal_q8_reduction
+	rm -f tests/test_metal_q8_gemv_reference
 	rm -f tests/test_metal_qwen4_hc
 	rm -f tests/test_metal_qwen4_moe_mid
 	rm -f tests/test_metal_qwen4_moe_down

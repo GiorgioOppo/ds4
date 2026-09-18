@@ -204,9 +204,7 @@ void kernel_mul_mv_q8_0_f32_impl(
     device const float * yb = y + ib0*QK8_0 + il*NQ;
 
     for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        // Same eight FP32 operands and accumulation order. Packed float4
-        // also permits tensor views with only scalar alignment. Q8 quant
-        // addresses stay 2-byte aligned at the 34-byte block stride.
+        // Packed activation loads also permit scalar-aligned tensor views.
         const float4 y0 = float4(((device const packed_float4 *)yb)[0]);
         const float4 y1 = float4(((device const packed_float4 *)yb)[1]);
         FOR_UNROLL (short i = 0; i < 4; ++i) {
@@ -215,13 +213,15 @@ void kernel_mul_mv_q8_0_f32_impl(
         }
 
         for (short row = 0; row < NR0; row++) {
-            device const char2 * qs2 = (device const char2 *)(ax[row][ib].qs + il*NQ);
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
 
             float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NQ / 2; ++i) {
-                const char2 q = qs2[i];
-                sumq += q.x * yl[2*i];
-                sumq += q.y * yl[2*i + 1];
+            // Preserve the reference eight-term loop. Pairing quants as
+            // char2 changes Metal fast-math code generation and rounding;
+            // small projection errors can amplify through recurrent decode.
+            // The full GEMV oracle pins this arithmetic, not just reduction.
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
             }
 
             sumf[row] += sumq*ax[row][ib].d;
