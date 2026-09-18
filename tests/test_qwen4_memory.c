@@ -13,6 +13,30 @@ static ds4_context_memory estimate(int ctx, uint32_t chunk) {
     return m;
 }
 
+static void chunk_resolution(void) {
+    const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
+    char *saved = env ? strdup(env) : NULL;
+    assert(!env || saved);
+    assert(unsetenv("DS4_QWEN4_PREFILL_CHUNK") == 0);
+    assert(qwen4_prefill_chunk_resolve(16384, 0) == 8192);
+    assert(qwen4_prefill_chunk_resolve(512, 0) == 512);
+    assert(setenv("DS4_QWEN4_PREFILL_CHUNK", "32", 1) == 0);
+    assert(qwen4_prefill_chunk_resolve(512, 0) == 32);
+    const uint32_t requests[] = {1, 128, 511, 512, 513, UINT32_MAX};
+    const uint32_t expected[] = {1, 128, 511, 512, 512, 512};
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        assert(qwen4_prefill_chunk_resolve(512, requests[i]) == expected[i]);
+        assert(estimate(512, requests[i]).prefill_cap == expected[i]);
+    }
+    assert(estimate(512, 0).prefill_cap == 32);
+    assert(setenv("DS4_QWEN4_PREFILL_CHUNK", "65537", 1) == 0);
+    assert(qwen4_prefill_chunk_resolve(16384, 0) == 8192);
+    assert(qwen4_prefill_chunk_resolve(16384, 16384) == 16384);
+    assert((saved ? setenv("DS4_QWEN4_PREFILL_CHUNK", saved, 1) :
+                    unsetenv("DS4_QWEN4_PREFILL_CHUNK")) == 0);
+    free(saved);
+}
+
 static void monotonic(void) {
     const uint32_t chunks[] = {1, 2, 8, 128, 1024, 4096, 8192};
     uint64_t previous = 0;
@@ -160,6 +184,7 @@ static void attention_query_planning(void) {
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
+    chunk_resolution();
     monotonic();
     streaming_staging();
     attention_query_planning();

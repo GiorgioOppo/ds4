@@ -1042,10 +1042,17 @@ static bool qwen4_attention_needs_index_query(uint32_t pos0, uint32_t n_tokens,
            (mtp || qwen4_attention_dense_rows(pos0, n_tokens, k_blocks) < n_tokens);
 }
 
-static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
-    const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
-    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
-    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
+/* The one-shot graph, sessions and memory admission must use the same shape:
+ * changing chunk boundaries also changes floating-point reduction order.
+ * An explicit chunk always wins over the environment, even when it reaches
+ * or exceeds the context; clamp it rather than falling back to a default. */
+static uint32_t qwen4_prefill_chunk_resolve(uint32_t ctx, uint32_t requested) {
+    uint32_t chunk = requested;
+    if (!chunk) {
+        const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
+        const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
+        chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
+    }
     return chunk > ctx ? ctx : chunk;
 }
 
@@ -1054,8 +1061,7 @@ static ds4_context_memory qwen4_graph_memory_estimate(uint32_t ctx, uint32_t pre
     /* Match the bounded graph workspace, including CPU staging. This API
      * has no MTP flag, so an embedded predictor reserves its primary and
      * both lazy verifier snapshots as well as the live recurrent state. */
-    uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
-    if (T > ctx) T = ctx;
+    const uint64_t T = qwen4_prefill_chunk_resolve(ctx, prefill_chunk);
     const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
     const uint64_t kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
@@ -59530,8 +59536,7 @@ static int generate_qwen4_metal_argmax(
         return 1;
     }
     ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-    const uint32_t cap = prefill_chunk && prefill_chunk < (uint32_t)ctx_size ?
-        prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
+    const uint32_t cap = qwen4_prefill_chunk_resolve((uint32_t)ctx_size, prefill_chunk);
     if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, cap, false, NULL, NULL, NULL, 0)) {
         free(g);
         return 1;
@@ -65458,8 +65463,7 @@ int ds4_engine_generate_argmax(
         uint64_t qwen4_reserved = 0;
         if (ds4_model_is_qwen4() && e->ssd_streaming) {
             if (ctx_size <= 0) return 1;
-            const uint32_t cap = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
-                e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
+            const uint32_t cap = qwen4_prefill_chunk_resolve((uint32_t)ctx_size, e->prefill_chunk);
             const ds4_context_memory memory = ds4_context_memory_estimate_with_prefill_mode(
                 e->backend, ctx_size, cap, true);
             if (!qwen4_streaming_memory_admit(e,
@@ -73346,8 +73350,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
-        const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
-            e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
+        const uint32_t cap_tokens = qwen4_prefill_chunk_resolve((uint32_t)ctx_size, e->prefill_chunk);
         const ds4_context_memory memory = ds4_context_memory_estimate_with_prefill_mode(
             e->backend, ctx_size, cap_tokens, e->ssd_streaming);
 #ifdef DS4_HAS_QWEN4_METAL

@@ -241,6 +241,28 @@ optional shared experts and all 16 routed slots. A failed SSD read must leave
 the completed cached/shared gate/up slots exact, preserve the untouched slots,
 and allow an exact retry after draining GPU work.
 The memory-estimate test runs without a GPU or model.
+
+To compare ordinary one-shot generation with the session path at identical
+prefill boundaries, including every vocabulary logit during continuation:
+
+```sh
+make tests/test_qwen4_generation
+./tests/test_qwen4_generation gguf/Qwen3.8-Flash-Next-Q2.gguf --ssd-streaming
+# Exercise sparse attention and many chunk boundaries with a longer fixture:
+./tests/test_qwen4_generation gguf/Qwen3.8-Flash-Next-Q2.gguf \
+  --ssd-streaming --chunk 128 --ctx 8192 --tokens 5760
+```
+
+Omit `--ssd-streaming` on a machine that can keep the model resident. The
+test checks explicit chunk precedence, progress frontiers, greedy tokens and
+full logits. Different chunk sizes can change reduction order and routed
+expert choices; compare the actual chunk boundaries before diagnosing token
+drift. In particular, upstream `8db1d1d` ignores `--prefill-chunk` in the
+ordinary one-shot Qwen path, although its sessions honor the option. For an
+A/B comparison with that revision, also set `DS4_QWEN4_PREFILL_CHUNK` to the
+same value in both binaries. This branch uses an explicit chunk in preference
+to that environment setting and clamps it to the context size.
+
 On CUDA, use `make test-qwen4-cuda` for the kernel tests. They compare the
 active kernels with independent CPU references, without model weights.
 Vision and end-to-end checks additionally require the checkpoints above.
