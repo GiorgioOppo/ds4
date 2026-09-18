@@ -58451,6 +58451,26 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     return ok;
 }
 
+/* Preserve the parent attention policy across dense/sparse subranges. In a
+ * large prefill the three dense rows at positions 2048..2050 still belong
+ * to matrix attention; their short internal range must not select decode
+ * arithmetic. Real short prefill tails and speculative rows are unchanged. */
+static bool qwen4_graph_attention_dispatch(ds4_qwen4_gpu_graph *g, uint32_t il,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
+        uint32_t rows, uint32_t pos0, bool use_sel, uint32_t parent_rows) {
+    const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+#ifdef __APPLE__
+    if (g->projection_phase == QWEN4_PROJECTION_PREFILL && parent_rows > 8u) {
+        return ds4_gpu_qwen4_attn_prefill_tensor(out, q, gate, g->layer_k_cache[il],
+                g->layer_v_cache[il], g->sel_tokens, g->n_sel, rows, DS4_N_HEAD,
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, use_sel, g->sel_stride, scale) != 0;
+    }
+#endif
+    return ds4_gpu_qwen4_attn_decode_tensor(out, q, gate, g->layer_k_cache[il],
+            g->layer_v_cache[il], g->sel_tokens, g->n_sel, parent_rows <= 2u ? g->attn_part : NULL,
+            rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, use_sel, g->sel_stride, scale) != 0;
+}
+
 /* T tokens at positions pos0.. of one attention layer.  Tokens with no more
  * complete blocks than the budget attend densely; the rest score the pooled
  * block keys and attend their top-k blocks plus the incomplete tail.  The
@@ -58464,13 +58484,9 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                                        uint32_t n_blocks_after, uint32_t cpos0, uint32_t cT) {
     const uint32_t ratio = 4u;
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     const uint32_t n_dense = qwen4_attention_dense_rows(cpos0, cT, g->k_blocks);
     if (n_dense > 0 &&
-        !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
-                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
-                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, cpos0, false, g->sel_stride,
-                                          scale)) {
+        !qwen4_graph_attention_dispatch(g, il, o_rows, q_rows, gate_rows, n_dense, cpos0, false, cT)) {
         return false;
     }
     if (n_dense >= cT) return true;
@@ -58493,10 +58509,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&
-        ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
-                                         g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
-                                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
-                                         scale);
+        qwen4_graph_attention_dispatch(g, il, o, q, gate, n_sparse, sp0, true, cT);
     ds4_gpu_tensor_free(iqn);
     ds4_gpu_tensor_free(o);
     ds4_gpu_tensor_free(gate);

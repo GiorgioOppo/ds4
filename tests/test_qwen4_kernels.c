@@ -983,6 +983,118 @@ static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     test_attn_mm_keys(T, pos0, sparse, 6, 24, false);
 }
 
+#ifdef __APPLE__
+/* A large prefill split at the dense/sparse boundary leaves three dense
+ * rows at positions 2048..2050. Those internal rows must keep the parent's
+ * matrix attention arithmetic, not inherit the short-tail decode policy. */
+static void test_attn_prefill_partition_case(bool sparse) {
+    const uint32_t T = sparse ? 17u : 2051u, pos0 = sparse ? 2051u : 0u;
+    const uint32_t H = 8u, Hkv = 1u, D = 256u, budget = 512u;
+    const uint32_t stride = budget * 4u + 4u, row = H * D, guard = 32u;
+    const uint64_t qn = (uint64_t)T * row, kvn = (uint64_t)(pos0 + T) * Hkv * D;
+    const uint64_t scratch_n = 8u * row + 2u * guard;
+    float *q = rand_vec(qn, 1.0f), *gate = rand_vec(qn, 2.0f);
+    _Float16 *kc = malloc(kvn * sizeof(*kc)), *vc = malloc(kvn * sizeof(*vc));
+    int32_t *sel = sparse ? malloc((uint64_t)T * stride * sizeof(*sel)) : NULL;
+    uint32_t *cnt = sparse ? malloc((uint64_t)T * sizeof(*cnt)) : NULL;
+    require_ok(q && gate && kc && vc && (!sparse || (sel && cnt)), "prefill partition allocation");
+    for (uint64_t i = 0; i < kvn; i++) {
+        kc[i] = (_Float16)(frand() - 0.5f);
+        vc[i] = (_Float16)(frand() - 0.5f);
+    }
+    if (sparse) for (uint32_t t = 0; t < T; t++) {
+        const uint32_t pos = pos0 + t, visible = (pos + 1u) / 4u;
+        /* 509 is coprime with each visible block count in this fixture:
+         * distinct selected blocks, with an order different from dense. */
+        for (uint32_t j = 0; j < budget; j++) for (uint32_t k = 0; k < 4u; k++)
+            sel[(uint64_t)t * stride + 4u * j + k] = (int32_t)(4u * ((509u * j + t) % visible) + k);
+        cnt[t] = 4u * budget;
+        for (uint32_t p = 4u * visible; p <= pos; p++) sel[(uint64_t)t * stride + cnt[t]++] = (int32_t)p;
+        for (uint32_t j = cnt[t]; j < stride; j++) sel[(uint64_t)t * stride + j] = -1;
+    }
+    ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn), *gref = upload(NULL, qn);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * sizeof(*kc));
+    ds4_gpu_tensor *gv = ds4_gpu_tensor_alloc(kvn * sizeof(*vc));
+    ds4_gpu_tensor *gsel = sparse ? ds4_gpu_tensor_alloc((uint64_t)T * stride * sizeof(*sel)) : NULL;
+    ds4_gpu_tensor *gcnt = sparse ? ds4_gpu_tensor_alloc((uint64_t)T * sizeof(*cnt)) : NULL;
+    ds4_gpu_tensor *scratch = upload(NULL, scratch_n);
+    require_ok(gk && gv && ds4_gpu_tensor_write(gk, 0, kc, kvn * sizeof(*kc)) &&
+               ds4_gpu_tensor_write(gv, 0, vc, kvn * sizeof(*vc)), "prefill partition KV upload");
+    require_ok(!sparse || (gsel && gcnt &&
+               ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * stride * sizeof(*sel)) &&
+               ds4_gpu_tensor_write(gcnt, 0, cnt, (uint64_t)T * sizeof(*cnt))), "prefill partition selection upload");
+    /* The existing API chooses MM for a whole prefill. Keep it as the
+     * independent dispatch reference instead of calling the new API twice. */
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(gref, gq, ggate, gk, gv, gsel, gcnt, NULL,
+               T, H, Hkv, D, pos0, sparse, stride, 0.0625f), "whole prefill attention reference");
+    float *ref = download(gref, qn);
+    for (uint64_t i = 0; i < qn; i++) require_ok(isfinite(ref[i]), "finite whole prefill attention");
+    const uint32_t first = sparse ? 1u : 3u, last = sparse ? 8u : 3u;
+    for (uint32_t n = first; n <= last; n++) {
+        const uint32_t t0 = T - n;
+        const uint64_t bytes = (uint64_t)n * row * sizeof(float);
+        ds4_gpu_tensor *vq = ds4_gpu_tensor_view(gq, (uint64_t)t0 * row * sizeof(float), bytes);
+        ds4_gpu_tensor *vgate = ds4_gpu_tensor_view(ggate, (uint64_t)t0 * row * sizeof(float), bytes);
+        ds4_gpu_tensor *vout = ds4_gpu_tensor_view(scratch, guard * sizeof(float), bytes);
+        ds4_gpu_tensor *vsel = sparse ? ds4_gpu_tensor_view(gsel, (uint64_t)t0 * stride * sizeof(*sel),
+                                                            (uint64_t)n * stride * sizeof(*sel)) : NULL;
+        ds4_gpu_tensor *vcnt = sparse ? ds4_gpu_tensor_view(gcnt, (uint64_t)t0 * sizeof(*cnt),
+                                                            (uint64_t)n * sizeof(*cnt)) : NULL;
+        require_ok(vq && vgate && vout && (!sparse || (vsel && vcnt)), "bounded prefill partition views");
+        require_ok(ds4_gpu_tensor_fill_f32(scratch, 17.25f, scratch_n), "prefill partition output guards");
+        require_ok(ds4_gpu_qwen4_attn_prefill_tensor(vout, vq, vgate, gk, gv, vsel, vcnt,
+                   n, H, Hkv, D, pos0 + t0, sparse, stride, 0.0625f), "partitioned prefill attention");
+        float *got = download(scratch, scratch_n);
+        require_ok(memcmp(got + guard, ref + (uint64_t)t0 * row, bytes) == 0,
+                   "prefill partition keeps whole-pass attention bits");
+        for (uint64_t i = 0; i < scratch_n; i++) if (i < guard || i >= guard + (uint64_t)n * row)
+            require_ok(got[i] == 17.25f, "prefill partition output guard intact");
+        free(got);
+        if (!sparse) {
+            /* Negative control: the old three-row dispatch must reproduce
+             * a difference, so this fixture cannot silently miss the bug. */
+            require_ok(ds4_gpu_qwen4_attn_decode_tensor(vout, vq, vgate, gk, gv, NULL, NULL, NULL,
+                       n, H, Hkv, D, pos0 + t0, false, stride, 0.0625f), "short-tail attention control");
+            float *legacy = download(vout, (uint64_t)n * row);
+            double max_error = 0.0;
+            for (uint64_t i = 0; i < (uint64_t)n * row; i++) {
+                require_ok(isfinite(legacy[i]), "finite short-tail attention control");
+                max_error = fmax(max_error, fabs((double)legacy[i] - ref[(uint64_t)t0 * row + i]));
+            }
+            require_ok(max_error > 0.0, "partition fixture detects old short-tail dispatch");
+            setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
+            require_ok(ds4_gpu_qwen4_attn_prefill_tensor(vout, vq, vgate, gk, gv, NULL, NULL,
+                       n, H, Hkv, D, pos0 + t0, false, stride, 0.0625f), "prefill attention diagnostic override");
+            unsetenv("DS4_QWEN4_NO_ATTN_MM");
+            float *diagnostic = download(vout, (uint64_t)n * row);
+            require_ok(memcmp(diagnostic, legacy, bytes) == 0, "prefill attention honors scalar override");
+            printf("  prefill dense partition 2048+3 exact; old dispatch max|d|=%.3e\n", max_error);
+            free(diagnostic);
+            free(legacy);
+        }
+        ds4_gpu_tensor_free(vcnt); ds4_gpu_tensor_free(vsel); ds4_gpu_tensor_free(vout);
+        ds4_gpu_tensor_free(vgate); ds4_gpu_tensor_free(vq);
+    }
+    if (sparse) puts("  prefill sparse partitions 1..8 rows exact; output guards intact");
+    free(ref); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
+    ds4_gpu_tensor_free(scratch); ds4_gpu_tensor_free(gref); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(gsel);
+    ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gq);
+}
+
+static void test_attn_prefill_partition(void) {
+    const uint32_t saved_rng = g_rng;
+    g_rng = 0x4ad34a12u;
+    const char *old = getenv("DS4_QWEN4_NO_ATTN_MM");
+    char *saved = old ? strdup(old) : NULL;
+    require_ok(!old || saved, "save attention diagnostic override");
+    unsetenv("DS4_QWEN4_NO_ATTN_MM");
+    test_attn_prefill_partition_case(false);
+    test_attn_prefill_partition_case(true);
+    if (saved) { setenv("DS4_QWEN4_NO_ATTN_MM", saved, 1); free(saved); }
+    g_rng = saved_rng;
+}
+#endif
+
 #ifndef __APPLE__
 static void test_attn_groups(void) {
     test_attn_mm_keys(32, 4093, false, 6, 24, false);
@@ -4065,7 +4177,9 @@ int main(void) {
     test_attn_mm(4, 128, false);
     test_attn_mm(8, 128, false);
     test_attn_mm(9, 128, false);
-#ifndef __APPLE__
+#ifdef __APPLE__
+    test_attn_prefill_partition();
+#else
     test_attn_groups();
 #endif
     test_gdn(&arena, 2, 6, 32, 7);

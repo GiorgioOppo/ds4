@@ -49631,12 +49631,12 @@ uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint
     return (uint64_t)n_tokens * n_head * QWEN4_ATTN_MAX_SPLITS * (2u + head_dim);
 }
 
-int ds4_gpu_qwen4_attn_decode_tensor(
+static int qwen4_attn_tensor_impl(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
-        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale) {
+        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale, bool prefill_mm) {
     const uint32_t n_keys = use_sel ? sel_stride : pos0 + n_tokens;
     uint32_t n_splits = 1;
     if (part) {
@@ -49677,10 +49677,10 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     } else {
         b[7] = b[6];
     }
-    /* Keep short prefill tails on the decode arithmetic. Rounding queries
-     * to half for just a few rows can flip nearly tied expert selections
-     * relative to one-token continuation; large prefills retain matrix tiles. */
-    if (n_splits == 1 && n_tokens > 8u && head_dim == 256u && n_head / n_head_kv <= 16u &&
+    /* Genuine short tails keep their decode arithmetic. A short dense/sparse
+     * subrange of a larger prefill must instead retain the parent's matrix
+     * arithmetic: its row count is a partition detail, not a phase change. */
+    if (n_splits == 1 && (prefill_mm || n_tokens > 8u) && head_dim == 256u && n_head / n_head_kv <= 16u &&
         getenv("DS4_QWEN4_NO_ATTN_MM") == NULL) {
         return qwen4_dispatch(QWEN4_K_ATTN_MM, &args, sizeof(args), b, 7,
                               MTLSizeMake(n_head_kv, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
@@ -49707,6 +49707,26 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     }
     return qwen4_dispatch(km, &args, sizeof(args), mb, 3,
                           MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_attn_decode_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale) {
+    return qwen4_attn_tensor_impl(out, q, gate, k_cache, v_cache, sel_tokens, n_sel, part,
+                                 n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel, sel_stride, scale, false);
+}
+
+int ds4_gpu_qwen4_attn_prefill_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale) {
+    return qwen4_attn_tensor_impl(out, q, gate, k_cache, v_cache, sel_tokens, n_sel, NULL,
+                                 n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel, sel_stride, scale, true);
 }
 
 /* ---- decode batch: attention over rows ----
