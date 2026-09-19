@@ -60,6 +60,27 @@ runs measured about 400 t/s for a 32K prefill and 290 t/s for an 8K append. The
 [network TP QA record](../QA_BEFORE_RELEASES.md#cuda-network-tensor-parallelism)
 has the timing controls and memory limits.
 
+## Qwen3.8 Flash Next
+
+Both Q2 and Q4 fit on one Spark. After building:
+
+```sh
+./download_model.sh qwen38-q2
+./ds4 --mtp --ctx 32768
+```
+
+Q2 keeps 41.73 GiB of weights resident; Q4 keeps 69.74 GiB. Both GGUFs also
+contain 95.37 GiB of BF16 n-grams, read directly from the SSD. Leave room
+for context and runtime buffers. Vision, the native agent, server APIs and
+text-session checkpoints work on CUDA; see [Qwen setup](QWEN38_FLASH_NEXT.md).
+
+September 15, 2026, Q2 on one Spark: a 16K prefill reached 250 t/s, extending
+it to 30K reached 243 t/s, and ordinary decode stayed around 17.3 t/s.
+These are single runs with 8,192-token prefill chunks and 32 decode tokens.
+A separate 256-token prose run measured 17.1 t/s ordinarily and 19.9 t/s with
+MTP, at temperature zero and 8K allocated context. Speculation is opt-in;
+its benefit depends on the prompt.
+
 ## GLM 5.3 Flash
 
 Q2 is the resident target for one Spark:

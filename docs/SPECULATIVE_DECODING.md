@@ -68,7 +68,7 @@ Both Qwen downloads include MTP and native BF16 n-grams in the main GGUF:
 
 Ordinary decode uses the same file with `--mtp` omitted. For non-zero
 temperature, add `--mtp-exact-sampling` to preserve the target sampling
-distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for the Metal runtime.
+distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for Metal and CUDA.
 
 The cycle drafts one token ahead by default and engages a **second, chained
 draft** (one extra nextn-layer step conditioned on the predictor's own

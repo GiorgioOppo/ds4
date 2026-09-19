@@ -255,6 +255,9 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     opt(fp, c, "--tensor-parallel", "Switch --role/--listen/--coordinator to two-machine tensor parallelism.");
     opt(fp, c, "--transport auto|rdma|tcp", "Tensor gate transport. Default: auto");
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    opt(fp, c, "--rdma-port N", "Select the local active Ethernet verbs port. Default: 1");
+#endif
     opt(fp, c, "--rdma-device NAME", "Select a verbs device when auto-detection is ambiguous.");
     opt(fp, c, "--rdma-gid-index N", "Select the local verbs GID index.");
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");

@@ -176,6 +176,25 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    if (g_deepseek41_model && ds4_rocm_is_gfx1151() &&
+        !g_quality_mode && !use_mask && head_dim == 512u &&
+        (n_head == 32u || n_head == 64u) && n_raw <= 128u &&
+        raw_cap == 128u && n_comp <= 512u && n_raw + n_comp >= 256u) {
+        const uint32_t splits = (n_raw + n_comp + 31u) / 32u;
+        const uint64_t part_count = (uint64_t)splits * n_head * 512u;
+        const uint64_t lse_count = (uint64_t)splits * n_head;
+        float *parts = (float *)cuda_tmp_alloc(
+                (part_count + lse_count) * sizeof(float), "V4.1 split decode attention");
+        if (!parts) return 0;
+        float *lse = parts + part_count;
+        ds41_attention_split_f32_heads_kernel<32, 4><<<dim3(n_head / 4u, splits), 128>>>(
+                parts, lse, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr, sinks, n_head, n_raw, n_comp, raw_start);
+        if (!cuda_ok(cudaGetLastError(), "V4.1 split decode attention launch")) return 0;
+        ds41_attention_split_combine_kernel<<<n_head, 256>>>(
+                (float *)heads->ptr, parts, lse, n_head, splits);
+        return cuda_ok(cudaGetLastError(), "V4.1 split decode attention combine");
+    }
     if (cfg->oldhip_attention_decode) {
         const uint32_t rows = n_raw + n_comp;
         const size_t shmem = (size_t)(rows ? rows : 1u) * sizeof(float);

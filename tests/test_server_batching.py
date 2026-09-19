@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import json
 import math
+from pathlib import Path
 import statistics
 import sys
 import threading
@@ -170,11 +171,14 @@ def comparable(result):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8000")
+    parser.add_argument("--model", default="deepseek-chat")
     parser.add_argument("--pairs", type=int, default=4)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--nonce", default="")
+    parser.add_argument("--output", type=Path,
+                        help="save complete requests, responses and summary as JSON")
     parser.add_argument(
         "--same-prompt", action="store_true",
         help="send one identical prompt and seed in every request",
@@ -209,6 +213,7 @@ def main():
                 CASES[3], i, nonce + "-cancel", True
             )
             payload["max_tokens"] = max(args.max_tokens or 0, 128)
+            payload["model"] = args.model
             cancel_payloads.append(payload)
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=args.cancel_first
@@ -236,6 +241,7 @@ def main():
         )
         if args.max_tokens is not None:
             payload["max_tokens"] = args.max_tokens
+        payload["model"] = args.model
         for copy in range(2):
             requests.append(payload)
             metadata.append((i, copy, name, filler_words))
@@ -254,6 +260,16 @@ def main():
     wall = time.monotonic() - wall_start
 
     failures = 0
+    for i, result in enumerate(results):
+        if result["finish"] not in ("stop", "length") or (
+            requests[i]["max_tokens"] > 0 and not (result["content"] or result["reasoning"])
+        ):
+            failures += 1
+            print("INVALID request=%d result=%s" % (i, result), file=sys.stderr)
+        count = result["completion_tokens"]
+        if count is not None and not 0 <= count <= requests[i]["max_tokens"]:
+            failures += 1
+            print("INVALID token budget request=%d result=%s" % (i, result), file=sys.stderr)
     for i in range(args.pairs):
         a = results[2 * i]
         b = results[2 * i + 1]
@@ -310,6 +326,12 @@ def main():
         ),
         "nonce": nonce,
     }
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({
+            "summary": summary, "metadata": metadata,
+            "requests": requests, "responses": results,
+        }, indent=2) + "\n")
     print(json.dumps(summary, sort_keys=True))
     return 0 if failures == 0 else 1
 

@@ -122,6 +122,7 @@ typedef struct {
     int leader_port;
     ds4_tp_transport transport;
     const char *rdma_device;
+    int rdma_port;              /* Linux RoCE port; zero selects port 1 */
     int rdma_gid_index;
     bool rdma_gid_index_set;
     bool glm_token_prefill;
@@ -534,6 +535,16 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* One speculative cycle for a batch of sessions (greedy acceptance, Qwen3.8
+ * with --mtp): each item feeds its token; a pending draft rides along as a
+ * second row and is committed when it is the target's argmax.  accepted[i]
+ * lists the tokens committed for item i (the fed token, then the draft) and
+ * n_accepted[i] how many; the session's logits then follow its last
+ * committed token.  Engines without native batching run one cycle per
+ * session in turn. */
+int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
+                                               int (*accepted)[2], int *n_accepted,
+                                               char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

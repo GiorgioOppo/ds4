@@ -1,5 +1,20 @@
 #define DS4_NO_GPU
+#ifndef __APPLE__
+#include <pthread.h>
+static int test_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+#define pthread_create test_pthread_create
+#endif
 #include "../ds4.c"
+#ifndef __APPLE__
+#undef pthread_create
+static int thread_budget = -1;
+static int test_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                               void *(*start)(void *), void *arg) {
+    if (!thread_budget) return EAGAIN;
+    if (thread_budget > 0) thread_budget--;
+    return pthread_create(thread,attr,start,arg);
+}
+#endif
 #include <assert.h>
 #include <sys/wait.h>
 
@@ -53,7 +68,9 @@ int main(void) {
     assert(rows && out);
     for (size_t i = 0; i < N; i++) rows[i] = (i * 173u) % 1000;
     rows[1] = rows[0]; rows[N-1] = 999;
-    for (size_t n = 0; n <= N; n = n ? (n == 16 ? 256 : N) : 16) {
+    const size_t sizes[] = {0,16,255,256,257,4095,4096,4097,N};
+    for (size_t ni = 0; ni < sizeof(sizes)/sizeof(*sizes); ni++) {
+        size_t n = sizes[ni];
         assert(qwen4_ngram_read(&m, rows, n, out));
         for (size_t i = 0; i < n; i++) {
             for (size_t c = 0; c < 160; c++) {
@@ -62,8 +79,21 @@ int main(void) {
                 assert(bits == expected);
             }
         }
-        if (n == N) break;
     }
+#ifndef __APPLE__
+    const int budgets[] = {0,1,7};
+    for (size_t bi = 0; bi < sizeof(budgets)/sizeof(*budgets); bi++) {
+        thread_budget = budgets[bi];
+        memset(out,0xff,(size_t)N*160*sizeof(*out));
+        assert(qwen4_ngram_read(&m,rows,N,out));
+        for (size_t i = 0; i < N; i++) for (size_t c = 0; c < 160; c++) {
+            uint32_t bits;
+            memcpy(&bits,out+i*160+c,4);
+            assert(bits == (uint32_t)value(rows[i],c)<<16);
+        }
+    }
+    thread_budget = -1;
+#endif
     uint32_t invalid = 1000;
     assert(!qwen4_ngram_read(&m, &invalid, 1, out) && errno == EINVAL);
     assert(!qwen4_ngram_read(&m, rows, SIZE_MAX, out) && errno == EINVAL);
@@ -75,9 +105,13 @@ int main(void) {
     uint32_t first = 0;
     assert(!qwen4_ngram_read(&m, &first, 1, out) && errno == EDOM);
     assert(!qwen4_ngram_read(&m, rows, N, out) && errno == EDOM);
+    uint16_t zero = 0;
+    assert(pwrite(fd,&zero,2,65536) == 2);
+    assert(qwen4_ngram_read(&m,rows,N,out));
     assert(!ftruncate(fd, 65536 + 320000 - 1));
     uint32_t last = 999;
     assert(!qwen4_ngram_read(&m, &last, 1, out) && errno == EIO);
+    assert(!qwen4_ngram_read(&m,rows,N,out) && errno == EIO);
     close(fd);
     model_close(&m);
     assert(m.ngram_fd == -1 && !m.ngram_tensor);

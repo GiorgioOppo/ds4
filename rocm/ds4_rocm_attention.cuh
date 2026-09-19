@@ -1945,3 +1945,91 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         out4[lane + 96u] = o3;
     }
 }
+
+/* V4.1 decode: parallel 32-key tiles, four heads sharing FP32 value loads.
+ * The guarded caller supplies the model's 128-row raw ring. */
+template<unsigned KEYS, unsigned HEADS>
+__global__ static void ds41_attention_split_f32_heads_kernel(
+        float *parts, float *lse, const float *q, const float *raw,
+        const float *comp, const float *sinks, unsigned H, unsigned NR,
+        unsigned C, unsigned RS) {
+    const unsigned hb = blockIdx.x * HEADS, split = blockIdx.y,
+                   tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5u,
+                   k0 = split * KEYS, N = NR + C;
+    __shared__ float p[HEADS][KEYS];
+    __shared__ float normalizer[HEADS];
+    for (unsigned hl = wave; hl < HEADS; hl += 4) {
+        unsigned h = hb + hl;
+        float query[16];
+#pragma unroll
+        for (unsigned d = 0; d < 16; d++)
+            query[d] = h < H ? q[(uint64_t)h * 512 + lane + d * 32] : 0.f;
+        for (unsigned k = 0; k < KEYS; k++) {
+            unsigned row = k0 + k;
+            float dot = 0;
+            if (row < N) {
+                const float *v = row < NR ? raw + (uint64_t)((RS + row) % 128) * 512
+                                          : comp + (uint64_t)(row - NR) * 512;
+#pragma unroll
+                for (unsigned d = 0; d < 16; d++) dot += query[d] * v[lane + d * 32];
+            }
+            dot = attention_warp_sum_oldhip_w32(dot);
+            if (lane == 0) p[hl][k] = row < N ? dot * rsqrtf(512.f) : -INFINITY;
+        }
+    }
+    __syncthreads();
+    for (unsigned hl = wave; hl < HEADS; hl += 4) {
+        unsigned h = hb + hl;
+        float mx = split == 0 && h < H ? sinks[h] : -INFINITY;
+        for (unsigned k = lane; k < KEYS; k += 32) mx = fmaxf(mx, p[hl][k]);
+        for (unsigned delta = 16; delta; delta >>= 1)
+            mx = fmaxf(mx, __shfl_xor(mx, delta, 32));
+        float sum = (split == 0 && lane == 0 && h < H) ? expf(sinks[h] - mx) : 0.f;
+        for (unsigned k = lane; k < KEYS; k += 32) {
+            float z = expf(p[hl][k] - mx);
+            p[hl][k] = z;
+            sum += z;
+        }
+        sum = attention_warp_sum_oldhip_w32(sum);
+        if (lane == 0) {
+            normalizer[hl] = 1.f / sum;
+            if (h < H) lse[(uint64_t)split * H + h] = mx + logf(sum);
+        }
+    }
+    __syncthreads();
+    for (unsigned d = tid; d < 512; d += 128) {
+        float values[HEADS] = {};
+        for (unsigned k = 0; k < KEYS && k0 + k < N; k++) {
+            unsigned row = k0 + k;
+            const float *v = row < NR ? raw + (uint64_t)((RS + row) % 128) * 512
+                                      : comp + (uint64_t)(row - NR) * 512;
+            float value = v[d];
+#pragma unroll
+            for (unsigned hl = 0; hl < HEADS; hl++) values[hl] += p[hl][k] * value;
+        }
+#pragma unroll
+        for (unsigned hl = 0; hl < HEADS; hl++)
+            if (hb + hl < H)
+                parts[((uint64_t)split * H + hb + hl) * 512 + d] = values[hl] * normalizer[hl];
+    }
+}
+
+/* Combine independently normalized key tiles, including the sink only in tile zero. */
+__global__ static void ds41_attention_split_combine_kernel(
+        float *out, const float *parts, const float *lse,
+        uint32_t n_head, uint32_t splits) {
+    const uint32_t head = blockIdx.x;
+    float max_lse = -INFINITY;
+    for (uint32_t k = 0; k < splits; k++)
+        max_lse = fmaxf(max_lse, lse[k * n_head + head]);
+    float denominator = 0.0f;
+    for (uint32_t k = 0; k < splits; k++)
+        denominator += expf(lse[k * n_head + head] - max_lse);
+    for (uint32_t dim = threadIdx.x; dim < 512u; dim += blockDim.x) {
+        float value = 0.0f;
+        for (uint32_t k = 0; k < splits; k++)
+            value += parts[((uint64_t)k * n_head + head) * 512u + dim] *
+                     expf(lse[k * n_head + head] - max_lse);
+        out[(uint64_t)head * 512u + dim] = value / denominator;
+    }
+}
