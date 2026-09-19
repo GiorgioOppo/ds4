@@ -410,7 +410,7 @@ static int agent_read_default_lines(agent_worker *w);
 static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
+    if (ds4_engine_is_qwen4(engine) || ds4_engine_is_bonsai(engine)) return AGENT_TOOL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
                                            : AGENT_TOOL_SYNTAX_DSML;
@@ -5123,7 +5123,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_chat_begin(w->engine, out);
     ds4_think_mode think_mode = effective_think_mode(w->cfg);
-    if (ds4_engine_is_qwen4(w->engine)) {
+    if (ds4_engine_is_qwen4(w->engine) || ds4_engine_is_bonsai(w->engine)) {
         const char *effort = ds4_qwen4_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
     } else {

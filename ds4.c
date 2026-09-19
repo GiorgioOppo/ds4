@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_bonsai.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -497,7 +498,7 @@ enum {
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 248320,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 2,
+    DS4_MAX_HEAD_KV          = 4,
     DS4_MAX_HEAD_DIM         = 576,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
@@ -527,6 +528,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_BONSAI = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +539,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_BONSAI = 7,
 } ds4_variant;
 
 typedef struct {
@@ -1006,8 +1009,33 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
            il % 4u != 3u;
 }
 
+static bool ds4_model_is_bonsai(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_BONSAI;
+}
+
 static bool ds4_model_is_qwen4(void) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP;
+}
+
+static bool ds4_model_uses_qwen_chat(void) {
+    return ds4_model_is_qwen4() || ds4_model_is_bonsai();
+}
+
+static ds4_context_memory bonsai_memory_estimate(ds4_backend backend, uint32_t ctx) {
+    ds4_context_memory m = {0};
+    m.prefill_cap = 1;
+    m.raw_cap = ctx;
+    m.raw_bytes = UINT64_C(16) * ctx * 4 * 256 * 2 * sizeof(float);
+    m.compressed_bytes = UINT64_C(48) * (48*128*128 + 10240*3) * sizeof(float);
+    m.scratch_bytes = UINT64_C(8)*1024*1024 + (uint64_t)ctx*24*sizeof(float);
+    if (backend == DS4_BACKEND_METAL) {
+        m.prefill_cap = ctx < DS4_BONSAI_METAL_PREFILL_CAP ? ctx : DS4_BONSAI_METAL_PREFILL_CAP;
+        /* Sum of the fixed 27B graph's 17 per-row activation buffers.
+         * Vocabulary logits and attention scores remain shared with decode. */
+        m.scratch_bytes += UINT64_C(134240) * m.prefill_cap * sizeof(float);
+    }
+    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+    return m;
 }
 
 /* Trunk layers repeat 3 GDN + 1 full attention; the MTP block is attention. */
@@ -2434,6 +2462,8 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    [142] = {"pq2_0", 128, 34},
+    [143] = {"ptq1_0",128, 28},
 };
 
 enum {
@@ -3249,6 +3279,13 @@ static void model_summary(const ds4_model *m) {
     }
     if (!model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used)) {
         model_get_u32(m, "glm-dsa.expert_group_used_count", &n_group_used);
+    }
+    if (ds4_streq(arch,"qwen35")) {
+        model_get_u32(m,"qwen35.block_count",&layers);
+        model_get_u64_compat(m,"qwen35.context_length",&ctx_train);
+        model_get_u32(m,"qwen35.attention.head_count",&n_head);
+        model_get_u32(m,"qwen35.attention.head_count_kv",&n_head_kv);
+        model_get_u32(m,"qwen35.attention.key_length",&head_dim);
     }
     const bool v41 = ds4_streq(arch, "deepseek41");
     if (v41) {
@@ -7230,6 +7267,8 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+#include "bonsai_bind.inc"
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7250,6 +7289,10 @@ static void config_validate_model(const ds4_model *m) {
             config_validate_qwen4_model(m);
             return;
         }
+    }
+    if (ds4_streq(arch, "qwen35")) {
+        config_validate_bonsai_model(m);
+        return;
     }
     config_validate_deepseek4_model(m);
 }
@@ -39723,6 +39766,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (ds4_model_is_bonsai()) return bonsai_memory_estimate(backend,ctx);
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4())
         return qwen4_graph_memory_estimate(ctx, prefill_chunk);
 
@@ -42285,6 +42329,7 @@ typedef enum {
 } ds4_vision_kind;
 
 struct ds4_engine {
+    ds4_bonsai_model *bonsai;
     char *model_path;
     uint64_t ds41_session_bytes;
     uint64_t qwen4_session_bytes;
@@ -43258,7 +43303,7 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
     }
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen_chat()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
         return;
     }
@@ -43385,7 +43430,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen_chat()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
          * second generation stop. */
         vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
@@ -43571,7 +43616,7 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen_chat()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
             ds4_die("this tokenizer does not provide the Qwen chat markers; use raw prompt tokenization");
@@ -43768,7 +43813,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen_chat()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
             bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
@@ -43834,7 +43879,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen_chat()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
     }
@@ -59864,6 +59909,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     (void)ssd_streaming;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (ds4_model_is_bonsai()) return bonsai_memory_estimate(backend,ctx);
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4())
         return qwen4_graph_memory_estimate(ctx, prefill_chunk);
 
@@ -60587,6 +60633,11 @@ typedef struct {
 } ds4_vision_identity;
 
 struct ds4_session {
+    ds4_bonsai_cpu *bonsai_cpu;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_bonsai_metal *bonsai_metal;
+#endif
+    uint32_t bonsai_pos;
     ds4_engine *engine;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
@@ -60694,6 +60745,24 @@ struct ds4_session {
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
+
+static void bonsai_session_reset(ds4_session *s) {
+    if (s->bonsai_cpu) ds4_bonsai_cpu_reset(s->bonsai_cpu);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->bonsai_metal) ds4_bonsai_metal_reset(s->bonsai_metal);
+#endif
+    s->bonsai_pos=0;
+}
+
+static bool bonsai_session_step(ds4_session *s, int token, float *logits) {
+    bool ok=false;
+    if (s->bonsai_cpu) ok=ds4_bonsai_cpu_eval(s->bonsai_cpu,token,logits);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->bonsai_metal) ok=ds4_bonsai_metal_eval(s->bonsai_metal,token,logits);
+#endif
+    if (ok) s->bonsai_pos++;
+    return ok;
+}
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -62548,7 +62617,7 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 }
 
 bool ds4_engine_has_output_head(ds4_engine *e) {
-    return e && weights_have_output_head(&e->weights);
+    return e && (e->bonsai || weights_have_output_head(&e->weights));
 }
 
 #ifndef DS4_NO_GPU
@@ -62839,6 +62908,7 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, boo
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    if (s && s->engine->bonsai) return 0;
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -63247,6 +63317,9 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (s && s->engine->bonsai) {
+        payload_set_err(err,errlen,"Bonsai session cache serialization is not supported"); return 1;
+    }
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -63598,6 +63671,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (s && s->engine->bonsai) {
+        payload_set_err(err,errlen,"Bonsai session cache serialization is not supported"); return 1;
+    }
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -64976,7 +65052,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (s->engine->bonsai || ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -65451,6 +65527,36 @@ int ds4_engine_generate_argmax(
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
+
+    if (e->bonsai) {
+        ds4_session *session=NULL;
+        char err[256]={0};
+        if (ds4_session_create(&session,e,ctx_size)) return 1;
+        ds4_session_set_display_progress(session,progress,progress_ud);
+        const double begin=now_sec();
+        int rc=ds4_session_sync(session,prompt,err,sizeof(err));
+        const double prefill_end=now_sec();
+        int generated=0, steps=0;
+        for (int i=0;!rc && i<n_predict && ds4_session_pos(session)<ctx_size;i++) {
+            const int token=ds4_session_argmax(session);
+            if (token<0 || ds4_token_is_stop(e,token)) break;
+            if (emit) emit(emit_ud,token);
+            generated++;
+            if (i+1>=n_predict || ds4_session_pos(session)+1>=ctx_size) break;
+            if (i+1<n_predict && ds4_session_pos(session)+1<ctx_size) {
+                rc=ds4_session_eval(session,token,err,sizeof(err));
+                if (!rc) steps++;
+            }
+        }
+        const double end=now_sec();
+        if (done) done(emit_ud);
+        if (rc) fprintf(stderr,"ds4: Bonsai generation failed: %s\n",err);
+        ds4_log(stderr,DS4_LOG_TIMING,"ds4: prefill: %.2f t/s, generation: %.2f t/s (%d emitted tokens)\n",
+            prefill_end>begin?(double)prompt->len/(prefill_end-begin):0,
+            end>prefill_end?(double)steps/(end-prefill_end):0,generated);
+        ds4_session_free(session);
+        return rc;
+    }
 
     if (ds4_backend_uses_graph(e->backend)) {
 #ifndef DS4_NO_GPU
@@ -67251,6 +67357,10 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 #endif
 
 static bool engine_legacy_graph_test_supported(ds4_engine *e) {
+    if (ds4_engine_is_bonsai(e)) {
+        fprintf(stderr, "ds4: legacy graph diagnostics do not implement Bonsai; use session logits instead\n");
+        return false;
+    }
     if (!ds4_engine_is_deepseek41(e)) return true;
     fprintf(stderr, "ds4: legacy graph diagnostics do not implement DeepSeek V4.1; use session logits instead\n");
     return false;
@@ -71092,6 +71202,30 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_bonsai()) {
+        const bool backend_ok = e->backend == DS4_BACKEND_CPU
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            || e->backend == DS4_BACKEND_METAL
+#endif
+            ;
+        if (!opt->inspect_only && (!backend_ok || e->ssd_streaming || e->glm_mtp || e->dspark ||
+            opt->first_token_test || opt->metal_graph_test || opt->tp.role != DS4_TP_NONE ||
+            opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1) || load_slice ||
+            e->distributed.role != DS4_DISTRIBUTED_NONE || e->power_percent != 100 ||
+            (opt->vision_path && opt->vision_path[0]) || (opt->mtp_path && opt->mtp_path[0]) ||
+            (opt->directional_steering_file && opt->directional_steering_file[0]))) {
+            fprintf(stderr, "ds4: Bonsai supports resident text inference on CPU or Metal; "
+                    "SSD expert streaming, MTP, vision, steering and distributed execution are unavailable\n");
+            ds4_engine_close(e); *out=NULL; return 1;
+        }
+        e->bonsai=bonsai_bind(&e->model);
+        vocab_load(&e->vocab,&e->model);
+        if ((uint32_t)e->vocab.n_vocab != e->bonsai->n_vocab) ds4_die("Bonsai vocabulary size mismatch");
+        e->model_path=realpath(opt->model_path,NULL);
+        fprintf(stderr,"ds4: Ternary Bonsai 2 27B: native %s, packed Prism weights, FP32 recurrent/KV state\n",
+                ds4_backend_name(e->backend));
+        *out=e; return 0;
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         if (e->ssd_streaming && (e->ssd_streaming_full_layers || e->ssd_streaming_preload_experts)) {
             fprintf(stderr, "ds4: Qwen SSD fills its expert cache on demand; full resident layers "
@@ -72296,6 +72430,10 @@ int ds4_engine_power(ds4_engine *e) {
 
 int ds4_engine_set_power(ds4_engine *e, int power_percent) {
     if (!e || power_percent < 1 || power_percent > 100) return 1;
+    if (e->bonsai && power_percent != 100) {
+        fprintf(stderr, "ds4: power throttling is not supported for Bonsai\n");
+        return 1;
+    }
     e->power_percent = power_percent;
     return 0;
 }
@@ -72367,6 +72505,10 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
     return ds4_model_is_glm53();
 }
 
+bool ds4_engine_is_bonsai(ds4_engine *e) {
+    return e && e->bonsai != NULL;
+}
+
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
@@ -72374,6 +72516,7 @@ bool ds4_engine_is_qwen4(ds4_engine *e) {
 
 /* The official template's default effort is xhigh; medium adds no text. */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
+    if (ds4_model_is_bonsai()) return NULL;
     switch (mode) {
     case DS4_THINK_HIGH:
     case DS4_THINK_MAX:  return DS4_QWEN4_REASONING_XHIGH;
@@ -73152,6 +73295,7 @@ void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
+    bonsai_model_free(e->bonsai);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -73320,6 +73464,26 @@ static int ds4_session_tp_register(ds4_session *s) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    if (e->bonsai) {
+        *out=NULL;
+        if ((uint32_t)ctx_size > e->bonsai->context) return 1;
+        ds4_session *s=xcalloc(1,sizeof(*s));
+        s->engine=e; s->ctx_size=ctx_size; s->prefill_cap=1;
+        bool ok=false;
+        if (e->backend==DS4_BACKEND_CPU) ok=(s->bonsai_cpu=ds4_bonsai_cpu_create(e->bonsai,(uint32_t)ctx_size))!=NULL;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (e->backend==DS4_BACKEND_METAL) {
+            s->prefill_cap=(uint32_t)ctx_size < DS4_BONSAI_METAL_PREFILL_CAP ?
+                (uint32_t)ctx_size : DS4_BONSAI_METAL_PREFILL_CAP;
+            if (e->prefill_chunk && e->prefill_chunk<s->prefill_cap) s->prefill_cap=e->prefill_chunk;
+            ok=(s->bonsai_metal=ds4_bonsai_metal_create(e->bonsai,(uint32_t)ctx_size))!=NULL;
+        }
+#endif
+        if (!ok) { ds4_session_free(s); return 1; }
+        s->logits=xcalloc(e->bonsai->n_vocab,sizeof(float));
+        s->sample_probs=xmalloc(e->bonsai->n_vocab*sizeof(float));
+        *out=s; return 0;
+    }
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");
@@ -73796,6 +73960,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_bonsai_cpu_free(s->bonsai_cpu);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_bonsai_metal_free(s->bonsai_metal);
+#endif
     if (s->glm_reserved_graph_bytes && s->engine) {
         s->engine->glm_session_graph_bytes -= s->glm_reserved_graph_bytes;
         s->engine->glm_session_count--;
@@ -73888,6 +74056,11 @@ bool ds4_session_is_distributed(ds4_session *s) {
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    if (s->engine->bonsai) {
+        if (power_percent == 100) return 0;
+        fprintf(stderr, "ds4: session power throttling is not supported for Bonsai\n");
+        return 1;
+    }
     if (ds4_engine_is_deepseek41(s->engine)) {
         if (power_percent == 100) return 0;
         fprintf(stderr, "ds4: session power throttling is not supported for DeepSeek V4.1\n");
@@ -75802,6 +75975,46 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     if (ds4_session_cancelled(s)) {
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    if (s->engine->bonsai) {
+        /* Validate all IDs before mutating a live recurrent state. */
+        for (int i=0;i<prompt->len;i++) if (prompt->v[i]<0 || (uint32_t)prompt->v[i]>=DS4_N_VOCAB) {
+            snprintf(err,errlen,"Bonsai prompt token %d is outside the vocabulary",i); return 1;
+        }
+        if (!s->checkpoint_valid || s->bonsai_pos!=(uint32_t)s->checkpoint.len ||
+            prompt->len<s->checkpoint.len || !ds4_tokens_starts_with(prompt,&s->checkpoint)) {
+            bonsai_session_reset(s); s->checkpoint.len=0; s->checkpoint_valid=false;
+        }
+        for (int i=s->checkpoint.len;i<prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                /* Intermediate rows skip the head; rebuild rather than expose stale logits. */
+                s->checkpoint_valid=false;
+                snprintf(err,errlen,"interrupted"); return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t count=(uint32_t)(prompt->len-i);
+            if (count>s->prefill_cap) count=s->prefill_cap;
+            s->checkpoint_valid=false;
+            float *logits=i+(int)count==prompt->len ? s->logits : NULL;
+            bool ok;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (s->bonsai_metal) {
+                ok=ds4_bonsai_metal_prefill(s->bonsai_metal,prompt->v+i,count,logits);
+                if (ok) s->bonsai_pos+=count;
+            } else
+#endif
+            {
+                ok=bonsai_session_step(s,prompt->v[i],logits);
+            }
+            if (!ok) {
+                snprintf(err,errlen,"Bonsai prefill failed at token %d",i); return 1;
+            }
+            for (uint32_t row=0;row<count;++row) token_vec_push(&s->checkpoint,prompt->v[i+(int)row]);
+            i+=(int)count;
+            if (s->display_progress) s->display_progress(s->display_progress_ud,"prefill",i,prompt->len);
+        }
+        s->checkpoint_valid=true;
+        ds4_session_report_progress(s,"prefill",prompt->len,prompt->len);
+        return 0;
     }
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
@@ -77853,6 +78066,20 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      err,
                                      errlen);
     }
+    if (s->engine->bonsai) {
+        if (token<0 || (uint32_t)token>=DS4_N_VOCAB || s->checkpoint.len>=s->ctx_size) {
+            snprintf(err,errlen,"Bonsai invalid token or context exhausted"); return 1;
+        }
+        if (!s->checkpoint_valid || s->bonsai_pos!=(uint32_t)s->checkpoint.len) {
+            snprintf(err,errlen,"Bonsai requires prompt synchronization after a rewind or failed evaluation");
+            return 1;
+        }
+        s->checkpoint_valid=false;
+        if (!bonsai_session_step(s,token,s->logits)) {
+            snprintf(err,errlen,"Bonsai decode failed"); return 1;
+        }
+        token_vec_push(&s->checkpoint,token); s->checkpoint_valid=true; return 0;
+    }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
@@ -79591,7 +79818,7 @@ static bool ds4_sessions_eval_batch_metal_supported(
         int count,
         ds4_engine *e) {
     const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
-    if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
+    if (!items || count < 2 || !e || e->bonsai || e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
@@ -80227,7 +80454,7 @@ static bool ds4_sessions_eval_batch_with_prefill_metal_supported(
     }
     ds4_engine *e = prefill_session->engine;
     const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
-    if (e->backend != DS4_BACKEND_METAL ||
+    if (e->backend != DS4_BACKEND_METAL || e->bonsai ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
         ds4_session_is_cpu(prefill_session) ||
@@ -85766,6 +85993,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
+    if (s->engine->bonsai) bonsai_session_reset(s);
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
@@ -85795,6 +86023,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
             s->checkpoint_valid = false;
     }
     bool state_ok = false;
+    if (s->engine->bonsai) bonsai_session_reset(s);
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
     if (s->checkpoint_valid && ds4_session_is_qwen4(s)) {

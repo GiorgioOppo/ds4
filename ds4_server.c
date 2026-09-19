@@ -1212,7 +1212,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
-    if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
+    if (ds4_engine_is_qwen4(engine) || ds4_engine_is_bonsai(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
            SERVER_MODEL_SYNTAX_DEEPSEEK41 : SERVER_MODEL_SYNTAX_DEEPSEEK;
@@ -1220,6 +1220,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
+    if (ds4_engine_is_bonsai(engine)) return "ternary-bonsai-2-27b";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
@@ -1231,6 +1232,7 @@ static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
+            !strcmp(id, "ternary-bonsai-2-27b") ||
             !strcmp(id, "qwen3.8-flash-next") ||
             !strcmp(id, "qwen3.8-flash-next-chat") ||
             !strcmp(id, "qwen3.8-flash-next-no-think") ||
@@ -14940,7 +14942,7 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
+    if (ds4_engine_is_deepseek41(s->engine) || ds4_engine_is_bonsai(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");

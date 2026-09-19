@@ -26,8 +26,8 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = ds4_bonsai.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_bonsai_metal.o ds4_layer_pack.o ds4_engram.o
+CPU_CORE_OBJS = ds4_bonsai.o ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
@@ -53,8 +53,8 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_engram.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = ds4_bonsai.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_engram.o $(MMQ_OBJS)
+CPU_CORE_OBJS = ds4_bonsai.o ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -403,7 +403,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4_bonsai.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -419,7 +419,7 @@ test-rocm:
 		test-session-state \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
 		ds4 ds4-server ds4-bench ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4_bonsai.o ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -580,7 +580,7 @@ test-qwen4-cuda: tests/test_qwen4_cuda
 	./tests/test_qwen4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_linux_memory.h ds4_engram.h
+ds4.o: ds4.c ds4.h ds4_bonsai.h bonsai_bind.inc ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_linux_memory.h ds4_engram.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -646,7 +646,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h
+ds4_cpu.o: ds4.c ds4.h ds4_bonsai.h bonsai_bind.inc ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h linenoise.h
@@ -958,19 +958,19 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_bonsai.h bonsai_bind.inc ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_bonsai.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_bonsai.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
@@ -1039,7 +1039,7 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_tp.h ds4_layer_pack.h
+ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_bonsai.h bonsai_bind.inc ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_tp.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
@@ -1176,6 +1176,10 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/test_bonsai_quant tests/test_bonsai_graph tests/test_bonsai_graph_metal tests/test_bonsai_model tests/test_bonsai_metal tests/test_bonsai_gdn_prefill tests/bench_bonsai_pq2 metal/bonsai.metal.inc metal/bonsai.metal.inc.tmp
+	rm -f tests/bench_bonsai_elementwise
+	rm -f tests/test_bonsai_mm
+	rm -f tests/test_bonsai_mma tests/test_bonsai_pq2_decode tests/test_bonsai_pairs tests/test_bonsai_fullrows
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_memory tests/test_qwen4_ssd_experts
 	rm -f tests/test_qwen4_ngram_state
@@ -1221,3 +1225,83 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+# Bonsai reference arithmetic deliberately keeps IEEE nonfinite checks/reductions.
+ds4_bonsai.o: ds4_bonsai.c ds4_bonsai.h bonsai_quant.h ds4_bonsai_validate.inc
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -c -o $@ $<
+
+ds4_bonsai_metal.o: ds4_bonsai_metal.m ds4_bonsai.h metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -c -o $@ $<
+
+tests/test_bonsai_quant: tests/test_bonsai_quant.c bonsai_quant.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< -lm
+
+metal/bonsai.metal.inc: metal/bonsai.metal
+	xxd -i $< > $@.tmp
+	mv $@.tmp $@
+
+tests/test_bonsai_model: tests/test_bonsai_model.c $(CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+tests/test_bonsai_graph: tests/test_bonsai_graph.c ds4_bonsai.o
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -DDS4_NO_GPU -I. -o $@ $^ -lm
+
+tests/test_bonsai_graph_metal: tests/test_bonsai_graph.c ds4_bonsai.o ds4_bonsai_metal.o
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -DDS4_BONSAI_TEST_METAL -I. -o $@ $^ $(METAL_LDLIBS)
+
+test-bonsai: tests/test_bonsai_quant tests/test_bonsai_graph
+	./tests/test_bonsai_quant
+	./tests/test_bonsai_graph
+
+tests/test_bonsai_metal: tests/test_bonsai_metal.m bonsai_quant.h metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+tests/bench_bonsai_pq2: tests/bench_bonsai_pq2.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+tests/bench_bonsai_elementwise: tests/bench_bonsai_elementwise.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+tests/test_bonsai_mm: tests/test_bonsai_mm.m metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+tests/test_bonsai_mma: tests/test_bonsai_mma.m bonsai_quant.h metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+tests/test_bonsai_fullrows: tests/test_bonsai_fullrows.m bonsai_quant.h metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+tests/test_bonsai_pq2_decode: tests/test_bonsai_pq2_decode.m bonsai_quant.h metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -I. -o $@ $< $(METAL_LDLIBS)
+
+tests/test_bonsai_pairs: tests/test_bonsai_pairs.m metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+tests/test_bonsai_gdn_prefill: tests/test_bonsai_gdn_prefill.m metal/bonsai.metal.inc
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-bonsai test-bonsai-metal bench-bonsai-pq2 bench-bonsai-bf16 bench-bonsai-elementwise bench-bonsai-mm bench-bonsai-mma
+bench-bonsai-pq2: tests/bench_bonsai_pq2
+	./tests/bench_bonsai_pq2
+
+bench-bonsai-bf16: tests/bench_bonsai_pq2
+	./tests/bench_bonsai_pq2 metal/bonsai.metal --bf16
+
+bench-bonsai-elementwise: tests/bench_bonsai_elementwise
+	./tests/bench_bonsai_elementwise
+
+bench-bonsai-mm: tests/test_bonsai_mm
+	./tests/test_bonsai_mm --bench
+
+bench-bonsai-mma: tests/test_bonsai_mma
+	./tests/test_bonsai_mma --bench
+
+test-bonsai-metal: tests/test_bonsai_fullrows tests/test_bonsai_metal tests/test_bonsai_graph_metal tests/test_bonsai_mm tests/test_bonsai_mma tests/test_bonsai_pq2_decode tests/test_bonsai_gdn_prefill tests/test_bonsai_pairs
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_metal
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_graph_metal
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_mm
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_mma
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_fullrows
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_pq2_decode
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_gdn_prefill
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_pairs
