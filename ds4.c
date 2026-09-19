@@ -6113,6 +6113,20 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+#ifdef DS4_ROCM_BUILD
+static bool ds41_rocm_tp_layer_supported(const ds4_layer_weights *l) {
+    return l && l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+        l->attn_output_a && l->attn_output_b &&
+        l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        (l->attn_output_a->type == DS4_TENSOR_Q8_0 ||
+         l->attn_output_a->type == DS4_TENSOR_Q4_K) &&
+        (l->attn_output_b->type == DS4_TENSOR_Q8_0 ||
+         l->attn_output_b->type == DS4_TENSOR_Q4_K);
+}
+#endif
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -41630,6 +41644,7 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
+#ifndef DS4_ROCM_BUILD
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
@@ -41655,23 +41670,20 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
         (!g->imatrix || ds4_gpu_tensor_copy(g->imatrix->attention_input[3], 0,
             g->low, 0, (uint64_t)groups * DS4_N_LORA_O * sizeof(float)));
 }
+#endif
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
 #ifdef DS4_ROCM_BUILD
-    if (g->tp_world == 2u)
-        return l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
-            l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
-            ds4_gpu_dsv41_attention_output_tp_batch(g->block, g->low, m->map, m->size,
-                l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
-                g->heads, 1u, g->tp_rank);
-    if (l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
-        l->attn_output_b->type == DS4_TENSOR_Q8_0)
-        return
-            ds4_gpu_dsv41_attention_output_batch(g->block, g->low, m->map, m->size,
-                l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, g->heads, 1u);
-    return g->tp_world == 1u && ds41_attention_low(g, m, l) &&
-        ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
+    if (!ds4_gpu_dsv41_attention_output_typed_batch(
+            g->block, g->low, m->map, m->size,
+            l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
+            l->attn_output_a->type, l->attn_output_b->type,
+            g->heads, 1u, g->tp_world, g->tp_rank)) return false;
+    /* The typed backend leaves the BF16-rounded low rows intact. Preserve
+     * the output-B input snapshot after the ordered A/B projection. */
+    return !g->imatrix || ds4_gpu_tensor_copy(g->imatrix->attention_input[3], 0,
+        g->low, 0, (uint64_t)(DS4_N_OUT_GROUP / g->tp_world) * DS4_N_LORA_O * sizeof(float));
 #else
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     if (!ds41_attention_low(g, m, l)) return false;
@@ -41685,46 +41697,19 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_output_batch(ds41_gpu_graph *g, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count) {
-#ifdef DS4_ROCM_BUILD
-    /* Keep the ROCm Q8 kernels and their BF16 low boundary. Mixed Q4/Q8
-     * single-device layouts use the typed scalar A projection before B;
-     * the ROCm TP admission check still requires Q8 output weights. */
-    const bool q8 = l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
-                    l->attn_output_b->type == DS4_TENSOR_Q8_0;
-    if (g->tp_world == 2u)
-        return q8 && ds4_gpu_dsv41_attention_output_tp_batch(
-            g->batch.block, g->batch.low, m->map, m->size,
-            l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
-            g->batch.heads, count, g->tp_rank);
-    if (g->tp_world != 1u) return false;
-    if (q8)
-        return ds4_gpu_dsv41_attention_output_batch(
-            g->batch.block, g->batch.low, m->map, m->size,
-            l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
-            g->batch.heads, count);
-    ds41_gpu_graph row = *g;
-    for (uint32_t t = 0; t < count; t++) {
-        row.heads = g->rows_view[t].heads;
-        row.low = g->rows_view[t].low;
-        if (!ds41_attention_low(&row, m, l)) return false;
-    }
-    return ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
-                              g->batch.low, count, false);
-#else
 #ifdef __APPLE__
     /* Q is dead after attention and is available until the FFN reuses it. */
     return ds4_gpu_dsv41_attention_output_typed_workspace_batch(
         g->batch.block, g->batch.low, g->batch.q, m->map, m->size,
 #else
-    /* CUDA batches Q4 with scalar reduction order, keeping the BF16 boundary
-     * between A and B inside the backend and the rank sum outside it. */
+    /* The backend owns the BF16 boundary between A and B; the caller owns
+     * the rank sum and final output rounding. */
     return ds4_gpu_dsv41_attention_output_typed_batch(
         g->batch.block, g->batch.low, m->map, m->size,
 #endif
         l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
         l->attn_output_a->type, l->attn_output_b->type,
         g->batch.heads, count, g->tp_world, g->tp_rank);
-#endif
 }
 
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
@@ -72956,12 +72941,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->tp.role != DS4_TP_NONE) {
         for (uint32_t il = 0; il < DS4_N_LAYER; ++il) {
             const ds4_layer_weights *l = &e->weights.layer[il];
-            if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
-                l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
-                l->ffn_down_exps->type != DS4_TENSOR_Q2_K ||
-                l->attn_output_a->type != DS4_TENSOR_Q8_0 ||
-                l->attn_output_b->type != DS4_TENSOR_Q8_0) {
-                fprintf(stderr, "ds4: V4.1 ROCm TP requires IQ2_XXS gate/up, Q2_K down and Q8_0 attention output weights (layer %u)\n", il);
+            if (!ds41_rocm_tp_layer_supported(l)) {
+                fprintf(stderr, "ds4: V4.1 ROCm TP requires IQ2_XXS gate/up, Q2_K down and Q8_0 or Q4_K attention output weights (layer %u)\n", il);
                 ds4_engine_close(e); *out = NULL; return 1;
             }
         }
@@ -74197,7 +74178,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         const uint32_t attention = ds41_attention_type_id(&e->weights);
         /* KV directories use the low byte, payloads validate the full tag.
