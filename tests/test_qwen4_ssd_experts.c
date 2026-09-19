@@ -453,7 +453,7 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
     enum { MAX_SLOTS = 16, INJ = HC * DS4_QWEN4_HC_CHUNKS * HC };
     const int mm = T > 8;
     need(slots <= MAX_SLOTS && slots >= 4 &&
-         (mm ? T <= 128 && slots == S && !shared && !duplicates && (seed_count == 0 || seed_count == 12) :
+         (mm ? T <= 16384 && slots == S && !shared && !duplicates && (seed_count == 0 || seed_count == 12) :
                T >= 1 && T <= 3 && seed_count <= 4), "split fixture shape");
     const uint32_t unique = mm ? 24u : slots - (duplicates ? 3u : 0u), stride = slots + shared;
     const uint32_t budget = unique > BUDGET ? unique : BUDGET;
@@ -727,6 +727,14 @@ int main(void) {
             check_split_one(formats + f, shapes[i], S, 0, 12, 0, 2, fileno(file), fileno(empty));
         }
     }
+    /* Half operands are private to each large SSD pass. Cross the policy
+     * boundary, grow scratch, then shrink/reuse it with new input contents.
+     * References use the public float path; down I/O failure tests leave an
+     * early half-producing mid in flight before the retry. */
+    check_split_one(formats, 8191, S, 0, 12, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats, 8192, S, 0, 12, 0, 2, fileno(file), fileno(empty));
+    check_split_one(formats, 16384, S, 0, 0, 0, 0, fileno(file), fileno(empty));
+    check_split_one(formats, 8192, S, 0, 12, 0, 0, fileno(file), fileno(empty));
     ds4_gpu_cleanup(); munmap(map, bytes); fclose(empty); fclose(file);
     puts("PASS Qwen SSD: cache, exact selected-only reads, full-selection fallback and retry");
     return 0;

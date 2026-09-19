@@ -48328,6 +48328,14 @@ static bool qwen4_bind_weight(qwen4_bind *b, const void *map, uint64_t size,
     return b->buf != nil;
 }
 
+/* A half shadow is valid only inside one SSD wrapper invocation and for the
+ * exact routed pass that produced it. Public float tensors remain readable
+ * and writable without any hidden cross-call cache association. */
+typedef struct {
+    const ds4_gpu_tensor *mid, *lists, *counts;
+    uint32_t tokens, slots, stride, width, list_cap;
+} qwen4_moe_half_pass;
+
 /* Scoped to one routed mid/down call. Indirect cache buffers are registered
  * on each encoder and protected by the same completion sequence as DeepSeek.
  * Compact staging supplies private address tables backed by owned payloads;
@@ -48345,6 +48353,7 @@ typedef struct {
     /* CPU-only immutable pass counts. Never bound or dereferenced by a GPU;
      * used only to copy active expert IDs into each encoder's setBytes args. */
     const int32_t *mm_pass_counts;
+    qwen4_moe_half_pass *half_pass;
 } qwen4_stream_weights;
 static qwen4_stream_weights *g_qwen4_stream_weights;
 static bool qwen4_moe_mm_m1_ssd(uint32_t n_tokens, uint32_t type);
@@ -48434,6 +48443,14 @@ enum {
     QWEN4_K_MOE_MM_DOWN_NT2,
     QWEN4_K_MOE_MM_DOWN_NT8,
     QWEN4_K_MOE_MM_MID_NT8,
+    QWEN4_K_MOE_MM_MID_F16_NT1,
+    QWEN4_K_MOE_MM_MID_F16_NT2,
+    QWEN4_K_MOE_MM_MID_F16_NT4,
+    QWEN4_K_MOE_MM_MID_F16_NT8,
+    QWEN4_K_MOE_MM_DOWN_F16_NT1,
+    QWEN4_K_MOE_MM_DOWN_F16_NT2,
+    QWEN4_K_MOE_MM_DOWN_F16_NT4,
+    QWEN4_K_MOE_MM_DOWN_F16_NT8,
     QWEN4_K_MOE_MM_MID_NAX,
     QWEN4_K_MOE_MM_DOWN_NAX,
     QWEN4_K_MOE_MM_MID_NAX64,
@@ -48544,6 +48561,14 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_nt2",
     "kernel_qwen4_moe_mm_down_nt8",
     "kernel_qwen4_moe_mm_mid_nt8",
+    "kernel_qwen4_moe_mm_mid_f16_nt1",
+    "kernel_qwen4_moe_mm_mid_f16_nt2",
+    "kernel_qwen4_moe_mm_mid_f16_nt4",
+    "kernel_qwen4_moe_mm_mid_f16_nt8",
+    "kernel_qwen4_moe_mm_down_f16_nt1",
+    "kernel_qwen4_moe_mm_down_f16_nt2",
+    "kernel_qwen4_moe_mm_down_f16_nt4",
+    "kernel_qwen4_moe_mm_down_f16_nt8",
     "kernel_qwen4_moe_mm_mid_nax",
     "kernel_qwen4_moe_mm_down_nax",
     "kernel_qwen4_moe_mm_mid_nax64",
@@ -50318,7 +50343,15 @@ static ds4_gpu_tensor *g_qwen4_nax_half_x, *g_qwen4_nax_half_mid, *g_qwen4_nax_h
 static uint64_t g_qwen4_nax_half_x_bytes, g_qwen4_nax_half_mid_bytes, g_qwen4_nax_half_midr_bytes;
 static const ds4_gpu_tensor *g_qwen4_nax_half_mid_for;
 static uint64_t g_qwen4_nax_half_mid_count;
+/* Separate storage from tensor-op scratch: the M1 simdgroup path preserves
+ * its original accumulation and only shares already-half-rounded operands. */
+static ds4_gpu_tensor *g_qwen4_half_x, *g_qwen4_half_mid;
+static uint64_t g_qwen4_half_x_bytes, g_qwen4_half_mid_bytes;
 static void qwen4_nax_release_scratch(void) {
+    ds4_gpu_tensor_free(g_qwen4_half_x);
+    ds4_gpu_tensor_free(g_qwen4_half_mid);
+    g_qwen4_half_x = g_qwen4_half_mid = NULL;
+    g_qwen4_half_x_bytes = g_qwen4_half_mid_bytes = 0;
     if (g_qwen4_nax_half_x) ds4_gpu_tensor_free(g_qwen4_nax_half_x);
     if (g_qwen4_nax_half_mid) ds4_gpu_tensor_free(g_qwen4_nax_half_mid);
     if (g_qwen4_nax_half_midr) ds4_gpu_tensor_free(g_qwen4_nax_half_midr);
@@ -50365,11 +50398,13 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap) {
+    qwen4_moe_half_pass *hp = g_qwen4_stream_weights ? g_qwen4_stream_weights->half_pass : NULL;
+    if (hp) hp->mid = NULL;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, weight_type, true);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_MID_NT");
-    const int kernel = nt == 1u ? QWEN4_K_MOE_MM_MID_NT1 :
+    int kernel = nt == 1u ? QWEN4_K_MOE_MM_MID_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_MID_NT2 :
                        nt == 8u ? QWEN4_K_MOE_MM_MID_NT8 : QWEN4_K_MOE_MM_MID;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
@@ -50391,6 +50426,8 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     const uint32_t dispatch_experts = qwen4_moe_mm_dispatch_experts(&args);
     if (dispatch_experts == UINT32_MAX) return 0;
     if (!dispatch_experts) {
+        if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
+            g_qwen4_stream_weights->half_pass->mid = NULL;
         /* No mid rows were produced or consumed. Do not let an unrelated
          * earlier NAX half-copy association survive this empty pass. */
         g_qwen4_nax_half_mid_for = NULL;
@@ -50439,15 +50476,35 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
                               qwen4_moe_mm_grid((ff_dim + 63u) / 64u, dispatch_experts, 1, args.expert_major),
                               MTLSizeMake(128, 1, 1), nax_fx || nax_comp ? 12288u : 10240u);
     }
-    if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 6,
+    const uint64_t half_x_bytes = (uint64_t)n_tokens * in_dim * sizeof(uint16_t);
+    const uint64_t half_mid_bytes = (uint64_t)n_tokens * n_out * ff_dim * sizeof(uint16_t);
+    /* Allocate both operands before encoding anything. If optional scratch
+     * does not fit, the original float path can still serve this pass. */
+    const bool half = hp &&
+        qwen4_nax_scratch(&g_qwen4_half_x, &g_qwen4_half_x_bytes, half_x_bytes) &&
+        qwen4_nax_scratch(&g_qwen4_half_mid, &g_qwen4_half_mid_bytes, half_mid_bytes);
+    if (half) {
+        [g_transient_buffers addObject:ds4_gpu_tensor_buffer(g_qwen4_half_x)];
+        [g_transient_buffers addObject:ds4_gpu_tensor_buffer(g_qwen4_half_mid)];
+        /* Reconvert on every producer call: x is a reused graph buffer and
+         * its address alone cannot establish that its contents are current. */
+        ds4_gpu_tensor *xh = qwen4_nax_half_operand(&g_qwen4_half_x, &g_qwen4_half_x_bytes,
+                                                   x, (uint64_t)n_tokens * in_dim);
+        if (!xh || !qwen4_bind_tensor(&b[4], xh, half_x_bytes, "moe input half") ||
+            !qwen4_bind_tensor(&b[6], g_qwen4_half_mid, half_mid_bytes, "moe mid half shadow")) return 0;
+        kernel = nt == 1u ? QWEN4_K_MOE_MM_MID_F16_NT1 : nt == 2u ? QWEN4_K_MOE_MM_MID_F16_NT2 :
+                 nt == 8u ? QWEN4_K_MOE_MM_MID_F16_NT8 : QWEN4_K_MOE_MM_MID_F16_NT4;
+    }
+    if (!qwen4_dispatch(kernel, &args, sizeof(args), b, half ? 7 : 6,
                           qwen4_moe_mm_grid((ff_dim + 31u) / 32u, dispatch_experts, tiles, args.expert_major),
                           MTLSizeMake(128, 1, 1), 0)) return 0;
     if (tails) {
         const MTLSize tail_grid = MTLSizeMake((ff_dim + 31u) / 32u, dispatch_experts, 1);
-        if (!qwen4_dispatch(QWEN4_K_MOE_MM_MID_NT1, &args, sizeof(args), b, 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
-        if (nt > 2u && !qwen4_dispatch(QWEN4_K_MOE_MM_MID_NT2, &args, sizeof(args), b, 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
-        if (nt > 4u && !qwen4_dispatch(QWEN4_K_MOE_MM_MID, &args, sizeof(args), b, 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (!qwen4_dispatch(half ? QWEN4_K_MOE_MM_MID_F16_NT1 : QWEN4_K_MOE_MM_MID_NT1, &args, sizeof(args), b, half ? 7 : 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 2u && !qwen4_dispatch(half ? QWEN4_K_MOE_MM_MID_F16_NT2 : QWEN4_K_MOE_MM_MID_NT2, &args, sizeof(args), b, half ? 7 : 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 4u && !qwen4_dispatch(half ? QWEN4_K_MOE_MM_MID_F16_NT4 : QWEN4_K_MOE_MM_MID, &args, sizeof(args), b, half ? 7 : 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
     }
+    if (half) *hp = (qwen4_moe_half_pass){mid, lists, counts, n_tokens, n_slots, n_out, ff_dim, list_cap};
     return 1;
 }
 
@@ -50456,12 +50513,15 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
+    qwen4_moe_half_pass *hp = g_qwen4_stream_weights ? g_qwen4_stream_weights->half_pass : NULL;
+    const qwen4_moe_half_pass producer = hp ? *hp : (qwen4_moe_half_pass){0};
+    if (hp) hp->mid = NULL; /* consume even if validation or dispatch fails */
     const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, weight_type, false);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
-    const int kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_NT1 :
+    int kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_DOWN_NT2 :
                        nt == 8u ? QWEN4_K_MOE_MM_DOWN_NT8 : QWEN4_K_MOE_MM_DOWN;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, ff_dim, out_dim, weight_type, row_bytes, list_cap,
@@ -50482,6 +50542,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint32_t dispatch_experts = qwen4_moe_mm_dispatch_experts(&args);
     if (dispatch_experts == UINT32_MAX) return 0;
     if (!dispatch_experts) {
+        if (g_qwen4_stream_weights && g_qwen4_stream_weights->half_pass)
+            g_qwen4_stream_weights->half_pass->mid = NULL;
         /* No mid rows were produced or consumed. Do not let an unrelated
          * earlier NAX half-copy association survive this empty pass. */
         g_qwen4_nax_half_mid_for = NULL;
@@ -50532,14 +50594,24 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
                               qwen4_moe_mm_grid((out_dim + 63u) / 64u, dispatch_experts, 1, args.expert_major),
                               MTLSizeMake(128, 1, 1), 8192u);
     }
+    const bool half = producer.mid == mid && producer.lists == lists && producer.counts == counts &&
+        producer.tokens == n_tokens && producer.slots == n_slots && producer.stride == n_out &&
+        producer.width == ff_dim && producer.list_cap == list_cap;
+    if (half) {
+        const uint64_t bytes = (uint64_t)n_tokens * n_out * ff_dim * sizeof(uint16_t);
+        if (!g_qwen4_half_mid || !qwen4_bind_tensor(&b[3], g_qwen4_half_mid, bytes, "moe mid half shadow")) return 0;
+        [g_transient_buffers addObject:ds4_gpu_tensor_buffer(g_qwen4_half_mid)];
+        kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_F16_NT1 : nt == 2u ? QWEN4_K_MOE_MM_DOWN_F16_NT2 :
+                 nt == 8u ? QWEN4_K_MOE_MM_DOWN_F16_NT8 : QWEN4_K_MOE_MM_DOWN_F16_NT4;
+    }
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
                           qwen4_moe_mm_grid((out_dim + 31u) / 32u, dispatch_experts, tiles, args.expert_major),
                           MTLSizeMake(128, 1, 1), 0)) return 0;
     if (tails) {
         const MTLSize tail_grid = MTLSizeMake((out_dim + 31u) / 32u, dispatch_experts, 1);
-        if (!qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT1, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
-        if (nt > 2u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT2, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
-        if (nt > 4u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (!qwen4_dispatch(half ? QWEN4_K_MOE_MM_DOWN_F16_NT1 : QWEN4_K_MOE_MM_DOWN_NT1, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 2u && !qwen4_dispatch(half ? QWEN4_K_MOE_MM_DOWN_F16_NT2 : QWEN4_K_MOE_MM_DOWN_NT2, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 4u && !qwen4_dispatch(half ? QWEN4_K_MOE_MM_DOWN_F16_NT4 : QWEN4_K_MOE_MM_DOWN, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
     }
     return 1;
 }
@@ -50671,6 +50743,7 @@ typedef struct {
     uint32_t resident_mask[3], missing_mask[3];
     double resident_ms, missing_t0;
     bool started, split, missing_mid_submitted;
+    qwen4_moe_half_pass *half_pass;
 } qwen4_stream_mid_overlap;
 
 static int qwen4_stream_mid_before_read(
@@ -50683,7 +50756,7 @@ static int qwen4_stream_mid_before_read(
     const bool mm = p->lists != NULL;
     const uint32_t routed_mask = (1u << p->n_slots) - 1u;
     qwen4_stream_weights snapshot = { .table = t, .addresses = true,
-        .masked_tokens = mm ? 0u : p->n_tokens, .frequency = p->frequency };
+        .masked_tokens = mm ? 0u : p->n_tokens, .frequency = p->frequency, .half_pass = p->half_pass };
     for (uint32_t u = 0; u < n_unique; u++) {
         if (!entries[u]) continue;
         snapshot.entries[snapshot.n_entries++] = entries[u];
@@ -50794,7 +50867,7 @@ static int qwen4_stream_missing_gate_up_ready(
     if (!p->lists || !n_pairs) return 0;
     const NSUInteger addr_bytes = (NSUInteger)t->n_total_expert * sizeof(uint64_t);
     qwen4_stream_weights snapshot = { .table = t, .addresses = true,
-        .frequency = p->frequency };
+        .frequency = p->frequency, .half_pass = p->half_pass };
     snapshot.gate = [g_device newBufferWithLength:addr_bytes options:MTLResourceStorageModeShared];
     snapshot.up = [g_device newBufferWithLength:addr_bytes options:MTLResourceStorageModeShared];
     NSMutableSet<id<MTLBuffer>> *payloads = [NSMutableSet set];
@@ -50901,11 +50974,17 @@ int ds4_gpu_qwen4_moe_stream_tensor(
 
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
     if (!ids) return 0;
-    qwen4_stream_weights stream = { .table = table };
+    qwen4_moe_half_pass half_pass = {0};
+    /* The complete SSD workload benefits at 8192 tokens. The 2048-token
+     * microbenchmark gain did not translate into a reliable total gain;
+     * smaller chunks retain the original path without extra scratch. */
+    const bool half_prefill = mm && gate_type == 16u && down_type == 10u && n_tokens >= 8192u &&
+                              ds4_gpu_device_name_contains("M1 Max");
+    qwen4_stream_weights stream = { .table = table, .half_pass = half_prefill ? &half_pass : NULL };
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = {0};
     qwen4_stream_mid_overlap overlap = {
         .table = table, .mid = mid, .part = part, .x = x, .selected = selected, .ids = ids,
-        .lists = lists, .frequency = frequency, .list_cap = list_cap,
+        .lists = lists, .frequency = frequency, .list_cap = list_cap, .half_pass = stream.half_pass,
         .gate_type = gate_type, .down_type = down_type, .n_tokens = n_tokens,
         .n_slots = n_slots, .in_dim = in_dim, .ff_dim = ff_dim, .shared_down_type = shared_down_type,
         .shared_type = shared_type, .shared_gate_offset = shared_gate_offset,

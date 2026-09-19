@@ -1100,7 +1100,11 @@ static ds4_context_memory qwen4_graph_memory_estimate(uint32_t ctx, uint32_t pre
         (uint64_t)(mtp ? 12u : 4u) * DS4_N_VOCAB;
     if (mtp) fixed += 12u * (hc + 1u) * E + 4u * hc_dim + 1u +
         2u * (((uint64_t)DS4_N_VOCAB + 4095u) / 4096u);
-    m.scratch_bytes = (T * ((gpu_row > old_row ? gpu_row : old_row) + hc_dim + 4u) + fixed) * 4u;
+    /* Reserve optional half copies of x and the routed MoE intermediate.
+     * Units here are float words; the legacy conservative estimate already
+     * covers these copies for the supported Qwen shapes. */
+    const uint64_t gpu_reserved_row = gpu_row + (E + used * F + 1u) / 2u;
+    m.scratch_bytes = (T * ((gpu_reserved_row > old_row ? gpu_reserved_row : old_row) + hc_dim + 4u) + fixed) * 4u;
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
     return m;
 }
