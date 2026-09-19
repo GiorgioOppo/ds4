@@ -14,6 +14,8 @@ deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
 
+This branch also supports native text inference for [Ternary Bonsai 2 27B](docs/BONSAI.md) on Metal and a CPU reference path.
+
 We test things in integration: model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
