@@ -84,6 +84,12 @@ Qwen fills its expert cache on demand, so `--ssd-streaming-cold` does not
 change its preload behavior. Popularity preloading and the GLM-specific
 `--ssd-streaming-full-layers` option are not supported for Qwen.
 
+On M1 Max, the shared half-operand MoE prefill path requires IQ2_XXS gate/up,
+Q2_K down and at least 8192 actual tokens in one streamed batch. The configured
+`--prefill-chunk` is only an upper limit: a 5760-token prompt with chunk 8192
+does not activate this path. Comparing that prompt at chunks 2048 and 8192
+measures the change in batching, not an isolated half-operand kernel gain.
+
 On a DGX Spark, build with `make cuda-spark` instead of `make`. Both Q2 and
 Q4 fit resident on an otherwise idle 128 GB Spark; the n-grams stay on SSD.
 The same commands support text, vision, MTP, steering and text-session
@@ -285,6 +291,63 @@ stale cache contents and payload restore, followed by greedy, depth-three
 and exact-sampling continuation checks. It uses a 128-token context and a
 1024-expert cache request. The small-buffer MTP CLI regression also accepts
 `--ssd-streaming`.
+
+For the sparse-attention boundary and a 17408-token prefix, use the longer
+predictor regression:
+
+```sh
+./tests/test_qwen4_mtp_prefill gguf/Qwen3.8-Flash-Next-Q2.gguf \
+  --ssd-streaming --long-context --prefill-chunk 2048 \
+  --dump-prefix /tmp/qwen-mtp-long-2048
+```
+
+Repeat with `--prefill-chunk 128` and a different dump prefix. The fixture
+uses repeated, fixed chat token IDs, one graph, a 17416-token context and a
+1024-expert cache request. It runs the trunk once and probes actual residual
+rows across the first sparse query and at the final prefix. Each probe
+compares cache-only preparation, the optimized last-row predictor and a
+recursive draft with the frozen full-layer reference, using identical input
+rows and lookahead tokens. It checks complete logits, cache contents, EH
+projections, residuals and unchanged trunk state for T1/T2/T3 and exact T3
+verification. Destination cache rows are poisoned before each replay.
+Bit-identical comparisons are between the candidate and frozen reference
+replayed from the same saved predictor state within each run. Equality between
+chunk sizes is checked separately: chunk-dependent grouping can change the
+arithmetic used to build the historical predictor cache.
+
+`--dump-prefix` writes the fixture IDs, target/trunk captures, reference and
+candidate predictor logits, and a JSONL manifest for comparisons between
+builds. `--prefix-tokens N` changes the fixture length; it must be a multiple
+of four covering the sparse boundary. These are implementation checks on a
+synthetic sequence, not a quality evaluation or an acceptance-rate benchmark.
+Comparing MTP acceptance between commits additionally requires the same
+prompt, sampling settings and draft-depth policy. A trunk arithmetic change
+can alter predictor inputs even when the predictor itself remains correct.
+
+On an M1 Max with 32 GiB and Q2 SSD streaming, the 17408-token fixture passed
+at chunks 128 and 2048 on `11811b9`, and at chunk 2048 on `04c0867` and
+`89986c3`. At chunk 2048, all 36 captured tensors from `89986c3` and `11811b9`
+were byte-identical. Differences from `04c0867` already appeared in the trunk
+residuals after the attention fix in `89986c3`; both predictor implementations
+followed those changed inputs.
+
+Between chunks 128 and 2048 on `11811b9`, the two captured trunk slices and
+final target logits were byte-identical. Predictor logits differed by at most
+0.0001266003, with no argmax change in the 16 full/recursive comparisons. A
+separate replay of identical rows as T3, T1+1+1, T2+1 and T1+2 found arithmetic
+differences beginning at the HC down projection; its per-stage differences
+were identical on `04c0867` and `11811b9`. This identifies an existing source
+of grouping-dependent predictor cache values, not a demonstrated quality or
+acceptance regression. The full-model runs above do not exercise the
+8192-row half-operand path.
+
+The independent `test_metal_qwen4_moe_half` comparison against the shader
+source from `89986c3` also passed 31 fixtures, including 8192 rows, with Metal
+API validation. Full shader validation exceeded the M1 threadgroup-memory
+limit for the NT8 gate/up stress case (36864 bytes reported, 32768 available).
+A separate NT1/2/4 subset passed with shader validation, including the
+8192-row fixture at mid NT4/down NT4. These kernel checks do not replace an
+8192-chunk full-model acceptance comparison.
 
 Official Alibaba continuations are tracked for 100 short prompts and 12
 archive/code prompts from 2K to 24K tokens. Build the quality scorer, then run

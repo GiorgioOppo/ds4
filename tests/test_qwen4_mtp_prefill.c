@@ -479,10 +479,356 @@ static void check_payload_modes(ds4_session *live, ds4_session *reference,
     puts("PASS MTP on/off payload compatibility, prefix replay and legacy-tag rejection");
 }
 
+/* The long fixture runs the trunk only once. At the first sparse query and
+ * at the deep prefix, replay one predictor layer over three actual trunk
+ * rows. Saving only the predictor cache keeps this feasible with SSD model
+ * weights on a 32 GiB Mac; no second context or full-model snapshot is used.
+ * This isolates optimized predictor arithmetic from upstream trunk changes.
+ * It does not measure speculative acceptance or establish model quality. */
+enum { LONG_PREFIX = 17408, LONG_CHUNK = 128 };
+
+typedef struct {
+    ds4_session *s;
+    const ds4_tokens *tokens;
+    uint32_t prefix, previous, boundary, probes;
+    const char *dump_prefix;
+    FILE *manifest;
+} long_check;
+
+typedef struct {
+    frontier state;
+    uint32_t last_rows, tail_pos;
+    int tail_next;
+    bool tail_valid, tail_cached, verify;
+    qwen4_projection_phase phase;
+    void *positions;
+} predictor_seed;
+
+static void finite_f32(const char *what, const float *v, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        if (!isfinite(v[i])) {
+            fprintf(stderr, "Qwen MTP long prefill: %s has nonfinite value at %llu\n",
+                    what, (unsigned long long)i);
+            exit(1);
+        }
+    }
+}
+
+static void finite_f16(const char *what, const void *p, uint64_t bytes) {
+    const uint16_t *v = p;
+    for (uint64_t i = 0; i < bytes / sizeof(*v); i++) {
+        if ((v[i] & 0x7c00u) == 0x7c00u) {
+            fprintf(stderr, "Qwen MTP long prefill: %s has nonfinite half at %llu\n",
+                    what, (unsigned long long)i);
+            exit(1);
+        }
+    }
+}
+
+static void finite_frontier(const frontier *f) {
+    finite_f16("nextn K", f->k, f->kv_bytes);
+    finite_f16("nextn V", f->v, f->kv_bytes);
+    finite_f32("nextn indexer keys", f->ik, f->ik_bytes / sizeof(float));
+    finite_f16("nextn pooled keys", f->block, f->block_bytes);
+    finite_f32("retained trunk row", f->tail, (uint64_t)DS4_N_EMBD * DS4_N_HC);
+    finite_f32("target logits", f->logits, DS4_N_VOCAB);
+}
+
+static void dump_long(const long_check *p, uint32_t idx, uint32_t T, bool verify,
+                       const char *kind, const void *data, uint64_t bytes) {
+    if (!p->dump_prefix) return;
+    char path[4096];
+    const int n = snprintf(path, sizeof(path), "%s.pos%u.T%u.verify%u.%s",
+                           p->dump_prefix, idx, T, verify, kind);
+    need(n > 0 && (size_t)n < sizeof(path), "bounded dump path");
+    FILE *f = fopen(path, "wb");
+    need(f != NULL, "open long-context dump");
+    const bool ok = fwrite(data, 1, (size_t)bytes, f) == (size_t)bytes;
+    const int close_rc = fclose(f);
+    need(ok && close_rc == 0, "write long-context dump");
+}
+
+static predictor_seed save_predictor(ds4_session *s, uint32_t batch, uint32_t idx) {
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const uint32_t il = DS4_N_LAYER - 1u;
+    predictor_seed seed = {.state = capture(s, batch), .last_rows = g->mtp_last_rows,
+        .tail_pos = g->mtp_tail_pos, .tail_next = g->mtp_tail_next_token,
+        .tail_valid = g->mtp_tail_valid, .tail_cached = g->mtp_tail_cached,
+        .verify = g->verify_rows_exact, .phase = g->projection_phase};
+    finite_frontier(&seed.state);
+    finite_f32("actual trunk rows", seed.state.residual,
+               seed.state.residual_bytes / sizeof(float));
+    /* A recursive probe may write one row beyond the actual prefix. Retain
+     * that storage too, without interpreting uninitialized future bytes. */
+    uint32_t saved_rows = seed.state.mtp_rows;
+    if (saved_rows < idx + 4u) saved_rows = idx + 4u;
+    free(seed.state.k); free(seed.state.v); free(seed.state.ik); free(seed.state.block);
+    seed.state.kv_bytes = qwen4_payload_kv_bytes(saved_rows);
+    seed.state.ik_bytes = qwen4_payload_ik_bytes(saved_rows);
+    seed.state.block_bytes = qwen4_payload_block_key_bytes(saved_rows);
+    seed.state.k = read_bytes(g->layer_k_cache[il], seed.state.kv_bytes);
+    seed.state.v = read_bytes(g->layer_v_cache[il], seed.state.kv_bytes);
+    seed.state.ik = read_bytes(g->layer_ik_cache[il], seed.state.ik_bytes);
+    seed.state.block = read_bytes(g->layer_block_key[il], seed.state.block_bytes);
+    seed.positions = malloc(4u * 4u * sizeof(uint32_t));
+    need(seed.positions && ds4_gpu_tensor_read(g->pos3,
+        (uint64_t)idx * 4u * sizeof(uint32_t), seed.positions, 4u * 4u * sizeof(uint32_t)),
+        "save probe RoPE positions");
+    return seed;
+}
+
+static void restore_predictor(ds4_session *s, const predictor_seed *seed,
+                              uint32_t idx, bool probe, bool verify) {
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const uint32_t il = DS4_N_LAYER - 1u;
+    const frontier *f = &seed->state;
+    need(ds4_gpu_tensor_write(g->layer_k_cache[il], 0, f->k, f->kv_bytes) &&
+         ds4_gpu_tensor_write(g->layer_v_cache[il], 0, f->v, f->kv_bytes) &&
+         ds4_gpu_tensor_write(g->layer_ik_cache[il], 0, f->ik, f->ik_bytes) &&
+         ds4_gpu_tensor_write(g->layer_block_key[il], 0, f->block, f->block_bytes) &&
+         ds4_gpu_tensor_write(g->pos3, (uint64_t)idx * 4u * sizeof(uint32_t),
+                              seed->positions, 4u * 4u * sizeof(uint32_t)),
+         "restore predictor-only cache and positions");
+    if (probe) {
+        /* Existing real prefix rows would hide a skipped cache publication.
+         * Poison only rows that the probe must recreate; older causal rows
+         * remain the identical real prefix for both executions. */
+        const uint64_t kv_bytes = qwen4_payload_kv_bytes(4u);
+        const uint64_t ik_bytes = qwen4_payload_ik_bytes(4u);
+        const uint64_t block_bytes = qwen4_payload_block_key_bytes(4u);
+        const uint64_t max_bytes = kv_bytes > ik_bytes ? kv_bytes : ik_bytes;
+        void *poison = malloc((size_t)max_bytes);
+        need(poison != NULL && max_bytes >= block_bytes, "long cache poison allocation");
+        memset(poison, 0xff, (size_t)max_bytes);
+        need(ds4_gpu_tensor_write(g->layer_k_cache[il], qwen4_payload_kv_bytes(idx), poison, kv_bytes) &&
+             ds4_gpu_tensor_write(g->layer_v_cache[il], qwen4_payload_kv_bytes(idx), poison, kv_bytes) &&
+             ds4_gpu_tensor_write(g->layer_ik_cache[il], qwen4_payload_ik_bytes(idx), poison, ik_bytes) &&
+             ds4_gpu_tensor_write(g->layer_block_key[il], qwen4_payload_block_key_bytes(idx),
+                                  poison, block_bytes), "poison cache rows under test");
+        free(poison);
+    }
+    g->mtp_pos = probe ? idx : f->mtp_rows;
+    g->mtp_last_rows = seed->last_rows;
+    g->mtp_tail_pos = seed->tail_pos; g->mtp_tail_next_token = seed->tail_next;
+    g->mtp_tail_valid = seed->tail_valid; g->mtp_tail_cached = seed->tail_cached;
+    g->projection_phase = seed->phase;
+    g->verify_rows_exact = probe ? verify : seed->verify;
+    ds4_gpu_qwen4_set_verify_rows_exact(g->verify_rows_exact);
+}
+
+static void check_long_trunk(ds4_session *s, const predictor_seed *seed) {
+    void *got = read_bytes(s->qwen4_graph.R, seed->state.residual_bytes);
+    exact("long unmodified trunk residual", got, seed->state.residual,
+          (size_t)seed->state.residual_bytes);
+    free(got);
+    exact("long unmodified target logits", s->logits, seed->state.logits,
+          (size_t)DS4_N_VOCAB * sizeof(float));
+}
+
+static void future_position(ds4_qwen4_gpu_graph *g, uint32_t idx) {
+    uint32_t pos3[4] = {0};
+    int32_t delta = g->mrope_delta;
+    qwen4_mrope_pos(NULL, 0, idx, &delta, pos3);
+    need(ds4_gpu_tensor_write(g->pos3, (uint64_t)idx * sizeof(pos3), pos3, sizeof(pos3)),
+         "long recursive RoPE position");
+}
+
+static void check_long_probe(long_check *p, uint32_t idx, uint32_t row, uint32_t batch) {
+    ds4_session *s = p->s;
+    ds4_engine *e = s->engine;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const uint64_t residual_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    need(row + 3u <= batch && idx + 4u < g->ctx_cap && idx + 3u < (uint32_t)p->tokens->len,
+         "long probe has actual rows, lookahead and context capacity");
+    predictor_seed seed = save_predictor(s, batch, idx);
+    const int *next = p->tokens->v + idx + 1u;
+    float *want = malloc((size_t)logits_bytes), *recursive = malloc((size_t)logits_bytes);
+    float *got = malloc((size_t)logits_bytes);
+    need(want && recursive && got, "long predictor comparison buffers");
+    dump_long(p, g->pos, 1u, false, "target.f32", s->logits, logits_bytes);
+    dump_long(p, idx, 3u, false, "trunk.f32",
+              (char *)seed.state.residual + row * residual_bytes, 3u * residual_bytes);
+    for (unsigned mode = 0; mode < 4u; mode++) {
+        const uint32_t T = mode < 3u ? mode + 1u : 3u;
+        const bool verify = mode == 3u;
+        const uint64_t proj_bytes = (uint64_t)T * (DS4_N_HC + 1u) * DS4_N_EMBD * sizeof(float);
+        int want_draft = -1, recursive_draft = -1, got_draft = -1;
+        restore_predictor(s, &seed, idx, true, verify);
+        need(reference_mtp_steps(g, &e->model, &e->weights, row, next, T, idx,
+                                 true, want, &want_draft), "long frozen complete predictor");
+        frontier expected = capture(s, 0);
+        finite_frontier(&expected); finite_f32("frozen predictor logits", want, DS4_N_VOCAB);
+        void *proj = read_bytes(g->mtp_proj, proj_bytes);
+        void *last = malloc((size_t)residual_bytes);
+        need(last && ds4_gpu_tensor_read(g->mtp_R, (T - 1u) * residual_bytes, last, residual_bytes),
+             "save frozen last predictor residual");
+        finite_f32("frozen EH projection", proj, proj_bytes / sizeof(float));
+        finite_f32("frozen predictor residual", last, residual_bytes / sizeof(float));
+        check_long_trunk(s, &seed);
+
+        future_position(g, idx + T);
+        ds4_gpu_tensor *saved_R = g->R;
+        ds4_gpu_tensor *last_view = ds4_gpu_tensor_view(g->mtp_R, (T - 1u) * residual_bytes, residual_bytes);
+        need(last_view != NULL, "long frozen recursive input view");
+        g->R = last_view;
+        const bool reference_ok = reference_mtp_steps(g, &e->model, &e->weights,
+            0, &want_draft, 1u, idx + T, true, recursive, &recursive_draft);
+        g->R = saved_R;
+        ds4_gpu_tensor_free(last_view);
+        need(reference_ok, "long frozen recursive predictor");
+        frontier recursive_expected = capture(s, 0);
+        finite_frontier(&recursive_expected);
+        finite_f32("frozen recursive logits", recursive, DS4_N_VOCAB);
+        void *recursive_R = read_bytes(g->mtp_R, residual_bytes);
+        finite_f32("frozen recursive residual", recursive_R, residual_bytes / sizeof(float));
+
+        restore_predictor(s, &seed, idx, true, verify);
+        need(qwen4_graph_mtp_cache_steps(g, &e->model, &e->weights, row, next, T, idx),
+             "long optimized cache-only predictor");
+        need(g->mtp_last_rows == 0, "long cache-only rows publish no predictor output");
+        compare_frontier(s, &expected, false);
+        void *actual = read_bytes(g->mtp_proj, proj_bytes);
+        exact("long cache-only EH projection", actual, proj, (size_t)proj_bytes); free(actual);
+        check_long_trunk(s, &seed);
+
+        restore_predictor(s, &seed, idx, true, verify);
+        need(qwen4_graph_mtp_steps(g, &e->model, &e->weights, row, next, T, idx,
+                                 true, got, &got_draft), "long optimized last-row predictor");
+        dump_long(p, idx, T, verify, "reference.f32", want, logits_bytes);
+        dump_long(p, idx, T, verify, "candidate.f32", got, logits_bytes);
+        finite_f32("optimized predictor logits", got, DS4_N_VOCAB);
+        exact("long full predictor logits", got, want, (size_t)logits_bytes);
+        need(got_draft == want_draft && got_draft == sample_argmax(got, DS4_N_VOCAB) &&
+             g->mtp_pos == idx + T && g->mtp_last_rows == T, "long predictor draft and row layout");
+        compare_frontier(s, &expected, false);
+        actual = read_bytes(g->mtp_proj, proj_bytes);
+        exact("long full EH projection", actual, proj, (size_t)proj_bytes); free(actual);
+        actual = malloc((size_t)residual_bytes);
+        need(actual && ds4_gpu_tensor_read(g->mtp_R, (T - 1u) * residual_bytes, actual, residual_bytes),
+             "read long last predictor residual");
+        exact("long last predictor residual", actual, last, (size_t)residual_bytes); free(actual);
+
+        future_position(g, idx + T);
+        need(qwen4_graph_mtp_chain_step(g, &e->model, &e->weights, got_draft,
+                                       idx + T, &got_draft), "long optimized recursive predictor");
+        need(ds4_gpu_tensor_read(g->logits, 0, got, logits_bytes), "read long recursive logits");
+        dump_long(p, idx, T, verify, "reference-recursive.f32", recursive, logits_bytes);
+        dump_long(p, idx, T, verify, "candidate-recursive.f32", got, logits_bytes);
+        finite_f32("optimized recursive logits", got, DS4_N_VOCAB);
+        exact("long recursive predictor logits", got, recursive, (size_t)logits_bytes);
+        need(got_draft == recursive_draft && g->mtp_pos == idx + T + 1u && g->mtp_last_rows == 1u,
+             "long recursive draft and cache frontier");
+        compare_frontier(s, &recursive_expected, false);
+        actual = read_bytes(g->mtp_R, residual_bytes);
+        exact("long recursive residual", actual, recursive_R, (size_t)residual_bytes); free(actual);
+        check_long_trunk(s, &seed);
+        if (p->manifest) {
+            fprintf(p->manifest, "{\"idx\":%u,\"T\":%u,\"verify\":%u,\"trunk_frontier\":%u,"
+                    "\"next_tokens\":[%d,%d,%d],\"draft\":%d,\"recursive_draft\":%d}\n",
+                    idx, T, verify, g->pos, next[0], next[1], next[2], want_draft, recursive_draft);
+            need(fflush(p->manifest) == 0, "flush long-context manifest");
+        }
+        printf("PASS long MTP idx=%u T=%u verify=%u: cache, EH, residual, full logits and recursive draft exact\n",
+               idx, T, verify);
+        fflush(stdout);
+        free_frontier(&recursive_expected); free_frontier(&expected);
+        free(recursive_R); free(last); free(proj);
+    }
+    restore_predictor(s, &seed, idx, false, false);
+    /* The session's host logits never changed. Restore the device head too,
+     * so this callback remains transparent to ordinary continuation. */
+    need(ds4_gpu_tensor_write(g->logits, 0, seed.state.logits, logits_bytes), "restore target device logits");
+    check_long_trunk(s, &seed);
+    free(seed.positions); free_frontier(&seed.state);
+    free(got); free(recursive); free(want);
+    p->probes++;
+}
+
+static void check_long_progress(void *opaque, const char *phase, int completed, int total) {
+    long_check *p = opaque;
+    if (strcmp(phase, "prefill_chunk")) return;
+    need(completed > (int)p->previous && completed <= total && (uint32_t)total == p->prefix,
+         "long prefill progress frontier");
+    const uint32_t end = (uint32_t)completed, batch = end - p->previous;
+    const uint32_t probes[] = {p->boundary - 2u, p->prefix - 3u};
+    for (unsigned i = 0; i < 2u; i++) {
+        if (probes[i] >= p->previous && probes[i] + 3u <= end)
+            check_long_probe(p, probes[i], probes[i] - p->previous, batch);
+    }
+    printf("long prefill %u/%u tokens\n", end, p->prefix); fflush(stdout);
+    p->previous = end;
+}
+
+static void run_long_test(ds4_engine *engine, uint32_t prefix_rows, uint32_t chunk,
+                           const char *dump_prefix) {
+    ds4_session *s = NULL;
+    const uint32_t ctx = prefix_rows + 8u;
+    need(ds4_session_create(&s, engine, (int)ctx) == 0, "allocate one long-context session");
+    need(s->qwen4_graph.cap_tokens == chunk, "requested long-context chunk size");
+    const uint32_t boundary = (s->qwen4_graph.k_blocks + 1u) * 4u - 1u;
+    need(prefix_rows >= boundary + 5u && prefix_rows % 4u == 0,
+         "long prefix covers sparse boundary and separate deep probe");
+    ds4_tokens phrase = {0}, tokens = {0};
+    ds4_encode_chat_prompt(engine, NULL,
+        "Count from one to ten and explain the pattern. Then compare Roman roads, aqueducts, "
+        "trade and laws with their modern equivalents. Keep each answer clear and factual.",
+        DS4_THINK_NONE, &phrase);
+    need(phrase.len >= 8, "real long-context fixture token IDs");
+    /* Fixed teacher-forced IDs make both chunk sizes and historical builds
+     * comparable. This repeated synthetic fixture is not a quality corpus. */
+    for (uint32_t i = 0; i < prefix_rows + 4u; i++)
+        ds4_tokens_push(&tokens, phrase.v[i % (uint32_t)phrase.len]);
+    long_check p = {.s = s, .tokens = &tokens, .prefix = prefix_rows,
+                   .boundary = boundary, .dump_prefix = dump_prefix};
+    if (dump_prefix) {
+        char path[4096];
+        const int n = snprintf(path, sizeof(path), "%s.jsonl", dump_prefix);
+        need(n > 0 && (size_t)n < sizeof(path), "bounded long manifest path");
+        p.manifest = fopen(path, "w"); need(p.manifest != NULL, "open long manifest");
+        fprintf(p.manifest, "{\"prefix_tokens\":%u,\"context\":%u,\"chunk\":%u,"
+                "\"sparse_position\":%u,\"vocab\":%u,\"fixture\":\"repeated-chat-ids\"}\n",
+                prefix_rows, ctx, chunk, boundary, DS4_N_VOCAB);
+        dump_long(&p, 0, (uint32_t)tokens.len, false, "tokens.i32", tokens.v,
+                  (uint64_t)tokens.len * sizeof(*tokens.v));
+    }
+    printf("long MTP fixture: prefix=%u ctx=%u chunk=%u sparse=%u, one graph, repeated token IDs\n",
+           prefix_rows, ctx, chunk, boundary); fflush(stdout);
+    ds4_tokens prefix = tokens; prefix.len = (int)prefix_rows;
+    ds4_session_set_progress(s, check_long_progress, &p);
+    need(ds4_session_sync(s, &prefix, error, sizeof(error)) == 0, "long real trunk prefill");
+    ds4_session_set_progress(s, NULL, NULL);
+    need(p.probes == 2u && s->qwen4_graph.pos == prefix_rows &&
+         s->qwen4_graph.mtp_pos + 1u == prefix_rows && s->qwen4_graph.mtp_last_rows == 0,
+         "both long probes ran and restored the original deferred frontier");
+    if (p.manifest) need(fclose(p.manifest) == 0, "close long manifest");
+    ds4_tokens_free(&tokens); ds4_tokens_free(&phrase); ds4_session_free(s);
+    puts("PASS long-context MTP frozen-layer regression (not an acceptance-rate benchmark)");
+}
+
 int main(int argc, char **argv) {
-    const bool streaming = argc == 3 && !strcmp(argv[2], "--ssd-streaming");
-    if (argc != 2 && !streaming) {
-        fprintf(stderr, "usage: %s QWEN_GGUF [--ssd-streaming]\n", argv[0]); return 2;
+    bool streaming = false, long_context = false, long_options = false;
+    uint32_t chunk = LONG_CHUNK, prefix_rows = LONG_PREFIX;
+    const char *dump_prefix = NULL;
+    bool valid = argc >= 2;
+    for (int i = 2; valid && i < argc; i++) {
+        if (!strcmp(argv[i], "--ssd-streaming")) streaming = true;
+        else if (!strcmp(argv[i], "--long-context")) long_context = true;
+        else if ((!strcmp(argv[i], "--prefill-chunk") || !strcmp(argv[i], "--prefix-tokens")) && i + 1 < argc) {
+            long_options = true;
+            const bool is_chunk = !strcmp(argv[i], "--prefill-chunk");
+            char *end = NULL;
+            const unsigned long value = strtoul(argv[++i], &end, 10);
+            valid = end && *end == '\0' && end != argv[i] && value <= 32768u;
+            if (is_chunk) { valid = valid && (value == 128u || value == 2048u); chunk = (uint32_t)value; }
+            else { valid = valid && value >= 128u && value % 4u == 0; prefix_rows = (uint32_t)value; }
+        } else if (!strcmp(argv[i], "--dump-prefix") && i + 1 < argc) {
+            long_options = true; dump_prefix = argv[++i];
+        } else valid = false;
+    }
+    if (!valid || (!long_context && long_options)) {
+        fprintf(stderr, "usage: %s QWEN_GGUF [--ssd-streaming] [--long-context "
+                "[--prefill-chunk 128|2048] [--prefix-tokens N] [--dump-prefix PATH]]\n", argv[0]); return 2;
     }
     const char *names[] = {"DS4_QWEN4_SPEC_FORCE_ACCEPT", "DS4_QWEN4_MTP_DEPTH",
                           "DS4_QWEN4_MTP_DRAFT_ROWS", "DS4_QWEN4_MTP_DRAFT_VOCAB",
@@ -493,10 +839,16 @@ int main(int argc, char **argv) {
         need(!v || saved[i], "save test environment"); need(unsetenv(names[i]) == 0, "clear test override");
     }
     ds4_engine_options opt = {.model_path = argv[1], .backend = DS4_BACKEND_METAL,
-        .context_size = TEST_CTX, .prefill_chunk = TEST_CHUNK, .glm_mtp = true,
+        .context_size = long_context ? prefix_rows + 8u : TEST_CTX,
+        .prefill_chunk = long_context ? chunk : TEST_CHUNK, .glm_mtp = true,
         .ssd_streaming = streaming, .ssd_streaming_cache_experts = streaming ? 1024u : 0u};
     ds4_engine *engine = NULL;
     need(ds4_engine_open(&engine, &opt) == 0 && ds4_engine_is_qwen4(engine), "open Qwen model");
+    if (long_context) {
+        run_long_test(engine, prefix_rows, chunk, dump_prefix);
+        ds4_engine_close(engine);
+        goto restore_environment;
+    }
     ds4_session *live = NULL, *reference = NULL;
     need(ds4_session_create(&live, engine, TEST_CTX) == 0 &&
          ds4_session_create(&reference, engine, TEST_CTX) == 0, "allocate two bounded sessions");
@@ -546,6 +898,7 @@ int main(int argc, char **argv) {
     ds4_session_snapshot_free(&snapshot);
     ds4_tokens_free(&other); ds4_tokens_free(&prompt);
     ds4_session_free(reference); ds4_session_free(live); ds4_engine_close(engine);
+restore_environment:
     for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         need((saved[i] ? setenv(names[i], saved[i], 1) : unsetenv(names[i])) == 0, "restore test environment");
         free(saved[i]);
