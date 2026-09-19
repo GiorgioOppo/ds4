@@ -95,6 +95,39 @@ VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
 
 For a machine with sufficient RAM for resident experts, omit both SSD options. Keep `--vision` for image requests and set `--ctx` to the required allocation. See [image request examples](MODELS.md#vision).
 
+### Q4 attention weights
+
+V4.1 attention projections accept Q4_K weights on ROCm, including output A/B
+with independent Q4_K or Q8_0 types. This applies to decode and batched prefill,
+resident or SSD-streamed experts, and TP2. Q-A, Q-B and KV use the existing
+typed dense kernels. The output path processes packed token/group rows directly,
+without a per-token graph loop. Q8/Q8 retains its previous kernels.
+
+Output A follows the existing Q4 policy: eligible resident gfx1151 batches use
+FP16 WMMA operands with F32 accumulation; SSD streaming and quality mode keep
+Q8_K activation quantization. Output B keeps Q8_K activation quantization.
+Both paths round the intermediate low projection to BF16. TP2 slices output
+B's columns while retaining its full weight row stride, and rounds the output
+only after summing the F32 rank partials. Both nodes must load the same attention
+quantization; the TP model identifier includes the five projection types.
+
+Use a GGUF whose attention projections have already been requantized to Q4_K;
+`--ssd-streaming` changes expert storage and does not convert attention weights.
+Run the model-free checks before full-model logits and throughput comparisons:
+
+```sh
+# Host checks; no AMD GPU required.
+make test-rocm-v41-q4-output-host test-deepseek41-rocm-output-dispatch-host
+
+# Native production-shape numerical checks on the ROCm machine.
+make test-rocm-v41-q4-output ROCM_ARCH=gfx1151
+```
+
+This integration has host validation only at the time of implementation.
+HIP compilation, native numerical results, full-model quality and Q4/Q8
+throughput comparisons still need to be measured on AMD hardware. The SSD
+performance figures above describe the earlier Q8-attention configuration.
+
 ### Reproduce SSD measurements
 
 Run one configuration per process; preserve the CSV, full frontier files and printed output. The timing input is the repository's `speed-bench/promessi_sposi.txt`.
