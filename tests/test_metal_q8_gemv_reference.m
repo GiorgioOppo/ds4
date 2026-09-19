@@ -7,6 +7,8 @@
  * --compile-only creates libraries and specialized pipelines, never a queue
  * or dispatch. --dense-source FILE replaces only the candidate source.
  * --output DIR writes a JSON report; no model or model weights are required.
+ * --benchmark additionally times NR0=2 against NR0=4 on Qwen projections,
+ * alternating execution order and keeping NSG=4 and arithmetic unchanged.
  *
  * This supplements the reduction-only oracle. It exercises the complete
  * packed-weight dot, K walk, scale multiplication, reduction and output tail.
@@ -14,8 +16,10 @@
  * e37f18576cd0c06217b0f1745021f1fe16f665cc; never generate it from the candidate.
  * Both arms receive the same immutable buffers and NSG specialization. They
  * compile as separate libraries with identical default or safe math options.
- * Odd output counts allocate a nonzero padded weight row, matching NR0=2's
- * unconditional weight reads; only valid output rows may be written.
+ * Tail output counts allocate nonzero weights through the next four-row
+ * boundary, matching both specializations' unconditional weight reads;
+ * only valid output rows may be written. Production NR4 dispatch must require
+ * rows divisible by four unless the weight allocation explicitly has padding.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -45,6 +49,15 @@ static const shape kShapes[] = {
     {32, 1, 1}, {64, 3, 3}, {256, 17, 1}, {320, 33, 2},
     {640, 65, 1}, {2560, 48, 1}, {2560, 65, 3}, {6144, 17, 1},
     {10240, 320, 1}, {10240, 3, 2},
+};
+/* Actual wide Qwen projections, excluding the vocabulary. Keep the full
+ * adversarial matrix on the small fixtures and sample these larger shapes
+ * under NSG=4, the non-vocabulary decode specialization. */
+static const shape kQwenShapes[] = {
+    {2560, 10240, 1}, /* GDN qkv */
+    {2560, 6144, 1},  /* GDN gate */
+    {6144, 2560, 1},  /* GDN/attention output */
+    {2560, 12288, 1}, /* Attention query + gate */
 };
 static const short kGroups[] = {1, 2, 4, 8};
 enum { kGroupCount = sizeof(kGroups) / sizeof(kGroups[0]) };
@@ -296,13 +309,14 @@ static id<MTLLibrary> make_library(id<MTLDevice> device, NSString *body, bool sa
     return lib;
 }
 
-static id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> library, short nsg) {
+static id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> library, short nsg, short nr0) {
     MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
     [values setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
     NSError *error = nil;
-    id<MTLFunction> fn = [library newFunctionWithName:@"kernel_mul_mv_q8_0_f32" constantValues:values error:&error];
+    NSString *name = nr0 == 4 ? @"kernel_mul_mv_q8_0_f32_nr4" : @"kernel_mul_mv_q8_0_f32";
+    id<MTLFunction> fn = [library newFunctionWithName:name constantValues:values error:&error];
     id<MTLComputePipelineState> pipeline = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
-    if (!pipeline) fail([NSString stringWithFormat:@"Metal pipeline NSG=%d: %@", nsg, error]);
+    if (!pipeline) fail([NSString stringWithFormat:@"Metal pipeline NR0=%d NSG=%d: %@", nr0, nsg, error]);
     if (pipeline.threadExecutionWidth != 32 || pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)(32*nsg))
         fail(@"device cannot execute the required Q8 SIMD geometry");
     return pipeline;
@@ -334,7 +348,7 @@ static void check_output_guards(id<MTLBuffer> buffer, size_t n) {
 static void fixture(id<MTLBuffer> weights, id<MTLBuffer> input, shape s, int pattern) {
     q8_block *w = (q8_block *)((char *)weights.contents + kOffset);
     float *x = (float *)((char *)input.contents + kOffset);
-    const uint32_t blocks = s.k / 32, physical_rows = (s.rows + 1u) & ~1u;
+    const uint32_t blocks = s.k / 32, physical_rows = (s.rows + 3u) & ~3u;
     for (uint32_t r = 0; r < physical_rows; ++r) for (uint32_t b = 0; b < blocks; ++b) {
         q8_block *p = &w[(uint64_t)r*blocks + b];
         const uint32_t random = mix_bits(r*65537u + b*313u + 471u);
@@ -367,7 +381,7 @@ static void fixture(id<MTLBuffer> weights, id<MTLBuffer> input, shape s, int pat
 
 static void encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline,
                    id<MTLBuffer> weights, id<MTLBuffer> input, id<MTLBuffer> output,
-                   shape s, short nsg) {
+                   shape s, short nsg, short nr0, uint32_t iterations) {
     const uint64_t row_bytes = (uint64_t)(s.k / 32u)*34u;
     mv_args args = {
         .ne00 = s.k, .ne01 = s.rows, .ne02 = 1,
@@ -375,7 +389,7 @@ static void encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pip
         .ne10 = s.k, .ne11 = s.tokens, .ne12 = 1,
         .nb10 = 4, .nb11 = (uint64_t)s.k*4u,
         .nb12 = (uint64_t)s.k*s.tokens*4u, .nb13 = (uint64_t)s.k*s.tokens*4u,
-        .ne0 = s.rows, .ne1 = s.tokens, .nr0 = 2, .r2 = 1, .r3 = 1,
+        .ne0 = s.rows, .ne1 = s.tokens, .nr0 = nr0, .r2 = 1, .r3 = 1,
     };
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     if (!encoder) fail(@"command encoder allocation");
@@ -384,17 +398,19 @@ static void encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pip
     [encoder setBuffer:weights offset:kOffset atIndex:1];
     [encoder setBuffer:input offset:kOffset atIndex:2];
     [encoder setBuffer:output offset:kOffset atIndex:3];
-    [encoder setThreadgroupMemoryLength:2u*32u*sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake((s.rows + 1u)/2u, s.tokens, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    [encoder setThreadgroupMemoryLength:(NSUInteger)nr0*32u*sizeof(float) atIndex:0];
+    for (uint32_t i = 0; i < iterations; ++i) {
+        [encoder dispatchThreadgroups:MTLSizeMake((s.rows + nr0 - 1u)/nr0, s.tokens, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    }
     [encoder endEncoding];
 }
 
 static NSDictionary *run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
                              id<MTLComputePipelineState> reference, id<MTLComputePipelineState> candidate,
-                             shape s, short nsg, bool safe, int pattern) {
+                             shape s, short nsg, short nr0, bool safe, int pattern) {
     const uint64_t n = (uint64_t)s.rows*s.tokens;
-    const uint32_t physical_rows = (s.rows + 1u) & ~1u;
+    const uint32_t physical_rows = (s.rows + 3u) & ~3u;
     id<MTLBuffer> weights = make_buffer(device, (uint64_t)physical_rows*(s.k/32u)*sizeof(q8_block));
     id<MTLBuffer> input = make_buffer(device, (uint64_t)s.k*s.tokens*sizeof(float));
     id<MTLBuffer> expected = make_buffer(device, n*sizeof(float)), actual = make_buffer(device, n*sizeof(float));
@@ -403,8 +419,8 @@ static NSDictionary *run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
     NSData *input_snapshot = [NSData dataWithBytes:input.contents length:input.length];
     id<MTLCommandBuffer> command = [queue commandBuffer];
     if (!command) fail(@"command buffer allocation");
-    encode(command, reference, weights, input, expected, s, nsg);
-    encode(command, candidate, weights, input, actual, s, nsg);
+    encode(command, reference, weights, input, expected, s, nsg, 2, 1);
+    encode(command, candidate, weights, input, actual, s, nsg, nr0, 1);
     [command commit]; [command waitUntilCompleted];
     if (command.status != MTLCommandBufferStatusCompleted)
         fail([NSString stringWithFormat:@"GPU execution: %@", command.error]);
@@ -420,8 +436,8 @@ static NSDictionary *run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
         if (!isfinite(ef[i]) || !isfinite(af[i])) fail(@"finite fixture produced non-finite output");
         if (want[i] != got[i]) {
             if (mismatches++ == 0) fprintf(stderr,
-                "DIFF %s NSG=%d K=%u rows=%u T=%u pattern=%d at=%llu e37=%08x (%.9g) current=%08x (%.9g)\n",
-                safe ? "safe" : "default", nsg, s.k, s.rows, s.tokens, pattern,
+                "DIFF %s NR0=%d NSG=%d K=%u rows=%u T=%u pattern=%d at=%llu e37=%08x (%.9g) current=%08x (%.9g)\n",
+                safe ? "safe" : "default", nr0, nsg, s.k, s.rows, s.tokens, pattern,
                 (unsigned long long)i, want[i], ef[i], got[i], af[i]);
         }
         double delta = fabs((double)ef[i] - af[i]);
@@ -448,14 +464,76 @@ static NSDictionary *run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
         if (fabs(ef[(uint64_t)t*s.rows + r] - dot) > bound ||
             fabs(af[(uint64_t)t*s.rows + r] - dot) > bound) fail(@"independent double dot exceeds rounding bound");
     }
-    return @{@"math":safe ? @"safe" : @"default", @"nsg":@(nsg), @"k":@(s.k), @"rows":@(s.rows),
+    return @{@"math":safe ? @"safe" : @"default", @"nsg":@(nsg), @"nr0":@(nr0), @"k":@(s.k), @"rows":@(s.rows),
              @"tokens":@(s.tokens), @"pattern":@(pattern), @"values":@(n), @"different_bits":@(mismatches),
              @"max_abs":@(max_abs), @"rmse":@(sqrt(sum_sq/n))};
 }
 
+static double bench_sample(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
+                           id<MTLBuffer> weights, id<MTLBuffer> input, id<MTLBuffer> output,
+                           shape s, short nr0, uint32_t iterations) {
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    if (!command) fail(@"benchmark command buffer allocation");
+    encode(command, pipeline, weights, input, output, s, 4, nr0, iterations);
+    [command commit]; [command waitUntilCompleted];
+    if (command.status != MTLCommandBufferStatusCompleted)
+        fail([NSString stringWithFormat:@"benchmark GPU execution: %@", command.error]);
+    const double elapsed = command.GPUEndTime - command.GPUStartTime;
+    if (!(elapsed > 0.0) || !isfinite(elapsed)) fail(@"GPU timestamps unavailable");
+    return elapsed * 1e6 / iterations;
+}
+
+static double median(NSArray<NSNumber *> *values) {
+    NSArray<NSNumber *> *sorted = [values sortedArrayUsingSelector:@selector(compare:)];
+    const NSUInteger n = sorted.count;
+    return n % 2u ? sorted[n/2u].doubleValue :
+        0.5 * (sorted[n/2u - 1u].doubleValue + sorted[n/2u].doubleValue);
+}
+
+static NSDictionary *benchmark_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                                    id<MTLComputePipelineState> nr2, id<MTLComputePipelineState> nr4,
+                                    shape s, uint32_t rounds, uint32_t iterations) {
+    const uint32_t physical_rows = (s.rows + 3u) & ~3u;
+    id<MTLBuffer> weights = make_buffer(device, (uint64_t)physical_rows*(s.k/32u)*sizeof(q8_block));
+    id<MTLBuffer> input = make_buffer(device, (uint64_t)s.k*sizeof(float));
+    id<MTLBuffer> out2 = make_buffer(device, (uint64_t)s.rows*sizeof(float));
+    id<MTLBuffer> out4 = make_buffer(device, (uint64_t)s.rows*sizeof(float));
+    fixture(weights, input, s, 1);
+    /* Warm both pipelines and allocations before timing. Repeated dispatches
+     * intentionally measure warm resident dense projections, not SSD reads. */
+    (void)bench_sample(queue, nr2, weights, input, out2, s, 2, 8);
+    (void)bench_sample(queue, nr4, weights, input, out4, s, 4, 8);
+    NSMutableArray<NSNumber *> *times2 = [NSMutableArray new], *times4 = [NSMutableArray new];
+    NSMutableArray<NSNumber *> *ratios = [NSMutableArray new];
+    for (uint32_t round = 0; round < rounds; ++round) @autoreleasepool {
+        double t2, t4;
+        if (round % 2u == 0u) {
+            t2 = bench_sample(queue, nr2, weights, input, out2, s, 2, iterations);
+            t4 = bench_sample(queue, nr4, weights, input, out4, s, 4, iterations);
+        } else {
+            t4 = bench_sample(queue, nr4, weights, input, out4, s, 4, iterations);
+            t2 = bench_sample(queue, nr2, weights, input, out2, s, 2, iterations);
+        }
+        [times2 addObject:@(t2)]; [times4 addObject:@(t4)]; [ratios addObject:@(t2/t4)];
+    }
+    check_output_guards(out2, s.rows); check_output_guards(out4, s.rows);
+    const bool exact = memcmp((char *)out2.contents + kOffset, (char *)out4.contents + kOffset,
+                              (size_t)s.rows*sizeof(float)) == 0;
+    if (!exact) fail(@"benchmark NR2/NR4 output mismatch");
+    const double time2 = median(times2), time4 = median(times4), speedup = median(ratios);
+    printf("BENCH Q8 NSG=4 K=%u rows=%u: NR2 %.3f us, NR4 %.3f us, paired median %.4fx\n",
+           s.k, s.rows, time2, time4, speedup);
+    return @{@"k":@(s.k), @"rows":@(s.rows), @"tokens":@1, @"nsg":@4,
+             @"rounds":@(rounds), @"iterations_per_sample":@(iterations),
+             @"nr2_us":times2, @"nr4_us":times4, @"paired_speedup":ratios,
+             @"median_nr2_us":@(time2), @"median_nr4_us":@(time4),
+             @"median_paired_speedup":@(speedup), @"bit_exact":@(exact)};
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        bool compile_only = false;
+        bool compile_only = false, benchmark = false;
+        uint32_t rounds = 9, iterations = 32;
         NSString *repo = @".", *override = nil, *output = nil;
         for (int i = 1; i < argc; ++i) {
             if (!strcmp(argv[i], "--compile-only")) compile_only = true;
@@ -463,10 +541,17 @@ int main(int argc, const char **argv) {
             else if (!strcmp(argv[i], "--repo") && i + 1 < argc) repo = @(argv[++i]);
             else if (!strcmp(argv[i], "--dense-source") && i + 1 < argc) override = @(argv[++i]);
             else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = @(argv[++i]);
+            else if (!strcmp(argv[i], "--benchmark")) benchmark = true;
+            else if (!strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = (uint32_t)strtoul(argv[++i], NULL, 10);
+            else if (!strcmp(argv[i], "--iterations") && i + 1 < argc) iterations = (uint32_t)strtoul(argv[++i], NULL, 10);
             else {
-                fprintf(stderr, "Usage: %s [--test|--compile-only] [--repo PATH] [--dense-source FILE] [--output DIR]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--test|--compile-only] [--repo PATH] [--dense-source FILE] [--output DIR] [--benchmark] [--rounds N] [--iterations N]\n", argv[0]);
                 return 2;
             }
+        }
+        if (!rounds || rounds > 1000u || !iterations || iterations > 10000u) {
+            fprintf(stderr, "rounds must be 1..1000; iterations must be 1..10000\n");
+            return 2;
         }
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) fail(@"Metal device unavailable");
@@ -476,10 +561,11 @@ int main(int argc, const char **argv) {
             id<MTLLibrary> legacy = make_library(device, kFrozenE37, mode != 0);
             id<MTLLibrary> current = make_library(device, candidate, mode != 0);
             for (size_t group = 0; group < kGroupCount; ++group) {
-                [pipelines addObject:make_pipeline(device, legacy, kGroups[group])];
-                [pipelines addObject:make_pipeline(device, current, kGroups[group])];
+                [pipelines addObject:make_pipeline(device, legacy, kGroups[group], 2)];
+                [pipelines addObject:make_pipeline(device, current, kGroups[group], 2)];
+                [pipelines addObject:make_pipeline(device, current, kGroups[group], 4)];
             }
-            printf("PASS compile %s: frozen e37 and candidate, NSG=1/2/4/8\n", mode ? "safe" : "default");
+            printf("PASS compile %s: frozen e37 NR2 and candidate NR2/NR4, NSG=1/2/4/8\n", mode ? "safe" : "default");
         }
         if (compile_only) {
             printf("PASS compile-only: %lu pipelines; no GPU queue, buffers or dispatches created\n",
@@ -491,19 +577,42 @@ int main(int argc, const char **argv) {
         NSMutableArray<NSDictionary *> *results = [NSMutableArray new];
         uint64_t mismatches = 0, values = 0;
         for (int mode = 0; mode < 2; ++mode) for (size_t group = 0; group < kGroupCount; ++group) {
-            const NSUInteger pi = (mode*kGroupCount + group)*2;
+            const NSUInteger pi = (mode*kGroupCount + group)*3;
+            for (short nr0 = 2; nr0 <= 4; nr0 += 2)
             for (size_t shape_id = 0; shape_id < sizeof(kShapes)/sizeof(kShapes[0]); ++shape_id)
                 for (int pattern = 0; pattern < kPatterns; ++pattern) @autoreleasepool {
-                    NSDictionary *result = run_case(device, queue, pipelines[pi], pipelines[pi + 1],
-                                                   kShapes[shape_id], kGroups[group], mode != 0, pattern);
+                    NSDictionary *result = run_case(device, queue, pipelines[pi], pipelines[pi + nr0/2],
+                                                   kShapes[shape_id], kGroups[group], nr0, mode != 0, pattern);
                     [results addObject:result];
                     mismatches += [result[@"different_bits"] unsignedLongLongValue];
                     values += [result[@"values"] unsignedLongLongValue];
                 }
+            if (kGroups[group] == 4) {
+                const int patterns[] = {0, 1, 2, 5};
+                for (short nr0 = 2; nr0 <= 4; nr0 += 2)
+                for (size_t shape_id = 0; shape_id < sizeof(kQwenShapes)/sizeof(kQwenShapes[0]); ++shape_id)
+                    for (size_t p = 0; p < sizeof(patterns)/sizeof(patterns[0]); ++p) @autoreleasepool {
+                        NSDictionary *result = run_case(device, queue, pipelines[pi], pipelines[pi + nr0/2],
+                                                       kQwenShapes[shape_id], 4, nr0, mode != 0, patterns[p]);
+                        [results addObject:result];
+                        mismatches += [result[@"different_bits"] unsignedLongLongValue];
+                        values += [result[@"values"] unsignedLongLongValue];
+                    }
+            }
+        }
+        NSMutableArray<NSDictionary *> *benchmarks = [NSMutableArray new];
+        if (benchmark && mismatches == 0) {
+            const NSUInteger pi = 2u * 3u; /* default math, NSG=4 */
+            for (size_t shape_id = 0; shape_id < sizeof(kQwenShapes)/sizeof(kQwenShapes[0]); ++shape_id) @autoreleasepool {
+                [benchmarks addObject:benchmark_case(device, queue, pipelines[pi + 1], pipelines[pi + 2],
+                                                     kQwenShapes[shape_id], rounds, iterations)];
+            }
         }
         NSDictionary *report = @{@"reference":@"e37f18576cd0c06217b0f1745021f1fe16f665cc", @"device":device.name,
                                  @"cases":@(results.count), @"values":@(values), @"different_bits":@(mismatches),
-                                 @"passed":@(mismatches == 0), @"results":results};
+                                 @"passed":@(mismatches == 0), @"results":results, @"benchmarks":benchmarks,
+                                 @"activation_offset_bytes":@(kOffset),
+                                 @"benchmark_scope":@"warm resident dense weights; GPU command timestamps; alternating NR2/NR4 order"};
         if (output) {
             NSError *error = nil;
             if (![[NSFileManager defaultManager] createDirectoryAtPath:output withIntermediateDirectories:YES attributes:nil error:&error])

@@ -2037,6 +2037,83 @@ static void test_decode_fusions(arena_t *a) {
     printf("Qwen decode fusions: exact residual/injection and Q8 checks passed\n");
 }
 
+#ifdef __APPLE__
+/* Exercise the public Qwen-only row tile against the generic two-row API.
+ * Each tensor is a tight, non-float4-aligned view; prefix/suffix sentinels and
+ * immutable input/weight snapshots catch binding or dispatch-size mistakes.
+ * The standalone frozen-kernel oracle supplies the independent arithmetic
+ * reference. This test pins the production host selection and bindings. */
+static void test_qwen4_q8_decode_rows(arena_t *a) {
+    const struct { uint32_t k, rows; } shapes[] = {
+        {2560u, 10240u}, {2560u, 6144u}, {6144u, 2560u}, {2560u, 12288u},
+        {2560u, 10242u}, /* Even but not a four-row tile: generic fallback. */
+    };
+    const uint32_t saved_rng = g_rng;
+    const char *nsg_env = getenv("DS4_METAL_Q8_MV_NSG");
+    char *saved_nsg = nsg_env ? strdup(nsg_env) : NULL;
+    require_ok(!nsg_env || saved_nsg, "Q8 row dispatch saved environment");
+    require_ok(setenv("DS4_METAL_Q8_MV_NSG", "4", 1) == 0, "Q8 row dispatch NSG");
+    for (uint32_t shape_id = 0; shape_id < sizeof(shapes) / sizeof(shapes[0]); ++shape_id) {
+        const uint32_t k = shapes[shape_id].k, rows = shapes[shape_id].rows;
+        const uint32_t prefix = 3u, suffix = 5u, out_n = prefix + rows + suffix;
+        const uint64_t bytes = (uint64_t)rows * (k / 32u) * 34u;
+        const uint64_t off = arena_alloc(a, bytes);
+        uint8_t *weights = a->base + off;
+        for (uint64_t block = 0; block < bytes / 34u; ++block) {
+            const uint16_t scale = f32_to_f16((1u + block % 7u) / 256.0f);
+            memcpy(weights + block * 34u, &scale, sizeof(scale));
+            for (uint32_t q = 0; q < 32u; ++q) {
+                const int8_t v = (int8_t)(127.0f * frand());
+                memcpy(weights + block * 34u + 2u + q, &v, sizeof(v));
+            }
+        }
+        uint8_t *weight_snapshot = malloc(bytes);
+        float *input = malloc((k + 2u) * sizeof(float));
+        require_ok(weight_snapshot && input, "Q8 row dispatch host allocations");
+        memcpy(weight_snapshot, weights, bytes);
+        input[0] = input[k + 1u] = 17.25f;
+        for (uint32_t i = 0; i < k; ++i) input[i + 1u] = frand() * (i % 11u ? 1.0f : 16.0f);
+        ds4_gpu_tensor *gx = upload(input, k + 2u);
+        ds4_gpu_tensor *generic = upload(NULL, out_n), *qwen = upload(NULL, out_n);
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(gx, sizeof(float), (uint64_t)k * sizeof(float));
+        ds4_gpu_tensor *rv = ds4_gpu_tensor_view(generic, prefix * sizeof(float), (uint64_t)rows * sizeof(float));
+        ds4_gpu_tensor *cv = ds4_gpu_tensor_view(qwen, prefix * sizeof(float), (uint64_t)rows * sizeof(float));
+        require_ok(xv && rv && cv, "Q8 row dispatch tight views");
+        /* NSG=2 is an independent fallback for a normally selected shape. */
+        const uint32_t variants = shape_id == 1u ? 2u : 1u;
+        for (uint32_t variant = 0; variant < variants; ++variant) {
+            require_ok(setenv("DS4_METAL_Q8_MV_NSG", variant ? "2" : "4", 1) == 0,
+                       "Q8 row dispatch group override");
+            require_ok(ds4_gpu_tensor_fill_f32(generic, 17.25f, out_n) &&
+                       ds4_gpu_tensor_fill_f32(qwen, 17.25f, out_n), "Q8 row dispatch output guards");
+            require_ok(ds4_gpu_begin_commands() &&
+                ds4_gpu_matmul_q8_0_tensor(rv, a->base, a->size, off, k, rows, xv, 1u) &&
+                ds4_gpu_qwen4_matmul_q8_0_tensor(cv, a->base, a->size, off, k, rows, xv, 1u) &&
+                ds4_gpu_end_commands(), "Q8 public row dispatch");
+            float *expected = download(generic, out_n), *actual = download(qwen, out_n);
+            check_exact_f32("Qwen Q8 row dispatch vs generic", actual, expected, out_n);
+            for (uint32_t i = 0; i < out_n; ++i) {
+                if (i < prefix || i >= prefix + rows)
+                    require_ok(actual[i] == 17.25f && expected[i] == 17.25f, "Q8 row dispatch view guards");
+                else require_ok(isfinite(actual[i]), "Q8 row dispatch finite output");
+            }
+            free(actual); free(expected);
+        }
+        float *after = download(gx, k + 2u);
+        check_exact_f32("Qwen Q8 row dispatch immutable input", after, input, k + 2u);
+        require_ok(memcmp(weight_snapshot, weights, bytes) == 0, "Q8 row dispatch immutable weights");
+        free(after); free(weight_snapshot); free(input);
+        ds4_gpu_tensor_free(cv); ds4_gpu_tensor_free(rv); ds4_gpu_tensor_free(xv);
+        ds4_gpu_tensor_free(qwen); ds4_gpu_tensor_free(generic); ds4_gpu_tensor_free(gx);
+    }
+    if (saved_nsg) require_ok(setenv("DS4_METAL_Q8_MV_NSG", saved_nsg, 1) == 0, "Q8 row dispatch restore NSG");
+    else require_ok(unsetenv("DS4_METAL_Q8_MV_NSG") == 0, "Q8 row dispatch clear NSG");
+    free(saved_nsg);
+    g_rng = saved_rng;
+    puts("Qwen Q8 public decode row dispatch: four model shapes and shape/NSG fallbacks exact");
+}
+#endif
+
 /* Match host greedy selection at SIMD/chunk boundaries and on exceptional values. */
 static void test_qwen4_argmax(void) {
     const uint32_t sizes[] = {1u, 31u, 32u, 33u, 255u, 256u, 257u, 4095u, 4096u, 4097u, 248320u};
@@ -4055,8 +4132,15 @@ int main(void) {
     const bool bench_reuse = reuse_bench && reuse_bench[0] && strcmp(reuse_bench, "0") != 0;
     const bool run_mtp = mtp_only && mtp_only[0] && strcmp(mtp_only, "0") != 0;
     const bool run_prep = prep_only && prep_only[0] && strcmp(prep_only, "0") != 0;
+#ifdef __APPLE__
+    const char *q8_rows_only = getenv("DS4_TEST_QWEN4_Q8_ROWS_ONLY");
+    const bool run_q8_rows = q8_rows_only && strcmp(q8_rows_only, "1") == 0;
+#endif
     arena_t arena;
     arena.size = (uint64_t)(run_reuse || bench_reuse || run_mtp || run_prep ? 96u : 1536u) << 20;
+#ifdef __APPLE__
+    if (run_q8_rows) arena.size = 128ull << 20;
+#endif
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -4064,6 +4148,14 @@ int main(void) {
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
+#ifdef __APPLE__
+    if (run_q8_rows) {
+        test_qwen4_q8_decode_rows(&arena);
+        ds4_gpu_cleanup();
+        munmap(arena.base, arena.size);
+        return 0;
+    }
+#endif
     if (run_reuse || bench_reuse) {
         test_m1_reuse(&arena, bench_reuse, run_reuse ? reuse_only : NULL);
         ds4_gpu_cleanup();
@@ -4146,6 +4238,9 @@ int main(void) {
     }
     printf("hyper-connections\n");
     test_decode_fusions(&arena);
+#ifdef __APPLE__
+    test_qwen4_q8_decode_rows(&arena);
+#endif
     test_qwen4_argmax();
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);

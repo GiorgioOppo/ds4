@@ -250,6 +250,24 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Four output rows reuse each activation load. The K walk, eight-term
+// quantized dot and reduction tree are exactly the same as the two-row
+// specialization above. Callers must provide complete four-row weight tiles
+// (or explicitly padded weights): the shared implementation reads all NR0
+// rows before its output bounds check. This needs 4*32*sizeof(float) scratch.
+[[host_name("kernel_mul_mv_q8_0_f32_nr4")]]
+kernel void kernel_mul_mv_q8_0_f32_nr4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see
