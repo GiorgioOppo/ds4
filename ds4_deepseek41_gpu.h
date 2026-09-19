@@ -53,7 +53,8 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
  * complete matrices; heads/low contain only this rank's contiguous groups.
  * Rounds low to BF16, then writes F32 output (a rank partial for world=2).
  * The caller owns the final TP sum and output BF16 boundary.
- * CUDA Q4 batches require a stream outside graph capture. */
+ * CUDA Q4 batches require a stream outside graph capture. ROCm accepts up
+ * to 65535 rows and requires disjoint, float-aligned activation buffers. */
 int ds4_gpu_dsv41_attention_output_typed_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size,

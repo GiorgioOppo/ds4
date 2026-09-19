@@ -1334,6 +1334,183 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
     return cuda_ok(cudaGetLastError(), "V4.1 TP attention output projection");
 }
 
+/* Q4 output uses the canonical Q4_K/Q8_K dot for decode and rollback.
+ * Unlike the older grouped decode kernel, token and group have independent
+ * grid axes. The weight row stride may include another TP rank's columns. */
+__global__ static void v41_grouped_q4_q8_K_kernel(
+        float *out, const char *w, const cuda_block_q8_K *xq,
+        uint64_t row_bytes, uint32_t blocks, uint32_t out_dim,
+        uint32_t n_tokens, uint32_t groups) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t token = blockIdx.y, group = blockIdx.z;
+    if (row >= out_dim || token >= n_tokens || group >= groups) return;
+    const cuda_block_q8_K *x = xq + ((uint64_t)token * groups + group) * blocks;
+    const cuda_block_q4_K *weights = reinterpret_cast<const cuda_block_q4_K *>(
+        w + ((uint64_t)group * out_dim + row) * row_bytes);
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < blocks; b += 8u)
+        acc += dev_dot_q4_K_q8_K_block(weights + b, x + b);
+    acc = rocm_q4_quarter_warp_sum_f32(acc, lane);
+    if (!lane) out[((uint64_t)token * groups + group) * out_dim + row] = acc;
+}
+
+static int v41_attention_output_q4(
+        float *out, const char *w, const float *x, uint32_t rows,
+        uint32_t groups, uint32_t k, uint32_t m, uint64_t row_bytes,
+        int wmma, int tile8) {
+    if (wmma == ROCM_Q4_PREFILL_WMMA_USE)
+        return rocm_q4_K_prefill_wmma_launch(out, w, x, rows, groups,
+            k, m, row_bytes, (uint64_t)groups * k, k,
+            (uint64_t)groups * m, "V4.1 Q4 attention output A WMMA");
+    const uint32_t blocks = k / CUDA_QK_K;
+    cuda_block_q8_K *xq = rocm_q4_K_prequant_alloc(
+        (uint64_t)rows * groups, blocks, "V4.1 Q4 attention scratch");
+    if (!xq || !rocm_q4_K_q8_quantize_launch(xq, x, k, rows * groups,
+                                            "V4.1 Q4 attention quantize")) return 0;
+    if (tile8) {
+        rocm_q4_K_prefill_tile8_strided_launch(dim3((m + 31u) / 32u,
+                (rows + 7u) / 8u, groups), out, w, xq, row_bytes,
+                blocks, m, rows, (uint64_t)groups * blocks, (uint64_t)groups * m);
+    } else {
+        v41_grouped_q4_q8_K_kernel<<<dim3((m + 31u) / 32u, rows, groups), 256u>>>(
+            out, w, xq, row_bytes, blocks, m, rows, groups);
+    }
+    return cuda_ok(cudaGetLastError(), "V4.1 Q4 attention projection");
+}
+
+/* Mixed Q4/Q8 matrices retain the V4.1 F32-input Q8 kernels. Generic dense
+ * Q8 entry points quantize activations and do not implement this contract. */
+static int v41_attention_output_q8_a(float *out, const unsigned char *w,
+        const float *x, uint32_t rows, uint32_t groups) {
+    if (rows == 1u && ds4_rocm_is_gfx1151()) {
+        v41_grouped_q8_f32_blocks4_kernel<<<groups * 128u, 256u>>>(
+            out, w, x, 4096u, 1024u, groups);
+    } else if (!g_quality_mode && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
+        const dim3 grid(8u, (rows + 63u) / 64u, groups);
+        if (groups == 4u)
+            v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 4u><<<grid, 256u>>>(
+                out, w, x, rows, 4096u, 1024u, UINT64_C(128) * 34u);
+        else
+            v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u><<<grid, 256u>>>(
+                out, w, x, rows, 4096u, 1024u, UINT64_C(128) * 34u);
+    } else if (rows >= 32u && ds4_rocm_is_gfx1151()) {
+        cuda_launch_grouped_q8_a_sharedx(out, w, x, rows, groups,
+            128u, 1024u, 128u * 34u, 8u, 8u, 8u);
+    } else {
+        grouped_q8_0_a_f32_batch_warp8_kernel<<<dim3(groups * 128u, rows), 256u>>>(
+            out, w, x, 4096u, 1024u, groups, rows, 128u);
+    }
+    return cuda_ok(cudaGetLastError(), "V4.1 mixed Q8 attention output A");
+}
+
+static int v41_attention_output_q8_b(float *out, const unsigned char *w,
+        const float *x, uint32_t rows, uint32_t k) {
+    const uint64_t row_bytes = UINT64_C(256) * 34u;
+    if (rows == 1u && ds4_rocm_is_gfx1151()) {
+        v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(out, w, x, k, 5120u, row_bytes);
+    } else if (!g_quality_mode && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
+        matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(40u, (rows + 63u) / 64u), 256u>>>(
+            out, w, x, rows, k, 5120u, row_bytes);
+    } else if (rows >= 32u && ds4_rocm_is_gfx1151()) {
+        cuda_launch_q8_batch_sharedx(out, w, x, k / 32u, 5120u,
+            rows, row_bytes, 8u, rows <= 2048u ? 16u : 8u, 8u);
+    } else {
+        matmul_q8_0_f32_batch_warp8_kernel<<<dim3(640u, rows), 256u>>>(
+            out, w, x, k, 5120u, rows, 256u);
+    }
+    return cuda_ok(cudaGetLastError(), "V4.1 mixed Q8 attention output B");
+}
+
+extern "C" int ds4_gpu_dsv41_attention_output_typed_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint32_t out_a_type, uint32_t out_b_type,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens,
+        uint32_t tp_world, uint32_t tp_rank) {
+    if (!model_map || !n_tokens || n_tokens > UINT16_MAX ||
+        (tp_world != 1u && tp_world != 2u) || tp_rank >= tp_world ||
+        (out_a_type != 8u && out_a_type != 12u) ||
+        (out_b_type != 8u && out_b_type != 12u)) return 0;
+    const uint32_t groups = 8u / tp_world, low_dim = groups * 1024u;
+    const uint64_t heads_bytes = (uint64_t)n_tokens * groups * 4096u * sizeof(float);
+    const uint64_t low_bytes = (uint64_t)n_tokens * low_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tokens * 5120u * sizeof(float);
+    const uint64_t a_row = out_a_type == 12u ? 16u * sizeof(cuda_block_q4_K) : 128u * 34u;
+    const uint64_t b_row = out_b_type == 12u ? 32u * sizeof(cuda_block_q4_K) : 256u * 34u;
+    const uint64_t a_bytes = 8192u * a_row, b_bytes = 5120u * b_row;
+    if (!cuda_model_range_fits(model_size, out_a_offset, a_bytes) ||
+        !cuda_model_range_fits(model_size, out_b_offset, b_bytes) ||
+        !cuda_tensor_has_bytes(heads, heads_bytes) ||
+        !cuda_tensor_has_bytes(low, low_bytes) ||
+        !cuda_tensor_has_bytes(out, out_bytes) ||
+        ((uintptr_t)heads->ptr | (uintptr_t)low->ptr | (uintptr_t)out->ptr) % alignof(float) ||
+        rocm_q4_K_byte_ranges_overlap(heads->ptr, heads_bytes, low->ptr, low_bytes) ||
+        rocm_q4_K_byte_ranges_overlap(heads->ptr, heads_bytes, out->ptr, out_bytes) ||
+        rocm_q4_K_byte_ranges_overlap(low->ptr, low_bytes, out->ptr, out_bytes)) return 0;
+    /* Retain the original Q8/Q8 kernels and their dispatch unchanged. */
+    if (out_a_type == 8u && out_b_type == 8u)
+        return tp_world == 1u
+            ? ds4_gpu_dsv41_attention_output_batch(out, low, model_map, model_size,
+                out_a_offset, out_b_offset, heads, n_tokens)
+            : ds4_gpu_dsv41_attention_output_tp_batch(out, low, model_map, model_size,
+                out_a_offset, out_b_offset, heads, n_tokens, tp_rank);
+
+    const int tile8 = rocm_q4_K_prefill_tile8_scope(n_tokens) &&
+                      rocm_q4_K_prefill_tile8_requested();
+    const int require_tile8 = rocm_q4_K_prefill_tile8_scope(n_tokens) &&
+                              rocm_q4_K_prefill_tile8_required();
+    if (require_tile8 && !tile8) return 0;
+    int a_wmma = out_a_type == 12u
+        ? rocm_q4_K_prefill_wmma_select(n_tokens, 4096u, 1024u)
+        : ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    if (a_wmma == ROCM_Q4_PREFILL_WMMA_REQUIRED_FAILURE) return 0;
+    if (require_tile8 && a_wmma == ROCM_Q4_PREFILL_WMMA_USE) {
+        if (rocm_q4_attn_q_b_env_bool("DS4_ROCM_REQUIRE_Q4_PREFILL_WMMA") == 1) return 0;
+        a_wmma = ROCM_Q4_PREFILL_WMMA_FALLBACK;
+    }
+    /* Resolve both ranges before launch. A is group-sharded, whereas B
+     * keeps the complete physical row stride and selects local K columns. */
+    const uint64_t local_a_bytes = low_dim * a_row;
+    const char *a = cuda_model_range_ptr(model_map,
+        out_a_offset + tp_rank * local_a_bytes, local_a_bytes, "V4.1 typed attention A");
+    const char *b = cuda_model_range_ptr(model_map,
+        out_b_offset, b_bytes, "V4.1 typed attention B");
+    if (!a || !b || (uintptr_t)a % (out_a_type == 12u ? 4u : 2u) ||
+        (uintptr_t)b % (out_b_type == 12u ? 4u : 2u) ||
+        rocm_q4_K_byte_ranges_overlap(a, local_a_bytes, low->ptr, low_bytes) ||
+        rocm_q4_K_byte_ranges_overlap(a, local_a_bytes, out->ptr, out_bytes) ||
+        rocm_q4_K_byte_ranges_overlap(b, b_bytes, low->ptr, low_bytes) ||
+        rocm_q4_K_byte_ranges_overlap(b, b_bytes, out->ptr, out_bytes)) return 0;
+    b += tp_rank * (b_row / tp_world);
+    /* Reserve the larger canonical activation scratch before either
+     * projection. Both stages use the default stream and reuse this arena. */
+    const uint64_t a_blocks = out_a_type == 12u && a_wmma != ROCM_Q4_PREFILL_WMMA_USE
+        ? (uint64_t)n_tokens * groups * 16u : 0u;
+    const uint64_t b_blocks = out_b_type == 12u ? (uint64_t)n_tokens * low_dim / 256u : 0u;
+    const uint64_t scratch_blocks = a_blocks > b_blocks ? a_blocks : b_blocks;
+    if (scratch_blocks && !rocm_q4_K_prequant_alloc(scratch_blocks, 1u,
+                                                   "V4.1 typed attention scratch")) return 0;
+    const int a_ok = out_a_type == 12u
+        ? v41_attention_output_q4((float *)low->ptr, a, (const float *)heads->ptr,
+            n_tokens, groups, 4096u, 1024u, a_row, a_wmma, tile8)
+        : v41_attention_output_q8_a((float *)low->ptr, (const unsigned char *)a,
+            (const float *)heads->ptr, n_tokens, groups);
+    if (!a_ok || !ds4_gpu_dsv41_quantize(low, low_dim, n_tokens, DS4_V41_BF16)) return 0;
+    /* B retains Q8_K activation quantization, as in V4 attention output.
+     * Return an unrounded F32 partial; the graph sums TP ranks before BF16. */
+    const int b_ok = out_b_type == 12u
+        ? v41_attention_output_q4((float *)out->ptr, b, (const float *)low->ptr,
+            n_tokens, 1u, low_dim, 5120u, b_row, ROCM_Q4_PREFILL_WMMA_FALLBACK, tile8)
+        : v41_attention_output_q8_b((float *)out->ptr, (const unsigned char *)b,
+            (const float *)low->ptr, n_tokens, low_dim);
+    if (b_ok && tile8 && (out_b_type == 12u ||
+            (out_a_type == 12u && a_wmma != ROCM_Q4_PREFILL_WMMA_USE)))
+        rocm_q4_K_prefill_tile8_note(0u, 0u, 1u, 0u, n_tokens);
+    return b_ok;
+}
+
 /* Staged correctness reference. Validate global IDs before any pointer-table
  * lookup; a null table entry suppresses every unowned gate/up/down load.
  * The ordinary routed-MoE dispatch is untouched. */
