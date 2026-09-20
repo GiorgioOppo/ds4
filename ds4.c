@@ -42711,7 +42711,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+#ifdef __APPLE__
+        if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]))
+            return false;
+#else
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+#endif
     }
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
@@ -46802,7 +46807,7 @@ static double glm_graph_bytes_to_gib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0 * 1024.0);
 }
 
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 static uint64_t g_glm_rocm_guard_available_baseline;
 #endif
 
@@ -57597,6 +57602,13 @@ static bool glm_graph_forward_token(
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
     ds4_gpu_tensor *last_indexer_selected = NULL;
     uint32_t last_indexer_selected_count = 0;
+    /* Number of leading selected slots that are known to index live cache rows.
+     * 0 means "all of them are" -- the producers that fill a contiguous range or
+     * a plain top-k.  The GLM-5.3 pooled expansion instead guarantees only
+     * [0, indexer_top_k) and pads the causal-tail slots above it with
+     * 0xffffffff, so it must never be handed to a kernel level that assumes
+     * every row is valid. */
+    uint32_t last_indexer_guaranteed_prefix = 0;
 #define DS4_GLM_PROFILE_DECODE_STAGE(part_, name_) do { \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary((part_), (name_), il, pos, 1, &decode_stage_t0); \
@@ -57926,12 +57938,14 @@ static bool glm_graph_forward_token(
                     }
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_fill");
                     last_indexer_selected_count = visible;
+                    last_indexer_guaranteed_prefix = 0;   /* contiguous range */
                 } else if (ok && (decode_ablate & DS4_GLM_ABLATE_INDEXER)) {
                     /* Ablation: valid selected ids without the score/topk
                      * chain, so downstream attention timing stays real. */
                     ok = ds4_gpu_glm_fill_selected_range_tensor(g->indexer_selected,
                                                                 indexer_top_k) != 0;
                     last_indexer_selected_count = indexer_top_k;
+                    last_indexer_guaranteed_prefix = 0;   /* contiguous range */
                 } else if (ok) {
                     ok = g->glm53 ?
                         glm53_graph_matmul(
@@ -58038,6 +58052,8 @@ static bool glm_graph_forward_token(
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_topk");
                     last_indexer_selected_count = g->glm53 ?
                         glm53_graph_indexer_selected_limit() : indexer_top_k;
+                    /* the pooled expansion pads slots >= indexer_top_k */
+                    last_indexer_guaranteed_prefix = g->glm53 ? indexer_top_k : 0;
                 }
                 if (ok) last_indexer_selected = g->indexer_selected;
             } else if (ok && (!last_indexer_selected || last_indexer_selected_count == 0)) {
@@ -58108,7 +58124,7 @@ static bool glm_graph_forward_token(
                                                                                     l->attn_v_b->type,
                                                                                     last_indexer_selected,
                                                                                     last_indexer_selected_count,
-                                                                                    true,
+                                                                                    last_indexer_guaranteed_prefix == 0u,
                                                                                     g->compact_cache_cap,
                                                                                     glm_graph_compact_cache_is_f16(),
                                                                                     tp_split_layer_heads ? tp_head_count : DS4_N_HEAD,
@@ -77533,6 +77549,23 @@ bool ds4_session_vision_state_matches(
            ds4_session_vision_prefix_matches(s, images, image_count);
 }
 
+bool ds4_session_vision_fingerprint_prefix_matches(
+        const ds4_session     *s,
+        const ds4_vision_span *images,
+        size_t                 image_count) {
+    if (!s || !s->checkpoint_valid) return false;
+    if ((image_count != 0 && !images)) return false;
+    if (s->checkpoint_image_count > image_count) return false;
+    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *current = &images[i];
+        if (old->token_count != current->embedding.token_count ||
+            memcmp(old->fingerprint, current->embedding.fingerprint,
+                   sizeof(old->fingerprint)) != 0) return false;
+    }
+    return true;
+}
+
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count) {
     if (!s || !s->checkpoint_valid || (image_count && !images) ||
@@ -87916,6 +87949,43 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
+}
+
+bool ds4_session_checkpoint_valid(const ds4_session *s) {
+    return s && s->checkpoint_valid;
+}
+
+ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    s->checkpoint_valid = true;
+    return s;
+}
+
+void ds4_session_free_test_checkpoint(ds4_session *s) {
+    if (!s) return;
+    token_vec_free(&s->checkpoint);
+    free(s->checkpoint_images);
+    free(s);
+}
+
+void ds4_session_set_test_images(ds4_session *s,
+                                 const ds4_vision_span *images, size_t n) {
+    if (!s) return;
+    free(s->checkpoint_images);
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
+    if (n == 0 || !images) return;
+    s->checkpoint_images = xcalloc(n, sizeof(*s->checkpoint_images));
+    for (size_t i = 0; i < n; i++) {
+        s->checkpoint_images[i].token_start = images[i].token_start;
+        s->checkpoint_images[i].token_count =
+            images[i].embedding.token_count;
+        memcpy(s->checkpoint_images[i].fingerprint,
+               images[i].embedding.fingerprint,
+               sizeof(s->checkpoint_images[i].fingerprint));
+    }
+    s->checkpoint_image_count = n;
 }
 
 int ds4_session_ctx(ds4_session *s) {

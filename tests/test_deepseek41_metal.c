@@ -85,9 +85,8 @@ static int check_router(void) {
             for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
                 const unsigned rows = counts[ci];
 #ifdef __APPLE__
-                /* Metal's fast log near 1 need not match host libm. Use the
-                 * established separate softplus/sqrt dispatches as reference;
-                 * selection and normalization are still checked on the CPU. */
+                /* Check the separate softplus/sqrt quality path alongside
+                 * the fused path and the independent mathematical oracle. */
                 ds4_gpu_set_quality(true);
                 const int ref_ok = ds4_gpu_router_select_batch_tensor(
                     ref_ids, ref_weights, ref_p, bias, bias_bytes,
@@ -113,19 +112,17 @@ static int check_router(void) {
                     for (unsigned k = 0; k < USED; k++) best[k] = -1;
                     for (unsigned e = 0; e < n; e++) {
                         const double v = logits[t * n + e];
-#ifdef __APPLE__
-                        ref[e] = metal_ref[t * n + e];
-                        CHECK(isfinite(ref[e]) && ref[e] >= 0);
-                        /* Keep an independent mathematical check where the
-                         * FP32 addition before log is well conditioned. */
-                        if (v >= 0) {
-                            const double mathematical = sqrt(v > 20 ? v : log1p(exp(v)));
-                            CHECK(fabs(ref[e] - mathematical) <= 3e-6 * (1 + mathematical));
-                        }
-                        /* At -80, FP32 1 + exp(x) rounds exactly to 1. */
-                        if (v == -80) CHECK(ref[e] == 0);
-#else
                         ref[e] = sqrt(v > 20 ? v : v < -20 ? exp(v) : log1p(exp(v)));
+#ifdef __APPLE__
+                        const double separate = metal_ref[t * n + e];
+                        CHECK(isfinite(separate) && separate >= 0);
+                        CHECK(fabs(separate - ref[e]) <= 3e-6 * (1 + ref[e]));
+                        /* An absolute tolerance would hide cancellation of
+                         * tiny probabilities, including softplus(-80). */
+                        if (v < -20) {
+                            CHECK(fabs(separate - ref[e]) <= 2e-5 * ref[e]);
+                            CHECK(fabs(probs[t * n + e] - ref[e]) <= 2e-5 * ref[e]);
+                        }
 #endif
                         if (!(fabs(probs[t * n + e] - ref[e]) <= 3e-6 * (1 + ref[e])))
                             fprintf(stderr, "router n=%u mode=%u rows=%u row=%u expert=%u logit=%.9g actual=%.9g ref=%.9g\n",
