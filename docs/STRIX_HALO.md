@@ -113,20 +113,42 @@ quantization; the TP model identifier includes the five projection types.
 
 Use a GGUF whose attention projections have already been requantized to Q4_K;
 `--ssd-streaming` changes expert storage and does not convert attention weights.
+The standard V4.1 `q4` conversion recipe quantizes the experts, while keeping
+attention in Q8_0. To select Q4_K attention, the converter also needs
+`--attention-proj q4_k`; a filename ending in `Q4.gguf` alone is not sufficient.
+
+The V4 decode graph also checks both output projection types before selecting
+its Q8-only kernel. In particular, Q8_0 output A with Q4_K output B must use the
+typed path. Previously, checking only A could interpret B's Q4_K bytes as Q8_0.
+This mixed-type decode fix does not establish the cause of an all-Q4 prefill
+failure reported against an older checkout.
+
 Run the model-free checks before full-model logits and throughput comparisons:
 
 ```sh
 # Host checks; no AMD GPU required.
-make test-rocm-v41-q4-output-host test-deepseek41-rocm-output-dispatch-host
+make test-rocm-q4-attention-host test-rocm-v41-q4-output-host \
+  test-deepseek41-rocm-output-dispatch-host
 
 # Native production-shape numerical checks on the ROCm machine.
+make test-rocm-q4-attention-projections ROCM_ARCH=gfx1151
 make test-rocm-v41-q4-output ROCM_ARCH=gfx1151
 ```
+
+The projection test exercises the public Q4_K API for V4 and V4.1 Q-A, Q-B and
+KV shapes in resident, quality and SSD modes, including the 1280-wide V4.1 Q-B
+input and 256-row batches eligible for resident WMMA. It checks sampled CPU
+reference dots, finite outputs and buffer guards. Its inputs are exactly
+representable in both FP16 and Q8_K; it does not measure general-input WMMA
+drift. The separate V4.1 output test covers A/B and mixed Q4_K/Q8_0 recipes.
 
 This integration has host validation only at the time of implementation.
 HIP compilation, native numerical results, full-model quality and Q4/Q8
 throughput comparisons still need to be measured on AMD hardware. The SSD
 performance figures above describe the earlier Q8-attention configuration.
+Include the branch and commit, ROCm version, model architecture, attention
+tensor types and complete command in a failure report: V4 and V4.1 use distinct
+graph implementations, even though they share some low-level kernels.
 
 ### Reproduce SSD measurements
 

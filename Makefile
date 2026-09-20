@@ -948,6 +948,11 @@ test-rocm-v41-q4-output-host: tests/test_rocm_v41_q4_output_host.py tests/test_r
 	python3 tests/test_rocm_v41_q4_output_host.py
 	python3 tests/test_rocm_v41_q8_dispatch_host.py
 
+.PHONY: test-rocm-q4-attention-host
+test-rocm-q4-attention-host: tests/test_attention_output_types.py tests/test_rocm_q4_projection_dispatch.py tests/kernel_source.py ds4.c ds4_rocm_compat.cu
+	python3 tests/test_attention_output_types.py
+	python3 tests/test_rocm_q4_projection_dispatch.py
+
 ifeq ($(UNAME_S),Linux)
 .PHONY: test-deepseek41-memory
 test-deepseek41-memory: tests/test_deepseek41_memory.c ds4.c ds4.h ds4_gpu.h ds4_linux_memory.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
@@ -1113,6 +1118,16 @@ ds4-kernel-v41-q4-output: tests/test_rocm_v41_q4_output.o ds4_rocm.o ds4_image.r
 .PHONY: test-rocm-v41-q4-output
 test-rocm-v41-q4-output: ds4-kernel-v41-q4-output
 	./ds4-kernel-v41-q4-output
+
+tests/test_rocm_q4_attention_projections.o: tests/test_rocm_q4_attention_projections.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+ds4-kernel-q4-attention-projections: tests/test_rocm_q4_attention_projections.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-rocm-q4-attention-projections
+test-rocm-q4-attention-projections: ds4-kernel-q4-attention-projections
+	./ds4-kernel-q4-attention-projections
 
 .PHONY: test-deepseek41-rocm
 test-deepseek41-rocm: ds4-kernel-v41
@@ -1403,7 +1418,7 @@ clean:
 	rm -f tests/test_deepseek41_candidates
 	rm -f tests/test_deepseek41_gather
 	rm -f tests/test_deepseek41_epilogues
-	rm -f ds4-kernel-v41 ds4-kernel-v41-q4-output
+	rm -f ds4-kernel-v41 ds4-kernel-v41-q4-output ds4-kernel-q4-attention-projections
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows
 	rm -f tests/test_cuda_v41_q4_output
