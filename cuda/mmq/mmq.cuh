@@ -4415,7 +4415,7 @@ static __global__ void ds4_mmq_compact_mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, blocks_per_ne00.z, x_soa, soa_blocks);
         return;
     }
 }
