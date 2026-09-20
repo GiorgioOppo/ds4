@@ -26589,7 +26589,10 @@ static bool metal_graph_encode_decode_layer_phase(
                 g->tp_rank * tp_groups, tp_groups,
                 DS4_N_EMBD,
                 metal_graph_heads(g));
-    } else if (ok && layer->attn_output_a->type != DS4_TENSOR_Q8_0) {
+    } else if (ok && (layer->attn_output_a->type != DS4_TENSOR_Q8_0 ||
+                      layer->attn_output_b->type != DS4_TENSOR_Q8_0)) {
+        /* The Q8-only output kernel interprets both matrices as Q8_0.
+         * Mixed recipes need typed dispatch even when only B is Q4_K. */
         ds4_gpu_tensor *attn_out_dst = g->tp_world == 2 ?
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN] : metal_graph_attn_out(g);
         ok = metal_graph_attention_output_dense_quant_low(metal_graph_attn_low(g),
