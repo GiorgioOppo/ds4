@@ -3560,7 +3560,7 @@ int ds4_gpu_qwen4_gdn_front_tensor(
 int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
                                 uint32_t grid_w, const void *model_map, uint64_t model_size,
                                 const ds4_qwen4_vision_weights *w);
-/* Dense GEMM (f32/f16/q8_0 rows, 32x32 tiles) and the batched hc mix pieces. */
+/* Dense GEMM (f32/f16/q8_0, plus bf16 on Metal; 32x32 tiles) and batched hc mix. */
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,

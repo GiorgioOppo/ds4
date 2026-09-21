@@ -15,6 +15,7 @@ typedef struct {
     float eps, base;
 } BonsaiArgs;
 _Static_assert(sizeof(BonsaiArgs) == 60, "Bonsai Metal argument layout");
+_Static_assert(DS4_BONSAI_METAL_PREFILL_CAP*3u*sizeof(int32_t)<=4096u,"inline MRoPE positions fit Metal setBytes");
 
 @interface BSMWeight : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -387,7 +388,17 @@ static bool bsm_gdn(BSMContext *s, id<MTLComputeCommandEncoder> enc, uint32_t il
     return bsm_mv(s,enc,&l->out,s->scratch[BS_ATTN],s->scratch[BS_RESULT],m->gdn_v_grouped);
 }
 
-static bool bsm_attention(BSMContext *s, id<MTLComputeCommandEncoder> enc, uint32_t il) {
+static bool bsm_rope(BSMContext *s, id<MTLComputeCommandEncoder> enc, BonsaiArgs a,
+                     id<MTLBuffer> x, uint32_t count, const int32_t *pos3) {
+    if (!a.rot) return true;
+    a.n=count;
+    if (pos3) [enc setBytes:pos3 length:(NSUInteger)count*3u*sizeof(int32_t) atIndex:2];
+    return bsm_dispatch(s,enc,pos3 ? @"bonsai_mrope" : @"bonsai_rope",a,@[x],NULL,
+                        MTLSizeMake(((uint64_t)a.heads*a.rot/2u+255u)/256u,count,1),MTLSizeMake(256,1,1));
+}
+
+static bool bsm_attention(BSMContext *s, id<MTLComputeCommandEncoder> enc, uint32_t il,
+                          const int32_t *pos3) {
     const ds4_bonsai_model *m=s->model;
     const ds4_bonsai_layer *l=&m->layer[il];
     const uint32_t d=m->head_dim, h=m->n_head, kh=m->n_kv_head, kv=kh*d;
@@ -398,9 +409,9 @@ static bool bsm_attention(BSMContext *s, id<MTLComputeCommandEncoder> enc, uint3
         !bsm_norm(s,enc,&l->k_norm,s->scratch[BS_K],s->scratch[BS_K],kh,d,d,false)) return false;
     BonsaiArgs a={.n=kv,.pos=s->position,.heads=h,.kvheads=kh,.dim=d,.rot=m->n_rot,.width=s->context,.base=m->rope_base};
     if (m->n_rot) {
-        if (!bsm_vector(s,enc,@"bonsai_rope",a,@[s->scratch[BS_Q]],NULL,h*m->n_rot/2u)) return false;
+        if (!bsm_rope(s,enc,a,s->scratch[BS_Q],1,pos3)) return false;
         BonsaiArgs kargs=a; kargs.heads=kh;
-        if (!bsm_vector(s,enc,@"bonsai_rope",kargs,@[s->scratch[BS_K]],NULL,kh*m->n_rot/2u)) return false;
+        if (!bsm_rope(s,enc,kargs,s->scratch[BS_K],1,pos3)) return false;
     }
     return bsm_vector(s,enc,@"bonsai_cache",a,@[s->scratch[BS_K],s->scratch[BS_V],s->keyCache[il],s->valueCache[il]],NULL,kv) &&
         bsm_dispatch(s,enc,@"bonsai_scores",a,@[s->scratch[BS_Q],s->keyCache[il],s->scratch[BS_SCORES]],NULL,
@@ -598,7 +609,7 @@ static bool bsm_gdn_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
 }
 
 static bool bsm_attention_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
-                               uint32_t il, uint32_t count) {
+                               uint32_t il, uint32_t count, const int32_t *pos3) {
     const ds4_bonsai_model *m=s->model;
     const ds4_bonsai_layer *l=&m->layer[il];
     const uint32_t d=m->head_dim,h=m->n_head,kh=m->n_kv_head,kv=kh*d,q=h*d;
@@ -612,11 +623,9 @@ static bool bsm_attention_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
     BonsaiArgs batchArgs={.n=kv,.pos=s->position,.heads=h,.kvheads=kh,.dim=d,
                           .rot=m->n_rot,.width=s->context,.base=m->rope_base};
     if (m->n_rot) {
-        if (!bsm_dispatch(s,enc,@"bonsai_rope",batchArgs,@[s->batch[BS_Q]],NULL,
-                          MTLSizeMake(((uint64_t)h*m->n_rot/2u+255u)/256u,count,1),MTLSizeMake(256,1,1))) return false;
+        if (!bsm_rope(s,enc,batchArgs,s->batch[BS_Q],count,pos3)) return false;
         BonsaiArgs ka=batchArgs;ka.heads=kh;
-        if (!bsm_dispatch(s,enc,@"bonsai_rope",ka,@[s->batch[BS_K]],NULL,
-                          MTLSizeMake(((uint64_t)kh*m->n_rot/2u+255u)/256u,count,1),MTLSizeMake(256,1,1))) return false;
+        if (!bsm_rope(s,enc,ka,s->batch[BS_K],count,pos3)) return false;
     }
     // Cache all rows now; each query below still reads only through its own
     // causal position, so future rows cannot influence earlier outputs.
@@ -707,7 +716,7 @@ ds4_bonsai_metal *ds4_bonsai_metal_create(const ds4_bonsai_model *m, uint32_t ct
         if (!s->library) { fprintf(stderr,"ds4: Bonsai Metal compilation failed: %s\n",error.localizedDescription.UTF8String); return NULL; }
         NSArray<NSString *> *names=@[@"bonsai_embed",@"bonsai_mv",@"bonsai_pq2_mv",@"bonsai_pq2_mv_full",@"bonsai_pq2_gate_up",@"bonsai_pq2_gate_up_full",@"bonsai_bf16_pair",@"bonsai_mm",@"bonsai_mm_pq2_tiled",@"bonsai_hadamard",@"bonsai_norm",@"bonsai_element",
             @"bonsai_conv",@"bonsai_gdn",@"bonsai_gdn_128",@"bonsai_conv_batch",@"bonsai_l2_batch",@"bonsai_gdn_batch",@"bonsai_gdn_batch_128",@"bonsai_mm_pq2_gate_up_tiled",
-            @"bonsai_rope",@"bonsai_cache",@"bonsai_scores",@"bonsai_softmax",@"bonsai_attention",
+            @"bonsai_rope",@"bonsai_mrope",@"bonsai_cache",@"bonsai_scores",@"bonsai_softmax",@"bonsai_attention",
             @"bonsai_scores_batch",@"bonsai_softmax_batch",@"bonsai_attention_batch",@"bonsai_bf16_pair_batch"];
         for (NSString *name in names) {
             id<MTLFunction> function=[s->library newFunctionWithName:name];
@@ -758,24 +767,39 @@ void ds4_bonsai_metal_reset(ds4_bonsai_metal *handle) {
 }
 
 bool ds4_bonsai_metal_eval(ds4_bonsai_metal *handle, int token, float *logits) {
+    return ds4_bonsai_metal_eval_row(handle,token,NULL,NULL,logits);
+}
+
+static bool bsm_embedding_valid(const float *embedding, uint32_t width) {
+    if (embedding) for (uint32_t i=0;i<width;++i) if (!isfinite(embedding[i])) return false;
+    return true;
+}
+
+bool ds4_bonsai_metal_eval_row(ds4_bonsai_metal *handle, int token,
+                              const float *row, const int32_t pos3[3], float *logits) {
     if (!handle) return false;
     @autoreleasepool {
         BSMContext *s=(__bridge BSMContext *)handle->implementation;
         const ds4_bonsai_model *m=s->model;
-        if (s->failed || token<0 || (uint32_t)token>=m->n_vocab || s->position>=s->context) return false;
+        if (s->failed || token<0 || (uint32_t)token>=m->n_vocab || s->position>=s->context ||
+            !bsm_embedding_valid(row,m->n_embd)) return false;
         id<MTLCommandBuffer> cb=[s->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
         if (!cb || !enc) return false;
         BSMWeight *embedding=bsm_weight(s,&m->embedding);
         const NSUInteger eo[]={embedding.offset,0};
-        bool ok=bsm_vector(s,enc,@"bonsai_embed",(BonsaiArgs){.cols=m->n_embd,.type=m->embedding.type,.row_bytes=embedding.rowBytes,.pos=(uint32_t)token},
-             @[embedding.buffer,m->embedding.signs ? s->scratch[BS_NORM] : s->scratch[BS_X]],eo,m->n_embd);
-        if (ok && m->embedding.signs) ok=bsm_transform(s,enc,&m->embedding,s->scratch[BS_NORM],s->scratch[BS_X],true,false);
+        bool ok=true;
+        if (row) memcpy(s->scratch[BS_X].contents,row,(size_t)m->n_embd*sizeof(float));
+        else {
+            ok=bsm_vector(s,enc,@"bonsai_embed",(BonsaiArgs){.cols=m->n_embd,.type=m->embedding.type,.row_bytes=embedding.rowBytes,.pos=(uint32_t)token},
+                 @[embedding.buffer,m->embedding.signs ? s->scratch[BS_NORM] : s->scratch[BS_X]],eo,m->n_embd);
+            if (ok && m->embedding.signs) ok=bsm_transform(s,enc,&m->embedding,s->scratch[BS_NORM],s->scratch[BS_X],true,false);
+        }
         for (uint32_t il=0;ok && il<m->n_layer;++il) {
             const ds4_bonsai_layer *l=&m->layer[il];
 
             ok=bsm_norm(s,enc,&l->norm,s->scratch[BS_X],s->scratch[BS_NORM],1,m->n_embd,m->n_embd,false) &&
-                ((il+1u)%m->full_interval==0 ? bsm_attention(s,enc,il) : bsm_gdn(s,enc,il)) &&
+                ((il+1u)%m->full_interval==0 ? bsm_attention(s,enc,il,pos3) : bsm_gdn(s,enc,il)) &&
                 bsm_element(s,enc,s->scratch[BS_X],s->scratch[BS_RESULT],s->scratch[BS_X],m->n_embd,0,0) &&
                 bsm_norm(s,enc,&l->post_norm,s->scratch[BS_X],s->scratch[BS_NORM],1,m->n_embd,m->n_embd,false) &&
                 bsm_gate_up(s,enc,&l->gate,&l->up,s->scratch[BS_NORM],s->scratch[BS_MID]) &&
@@ -803,15 +827,22 @@ bool ds4_bonsai_metal_eval(ds4_bonsai_metal *handle, int token, float *logits) {
 
 bool ds4_bonsai_metal_prefill(ds4_bonsai_metal *handle, const int *tokens,
                              uint32_t count, float *logits) {
+    return ds4_bonsai_metal_prefill_rows(handle,tokens,count,NULL,NULL,logits);
+}
+
+bool ds4_bonsai_metal_prefill_rows(ds4_bonsai_metal *handle, const int *tokens,
+                                  uint32_t count, const float *const *embeddings,
+                                  const int32_t *pos3, float *logits) {
     if (!handle || !tokens || !count) return false;
-    if (count==1u) return ds4_bonsai_metal_eval(handle,tokens[0],logits);
+    if (count==1u) return ds4_bonsai_metal_eval_row(handle,tokens[0],embeddings ? embeddings[0] : NULL,pos3,logits);
     @autoreleasepool {
         BSMContext *s=(__bridge BSMContext *)handle->implementation;
         const ds4_bonsai_model *m=s->model;
         if (s->failed || count>s->batchCapacity || s->position>s->context || count>s->context-s->position)
             return false;
         for (uint32_t row=0;row<count;++row)
-            if (tokens[row]<0 || (uint32_t)tokens[row]>=m->n_vocab) return false;
+            if (tokens[row]<0 || (uint32_t)tokens[row]>=m->n_vocab ||
+                !bsm_embedding_valid(embeddings ? embeddings[row] : NULL,m->n_embd)) return false;
 
         id<MTLCommandBuffer> cb=[s->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
@@ -820,6 +851,10 @@ bool ds4_bonsai_metal_prefill(ds4_bonsai_metal *handle, const int *tokens,
         bool ok=true;
         for (uint32_t row=0;ok && row<count;++row) {
             const NSUInteger off=bsm_row_offset(row,m->n_embd);
+            if (embeddings && embeddings[row]) {
+                memcpy((char *)s->batch[BS_X].contents+off,embeddings[row],(size_t)m->n_embd*sizeof(float));
+                continue;
+            }
             const NSUInteger offsets[]={embedding.offset,off};
             ok=bsm_vector(s,enc,@"bonsai_embed",(BonsaiArgs){.cols=m->n_embd,.type=m->embedding.type,
                  .row_bytes=embedding.rowBytes,.pos=(uint32_t)tokens[row]},
@@ -832,7 +867,7 @@ bool ds4_bonsai_metal_prefill(ds4_bonsai_metal *handle, const int *tokens,
             ok=bsm_norm(s,enc,&l->norm,s->batch[BS_X],s->batch[BS_NORM],
                         count,m->n_embd,m->n_embd,false);
             if (ok) ok=(il+1u)%m->full_interval==0 ?
-                bsm_attention_batch(s,enc,il,count) : bsm_gdn_batch(s,enc,il,count);
+                bsm_attention_batch(s,enc,il,count,pos3) : bsm_gdn_batch(s,enc,il,count);
             if (ok) ok=bsm_element_rows(s,enc,s->batch[BS_X],s->batch[BS_RESULT],s->batch[BS_X],count,m->n_embd,0) &&
                 bsm_norm(s,enc,&l->post_norm,s->batch[BS_X],s->batch[BS_NORM],count,m->n_embd,m->n_embd,false);
             if (ok) ok=bsm_gate_up_batch(s,enc,l,count);

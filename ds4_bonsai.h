@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Native text-only Qwen3.5 dense graph used by Prism Ternary Bonsai 2.
+/* Native Qwen3.5 dense graph used by Prism Ternary Bonsai 2.
  * Weights and signs are borrowed from the engine and outlive all sessions. */
 #define DS4_BONSAI_LAYERS 64
 #define DS4_BONSAI_METAL_PREFILL_CAP 128u
@@ -61,10 +61,24 @@ void ds4_bonsai_metal_free(ds4_bonsai_metal *s);
 void ds4_bonsai_metal_reset(ds4_bonsai_metal *s);
 /* logits==NULL skips the final vocabulary projection during prompt ingest. */
 bool ds4_bonsai_metal_eval(ds4_bonsai_metal *s, int token, float *logits);
+/* Optional external embeddings contain n_embd finite floats in the original
+ * embedding space (no inverse Hadamard). NULL selects the token's word row.
+ * Optional signed positions are (time,height,width); they affect RoPE only,
+ * never the KV write position or causal attention bounds. Token IDs remain
+ * required and valid even for injected rows. Calls consume inputs before
+ * returning; invalid inputs do not advance the recurrent state. */
+bool ds4_bonsai_metal_eval_row(ds4_bonsai_metal *s, int token,
+                              const float *embedding, const int32_t pos3[3], float *logits);
 /* A causal layer-major prompt chunk, at most DS4_BONSAI_METAL_PREFILL_CAP
  * tokens. Only the last row's logits are computed when logits is non-NULL.
  * Failed GPU execution requires reset; no partial position is committed. */
 bool ds4_bonsai_metal_prefill(ds4_bonsai_metal *s, const int *tokens,
                              uint32_t count, float *logits);
+/* embeddings is an optional array of count row pointers, each independently
+ * nullable. pos3 is optional packed [count][3]. Count one retains decode's
+ * arithmetic, including when either optional input is supplied. */
+bool ds4_bonsai_metal_prefill_rows(ds4_bonsai_metal *s, const int *tokens,
+                                  uint32_t count, const float *const *embeddings,
+                                  const int32_t *pos3, float *logits);
 #endif
 #endif

@@ -7619,17 +7619,18 @@ static void deepseek4_vision_weights_bind(
     }
 }
 
-/* Qwen3.8 vision: llama.cpp's Qwen3-VL mmproj (clip / qwen3vl_merger).
- * Matmul weights may be f32, f16 or q8_0; everything else is f32. */
+/* Shared Qwen3.8/Bonsai vision: Qwen3-VL mmproj (clip / qwen3vl_merger).
+ * Matmul weights may be f32, f16, bf16 or q8_0; other tensors are f32. */
 static uint64_t qwen4_vision_dense(const ds4_model *m, const char *name, uint64_t in_dim, uint64_t out_dim,
                                    uint32_t *type) {
     const ds4_tensor *t = required_tensor(m, name);
     uint64_t in = 1;
     for (uint32_t d = 0; d + 1 < t->ndim; d++) in *= t->dim[d];
-    if ((t->type != DS4_TENSOR_F32 && t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_Q8_0) ||
+    if ((t->type != DS4_TENSOR_F32 && t->type != DS4_TENSOR_F16 &&
+         t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_Q8_0) ||
         t->ndim < 2 || in != in_dim || t->dim[t->ndim - 1] != out_dim) {
         fprintf(stderr, "ds4: vision tensor %s has type %s/shape [%" PRIu64 " x %" PRIu64 "], expected "
-                "f32|f16|q8_0 [%" PRIu64 " x %" PRIu64 "]\n", name, tensor_type_name(t->type),
+                "f32|f16|bf16|q8_0 [%" PRIu64 " x %" PRIu64 "]\n", name, tensor_type_name(t->type),
                 in, t->ndim ? t->dim[t->ndim - 1] : 0, in_dim, out_dim);
         exit(1);
     }
@@ -7672,7 +7673,7 @@ static void qwen4_vision_weights_bind(ds4_qwen4_vision_weights *w, const ds4_mod
     uint32_t patch_type1 = 0;
     w->patch_w0 = qwen4_vision_dense(m, "v.patch_embd.weight", 3u * P * P, E, &w->patch_type);
     w->patch_w1 = qwen4_vision_dense(m, "v.patch_embd.weight.1", 3u * P * P, E, &patch_type1);
-    if (patch_type1 != w->patch_type || w->patch_type == DS4_TENSOR_Q8_0) ds4_die("vision patch weights must both be f32 or f16");
+    if (patch_type1 != w->patch_type || w->patch_type == DS4_TENSOR_Q8_0) ds4_die("vision patch weights must share f32, f16 or bf16 encoding");
     w->patch_b = deepseek4_vision_required_offset(m, "v.patch_embd.bias", DS4_TENSOR_F32, 1, d_e);
     w->post_ln_w = deepseek4_vision_required_offset(m, "v.post_ln.weight", DS4_TENSOR_F32, 1, d_e);
     w->post_ln_b = deepseek4_vision_required_offset(m, "v.post_ln.bias", DS4_TENSOR_F32, 1, d_e);
@@ -60631,6 +60632,9 @@ typedef struct ds4_dspark_spec_stats {
 typedef struct {
     uint32_t token_start;
     uint32_t token_count;
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t layout;
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
@@ -60640,6 +60644,7 @@ struct ds4_session {
     ds4_bonsai_metal *bonsai_metal;
 #endif
     uint32_t bonsai_pos;
+    int32_t bonsai_mrope_delta; /* rotary counter minus causal token position */
     ds4_engine *engine;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
@@ -60754,13 +60759,20 @@ static void bonsai_session_reset(ds4_session *s) {
     if (s->bonsai_metal) ds4_bonsai_metal_reset(s->bonsai_metal);
 #endif
     s->bonsai_pos=0;
+    s->bonsai_mrope_delta=0;
 }
 
 static bool bonsai_session_step(ds4_session *s, int token, float *logits) {
     bool ok=false;
     if (s->bonsai_cpu) ok=ds4_bonsai_cpu_eval(s->bonsai_cpu,token,logits);
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (s->bonsai_metal) ok=ds4_bonsai_metal_eval(s->bonsai_metal,token,logits);
+    if (s->bonsai_metal) {
+        if (s->bonsai_mrope_delta) {
+            const int32_t p=(int32_t)((int64_t)s->bonsai_pos+s->bonsai_mrope_delta);
+            const int32_t pos3[3]={p,p,p};
+            ok=ds4_bonsai_metal_eval_row(s->bonsai_metal,token,NULL,pos3,logits);
+        } else ok=ds4_bonsai_metal_eval(s->bonsai_metal,token,logits);
+    }
 #endif
     if (ok) s->bonsai_pos++;
     return ok;
@@ -71093,7 +71105,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->backend != DS4_BACKEND_METAL &&
             opt->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
-                    "ds4: GLM-5.3 vision requires --metal, --cuda, or --rocm\n");
+                    "ds4: vision requires a GPU backend (--metal, --cuda, or --rocm)\n");
             free(e);
             *out = NULL;
             return 1;
@@ -71214,15 +71226,36 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->first_token_test || opt->metal_graph_test || opt->tp.role != DS4_TP_NONE ||
             opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1) || load_slice ||
             e->distributed.role != DS4_DISTRIBUTED_NONE || e->power_percent != 100 ||
-            (opt->vision_path && opt->vision_path[0]) || (opt->mtp_path && opt->mtp_path[0]) ||
+            (opt->mtp_path && opt->mtp_path[0]) ||
             (opt->directional_steering_file && opt->directional_steering_file[0]))) {
             fprintf(stderr, "ds4: Bonsai supports resident text inference on CPU or Metal; "
-                    "SSD expert streaming, MTP, vision, steering and distributed execution are unavailable\n");
+                    "SSD expert streaming, MTP, steering and distributed execution are unavailable\n");
             ds4_engine_close(e); *out=NULL; return 1;
         }
         e->bonsai=bonsai_bind(&e->model);
         vocab_load(&e->vocab,&e->model);
         if ((uint32_t)e->vocab.n_vocab != e->bonsai->n_vocab) ds4_die("Bonsai vocabulary size mismatch");
+        if (opt->vision_path && opt->vision_path[0]) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (e->backend != DS4_BACKEND_METAL && !opt->inspect_only) {
+                fprintf(stderr,"ds4: Bonsai vision requires Metal\n");
+                ds4_engine_close(e); *out=NULL; return 1;
+            }
+            model_open(&e->vision_model,opt->vision_path,true,false);
+            qwen4_vision_weights_bind(&e->qwen4_vision_weights,&e->vision_model);
+            config_expect_u32("Bonsai vision projection_dim",e->qwen4_vision_weights.n_out,e->bonsai->n_embd);
+            e->vision_start_token=vocab_lookup(&e->vocab,"<|vision_start|>");
+            e->vision_image_token=vocab_lookup(&e->vocab,"<|image_pad|>");
+            e->vision_end_token=vocab_lookup(&e->vocab,"<|vision_end|>");
+            if (e->vision_start_token<0 || e->vision_image_token<0 || e->vision_end_token<0)
+                ds4_die("Bonsai vocabulary is missing vision tokens");
+            e->vision_kind=DS4_VISION_QWEN4;
+            e->vision_ready=true;
+#else
+            fprintf(stderr,"ds4: Bonsai vision requires a Metal build\n");
+            ds4_engine_close(e); *out=NULL; return 1;
+#endif
+        }
         e->model_path=realpath(opt->model_path,NULL);
         fprintf(stderr,"ds4: Ternary Bonsai 2 27B: native %s, packed Prism weights, FP32 recurrent/KV state\n",
                 ds4_backend_name(e->backend));
@@ -72795,7 +72828,7 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_uses_qwen_chat()) {
         if (!tool && !user) {
             if (error && error_cap)
                 snprintf(error, error_cap, "multimodal messages require a user or tool role");
@@ -75649,6 +75682,9 @@ bool ds4_session_vision_prefix_matches(
         const ds4_vision_span *current = &images[i];
         if (old->token_start != current->token_start ||
             old->token_count != current->embedding.token_count ||
+            old->grid_width != current->embedding.grid_width ||
+            old->grid_height != current->embedding.grid_height ||
+            old->layout != current->embedding.layout ||
             memcmp(old->fingerprint, current->embedding.fingerprint,
                    sizeof(old->fingerprint)) != 0) return false;
     }
@@ -75674,6 +75710,9 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
         image_count != s->checkpoint_image_count) return false;
     for (size_t i = 0; i < image_count; i++) {
         if (images[i].embedding.token_count != s->checkpoint_images[i].token_count ||
+            images[i].embedding.grid_width != s->checkpoint_images[i].grid_width ||
+            images[i].embedding.grid_height != s->checkpoint_images[i].grid_height ||
+            images[i].embedding.layout != s->checkpoint_images[i].layout ||
             memcmp(images[i].embedding.fingerprint, s->checkpoint_images[i].fingerprint,
                    sizeof(images[i].embedding.fingerprint))) return false;
     }
@@ -75710,6 +75749,9 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
         for (size_t i = 0; i < s->sync_image_count; i++) {
             copy[i].token_start = s->sync_images[i].token_start;
             copy[i].token_count = s->sync_images[i].embedding.token_count;
+            copy[i].grid_width = s->sync_images[i].embedding.grid_width;
+            copy[i].grid_height = s->sync_images[i].embedding.grid_height;
+            copy[i].layout = s->sync_images[i].embedding.layout;
             memcpy(copy[i].fingerprint,
                    s->sync_images[i].embedding.fingerprint,
                    sizeof(copy[i].fingerprint));
@@ -75890,8 +75932,14 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
-    if (!s || !prompt || (image_count != 0 && !images)) {
+    if (!s || !prompt || !prompt->v || prompt->len <= 0 || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
+        return 1;
+    }
+    if (prompt->len >= s->ctx_size) {
+        snprintf(err, errlen,
+                 "prompt length %d exceeds context %d (one token of generation room is required)",
+                 prompt->len, s->ctx_size);
         return 1;
     }
     if (image_count != 0 && !s->engine->vision_ready) {
@@ -75926,6 +75974,21 @@ int ds4_session_sync_multimodal(
                     snprintf(err, errlen,
                              "image span does not cover image placeholder tokens");
                     return 1;
+                }
+            }
+        }
+        if (s->engine->bonsai &&
+            (!span->embedding.grid_width || !span->embedding.grid_height ||
+             (uint64_t)span->embedding.grid_width*span->embedding.grid_height != span->embedding.token_count ||
+             span->embedding.layout != 0)) {
+            snprintf(err,errlen,"invalid Bonsai image grid"); return 1;
+        }
+        if (s->engine->bonsai) {
+            const uint64_t values=(uint64_t)span->embedding.token_count*s->engine->bonsai->n_embd;
+            for (uint64_t j=0;j<values;++j) {
+                uint32_t bits; memcpy(&bits,span->embedding.data+j,sizeof(bits));
+                if ((bits&UINT32_C(0x7f800000))==UINT32_C(0x7f800000)) {
+                    snprintf(err,errlen,"nonfinite Bonsai image embedding"); return 1;
                 }
             }
         }
@@ -76004,7 +76067,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             bool ok;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
             if (s->bonsai_metal) {
-                ok=ds4_bonsai_metal_prefill(s->bonsai_metal,prompt->v+i,count,logits);
+                if (s->sync_image_count || s->bonsai_mrope_delta) {
+                    const float *rows[DS4_BONSAI_METAL_PREFILL_CAP];
+                    int32_t positions[DS4_BONSAI_METAL_PREFILL_CAP*3u];
+                    int32_t delta=s->bonsai_mrope_delta;
+                    for (uint32_t t=0;t<count;++t) {
+                        uint32_t pos3[3];
+                        qwen4_mrope_pos(s->sync_images,s->sync_image_count,(uint32_t)i+t,&delta,pos3);
+                        for (unsigned d=0;d<3;++d) positions[t*3u+d]=(int32_t)pos3[d];
+                        rows[t]=qwen4_span_row(s->sync_images,s->sync_image_count,(uint32_t)i+t);
+                    }
+                    ok=ds4_bonsai_metal_prefill_rows(s->bonsai_metal,prompt->v+i,count,rows,positions,logits);
+                    if (ok) s->bonsai_mrope_delta=delta;
+                } else ok=ds4_bonsai_metal_prefill(s->bonsai_metal,prompt->v+i,count,logits);
                 if (ok) s->bonsai_pos+=count;
             } else
 #endif

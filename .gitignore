@@ -119,3 +119,7 @@ __pycache__/
 /tests/test_bonsai_attention_batch
 /tests/test_bonsai_bf16_pair_batch
 /tests/test_bonsai_pq2_prefill_load
+
+/tests/test_bonsai_vision_model
+/tests/test_qwen4_vision_bf16
+/tests/test_bonsai_rows

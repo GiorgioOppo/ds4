@@ -4717,13 +4717,13 @@ template [[host_name("kernel_qwen4_moe_mm_down_naxc64")]] kernel void kernel_qwe
 #undef QWEN4_NAX_DOWN_SIG_HALF
 #undef QWEN4_NAX_DOWN_SIG_FLOAT
 #endif /* DS4_METAL_HAS_TENSOR */
-/* --- prefill: dense tiled GEMM for f32/f16/q8_0 weights ----------------- */
+/* --- prefill: dense tiled GEMM for f32/f16/bf16/q8_0 weights ------------ */
 
 struct ds4_metal_args_qwen4_dense_mm {
     uint32_t n_tokens;
     uint32_t in_dim;
     uint32_t out_rows;
-    uint32_t weight_type;   /* 0 f32, 1 f16, 8 q8_0 */
+    uint32_t weight_type;   /* 0 f32, 1 f16, 8 q8_0, 30 bf16 */
     uint32_t row_bytes;
     /* Number of k-splits.  One (or zero) writes straight to out; more makes
      * each grid slice cover a slice of k and write its own partial plane,
@@ -4737,13 +4737,17 @@ struct ds4_metal_args_qwen4_dense_mm {
 #define QWEN4_DM_K 32
 
 /* 8 consecutive weights of row `row` starting at element k0 (k0 % 8 == 0);
- * f32/f16 rows may end mid-tile (in_dim % 32 != 0), q8_0 rows cannot */
+ * f32/f16/bf16 rows may end mid-tile (in_dim % 32 != 0), q8_0 rows cannot */
 static inline void qwen4_dm_stage8(device const char *row, uint k0, uint k_end, uint type, threadgroup float *dst) {
     if (type == 8) {
         qwen4_mm_stage8<float>(row, k0 / 32, (k0 % 32) / 8, 8u, dst);
     } else if (type == 1) {
         device const half *w = (device const half *)row + k0;
         for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? (float)w[i] : 0.0f;
+    } else if (type == 30) {
+        device const ushort *w = (device const ushort *)row + k0;
+        for (uint i = 0; i < 8; i++)
+            dst[i] = k0 + i < k_end ? as_type<float>((uint)w[i] << 16) : 0.0f;
     } else {
         device const float *w = (device const float *)row + k0;
         for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? w[i] : 0.0f;

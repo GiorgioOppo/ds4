@@ -51402,12 +51402,14 @@ static int qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows, bool allow_split_k) {
-    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : weight_type == 1u ? in_dim * 2u :
+    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u :
+                               (weight_type == 1u || weight_type == 30u) ? in_dim * 2u :
                                qwen4_expert_row_bytes(weight_type, in_dim);
     struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
         { n_tokens, in_dim, out_rows, weight_type, row_bytes, 1, 0, 0 };
     qwen4_bind b[3];
-    if (n_tokens == 0 || row_bytes == 0 || (weight_type != 0u && weight_type != 1u && weight_type != 8u) ||
+    if (n_tokens == 0 || row_bytes == 0 ||
+        (weight_type != 0u && weight_type != 1u && weight_type != 8u && weight_type != 30u) ||
         (weight_type == 8u && (in_dim % 32) != 0) || (in_dim % 8) != 0 || out_rows == 0) {
         fprintf(stderr, "ds4: Qwen3.8 dense mm rejected type %u in %u out %u tokens %u\n",
                 weight_type, in_dim, out_rows, n_tokens);

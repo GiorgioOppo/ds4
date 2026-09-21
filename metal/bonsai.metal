@@ -310,6 +310,23 @@ kernel void bonsai_rope(constant BonsaiArgs &a [[buffer(0)]], device float *x [[
     x[offset + h * a.dim + j + half_rot] = p * s + q * c;
 }
 
+// Qwen3.5 interleaved MRoPE [11,11,10]: the 32 rotary pairs take
+// t,h,w,t,h,w,...,t,h. This is the Qwen/Prism IMRoPE section selection,
+// retaining Bonsai's existing NeoX pair arithmetic and inverse frequencies.
+// Args.n is the row count; positions are packed signed [row][3].
+kernel void bonsai_mrope(constant BonsaiArgs &a [[buffer(0)]], device float *x [[buffer(1)]],
+                         constant int *positions [[buffer(2)]], uint2 index [[thread_position_in_grid]]) {
+    const uint i=index.x,half_rot=a.rot/2u;
+    if(index.y>=a.n || i>=a.heads*half_rot)return;
+    const uint h=i/half_rot,j=i%half_rot;
+    const ulong offset=ulong(index.y)*a.heads*a.dim;
+    const float angle=float(positions[ulong(index.y)*3u+j%3u])*pow(a.base,-2.0f*float(j)/float(a.rot));
+    const float c=cos(angle),s=sin(angle);
+    const float p=x[offset+h*a.dim+j],q=x[offset+h*a.dim+j+half_rot];
+    x[offset+h*a.dim+j]=p*c-q*s;
+    x[offset+h*a.dim+j+half_rot]=p*s+q*c;
+}
+
 kernel void bonsai_cache(constant BonsaiArgs &a [[buffer(0)]],
                          device const float *k [[buffer(1)]], device const float *v [[buffer(2)]],
                          device float *kc [[buffer(3)]], device float *vc [[buffer(4)]],
