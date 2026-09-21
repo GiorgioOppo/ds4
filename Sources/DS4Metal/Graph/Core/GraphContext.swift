@@ -55,6 +55,8 @@ public final class GraphContext {
         adaptiveSplitK = ProcessInfo.processInfo.environment["DS4_ADAPTIVE_SPLITK"] != "0"
         vectorCopies = ProcessInfo.processInfo.environment["DS4_VECTOR_COPY"] == "1"
         fusedFlashKVStage = ProcessInfo.processInfo.environment["DS4_FLASH_KV_STAGE"] == "1"
+        fusedAttentionOutputHC = ProcessInfo.processInfo.environment["DS4_FUSED_ATTN_OUT_HC"] != "0"
+        fusedAttentionOutputHCQ4 = ProcessInfo.processInfo.environment["DS4_FUSED_ATTN_OUT_HC"] == "1"
     }
 
     /// DS4_ADAPTIVE_SPLITK (default on; `=0` restores the fixed dispatch):
@@ -125,6 +127,14 @@ public final class GraphContext {
     /// loads while preserving each matrix's original reduction order.
     nonisolated(unsafe) static var fusedCompressorProj =
         ProcessInfo.processInfo.environment["DS4_FUSED_COMP_PROJ"] != "0"
+
+    /// Decode output-B + HC=4 fusion defaults on for Q8. Q4 remains opt-in
+    /// after its M1 Max microbenchmark regressed; =1 enables both, =0 disables
+    /// both. The graph operation also guards shape/layout and preserves fallback.
+    nonisolated(unsafe) static var fusedAttentionOutputHC =
+        ProcessInfo.processInfo.environment["DS4_FUSED_ATTN_OUT_HC"] != "0"
+    nonisolated(unsafe) static var fusedAttentionOutputHCQ4 =
+        ProcessInfo.processInfo.environment["DS4_FUSED_ATTN_OUT_HC"] == "1"
 
     public init(_ rt: MetalRuntime) { self.rt = rt }
 

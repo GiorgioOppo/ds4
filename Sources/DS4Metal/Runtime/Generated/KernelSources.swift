@@ -11479,6 +11479,184 @@ kernel void kernel_dsv4_softmax_pool(
     *((device float *) (dst + id*args.nb0 + ic*args.nb1)) = acc/sum;
 }
 """###,
+        "attn_out_fused": ###"""
+// Decode attention output-B + HC=4, ported from GiorgioOppo/ds4
+// b8507c9f848abb8f24020b136a3db2834ffd600a:metal/moe.metal.
+// Concatenate after moe.metal and dsv4_hc.metal. Reuse the Swift baseline's
+// Q4_K matvec implementation and HC argument layout; no new quantization math.
+// Q8_0 uses the existing kernel_dsv4_q8_hc_expand4_q8_0 in dsv4_hc.metal.
+kernel void kernel_dsv4_attn_out_q4_K_hc_expand4(
+        constant ds4_metal_args_mul_mv & mv,
+        constant ds4_metal_args_dsv4_hc_expand & hc,
+        device const char * weight,
+        device const char * input,
+        device       char * block_out,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    // moe.metal undefines N_R0_Q4_K after defining the shared helper.
+    // Keep its two-row specialization local to this separate kernel unit.
+    constexpr short rows_per_simdgroup = 2;
+    if (hc.n_hc != 4 || hc.n_tokens != 1 || hc.has_add != 0 ||
+        mv.ne0 != hc.n_embd || (mv.ne0 & 1) != 0 ||
+        hc.nb_block0 != sizeof(float)) {
+        return;
+    }
+
+    const int first_row =
+        (tgpig.x * FC_mul_mv_nsg + sgitg) * rows_per_simdgroup;
+    if (first_row < mv.ne0) {
+        kernel_mul_mv_q4_K_f32_impl<rows_per_simdgroup,
+                                  constant ds4_metal_args_mul_mv &>(
+            mv, weight, input, block_out, shmem,
+            tgpig, tiisg, sgitg);
+    }
+
+    // Every simdgroup, including an inactive tail group, reaches this barrier.
+    // Read the materialized F32 value exactly as the standalone HC dispatch
+    // does; keep block_out available for diagnostics and parity comparisons.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tiisg != 0) return;
+    FOR_UNROLL(short row = 0; row < rows_per_simdgroup; ++row) {
+        const int d = first_row + row;
+        if (d >= mv.ne0) continue;
+
+        const float block_v = *((device const float *)(
+            block_out + (uint64_t)d * hc.nb_block0));
+        const float r0 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+        const float r1 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+        const float r2 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+        const float r3 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+        FOR_UNROLL(short dst_hc = 0; dst_hc < 4; ++dst_hc) {
+            float acc = block_v * *((device const float *)(
+                post + (uint64_t)dst_hc * hc.nb_post0));
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+            *((device float *)(dst + (uint64_t)d * hc.nb0 +
+                                (uint64_t)dst_hc * hc.nb1)) = acc;
+        }
+    }
+}
+"""###,
+        "q4_prefill_pair": ###"""
+// Q-A/KV prefill specialization from ds4 b8507c9f848abb8f24020b136a3db2834ffd600a.
+// Same M32 x N32 x K64 staging and K accumulation as the C F16-RHS kernel.
+// Dequantization keeps Swift's existing Q4_K arithmetic, including half d/16,
+// so this optimization does not change the meaning of subnormal scale blocks.
+// The host admits only complete tiles and the production 4096 -> 1024/512 shape.
+
+kernel void kernel_dsv4_q4_prefill_rhs_f16(
+        constant uint &count [[buffer(0)]],
+        device const float *src [[buffer(1)]],
+        device half4 *dst [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint base = 4 * gid;
+    if (base >= count) return; // host requires count divisible by four
+    // Scalar input access also permits F32 views with a non-vector-aligned offset.
+    dst[gid] = half4(src[base], src[base + 1], src[base + 2], src[base + 3]);
+}
+
+kernel void kernel_dsv4_q4_prefill_f16_rhs_m32_k64(
+        constant ds4_metal_args_mul_mm &args [[buffer(0)]],
+        device const char *src0 [[buffer(1)]],
+        device const char *src1 [[buffer(2)]],
+        device float *dst [[buffer(3)]],
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 32, NR1 = 32, NK = 64, NL0 = 4, NL1 = 4, MA = 2;
+    threadgroup half *sa = (threadgroup half *)shmem;
+    threadgroup half *sb = (threadgroup half *)(shmem + 4096);
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+    const short il0 = tiitg % NL0;
+    short il = il0;
+    device const block_q4_K *x =
+        (device const block_q4_K *)(src0 + args.nb01 * (r0 + tiitg / NL0));
+    const short iy = 8 * (tiitg % NL1);
+    device const half *y = (device const half *)(src1
+        + args.nb11 * (r1 + tiitg / NL1) + args.nb10 * iy);
+    simdgroup_half8x8 ma[MA], mb[2];
+    simdgroup_float8x8 mc[2 * MA];
+    for (short i = 0; i < 2 * MA; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loopK = 0; loopK < args.ne00; loopK += NK) {
+        half4x4 a;
+        dequantize_q4_K(x, il, a);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (short i = 0; i < 16; ++i) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (tiitg / NL0) / 8;
+            const short lx = (tiitg / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = (NR0 / 8) * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = a[i / 4][i % 4];
+        }
+        #pragma unroll
+        for (short pass = 0; pass < 2; ++pass) {
+            const short sx = tiitg % NL1;
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4 *)(sb + 1024 * pass + 64 * ib + 8 * ly) =
+                *((device const half2x4 *)(y + 32 * pass));
+        }
+        il = il + 4 < 16 ? il + 4 : il % NL0;
+        x = il < NL0 ? x + 1 : x;
+        y += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *lsma = sa + MA * 64 * (sgitg % 2);
+        threadgroup const half *lsmb = sb + 2 * 64 * (sgitg / 2);
+        #pragma unroll
+        for (short ik = 0; ik < NK / 8; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < MA; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 2 * MA; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / MA], ma[i % MA], mc[i]);
+            }
+            lsma += (NR0 / 8) * 64;
+            lsmb += 4 * 64;
+        }
+    }
+    device float *out = dst + r0 + (NR0 / 2) * (sgitg & 1)
+        + (r1 + 16 * (sgitg >> 1)) * args.ne0;
+    for (short i = 0; i < 2 * MA; ++i) {
+        simdgroup_store(mc[i], out + 8 * (i % MA) + 8 * args.ne0 * (i / MA), args.ne0, 0, false);
+    }
+}
+"""###,
         "glm52_router": ###"""
 // GLM 5.2 (`glm-dsa`) kernels.
 //

@@ -304,16 +304,25 @@ extension GraphContext {
             try attnOutLowQ8(outputA: w.attnOutA, heads: s.heads, low: s.attnLow,
                              nGroups: d.nOutGroup, groupDim: d.attnGroupDim, rank: d.nLoraO)
         }
-        if w.attnOutQ4 {
-            // DS4_DENSE_Q4: output_b requantized to Q4_K (see q_b above).
-            try denseQ4(w.attnOut, s.attnLow, s.blockOut,
-                        inDim: d.attnLowDim, outDim: d.nEmbd, id0: s.id0, d: d)
-        } else {
-            try matmulQ8_0(weight: w.attnOut, x: s.attnLow, out: s.blockOut, inDim: d.attnLowDim, outDim: d.nEmbd)
+        var fusedOutputHC = false
+        if w.attnOutAQ4 == w.attnOutQ4, !w.attnOutQ4 || d.denseQ4Kernel {
+            fusedOutputHC = try attentionOutputHCFused(
+                weight: w.attnOut, x: s.attnLow, blockOut: s.blockOut,
+                residual: curHc, split: split, out: s.afterAttn,
+                inDim: d.attnLowDim, outDim: d.nEmbd, q4: w.attnOutQ4, nHC: d.nHC)
         }
-        try hcExpand4(blockOut: s.blockOut, residual: curHc, post: split, comb: split,
-                      blockAdd: nil, out: s.afterAttn, nEmbd: d.nEmbd, nTokens: 1,
-                      postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+        if !fusedOutputHC {
+            if w.attnOutQ4 {
+                // DS4_DENSE_Q4: output_b requantized to Q4_K (see q_b above).
+                try denseQ4(w.attnOut, s.attnLow, s.blockOut,
+                            inDim: d.attnLowDim, outDim: d.nEmbd, id0: s.id0, d: d)
+            } else {
+                try matmulQ8_0(weight: w.attnOut, x: s.attnLow, out: s.blockOut, inDim: d.attnLowDim, outDim: d.nEmbd)
+            }
+            try hcExpand4(blockOut: s.blockOut, residual: curHc, post: split, comb: split,
+                          blockAdd: nil, out: s.afterAttn, nEmbd: d.nEmbd, nTokens: 1,
+                          postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+        }
         encoder.popDebugGroup()                       // attn-out
         try phase("out-proj")                         // output_a/b + HC expand
         encoder.pushDebugGroup("hc-ffn")

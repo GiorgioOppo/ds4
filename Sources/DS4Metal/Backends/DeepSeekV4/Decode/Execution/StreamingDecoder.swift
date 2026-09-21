@@ -112,6 +112,9 @@ public final class StreamingDecoder {
     /// for A/B. Layers with Q4-requantized dense weights (DS4_DENSE_Q4 /
     /// DS4_QKV_Q4) fall back automatically.
     let prefillDenseMM = ProcessInfo.processInfo.environment["DS4_PREFILL_DENSE_MM"] != "0"
+    /// Shared-F16-RHS Q-A/KV prefill on the C-validated M1–M4 production
+    /// shape. Cache environment switches once per decoder, outside hot loops.
+    let prefillQ4Pair = ProcessInfo.processInfo.environment["DS4_PREFILL_Q4_PAIR"] != "0"
     /// DS4_PREFILL_FULL_LAYER (default ON): when the chunk has at least
     /// DS4_PREFILL_FULL_LAYER_MIN tokens (512), prefill phase B streams the
     /// WHOLE routed layer once (all experts, global ids — no unions, no

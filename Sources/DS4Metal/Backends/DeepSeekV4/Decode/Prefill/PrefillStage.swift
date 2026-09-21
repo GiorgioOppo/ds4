@@ -107,6 +107,10 @@ extension StreamingDecoder {
             let mixMat: GPUTensor     // nq × 24 (HC mixer output)
             let embdMat: GPUTensor    // nq × nEmbd (HC collapse scratch)
             let curMat: GPUTensor     // nq × nEmbd (attn-normed rows)
+            /// One bounded F16 RHS shared by Q-A and KV. Per-stage ownership
+            /// and the decoder's serial tracked queue order GPU-only reuse
+            /// across pipelined runs; no CPU writes or global scratch state.
+            let qkvPairRHS: GPUTensor?
             let qrMat: GPUTensor      // nq × qRank
             let qrNormMat: GPUTensor  // nq × qRank
             let kvMat: GPUTensor      // nq × headDim (latent rows pre-store)
@@ -166,6 +170,16 @@ extension StreamingDecoder {
                 mixMat = try .zeros(rt, floatCount: nq * 24)
                 embdMat = try .zeros(rt, floatCount: nq * d.nEmbd)
                 curMat = try .zeros(rt, floatCount: nq * d.nEmbd)
+                let pairCapacity = (min(nq, 256) / 32) * 32
+                if GraphContext.q4PrefillPairEligible(deviceName: rt.device.name,
+                    inDim: d.nEmbd, qOutDim: d.qRank, kvOutDim: d.headDim, nTok: pairCapacity) {
+                    // Allocation pressure disables the optional specialization.
+                    qkvPairRHS = try? .uninitializedBytes(rt,
+                        byteLength: pairCapacity * d.nEmbd * 2,
+                        elementCount: pairCapacity * d.nEmbd)
+                } else {
+                    qkvPairRHS = nil
+                }
                 qrMat = try .zeros(rt, floatCount: nq * d.qRank)
                 qrNormMat = try .zeros(rt, floatCount: nq * d.qRank)
                 kvMat = try .zeros(rt, floatCount: nq * d.headDim)

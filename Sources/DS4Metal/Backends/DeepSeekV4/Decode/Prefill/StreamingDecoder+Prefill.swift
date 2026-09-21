@@ -1565,9 +1565,20 @@ extension StreamingDecoder {
                                            finalize: .indexerQat, nCompVis: &idxVis)
         }
         try c.phase("comp")                       // DS4_PROFILE_PREFILL boundary (NSA recurrences)
+        // Q-A and KV consume the same attn-normed rows. Both raw projections
+        // may be written here: their own norms/RoPE still run in the original
+        // order below, and the compressor inputs have already been consumed.
+        var qkvPaired = false
+        if prefillQ4Pair, w.qAQ4, w.kvQ4, let rhs = fb.qkvPairRHS {
+            qkvPaired = try c.encodeQ4PrefillPair(weightQA: w.qA, weightKV: w.kvW,
+                act: fb.curMat, qOut: fb.qrMat, kvOut: fb.kvMat, rhsF16: rhs,
+                inDim: d.nEmbd, qOutDim: d.qRank, kvOutDim: d.headDim, nTok: nq)
+        }
         // ── A1c: batched Q path (GEMM + norms + RoPE over all rows).
-        try encodeMMDense(c, weight: w.qA, q4: w.qAQ4, act: fb.curMat, out: fb.qrMat,
-                          inDim: d.nEmbd, outDim: d.qRank, nTok: nq)
+        if !qkvPaired {
+            try encodeMMDense(c, weight: w.qA, q4: w.qAQ4, act: fb.curMat, out: fb.qrMat,
+                              inDim: d.nEmbd, outDim: d.qRank, nTok: nq)
+        }
         try c.rmsNorm(fb.qrMat, weight: w.qANorm, out: fb.qrNormMat, rows: nq, n: d.qRank, eps: rmsEps)
         try encodeMMDense(c, weight: w.qB, q4: w.qBQ4, act: fb.qrNormMat, out: fb.qMat,
                           inDim: d.qRank, outDim: d.qDim, nTok: nq)
@@ -1579,8 +1590,10 @@ extension StreamingDecoder {
                        betaSlow: layerRope.betaSlow, pos0: posFirst, posStep: 1)
         try c.phase("q")                          // DS4_PROFILE_PREFILL boundary (Q GEMMs)
         // ── A1d: batched KV path + per-token fp8 ring store.
-        try encodeMMDense(c, weight: w.kvW, q4: w.kvQ4, act: fb.curMat, out: fb.kvMat,
-                          inDim: d.nEmbd, outDim: d.headDim, nTok: nq)
+        if !qkvPaired {
+            try encodeMMDense(c, weight: w.kvW, q4: w.kvQ4, act: fb.curMat, out: fb.kvMat,
+                              inDim: d.nEmbd, outDim: d.headDim, nTok: nq)
+        }
         try c.rmsNorm(fb.kvMat, weight: w.kvNorm, out: fb.kvMat, rows: nq, n: d.headDim, eps: rmsEps)
         try c.ropeTail(x: fb.kvMat, nTok: nq, nHead: 1, headDim: d.headDim, nRot: d.nRot,
                        nCtxOrig: layerRope.nCtxOrig, freqBase: layerRope.freqBase,
