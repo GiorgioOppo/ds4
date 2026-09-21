@@ -38,6 +38,23 @@ static inline float bs_weight(device const uchar *w, uint i, uint type) {
     return float(*(device const half *)(b + 26u)) * float(int((q * 3u) >> 8) - 1);
 }
 
+// PTQ lane metadata is independent of the quantization block. Four entries
+// cover the original lane, lane+32, lane+64 and lane+96 dot-product walk.
+static inline uint bs_ptq_byte(uint j) {
+    return j < 80u ? j % 16u : (j < 120u ? 16u + (j - 80u) % 8u : 24u + (j - 120u) % 2u);
+}
+static inline uint bs_ptq_power(uint j) {
+    constexpr uint powers[] = {1u, 3u, 9u, 27u, 81u};
+    return powers[j < 80u ? j / 16u : (j < 120u ? (j - 80u) / 8u : (j - 120u) / 2u)];
+}
+static inline float4 bs_ptq_weights4(device const uchar *p, uint4 bytes, uint4 powers) {
+    const uint4 packed = uint4(p[bytes.x], p[bytes.y], p[bytes.z], p[bytes.w]);
+    // The byte multiplication wraps BEFORE extraction, including qh's
+    // four-trit tail. Applying modulo 243 or interpreting raw base 3 differs.
+    const uint4 codes = (((packed * powers) & 255u) * 3u) >> 8u;
+    return float(*(device const half *)(p + 26u)) * float4(int4(codes) - 1);
+}
+
 kernel void bonsai_embed(constant BonsaiArgs &a [[buffer(0)]],
                          device const uchar *w [[buffer(1)]], device float *out [[buffer(2)]],
                          uint i [[thread_position_in_grid]]) {
@@ -68,6 +85,20 @@ kernel void bonsai_mv(constant BonsaiArgs &a [[buffer(0)]],
                 sum += (scale * q.y) * x[k + 32u];
                 sum += (scale * q.z) * x[k + 64u];
                 sum += (scale * q.w) * x[k + 96u];
+            }
+        } else if (a.type == 143u) {
+            const uint4 bytes = uint4(bs_ptq_byte(lane), bs_ptq_byte(lane + 32u),
+                                     bs_ptq_byte(lane + 64u), bs_ptq_byte(lane + 96u));
+            const uint4 powers = uint4(bs_ptq_power(lane), bs_ptq_power(lane + 32u),
+                                      bs_ptq_power(lane + 64u), bs_ptq_power(lane + 96u));
+#pragma unroll 4
+            for (uint block = 0; block < a.cols / 128u; ++block) {
+                const float4 weight = bs_ptq_weights4(wr + block * 28u, bytes, powers);
+                const uint k = block * 128u + lane;
+                sum += weight.x * x[k];
+                sum += weight.y * x[k + 32u];
+                sum += weight.z * x[k + 64u];
+                sum += weight.w * x[k + 96u];
             }
         } else if (a.type == 30u) {
             // GDN alpha/beta have few BF16 output rows. Resolve the storage
@@ -114,6 +145,24 @@ kernel void bonsai_mm(constant BonsaiArgs &a [[buffer(0)]],
                     sums[t] += (scale * q.w) * xt[k + 96u];
                 }
             }
+        } else if (a.type == 143u) {
+            const uint4 bytes = uint4(bs_ptq_byte(lane), bs_ptq_byte(lane + 32u),
+                                     bs_ptq_byte(lane + 64u), bs_ptq_byte(lane + 96u));
+            const uint4 powers = uint4(bs_ptq_power(lane), bs_ptq_power(lane + 32u),
+                                      bs_ptq_power(lane + 64u), bs_ptq_power(lane + 96u));
+            for (uint block = 0; block < a.cols / 128u; ++block) {
+                const float4 weight = bs_ptq_weights4(wr + block * 28u, bytes, powers);
+                const uint k = block * 128u + lane;
+#pragma unroll
+                for (uint t = 0; t < 4u; ++t) {
+                    if (first + t >= a.n) continue;
+                    device const float *xt = x + ulong(first + t) * a.cols;
+                    sums[t] += weight.x * xt[k];
+                    sums[t] += weight.y * xt[k + 32u];
+                    sums[t] += weight.z * xt[k + 64u];
+                    sums[t] += weight.w * xt[k + 96u];
+                }
+            }
         } else if (a.type == 30u) {
             device const ushort *wb = (device const ushort *)wr;
             for (uint k = lane; k < a.cols; k += 32u) {
@@ -137,6 +186,208 @@ kernel void bonsai_mm(constant BonsaiArgs &a [[buffer(0)]],
         if (!lane && row < a.rows && first + t < a.n)
             out[ulong(first + t) * a.rows + row] = sum;
     }
+}
+
+// Fused PTQ gate/up/SiLU decode: two row pairs per SIMD group share input
+// loads and lane metadata. Both dot products retain bonsai_mv's four updates
+// per 128-weight block and final simd_sum. Grid ceil(rows/8), 128 threads.
+static inline uint bs_ptq_shift(uint j) {
+    return 2u * (j < 80u ? j / 16u : (j < 120u ? (j - 80u) / 8u : (j - 120u) / 2u));
+}
+// Exact five-trit lookup for fused decode only. For byte b, field n is
+// ((((b * 3^n) & 255) * 3) >> 8), packed at bit 2*n (n=0..4).
+// Include all 256 bytes, not just canonical encodings. This 512-byte table
+// replaces repeated integer multiplies; scales and dot products remain FP32.
+constant ushort bs_ptq_lut[256]={
+    0,0,256,512,64,320,576,128,384,640,16,272,528,80,336,592,
+    144,400,656,32,32,288,544,96,352,608,160,416,672,4,260,516,
+    68,324,580,132,388,644,20,276,276,532,84,340,596,148,404,660,
+    36,292,548,100,356,612,164,420,676,8,264,520,520,72,328,584,
+    136,392,648,24,280,536,88,344,600,152,408,664,40,296,552,552,
+    104,360,616,168,424,680,1,257,513,65,321,577,129,385,641,17,
+    273,529,81,81,337,593,145,401,657,33,289,545,97,353,609,161,
+    417,673,5,261,517,69,325,325,581,133,389,645,21,277,533,85,
+    341,597,149,405,661,37,293,549,101,357,357,613,165,421,677,9,
+    265,521,73,329,585,137,393,649,25,281,537,89,345,601,601,153,
+    409,665,41,297,553,105,361,617,169,425,681,2,258,514,66,322,
+    578,130,130,386,642,18,274,530,82,338,594,146,402,658,34,290,
+    546,98,354,610,162,162,418,674,6,262,518,70,326,582,134,390,
+    646,22,278,534,86,342,598,150,406,406,662,38,294,550,102,358,
+    614,166,422,678,10,266,522,74,330,586,138,394,650,650,26,282,
+    538,90,346,602,154,410,666,42,298,554,106,362,618,170,426,682
+};
+static inline float4 bs_ptq_lut_weights4(device const uchar *p, uint4 bytes, uint4 powers) {
+    const uint aa=bs_ptq_lut[p[bytes.x]];
+    const uint bb=bs_ptq_lut[p[16u+(bytes.x&7u)]];
+    const uint cc=bs_ptq_lut[p[24u+(bytes.x&1u)]];
+    const uint4 packed=uint4(aa,aa,bytes.z<16u?aa:bb,bytes.w<24u?bb:cc);
+    const uint4 codes=(packed>>powers)&3u;
+    return float(*(device const half *)(p + 26u)) * float4(int4(codes) - 1);
+}
+
+kernel void bonsai_ptq_gate_up(constant BonsaiArgs &a [[buffer(0)]],
+    device const uchar *gate [[buffer(1)]], device const uchar *up [[buffer(2)]],
+    device const float *x [[buffer(3)]], device float *mid [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint NR=2u;
+    const uint first=(group*4u+sg)*NR;
+    const uint4 bytes=uint4(bs_ptq_byte(lane),bs_ptq_byte(lane+32u),
+                           bs_ptq_byte(lane+64u),bs_ptq_byte(lane+96u));
+    const uint4 powers=uint4(bs_ptq_shift(lane),bs_ptq_shift(lane+32u),
+                            bs_ptq_shift(lane+64u),bs_ptq_shift(lane+96u));
+    float sums_g[NR],sums_u[NR];
+#pragma unroll
+    for (uint r=0;r<NR;++r) {sums_g[r]=0.0f;sums_u[r]=0.0f;}
+    for (uint block=0;block<a.cols/128u;++block) {
+        const uint k=block*128u+lane;
+        const float4 input=float4(x[k],x[k+32u],x[k+64u],x[k+96u]);
+#pragma unroll
+        for (uint r=0;r<NR;++r) {
+            if (first+r>=a.rows) continue;
+            const ulong offset=ulong(first+r)*a.row_bytes+block*28u;
+            const float4 g=bs_ptq_lut_weights4(gate+offset,bytes,powers);
+            const float4 u=bs_ptq_lut_weights4(up+offset,bytes,powers);
+            sums_g[r]+=g.x*input.x;
+            sums_g[r]+=g.y*input.y;
+            sums_g[r]+=g.z*input.z;
+            sums_g[r]+=g.w*input.w;
+            sums_u[r]+=u.x*input.x;
+            sums_u[r]+=u.y*input.y;
+            sums_u[r]+=u.z*input.z;
+            sums_u[r]+=u.w*input.w;
+        }
+    }
+#pragma unroll
+    for (uint r=0;r<NR;++r) {
+        const float g=simd_sum(sums_g[r]),u=simd_sum(sums_u[r]);
+        if (!lane && first+r<a.rows) mid[first+r]=(g/(1.0f+exp(-g)))*u;
+    }
+}
+
+// Two rows per SIMD group; each token keeps the same four additions per
+// block and final SIMD reduction. Full removes bounds checks only when the
+// complete threadgroup output tile fits, before entering the K loop.
+template<uint NT,bool Full>
+inline void bonsai_ptq_mm_body(constant BonsaiArgs&a,
+    device const uchar*w,device const float*x,device float*out,
+    uint2 group,ushort lane,ushort sg) {
+    const uint first_row=(group.x*4u+sg)*2u,first_token=group.y*NT;
+    const uint4 bytes=uint4(bs_ptq_byte(lane),bs_ptq_byte(lane+32u),bs_ptq_byte(lane+64u),bs_ptq_byte(lane+96u));
+    const uint4 powers=uint4(bs_ptq_power(lane),bs_ptq_power(lane+32u),bs_ptq_power(lane+64u),bs_ptq_power(lane+96u));
+    float sums[2][NT];
+#pragma unroll
+    for(uint r=0;r<2;++r) {
+#pragma unroll
+        for(uint t=0;t<NT;++t)sums[r][t]=0.0f;
+    }
+    for(uint block=0;block<a.cols/128u;++block) {
+        const uint k=block*128u+lane;
+        float4 input[NT];
+#pragma unroll
+        for(uint t=0;t<NT;++t) {
+            if(!Full && first_token+t>=a.n)continue;
+            device const float*xt=x+ulong(first_token+t)*a.cols;
+            input[t]=float4(xt[k],xt[k+32u],xt[k+64u],xt[k+96u]);
+        }
+#pragma unroll
+        for(uint r=0;r<2;++r) {
+            if(!Full && first_row+r>=a.rows)continue;
+            const float4 weight=bs_ptq_weights4(w+ulong(first_row+r)*a.row_bytes+block*28u,bytes,powers);
+#pragma unroll
+            for(uint t=0;t<NT;++t) {
+                if(!Full && first_token+t>=a.n)continue;
+                sums[r][t]+=weight.x*input[t].x;
+                sums[r][t]+=weight.y*input[t].y;
+                sums[r][t]+=weight.z*input[t].z;
+                sums[r][t]+=weight.w*input[t].w;
+            }
+        }
+    }
+#pragma unroll
+    for(uint r=0;r<2;++r) {
+#pragma unroll
+        for(uint t=0;t<NT;++t) {
+            const float total=simd_sum(sums[r][t]);
+            if(!lane && (Full || (first_row+r<a.rows && first_token+t<a.n)))
+                out[ulong(first_token+t)*a.rows+first_row+r]=total;
+        }
+    }
+}
+
+// Grid ceil(rows/8),ceil(n/4),128 threads. Retain the four-token path for
+// small batches, including its original per-row/per-token bounds checks.
+kernel void bonsai_ptq_mm(constant BonsaiArgs&a [[buffer(0)]],
+    device const uchar*w [[buffer(1)]],device const float*x [[buffer(2)]],device float*out [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],ushort lane [[thread_index_in_simdgroup]],ushort sg [[simdgroup_index_in_threadgroup]]) {
+    bonsai_ptq_mm_body<4,false>(a,w,x,out,group,lane,sg);
+}
+
+// Grid ceil(rows/8),ceil(n/8),128 threads. The last tile keeps bounded loads
+// and stores even when only some rows or tokens are present.
+kernel void bonsai_ptq_mm_8(constant BonsaiArgs&a [[buffer(0)]],
+    device const uchar*w [[buffer(1)]],device const float*x [[buffer(2)]],device float*out [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],ushort lane [[thread_index_in_simdgroup]],ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if((group.x+1u)*8u<=a.rows && (group.y+1u)*8u<=a.n)
+        bonsai_ptq_mm_body<8,true>(a,w,x,out,group,lane,sg);
+    else bonsai_ptq_mm_body<8,false>(a,w,x,out,group,lane,sg);
+}
+
+// One output pair per SIMD group. Both projections retain their independent
+// FP32 accumulators and the same SwiGLU expression as the separate dispatch.
+template<uint NT,bool Full>
+inline void bonsai_ptq_gate_up_batch_body(constant BonsaiArgs&a,
+    device const uchar*gate,device const uchar*up,device const float*x,device float*mid,
+    uint2 group,ushort lane,ushort sg) {
+    const uint row=group.x*4u+sg,first_token=group.y*NT;
+    const uint4 bytes=uint4(bs_ptq_byte(lane),bs_ptq_byte(lane+32u),bs_ptq_byte(lane+64u),bs_ptq_byte(lane+96u));
+    const uint4 powers=uint4(bs_ptq_power(lane),bs_ptq_power(lane+32u),bs_ptq_power(lane+64u),bs_ptq_power(lane+96u));
+    float sums_g[NT]={0.0f,0.0f,0.0f,0.0f},sums_u[NT]={0.0f,0.0f,0.0f,0.0f};
+    if(Full || row<a.rows)for(uint block=0;block<a.cols/128u;++block) {
+        const uint k=block*128u+lane;
+        const ulong offset=ulong(row)*a.row_bytes+block*28u;
+        const float4 g=bs_ptq_weights4(gate+offset,bytes,powers);
+        const float4 u=bs_ptq_weights4(up+offset,bytes,powers);
+#pragma unroll
+        for(uint t=0;t<NT;++t) {
+            if(!Full && first_token+t>=a.n)continue;
+            device const float*xt=x+ulong(first_token+t)*a.cols;
+            const float4 input=float4(xt[k],xt[k+32u],xt[k+64u],xt[k+96u]);
+            sums_g[t]+=g.x*input.x;
+            sums_g[t]+=g.y*input.y;
+            sums_g[t]+=g.z*input.z;
+            sums_g[t]+=g.w*input.w;
+            sums_u[t]+=u.x*input.x;
+            sums_u[t]+=u.y*input.y;
+            sums_u[t]+=u.z*input.z;
+            sums_u[t]+=u.w*input.w;
+        }
+    }
+#pragma unroll
+    for(uint t=0;t<NT;++t) {
+        const float g=simd_sum(sums_g[t]),u=simd_sum(sums_u[t]);
+        if(!lane && (Full || (row<a.rows && first_token+t<a.n)))
+            mid[ulong(first_token+t)*a.rows+row]=(g/(1.0f+exp(-g)))*u;
+    }
+}
+
+// Grid ceil(rows/4),ceil(n/4),128 threads.
+kernel void bonsai_ptq_gate_up_batch(constant BonsaiArgs&a [[buffer(0)]],
+    device const uchar*gate [[buffer(1)]],device const uchar*up [[buffer(2)]],
+    device const float*x [[buffer(3)]],device float*mid [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],ushort lane [[thread_index_in_simdgroup]],ushort sg [[simdgroup_index_in_threadgroup]]) {
+    bonsai_ptq_gate_up_batch_body<4,false>(a,gate,up,x,mid,group,lane,sg);
+}
+
+// Grid ceil(rows/4),ceil(n/8),128 threads; select the complete-tile path
+// uniformly before the projection loop, with the checked path for tails.
+kernel void bonsai_ptq_gate_up_batch_8(constant BonsaiArgs&a [[buffer(0)]],
+    device const uchar*gate [[buffer(1)]],device const uchar*up [[buffer(2)]],
+    device const float*x [[buffer(3)]],device float*mid [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],ushort lane [[thread_index_in_simdgroup]],ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if((group.x+1u)*4u<=a.rows && (group.y+1u)*8u<=a.n)
+        bonsai_ptq_gate_up_batch_body<8,true>(a,gate,up,x,mid,group,lane,sg);
+    else bonsai_ptq_gate_up_batch_body<8,false>(a,gate,up,x,mid,group,lane,sg);
 }
 
 kernel void bonsai_hadamard(constant BonsaiArgs &a [[buffer(0)]],

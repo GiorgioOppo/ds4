@@ -1181,7 +1181,7 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 clean:
 	rm -f tests/test_bonsai_quant tests/test_bonsai_graph tests/test_bonsai_graph_metal tests/test_bonsai_model tests/test_bonsai_metal tests/test_bonsai_gdn_prefill tests/bench_bonsai_pq2 metal/bonsai.metal.inc metal/bonsai.metal.inc.tmp
 	rm -f tests/bench_bonsai_elementwise
-	rm -f tests/test_bonsai_mm
+	rm -f tests/test_bonsai_mm tests/test_bonsai_ptq
 	rm -f tests/test_bonsai_mma tests/test_bonsai_pq2_decode tests/test_bonsai_pairs tests/test_bonsai_fullrows
 	rm -f tests/test_bonsai_prefill_pair tests/test_bonsai_attention_batch
 	rm -f tests/test_bonsai_bf16_pair_batch
@@ -1278,6 +1278,9 @@ tests/bench_bonsai_elementwise: tests/bench_bonsai_elementwise.m
 tests/test_bonsai_mm: tests/test_bonsai_mm.m metal/bonsai.metal.inc
 	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
 
+tests/test_bonsai_ptq: tests/test_bonsai_ptq.m metal/bonsai.metal
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
 tests/test_bonsai_mma: tests/test_bonsai_mma.m bonsai_quant.h metal/bonsai.metal.inc
 	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
 
@@ -1318,10 +1321,14 @@ bench-bonsai-elementwise: tests/bench_bonsai_elementwise
 bench-bonsai-mm: tests/test_bonsai_mm
 	./tests/test_bonsai_mm --bench
 
+.PHONY: bench-bonsai-ptq
+bench-bonsai-ptq: tests/test_bonsai_ptq
+	./tests/test_bonsai_ptq --bench
+
 bench-bonsai-mma: tests/test_bonsai_mma
 	./tests/test_bonsai_mma --bench
 
-test-bonsai-metal: tests/test_bonsai_fullrows tests/test_bonsai_metal tests/test_bonsai_graph_metal tests/test_bonsai_mm tests/test_bonsai_mma tests/test_bonsai_pq2_decode tests/test_bonsai_gdn_prefill tests/test_bonsai_pairs tests/test_bonsai_prefill_pair tests/test_bonsai_attention_batch tests/test_bonsai_bf16_pair_batch tests/test_bonsai_pq2_prefill_load tests/test_bonsai_rows
+test-bonsai-metal: tests/test_bonsai_fullrows tests/test_bonsai_metal tests/test_bonsai_graph_metal tests/test_bonsai_mm tests/test_bonsai_mma tests/test_bonsai_pq2_decode tests/test_bonsai_gdn_prefill tests/test_bonsai_pairs tests/test_bonsai_prefill_pair tests/test_bonsai_attention_batch tests/test_bonsai_bf16_pair_batch tests/test_bonsai_pq2_prefill_load tests/test_bonsai_rows tests/test_bonsai_ptq
 	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_metal
 	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_graph_metal
 	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_mm
@@ -1335,3 +1342,4 @@ test-bonsai-metal: tests/test_bonsai_fullrows tests/test_bonsai_metal tests/test
 	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_bf16_pair_batch
 	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_pq2_prefill_load
 	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_rows
+	MTL_DEBUG_LAYER=1 ./tests/test_bonsai_ptq

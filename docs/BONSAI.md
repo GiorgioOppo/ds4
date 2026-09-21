@@ -28,9 +28,11 @@ the projector weights and vision workspace.
 
 To use PTQ1_0, substitute `gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf` for the
 model path. Both language files also work with `--cpu` for text inference.
-PTQ1_0 uses the generic packed Metal kernels and is substantially slower than
-PQ2_0 on the current implementation. The specialized PQ2 decode, tiled
-prefill and gate/up kernels described below do not apply to PTQ1_0.
+PTQ1_0 has dedicated block decoding and fused Metal gate/up kernels. Its
+prefill kernels reuse activations across output rows and coefficients across
+up to eight tokens, preserving the original scalar FP32 sum order. PQ2_0 uses a separate
+matrix-tiled prefill path; PTQ1_0 does not repack the model into PQ2 or expand
+weights persistently.
 
 ```sh
 ./ds4-server --metal \
@@ -164,6 +166,32 @@ original lane assignment, addition order and final SIMD reduction. Sibling proje
 sign table and width match. This removes 144 redundant transforms per token
 for the supplied checkpoint without reusing stale activations across layers.
 
+PTQ1_0 also decodes one 128-weight block per iteration. The byte indices and
+powers of three for each lane are computed outside the block loop; each scale
+is loaded once for four coefficients. The integer byte product wraps modulo
+256 before extracting each trit, including the final eight coefficients.
+The output still uses the original lane assignment, multiplication/addition
+order and final SIMD reduction. Activations and accumulators stay FP32.
+
+For PTQ matrices with at least 4096 output rows and batches of at least four
+tokens, each SIMD group computes two rows by four or eight tokens. Batches
+of eight or more tokens use eight-token tiles; complete tiles skip bounds
+checks in the K loop, and partial tiles retain bounded loads and stores.
+Compatible gate/up
+projections instead share input loads and publish the SiLU product directly:
+two row pairs per SIMD group for decode, one pair by four or eight tokens for prefill.
+These fusions require matching types, shapes and Hadamard sign tables.
+Smaller projections, short batches and incompatible siblings retain the
+separate block-decoding path. The weights remain in their 28-byte packed
+blocks and the session's allocation sizes are unchanged.
+
+Fused PTQ decode gate/up uses an exact 512-byte constant table containing
+the five trit codes for each possible stored byte. Lane-specific shifts
+select the required codes, retaining wrap-before-extraction semantics for
+all 256 byte values. This lookup is restricted to decode gate/up; other
+projections retain arithmetic extraction. The standalone PTQ decode loop
+is unrolled four blocks at a time, without reordering its FP32 additions.
+
 A further pass applies the typed-load and SIMD-reduction techniques used by
 `metal/dense.metal` and `metal/norm.metal`, while retaining Bonsai's arithmetic.
 BF16 alpha/beta projections resolve their storage type before the K loop.
@@ -281,9 +309,9 @@ checkpoint so a subsequent synchronization rebuilds recurrent state.
   before evaluating more tokens. Changing a prompt prefix rebuilds its state.
 - MTP, CUDA/ROCm, SSD expert streaming, distributed execution,
   directional steering and serialized session/KV caches are not implemented.
-- PQ2_0 and PTQ1_0 are native language formats on CPU and Metal. PTQ1_0 retains
-  the generic projection paths; the PQ2 performance results below do not
-  describe PTQ1_0 throughput.
+- PQ2_0 and PTQ1_0 are native language formats on CPU and Metal, with separate
+  optimized Metal projection paths. Their performance measurements below
+  refer to the named checkpoint and are not interchangeable.
 
 ## Validation
 
@@ -298,6 +326,8 @@ make bench-bonsai-bf16       # typed BF16 alpha/beta projections
 make bench-bonsai-elementwise # exact norm/Hadamard checks and GPU timings
 make bench-bonsai-mm         # four-token projections versus repeated GEMV
 make bench-bonsai-mma        # FP32 tiled PQ2 prefill versus four-token kernel
+make bench-bonsai-ptq        # frozen generic PTQ versus block and batched kernels
+./tests/test_bonsai_ptq --bench-fused # PTQ gate/up/SiLU GPU timings
 ./tests/test_bonsai_pairs --bench # exact gate/up and BF16 decode fusions
 ./tests/test_bonsai_fullrows --bench # complete-row specialization vs frozen kernels
 ./tests/test_bonsai_gdn_prefill --bench # generic vs register-state recurrence
@@ -390,6 +420,83 @@ and RMSE <=1e-5. Reset, changed prefix, append and rewind/replay passed; the
 largest measured lifecycle difference was 1.98e-5, with RMSE 3.89e-6.
 
 ## Current Metal performance
+
+### PTQ1_0 block decoding and exact fusions (2026-09-21)
+
+Baseline: `bfb488f`, before the dedicated PTQ block loaders and fusions.
+Both binaries used `Ternary-Bonsai-2-27B-PTQ1_0.gguf` on Apple M1 Max
+(32 GiB), context 4096, chunk 128, and 32 greedy decode steps. The short
+fixture is the 19-token non-thinking chat prompt `narrami la storia di roma`;
+the 128-token fixture repeats and truncates those same prompt IDs. Three
+alternating baseline/candidate pairs ran for each fixture,
+with one model process at a time. Median rates:
+
+| Prompt tokens | Phase | Baseline, token/s | Optimized, token/s | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 19 | prefill | 3.489 | 14.053 | 4.03x |
+| 19 | decode | 1.627 | 7.570 | 4.65x |
+| 128 | prefill | 3.759 | 15.172 | 4.04x |
+| 128 | decode | 1.602 | 7.019 | 4.38x |
+
+All captured full-vocabulary logits and greedy token IDs matched the
+baseline bit for bit in all six pairs. Prefill timing includes copying and
+saving its frontier logits; decode timing covers session evaluation only.
+These are local results for PTQ1_0, not forecasts for other hardware or a
+comparison with a different quantized checkpoint.
+
+The gain comes from hoisting PTQ byte/trit metadata out of the block loop,
+sharing coefficient/input loads, and fusing gate/up with SiLU. The packed
+weights, FP32 activations, allocation sizes and per-result reduction order
+are retained. Multirow standalone decode variants were measured and omitted
+because they did not consistently improve on the block decoder.
+
+`make test-bonsai-metal` includes the independent PTQ test, with scalar
+MV/MM and SwiGLU references frozen from `bfb488f`. It covers all 256 stored
+byte values at every trit position, scale extremes, zero rows/tokens,
+partial and empty dimensions, real FFN shapes, read-only inputs and guarded
+outputs. The complete CPU/Metal suite and the PTQ test with Metal API and
+shader validation passed. To reproduce the real-model short fixture:
+
+```sh
+./tests/test_bonsai_model \
+  --model gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf --backend metal \
+  --text 'narrami la storia di roma' --chat \
+  --ctx 4096 --chunk 128 --decode 32 --logits /tmp/ptq-logits.f32
+```
+
+### PTQ1_0 eight-token tiles and decode lookup (2026-09-21)
+
+A second PTQ pass reuses each decoded coefficient across eight prefill tokens
+and specializes complete tiles to remove bounds checks from the block loop.
+Four-token tiles remain available for smaller batches. Fused decode gate/up
+uses an exact 512-byte trit table; standalone PTQ decode unrolls four blocks
+without changing the FP32 accumulation order. No extra model-weight copy or
+change to the GGUF is required.
+
+The baseline for this comparison is the preceding PTQ block/fusion pass,
+not `bfb488f`. Three new alternating pairs per fixture used the same M1 Max,
+PTQ1_0 file, context 4096, chunk 128 and 32 greedy decode steps. Median rates:
+
+| Prompt tokens | Phase | Before this pass, token/s | After this pass, token/s | Gain |
+| ---: | --- | ---: | ---: | ---: |
+| 19 | prefill | 13.157 | 14.998 | +14.0% |
+| 19 | decode | 7.192 | 7.428 | +3.3% |
+| 128 | prefill | 15.674 | 21.074 | +34.5% |
+| 128 | decode | 7.315 | 7.408 | +1.3% |
+
+A separate three-pair ablation kept the eight-token prefill in both binaries
+and compared decode with and without the lookup/unrolling changes. With the
+128-token fixture and 64 decode steps, median decode rose from 7.305 to
+7.793 token/s (+6.7%). Individual paired gains varied from +0.2% to +10.5%;
+this is a smaller and less stable benefit than the prefill improvement.
+It is not an additional percentage to multiply by the table's decode gains.
+
+All full-vocabulary logits and greedy token trajectories were bit-identical
+within every pair in both experiments. The independent PTQ test also checks
+the new eight-token full and partial tiles against the frozen scalar reference,
+including all 256 byte encodings in both sides of fused gate/up, real FFN
+shapes and guarded tails. The CPU/Metal suite and PTQ API/shader validation
+passed. These results cover the tested fixtures, not arbitrary long contexts.
 
 ### PQ2 load reuse and larger exact chunks (2026-09-20)
 

@@ -123,3 +123,4 @@ __pycache__/
 /tests/test_bonsai_vision_model
 /tests/test_qwen4_vision_bf16
 /tests/test_bonsai_rows
+/tests/test_bonsai_ptq

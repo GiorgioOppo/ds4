@@ -327,7 +327,8 @@ static bool bsm_element(BSMContext *s, id<MTLComputeCommandEncoder> enc, id<MTLB
 static bool bsm_gate_up(BSMContext *s, id<MTLComputeCommandEncoder> enc,
                        const ds4_bonsai_tensor *gate, const ds4_bonsai_tensor *up,
                        id<MTLBuffer> x, id<MTLBuffer> mid) {
-    if (gate->type!=142u || up->type!=142u || gate->rows<4096u ||
+    const bool ptq=gate->type==143u;
+    if ((!ptq && gate->type!=142u) || up->type!=gate->type || gate->rows<4096u ||
         gate->rows!=up->rows || gate->cols!=up->cols || gate->signs!=up->signs) {
         const ds4_bonsai_tensor *tensors[]={gate,up};
         const unsigned outputs[]={BS_GATE,BS_UP};
@@ -340,11 +341,12 @@ static bool bsm_gate_up(BSMContext *s, id<MTLComputeCommandEncoder> enc,
         if (!bsm_transform(s,enc,gate,x,s->scratch[BS_ROT],false,false)) return false;
         x=s->scratch[BS_ROT];
     }
-    BonsaiArgs a={.rows=gate->rows,.cols=gate->cols,.type=142u,.row_bytes=g.rowBytes};
+    BonsaiArgs a={.rows=gate->rows,.cols=gate->cols,.type=gate->type,.row_bytes=g.rowBytes};
     const NSUInteger offsets[]={g.offset,u.offset,0,0};
-    NSString *name=gate->rows%8u==0 ? @"bonsai_pq2_gate_up_full" : @"bonsai_pq2_gate_up";
+    NSString *name=ptq ? @"bonsai_ptq_gate_up" :
+        (gate->rows%8u==0 ? @"bonsai_pq2_gate_up_full" : @"bonsai_pq2_gate_up");
     return bsm_dispatch(s,enc,name,a,@[g.buffer,u.buffer,x,mid],offsets,
-                        MTLSizeMake(((uint64_t)gate->rows+7u)/8u,1,1),MTLSizeMake(64,1,1));
+                        MTLSizeMake(((uint64_t)gate->rows+7u)/8u,1,1),MTLSizeMake(ptq ? 128u : 64u,1,1));
 }
 
 static bool bsm_alpha_beta(BSMContext *s, id<MTLComputeCommandEncoder> enc,
@@ -455,6 +457,14 @@ static bool bsm_mm_prepared(BSMContext *s, id<MTLComputeCommandEncoder> enc,
     if (t->type==142u && t->rows>=4096u && count>=16u)
         return bsm_dispatch(s,enc,@"bonsai_mm_pq2_tiled",a,@[w.buffer,x,out],offsets,
                             MTLSizeMake(((uint64_t)t->rows+63u)/64u,(count+31u)/32u,1),MTLSizeMake(128,1,1));
+    // PTQ shares activations over two output rows and decoded weights over
+    // up to eight tokens, retaining each result's scalar FP32 reduction.
+    if (t->type==143u && t->rows>=4096u && count>=4u) {
+        const uint32_t tokens=count>=8u ? 8u : 4u;
+        NSString *name=tokens==8u ? @"bonsai_ptq_mm_8" : @"bonsai_ptq_mm";
+        return bsm_dispatch(s,enc,name,a,@[w.buffer,x,out],offsets,
+                            MTLSizeMake(((uint64_t)t->rows+7u)/8u,(count+tokens-1u)/tokens,1),MTLSizeMake(128,1,1));
+    }
     if (count<4u) {
         for (uint32_t row=0;row<count;++row) {
             const NSUInteger rowOffsets[]={w.offset,bsm_row_offset(row,t->cols),bsm_row_offset(row,t->rows)};
@@ -509,12 +519,15 @@ static bool bsm_mm_siblings(BSMContext *s, id<MTLComputeCommandEncoder> enc,
     return true;
 }
 
-/* Pair the two tiled PQ2 projections and publish only the SwiGLU result.
+/* Fuse matching packed gate/up projections and publish only SwiGLU.
+ * PQ2 uses matrix tiles; PTQ retains independent scalar sums for each token.
  * Keep the original projection path for short chunks and other layouts. */
 static bool bsm_gate_up_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
                               const ds4_bonsai_layer *l, uint32_t count) {
     const ds4_bonsai_tensor *gate=&l->gate, *up=&l->up;
-    if (count<16u || gate->type!=142u || up->type!=142u || gate->rows<4096u ||
+    const bool ptq=gate->type==143u;
+    if (count<(ptq ? 4u : 16u) || (!ptq && gate->type!=142u) ||
+        up->type!=gate->type || gate->rows<4096u ||
         gate->rows!=up->rows || gate->cols!=up->cols || gate->signs!=up->signs) {
         const ds4_bonsai_tensor *projections[]={gate,up};
         const unsigned outputs[]={BS_GATE,BS_UP};
@@ -528,8 +541,14 @@ static bool bsm_gate_up_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
         if (!bsm_transform_batch(s,enc,gate,x,count,false)) return false;
         x=s->batch[BS_ROT];
     }
-    const BonsaiArgs a={.n=count,.rows=gate->rows,.cols=gate->cols,.type=142u,.row_bytes=g.rowBytes};
+    const BonsaiArgs a={.n=count,.rows=gate->rows,.cols=gate->cols,.type=gate->type,.row_bytes=g.rowBytes};
     const NSUInteger offsets[]={g.offset,u.offset,0,0};
+    if (ptq) {
+        const uint32_t tokens=count>=8u ? 8u : 4u;
+        NSString *name=tokens==8u ? @"bonsai_ptq_gate_up_batch_8" : @"bonsai_ptq_gate_up_batch";
+        return bsm_dispatch(s,enc,name,a,@[g.buffer,u.buffer,x,s->batch[BS_MID]],offsets,
+                            MTLSizeMake(((uint64_t)gate->rows+3u)/4u,(count+tokens-1u)/tokens,1),MTLSizeMake(128,1,1));
+    }
     return bsm_dispatch(s,enc,@"bonsai_mm_pq2_gate_up_tiled",a,@[g.buffer,u.buffer,x,s->batch[BS_MID]],offsets,
                         MTLSizeMake(((uint64_t)gate->rows+31u)/32u,(count+31u)/32u,1),MTLSizeMake(128,1,1));
 }
@@ -717,13 +736,13 @@ ds4_bonsai_metal *ds4_bonsai_metal_create(const ds4_bonsai_model *m, uint32_t ct
         NSArray<NSString *> *names=@[@"bonsai_embed",@"bonsai_mv",@"bonsai_pq2_mv",@"bonsai_pq2_mv_full",@"bonsai_pq2_gate_up",@"bonsai_pq2_gate_up_full",@"bonsai_bf16_pair",@"bonsai_mm",@"bonsai_mm_pq2_tiled",@"bonsai_hadamard",@"bonsai_norm",@"bonsai_element",
             @"bonsai_conv",@"bonsai_gdn",@"bonsai_gdn_128",@"bonsai_conv_batch",@"bonsai_l2_batch",@"bonsai_gdn_batch",@"bonsai_gdn_batch_128",@"bonsai_mm_pq2_gate_up_tiled",
             @"bonsai_rope",@"bonsai_mrope",@"bonsai_cache",@"bonsai_scores",@"bonsai_softmax",@"bonsai_attention",
-            @"bonsai_scores_batch",@"bonsai_softmax_batch",@"bonsai_attention_batch",@"bonsai_bf16_pair_batch"];
+            @"bonsai_scores_batch",@"bonsai_softmax_batch",@"bonsai_attention_batch",@"bonsai_bf16_pair_batch",@"bonsai_ptq_mm",@"bonsai_ptq_gate_up",@"bonsai_ptq_gate_up_batch",@"bonsai_ptq_mm_8",@"bonsai_ptq_gate_up_batch_8"];
         for (NSString *name in names) {
             id<MTLFunction> function=[s->library newFunctionWithName:name];
             id<MTLComputePipelineState> pipeline=function ? [s->device newComputePipelineStateWithFunction:function error:&error] : nil;
             const NSUInteger requiredThreads=([name isEqualToString:@"bonsai_gdn_128"] ||
                 [name isEqualToString:@"bonsai_gdn_batch_128"] || [name isEqualToString:@"bonsai_mm_pq2_gate_up_tiled"] ||
-                [name isEqualToString:@"bonsai_bf16_pair_batch"]) ? 128u : 256u;
+                [name isEqualToString:@"bonsai_bf16_pair_batch"] || [name hasPrefix:@"bonsai_ptq_"]) ? 128u : 256u;
             if (!pipeline || pipeline.threadExecutionWidth!=32 || pipeline.maxTotalThreadsPerThreadgroup<requiredThreads) {
                 fprintf(stderr,"ds4: Bonsai Metal pipeline unavailable: %s\n",name.UTF8String); return NULL;
             }
