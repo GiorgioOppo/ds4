@@ -1,8 +1,9 @@
 # Ternary Bonsai 2 27B
 
-This branch provides native text inference for the Prism
+This branch provides native text inference and static-image input for the Prism
 [Ternary-Bonsai-2-27B GGUF](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
-on Metal, plus a scalar CPU reference implementation. It does not invoke or
+on Metal, plus a scalar CPU text reference implementation. Both PQ2_0 and
+PTQ1_0 language checkpoints are supported. It does not invoke or
 link llama.cpp at runtime.
 
 ## Run
@@ -19,9 +20,17 @@ Build on macOS with `make -j4 ds4 ds4-server`, then run:
 The model is dense, with no routed experts. Do not pass `--ssd-streaming`:
 the packed PQ2 file is about 6.71 GiB and is mapped directly as Metal weights.
 The 4096-token session additionally uses about 512 MiB for full-attention KV,
-150 MiB for GDN state/history, and scratch buffers including 16.4 MiB for batched
-prefill. Metal checks
-the aggregate session allocation against the device's recommended working set.
+150 MiB for GDN state/history, and scratch buffers including 65.55 MiB for
+batched prefill. Metal checks the aggregate session allocation against the
+device's recommended working set.
+These figures cover the language session; image encoding additionally uses
+the projector weights and vision workspace.
+
+To use PTQ1_0, substitute `gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf` for the
+model path. Both language files also work with `--cpu` for text inference.
+PTQ1_0 uses the generic packed Metal kernels and is substantially slower than
+PQ2_0 on the current implementation. The specialized PQ2 decode, tiled
+prefill and gate/up kernels described below do not apply to PTQ1_0.
 
 ```sh
 ./ds4-server --metal \
@@ -33,6 +42,82 @@ The OpenAI-compatible model ID is `ternary-bonsai-2-27b`.
 Text chat uses Qwen ChatML, with the checkpoint's thinking/non-thinking prefix.
 The Qwen Flash Next reasoning-effort system instruction is not inserted for
 this model.
+
+## Images on Metal
+
+Pass either matching projector with `--vision`, alongside either PQ2_0 or
+PTQ1_0 as the language model:
+
+| File | Role |
+| --- | --- |
+| `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | BF16 vision tower and projection weights |
+| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | Q8_0 vision weights with F16 FFN-down matrices |
+
+These projector files are accessories to the language checkpoint, not
+standalone models. Image inference requires Metal; CPU support covers text.
+For the interactive CLI:
+
+```sh
+./ds4 --metal \
+  -m gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+  --vision gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf \
+  --ctx 4096 --nothink --temp 0
+```
+
+At the prompt, use `/read tests/vision-fixtures/qwen38/maple.png`, then ask
+follow-up questions in the same conversation. PNG and JPEG static images are
+supported. The shared Qwen3-VL encoder resizes images to a grid of 16-pixel
+patches, merges 2x2 patches, and produces 5120-component embedding rows.
+It defaults to 64–1024 image tokens; `DS4_QWEN4_IMAGE_MAX_TOKENS` controls the
+upper bound. BF16 weights widen directly to FP32 in the existing vision
+matrix kernel, including the 4304-wide FFN tail; F32, F16 and Q8_0 paths remain
+available.
+
+For HTTP, start:
+
+```sh
+./ds4-server --metal \
+  -m gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+  --vision gguf/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf \
+  --ctx 4096 --host 127.0.0.1 --port 8000
+```
+
+OpenAI chat accepts `image_url` content parts containing PNG/JPEG data URIs.
+For example, from another terminal:
+
+```sh
+python3 - <<'PY' | curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' --data-binary @-
+import base64, json
+from pathlib import Path
+data = base64.b64encode(Path("tests/vision-fixtures/qwen38/maple.png").read_bytes()).decode()
+print(json.dumps({
+    "model": "ternary-bonsai-2-27b", "temperature": 0, "max_tokens": 64,
+    "think": False,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Read the text in this image."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + data}}
+    ]}]
+}))
+PY
+```
+
+Remote image URLs and server-side file paths are rejected. See
+[server image input](SERVER.md#images) for the request limits.
+
+Image rows already occupy the language model's original embedding space.
+They bypass the folded token-embedding lookup and its inverse Hadamard;
+subsequent folded projections still apply their declared transforms.
+Full-attention layers use interleaved MRoPE sections `[11, 11, 10]` with
+temporal, row and column coordinates. The rotary counter advances by the
+image grid's maximum dimension, while causal KV positions continue to count
+every token. Text continuation retains this offset; reset and rewind clear it
+before replay. GDN continues to process all text and image rows in order.
+
+Live image-prefix reuse checks token spans, source-image fingerprints, grid
+width/height and layout. Changing the grid with the same fingerprint therefore
+rebuilds the state. Invalid prompts, inconsistent grids and nonfinite embedding
+rows are rejected before prefill changes the session.
 
 ## Implemented graph and formats
 
@@ -106,14 +191,28 @@ path. Unrotated BF16 alpha/beta projections also share one kernel while keeping
 independent accumulators and the original reduction order. These two fusions
 do not change the multi-token prefill projection path.
 
+For compatible PQ2 prefill gate/up matrices and chunks of at least sixteen
+tokens, a separate tiled fusion now computes both projections and SiLU in
+one dispatch. A physical 64-row tile holds 32 matching gate/up rows. It keeps
+the existing FP32 matrix accumulation order and eight accumulators per SIMD
+group, then reuses weight scratch for the activation. Gate/up intermediate
+vectors are not written or read on this path. Declared threadgroup scratch
+remains 12 KiB; short chunks and incompatible shapes or sign tables retain
+the separate projection path.
+
 For complete groups, separate template instantiations remove row-bound checks
 inside these GEMV loops: sixteen rows per standalone threadgroup and eight
 per fused gate/up threadgroup. The host selects them only when the row count
 is divisible by the corresponding group size. The general kernels retain all
 checks for partial groups; both versions share the same arithmetic body.
 
-Metal prefill processes up to 32 tokens per chunk in layer order. The effective
-chunk size is the smaller of `--prefill-chunk`, 32, and the remaining prompt.
+Metal prefill processes up to 128 tokens per chunk in layer order, bounded by
+`--prefill-chunk` and the remaining prompt. Chunks larger than 32 are rounded
+down to a multiple of 32; the final short remainder is handled separately.
+This coalesces complete legacy blocks while preserving the scalar/four-token
+projection path of their original tail. Explicit chunk sizes of 32 or less
+keep their previous schedule. The fixed per-session batch activation buffers
+use 65.55 MiB at capacity 128, versus 16.39 MiB at capacity 32.
 GDN convolution and recurrence still run in token order; full attention writes
 KV and applies the causal bound for each query. Projection matrices, Hadamard
 transforms, normalizations, residuals and FFN activation work on batched rows.
@@ -126,16 +225,43 @@ does not make them visible to earlier queries: each score/attention operation
 retains its own causal position. At sixteen or more tokens, GDN convolution,
 Q/K L2 normalization and recurrence use three batched dispatches per layer.
 Convolution and recurrence walk tokens causally and retain the single-token
-arithmetic order and FP32 state. Smaller chunks retain the original GDN path.
+arithmetic order and FP32 state. Smaller chunks retain per-token dispatches.
+
+The checkpoint's 128-dimensional GDN state has specialized prefill and decode
+kernels. Each value lane loads its state column into a fixed-size private
+array, executes the two recurrence passes in the original ascending key
+order, and writes state after the complete scan. Prefill keeps the state
+across all tokens in the chunk. FP32 arithmetic, convolution, normalization
+and causal token order are retained. Other state dimensions use the generic
+kernel.
+
+For unrotated BF16 alpha/beta projections, chunks of at least four tokens
+share a paired four-token kernel. It reuses input loads across the two
+projections, retaining each output's original lane/K order and SIMD sum.
+Other types, rotated weights and short chunks keep the separate path.
+
+Full-attention prefill groups up to eight queries into three dispatches:
+scores, softmax and the weighted value sum. Each query retains its original
+causal bound, FP32 dot-product order, 256-thread softmax tree and ascending
+value accumulation. This is complete causal attention, without sparse masks.
+The reusable score workspace is capped at 32 MiB by reducing the query batch
+at long contexts; if one query already exceeds that cap, it retains the
+original single-query allocation. At context 4096 the checkpoint uses 3 MiB
+of score workspace rather than 384 KiB. Decode retains its single-query path.
 
 For PQ2 matrices with at least 4096 output rows and chunks of at least sixteen
 tokens, prefill uses a 64-output by 32-token by 32-K matrix tile, following the
 packed shared-memory layout used by the existing DeepSeek Metal kernels.
-Each thread expands sixteen coefficients with one scale load. Matrix operands
-and accumulators stay FP32; weights are expanded only in 12 KiB of threadgroup
-scratch, not into a persistent full-precision matrix. Contiguous `float4`
-activation loads feed the tile, and complete output tiles store directly to
-device memory; partial tiles retain a bounds-checked scratch path. Matrix accumulation
+Each thread loads its scale and four packed words once per 128-coefficient
+quantization block. Four 32-K passes reuse these registers, with aligned
+16-bit loads accommodating the 34-byte PQ2 blocks. Both the standalone and
+paired gate/up tiles retain the original sequence of eight-wide matrix
+accumulations. Matrix operands and accumulators stay FP32; weights are
+expanded only in 12 KiB of threadgroup scratch, not into a persistent
+full-precision matrix. Contiguous `float4` activation loads feed the tile.
+Complete standalone projection tiles store directly to device memory;
+partial tiles retain a bounds-checked scratch path. Paired gate/up tiles
+stage their outputs in scratch to apply SiLU. Matrix accumulation
 changes association relative to GEMV. Smaller projections and chunks use a
 four-token kernel that preserves each token's original reduction, or serial
 GEMV for chunks below four tokens. CPU prefill remains sequential.
@@ -148,12 +274,16 @@ checkpoint so a subsequent synchronization rebuilds recurrent state.
 
 - CLI and HTTP text generation, incremental prompt reuse, independent sessions,
   reset and prefix rebuilding are supported.
+- Static PNG/JPEG images are supported on Metal with either language format
+  and either matching BF16 or Q8_0 projector, through CLI `/read` and HTTP
+  `image_url` data URIs. Video and audio input are outside this implementation.
 - Rewind invalidates the recurrent checkpoint; synchronize the retained prompt
   before evaluating more tokens. Changing a prompt prefix rebuilds its state.
-- MTP, vision/mmproj, CUDA/ROCm, SSD expert streaming, distributed execution,
+- MTP, CUDA/ROCm, SSD expert streaming, distributed execution,
   directional steering and serialized session/KV caches are not implemented.
-- PQ2 was tested with the full 27B checkpoint. PTQ packing and execution are
-  tested with synthetic weights; a full PTQ checkpoint comparison is still needed.
+- PQ2_0 and PTQ1_0 are native language formats on CPU and Metal. PTQ1_0 retains
+  the generic projection paths; the PQ2 performance results below do not
+  describe PTQ1_0 throughput.
 
 ## Validation
 
@@ -161,6 +291,8 @@ checkpoint so a subsequent synchronization rebuilds recurrent state.
 make test-bonsai             # codecs, Hadamard, graph and malformed inputs
 make test-bonsai-metal       # native kernels and CPU/Metal graph parity
 make tests/test_bonsai_model # optional real-model API/lifecycle runner
+make tests/test_bonsai_rows tests/test_qwen4_vision_bf16
+make tests/test_bonsai_vision_model # real-model image/session runner
 make bench-bonsai-pq2        # original vs optimized PQ2 kernels, no model needed
 make bench-bonsai-bf16       # typed BF16 alpha/beta projections
 make bench-bonsai-elementwise # exact norm/Hadamard checks and GPU timings
@@ -168,7 +300,54 @@ make bench-bonsai-mm         # four-token projections versus repeated GEMV
 make bench-bonsai-mma        # FP32 tiled PQ2 prefill versus four-token kernel
 ./tests/test_bonsai_pairs --bench # exact gate/up and BF16 decode fusions
 ./tests/test_bonsai_fullrows --bench # complete-row specialization vs frozen kernels
+./tests/test_bonsai_gdn_prefill --bench # generic vs register-state recurrence
+./tests/test_bonsai_prefill_pair --bench # tiled prefill gate/up/SiLU fusion
+./tests/test_bonsai_bf16_pair_batch --bench # paired GDN alpha/beta prefill
+./tests/test_bonsai_pq2_prefill_load --bench # PQ2 block-load reuse
+./tests/test_bonsai_attention_batch --bench # serial vs batched causal attention
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./tests/test_bonsai_rows
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./tests/test_qwen4_vision_bf16
+./tests/test_bonsai_vision_model \
+  gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+  gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf \
+  tests/vision-fixtures/qwen38/maple.png --lifecycle
 ```
+
+For the format/vision addition on 2026-09-20, the model-free embedding-row and
+MRoPE tests passed, as did BF16 dense-matrix and synthetic 27-layer vision
+encoder tests with Metal API and shader validation. The BF16 tests compare
+against exactly expanded F32 weights and cover split/unsplit accumulation,
+tails, offsets, BF16 range, FFN width 4304 and output width 5120.
+All four PQ2_0/PTQ1_0 × BF16/Q8_0 combinations read `MAPLE 8153` from the
+maple fixture. Image-cache reuse, invalid-input atomicity, grid changes,
+reset and rewind/replay checks passed. The CLI also read the image with its
+default 300 image tokens, spanning multiple 128-token chunks. An HTTP
+`image_url` request returned `MAPLE 8153`; a subsequent question returned
+`8153` while the server reused both the image embedding and live KV state.
+This is one image fixture, not a general vision-quality benchmark.
+
+The shared vision encoder was compared with Prism's CPU implementation on
+the same 54 image tokens. With identical normalized input pixels, the BF16
+embedding cosine was 0.99999424 (RMSE 0.002682); Q8_0 was 0.99991836
+(RMSE 0.010244). The reference uses lower-precision intermediate dot-product
+inputs and a different merger GELU approximation; bitwise agreement is not
+expected. Its default image preprocessing also adds padding, whereas ds4's
+existing Qwen preprocessing resizes directly. Using each runtime's default
+preprocessing gave cosines 0.946733 and 0.947465 respectively. The higher
+same-input figures validate the encoder comparison, not equivalence of the
+two complete image pipelines. `tests/bonsai_vision_reference.cpp` makes both
+comparisons reproducible without linking Prism into ds4.
+
+Text-only PQ2_0 logits remained bit-identical to the pre-vision implementation
+for a 128-token prompt plus 32 decode steps; PTQ1_0 matched for a 19-token
+prompt plus eight steps. Both complete Bonsai suites and the shared Qwen
+kernel suite passed after the changes.
+
+The optional vision lifecycle runner also checks malformed prompts before
+span access, finite embeddings, cache identity and grid changes with the same
+fingerprint against cold replay. Substitute the language/projector paths to
+exercise another supported combination. Run real-model tests one process at
+a time.
 
 The model-free tests cover all fp16 scales, PQ2/PTQ packing, explicit-matrix
 Hadamard oracles, grouped output, GDN SiLU versus sigmoid, causal convolution,
@@ -211,6 +390,95 @@ and RMSE <=1e-5. Reset, changed prefix, append and rewind/replay passed; the
 largest measured lifecycle difference was 1.98e-5, with RMSE 3.89e-6.
 
 ## Current Metal performance
+
+### PQ2 load reuse and larger exact chunks (2026-09-20)
+
+This second pass combines PQ2 block-load reuse, paired BF16 alpha/beta
+projections and a 128-token prefill cap. Its baseline is the preceding exact
+prefill/recurrent-state pass below, already including its fused gate/up,
+register-state GDN and batched attention. These are incremental measurements,
+not a comparison against the original remote commit.
+
+On Apple M1 Max (32 GiB), both versions used the same PQ2 model, context 4096,
+configured chunk 128 and 32 greedy decode steps. The baseline's effective cap
+was 32; the candidate's was 128. Both were warmed, then three alternating
+pairs ran per prompt with one model process at a time. Median rates:
+
+| Prompt tokens | Phase | Previous pass, token/s | This pass, token/s | Change |
+| ---: | --- | ---: | ---: | ---: |
+| 19 | prefill | 24.737 | 27.024 | +9.2% |
+| 19 | decode | 16.364 | 16.459 | +0.6% |
+| 128 | prefill | 46.317 | 58.895 | +27.2% |
+| 128 | decode | 16.006 | 16.256 | +1.6% |
+| 512 | prefill | 44.943 | 56.456 | +25.6% |
+| 512 | decode | 14.488 | 14.483 | -0.0% |
+
+All 18 runs matched bit for bit across the prefill frontier and 32 subsequent
+full-vocabulary logit rows, including greedy token trajectories. The 19-token
+input is the formatted Rome chat prompt; the larger inputs repeat those IDs
+and measure throughput rather than answer quality. Prefill includes frontier
+copy/save overhead; decode timing covers evaluation only. The decode kernels
+were unchanged in this pass; the small decode differences do not establish a
+new decode speedup. These timings do not predict other devices or prompts.
+
+Additional full-model comparisons passed bit for bit for prompt lengths 33,
+47, 48, 64, 65, 79, 111, 112, 129 and 2049 followed by four decode steps; for
+129-token prompts with configured chunk sizes 8, 16, 48 and 64; and for
+arithmetic/Python chat prompts followed by sixteen decode steps. Public
+session lifecycle tests passed their existing tolerances. The CPU/Metal
+Bonsai suites passed, including 43 GDN fixtures through 129 tokens, 132 BF16
+pair fixtures, mixed graph chunks through 128 tokens, and frozen PQ2 tile
+oracles with nonzero output tails. New BF16 and PQ2 paths also passed Metal
+API/shader validation. These are scoped correctness checks, not proof of
+quality for every prompt.
+
+The chunk-only experiment, before the two kernel changes, measured medians
+of 46.345, 53.166 and 54.639 token/s at effective caps 32, 64 and 128 for the
+128-token fixture, with identical logits. It used three rotating measured
+rounds after a warm-up. The full-model table above measures all three changes
+together; their gains must not be added.
+
+The wider M32/N64 and K64 matrix tile experiments were slower on this device
+and were discarded. The retained tile still has eight accumulators per SIMD
+group and 12 KiB of threadgroup scratch. No persistent expanded weight matrix
+or lower-precision activation/state was introduced.
+
+### Exact prefill and recurrent-state pass (2026-09-20)
+
+Three alternating baseline/candidate pairs per prompt compared this pass with
+commit `3add166` on Apple M1 Max (32 GiB), using the same PQ2 GGUF and context
+4096. The configured prefill chunk was 128 (effective Bonsai cap 32), followed
+by 32 greedy decode steps. Both binaries were warmed first; only one model
+process ran at a time. Median rates:
+
+| Prompt tokens | Phase | Baseline, token/s | Optimized, token/s | Gain |
+| ---: | --- | ---: | ---: | ---: |
+| 19 | prefill | 21.770 | 24.486 | +12.5% |
+| 19 | decode | 14.906 | 15.882 | +6.5% |
+| 128 | prefill | 37.071 | 45.477 | +22.7% |
+| 128 | decode | 14.811 | 15.537 | +4.9% |
+| 512 | prefill | 34.295 | 44.079 | +28.5% |
+| 512 | decode | 12.992 | 14.037 | +8.0% |
+
+All candidate runs matched the corresponding baseline bit for bit, covering
+33 full-vocabulary logit rows per run and their greedy token trajectories
+in the 18-run comparison. The 19-token input is the non-thinking
+Rome chat prompt; 128 and 512 tokens repeat its IDs as throughput fixtures,
+not quality datasets. Prefill timing includes copying/saving the frontier
+logits; decode timing covers evaluation only. These are local measurements,
+not guarantees for other devices or prompts.
+
+Additional baseline/candidate checks passed bit for bit for 513- and
+2049-token repeated-ID prompts followed by four decode steps, arithmetic and
+Python chat prompts followed by sixteen steps, and 128-token prompts with
+chunk sizes 8 and 16. Public session reset, prefix changes, invalidation and
+rewind/replay also passed the existing lifecycle tolerances. Those lifecycle
+checks compare different ingestion schedules, which need not be bit-identical.
+
+The GDN, paired prefill projections and batched attention also have independent
+kernel checks against the prior arithmetic, with Metal API/shader validation,
+canaries and chunk/causality checks. The graph test exercises score-workspace
+reuse with a synthetic context that reduces the attention group to six queries.
 
 ### First batched pass
 
