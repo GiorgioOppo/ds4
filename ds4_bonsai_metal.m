@@ -34,7 +34,7 @@ static uint64_t bsm_reserved_bytes;
 @interface BSMContext : NSObject {
 @public
     const ds4_bonsai_model *model;
-    uint32_t context, position, batchCapacity;
+    uint32_t context, position, batchCapacity, attentionBatchCapacity;
     bool failed;
     uint64_t reservedBytes;
     id<MTLDevice> device;
@@ -379,7 +379,7 @@ static bool bsm_gdn(BSMContext *s, id<MTLComputeCommandEncoder> enc, uint32_t il
          @[s->scratch[BS_QKV],conv.buffer,s->history[il],s->scratch[BS_CONV]],co,channels) ||
         !bsm_norm(s,enc,NULL,s->scratch[BS_CONV],s->scratch[BS_CONV],2u*kh,d,d,true)) return false;
     const NSUInteger so[] = {0,0,0,A.offset,dt.offset,0,0};
-    if (!bsm_dispatch(s,enc,@"bonsai_gdn",(BonsaiArgs){.dim=d,.heads=vh,.kvheads=kh,.type=l->a.type,.mode=l->dt.type},
+    if (!bsm_dispatch(s,enc,d==128u ? @"bonsai_gdn_128" : @"bonsai_gdn",(BonsaiArgs){.dim=d,.heads=vh,.kvheads=kh,.type=l->a.type,.mode=l->dt.type},
          @[s->scratch[BS_CONV],s->scratch[BS_ALPHA],s->scratch[BS_BETA],A.buffer,dt.buffer,s->state[il],s->scratch[BS_GDN]],so,
          MTLSizeMake(vh,1,1),MTLSizeMake(d,1,1)) ||
         !bsm_norm(s,enc,&l->ssm_norm,s->scratch[BS_GDN],s->scratch[BS_ATTN],vh,d,d,false) ||
@@ -498,6 +498,49 @@ static bool bsm_mm_siblings(BSMContext *s, id<MTLComputeCommandEncoder> enc,
     return true;
 }
 
+/* Pair the two tiled PQ2 projections and publish only the SwiGLU result.
+ * Keep the original projection path for short chunks and other layouts. */
+static bool bsm_gate_up_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
+                              const ds4_bonsai_layer *l, uint32_t count) {
+    const ds4_bonsai_tensor *gate=&l->gate, *up=&l->up;
+    if (count<16u || gate->type!=142u || up->type!=142u || gate->rows<4096u ||
+        gate->rows!=up->rows || gate->cols!=up->cols || gate->signs!=up->signs) {
+        const ds4_bonsai_tensor *projections[]={gate,up};
+        const unsigned outputs[]={BS_GATE,BS_UP};
+        return bsm_mm_siblings(s,enc,projections,s->batch[BS_NORM],outputs,2,count) &&
+            bsm_element_rows(s,enc,s->batch[BS_GATE],s->batch[BS_UP],s->batch[BS_MID],count,gate->rows,1);
+    }
+    BSMWeight *g=bsm_weight(s,gate), *u=bsm_weight(s,up);
+    if (!g || !u || g.rowBytes!=u.rowBytes) return false;
+    id<MTLBuffer> x=s->batch[BS_NORM];
+    if (gate->signs) {
+        if (!bsm_transform_batch(s,enc,gate,x,count,false)) return false;
+        x=s->batch[BS_ROT];
+    }
+    const BonsaiArgs a={.n=count,.rows=gate->rows,.cols=gate->cols,.type=142u,.row_bytes=g.rowBytes};
+    const NSUInteger offsets[]={g.offset,u.offset,0,0};
+    return bsm_dispatch(s,enc,@"bonsai_mm_pq2_gate_up_tiled",a,@[g.buffer,u.buffer,x,s->batch[BS_MID]],offsets,
+                        MTLSizeMake(((uint64_t)gate->rows+31u)/32u,(count+31u)/32u,1),MTLSizeMake(128,1,1));
+}
+
+static bool bsm_alpha_beta_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
+                                 const ds4_bonsai_layer *l, uint32_t count) {
+    const ds4_bonsai_tensor *alpha=&l->alpha, *beta=&l->beta;
+    if (count<4u || alpha->type!=30u || beta->type!=30u || alpha->signs || beta->signs ||
+        alpha->rows!=beta->rows || alpha->cols!=beta->cols) {
+        const ds4_bonsai_tensor *projections[]={alpha,beta};
+        const unsigned outputs[]={BS_ALPHA,BS_BETA};
+        return bsm_mm_siblings(s,enc,projections,s->batch[BS_NORM],outputs,2,count);
+    }
+    BSMWeight *a=bsm_weight(s,alpha), *b=bsm_weight(s,beta);
+    if (!a || !b) return false;
+    const BonsaiArgs args={.n=count,.rows=alpha->rows,.cols=alpha->cols,.type=30u,.row_bytes=a.rowBytes};
+    const NSUInteger offsets[]={a.offset,b.offset,0,0,0};
+    return bsm_dispatch(s,enc,@"bonsai_bf16_pair_batch",args,
+                        @[a.buffer,b.buffer,s->batch[BS_NORM],s->batch[BS_ALPHA],s->batch[BS_BETA]],offsets,
+                        MTLSizeMake(((uint64_t)alpha->rows+3u)/4u,(count+3u)/4u,1),MTLSizeMake(128,1,1));
+}
+
 /* Long chunks share conv/L2/scan dispatches. Every recurrent update retains
  * the single-token arithmetic and order; short chunks use the original loop. */
 static bool bsm_gdn_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
@@ -506,9 +549,10 @@ static bool bsm_gdn_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
     const ds4_bonsai_layer *l=&m->layer[il];
     const uint32_t d=m->ssm_dim,vh=m->n_v_head,kh=m->n_k_head;
     const uint32_t channels=(2u*kh+vh)*d,v=vh*d;
-    const ds4_bonsai_tensor *projections[]={&l->qkv,&l->z,&l->alpha,&l->beta};
-    const unsigned outputs[]={BS_QKV,BS_Z,BS_ALPHA,BS_BETA};
-    if (!bsm_mm_siblings(s,enc,projections,s->batch[BS_NORM],outputs,4,count)) return false;
+    const ds4_bonsai_tensor *projections[]={&l->qkv,&l->z};
+    const unsigned outputs[]={BS_QKV,BS_Z};
+    if (!bsm_mm_siblings(s,enc,projections,s->batch[BS_NORM],outputs,2,count) ||
+        !bsm_alpha_beta_batch(s,enc,l,count)) return false;
     BSMWeight *conv=bsm_weight(s,&l->conv),*A=bsm_weight(s,&l->a),*dt=bsm_weight(s,&l->dt);
     if (!conv || !A || !dt) return false;
     if (count>=16u) {
@@ -520,7 +564,7 @@ static bool bsm_gdn_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
              (BonsaiArgs){.n=count,.cols=d,.heads=2u*kh,.width=channels,.eps=m->eps},
              @[s->batch[BS_CONV]],NULL,MTLSizeMake(2u*kh,count,1),MTLSizeMake(256,1,1))) return false;
         const NSUInteger so[]={0,0,0,A.offset,dt.offset,0,0};
-        if (!bsm_dispatch(s,enc,@"bonsai_gdn_batch",
+        if (!bsm_dispatch(s,enc,d==128u ? @"bonsai_gdn_batch_128" : @"bonsai_gdn_batch",
              (BonsaiArgs){.n=count,.dim=d,.heads=vh,.kvheads=kh,.type=l->a.type,.mode=l->dt.type},
              @[s->batch[BS_CONV],s->batch[BS_ALPHA],s->batch[BS_BETA],A.buffer,dt.buffer,s->state[il],s->batch[BS_GDN]],so,
              MTLSizeMake(vh,1,1),MTLSizeMake(d,1,1))) return false;
@@ -533,7 +577,7 @@ static bool bsm_gdn_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
                  @[s->batch[BS_QKV],conv.buffer,s->history[il],s->batch[BS_CONV]],co,channels) ||
                 !bsm_norm_at(s,enc,NULL,s->batch[BS_CONV],s->batch[BS_CONV],2u*kh,d,d,true,cOff,cOff)) return false;
             const NSUInteger so[]={cOff,hOff,hOff,A.offset,dt.offset,0,vOff};
-            if (!bsm_dispatch(s,enc,@"bonsai_gdn",(BonsaiArgs){.dim=d,.heads=vh,.kvheads=kh,.type=l->a.type,.mode=l->dt.type},
+            if (!bsm_dispatch(s,enc,d==128u ? @"bonsai_gdn_128" : @"bonsai_gdn",(BonsaiArgs){.dim=d,.heads=vh,.kvheads=kh,.type=l->a.type,.mode=l->dt.type},
                  @[s->batch[BS_CONV],s->batch[BS_ALPHA],s->batch[BS_BETA],A.buffer,dt.buffer,s->state[il],s->batch[BS_GDN]],so,
                  MTLSizeMake(vh,1,1),MTLSizeMake(d,1,1))) return false;
         }
@@ -579,14 +623,15 @@ static bool bsm_attention_batch(BSMContext *s, id<MTLComputeCommandEncoder> enc,
     if (!bsm_dispatch(s,enc,@"bonsai_cache",batchArgs,
                       @[s->batch[BS_K],s->batch[BS_V],s->keyCache[il],s->valueCache[il]],NULL,
                       MTLSizeMake(((uint64_t)kv+255u)/256u,count,1),MTLSizeMake(256,1,1))) return false;
-    for (uint32_t row=0;row<count;++row) {
+    for (uint32_t row=0;row<count;row+=s->attentionBatchCapacity) {
         const NSUInteger qOff=bsm_row_offset(row,q);
-        BonsaiArgs a=batchArgs;a.pos+=row;
+        BonsaiArgs a=batchArgs;a.pos+=row;a.n=MIN(count-row,s->attentionBatchCapacity);
         const NSUInteger scoreOff[]={qOff,0,0},attnOff[]={0,0,qOff};
-        if (!bsm_dispatch(s,enc,@"bonsai_scores",a,@[s->batch[BS_Q],s->keyCache[il],s->scratch[BS_SCORES]],scoreOff,
-                          MTLSizeMake(((uint64_t)a.pos+256u)/256u,h,1),MTLSizeMake(256,1,1)) ||
-            !bsm_dispatch(s,enc,@"bonsai_softmax",a,@[s->scratch[BS_SCORES]],NULL,MTLSizeMake(h,1,1),MTLSizeMake(256,1,1)) ||
-            !bsm_vector(s,enc,@"bonsai_attention",a,@[s->scratch[BS_SCORES],s->valueCache[il],s->batch[BS_ATTN]],attnOff,q)) return false;
+        if (!bsm_dispatch(s,enc,@"bonsai_scores_batch",a,@[s->batch[BS_Q],s->keyCache[il],s->scratch[BS_SCORES]],scoreOff,
+                          MTLSizeMake(((uint64_t)a.pos+a.n+255u)/256u,h,a.n),MTLSizeMake(256,1,1)) ||
+            !bsm_dispatch(s,enc,@"bonsai_softmax_batch",a,@[s->scratch[BS_SCORES]],NULL,MTLSizeMake(h,a.n,1),MTLSizeMake(256,1,1)) ||
+            !bsm_dispatch(s,enc,@"bonsai_attention_batch",a,@[s->scratch[BS_SCORES],s->valueCache[il],s->batch[BS_ATTN]],attnOff,
+                          MTLSizeMake(((uint64_t)q+255u)/256u,a.n,1),MTLSizeMake(256,1,1))) return false;
     }
     const uint64_t elements=(uint64_t)count*q;
     if (elements>UINT32_MAX ||
@@ -634,12 +679,17 @@ ds4_bonsai_metal *ds4_bonsai_metal_create(const ds4_bonsai_model *m, uint32_t ct
         if (!ds4_bonsai_model_valid(m) || !ctx || (m->context && ctx>m->context)) return NULL;
         BSMContext *s=[BSMContext new]; s->model=m; s->context=ctx;
         s->batchCapacity=MIN(ctx,DS4_BONSAI_METAL_PREFILL_CAP);
+        // Reuse a bounded workspace for up to eight causal queries. At very
+        // long contexts, reduce the query batch to keep scores within 32 MiB
+        // (or the original single-query allocation if that is already larger).
+        const uint64_t scoreRow=(uint64_t)ctx*m->n_head;
+        s->attentionBatchCapacity=ds4_bonsai_metal_score_capacity(ctx,m->n_head);
         s->device=MTLCreateSystemDefaultDevice(); s->queue=[s->device newCommandQueue];
         s->weights=[NSMutableDictionary dictionary]; s->signBuffers=[NSMutableDictionary dictionary];
         s->pipelines=[NSMutableDictionary dictionary];
         const uint64_t e=m->n_embd,f=m->n_ff,q=(uint64_t)m->n_head*m->head_dim,kv=(uint64_t)m->n_kv_head*m->head_dim;
         const uint64_t v=(uint64_t)m->n_v_head*m->ssm_dim,c=(2ull*m->n_k_head+m->n_v_head)*m->ssm_dim;
-        const uint64_t sizes[BS_BUFFER_COUNT]={e,e,e,MAX(c,2u*q),v,m->n_v_head,m->n_v_head,c,v,q,kv,kv,MAX(q,v),f,f,f,MAX(MAX(e,f),MAX(q,v)),m->n_vocab,(uint64_t)ctx*m->n_head};
+        const uint64_t sizes[BS_BUFFER_COUNT]={e,e,e,MAX(c,2u*q),v,m->n_v_head,m->n_v_head,c,v,q,kv,kv,MAX(q,v),f,f,f,MAX(MAX(e,f),MAX(q,v)),m->n_vocab,scoreRow*s->attentionBatchCapacity};
         if (!s->device || !s->queue || !bsm_memory_admit(s,sizes) || !bsm_validate(s)) {
             fprintf(stderr,"ds4: Bonsai Metal unsupported model shape, tensor layout, or device\n"); return NULL;
         }
@@ -656,12 +706,16 @@ ds4_bonsai_metal *ds4_bonsai_metal_create(const ds4_bonsai_model *m, uint32_t ct
         s->library=[s->device newLibraryWithSource:source options:options error:&error];
         if (!s->library) { fprintf(stderr,"ds4: Bonsai Metal compilation failed: %s\n",error.localizedDescription.UTF8String); return NULL; }
         NSArray<NSString *> *names=@[@"bonsai_embed",@"bonsai_mv",@"bonsai_pq2_mv",@"bonsai_pq2_mv_full",@"bonsai_pq2_gate_up",@"bonsai_pq2_gate_up_full",@"bonsai_bf16_pair",@"bonsai_mm",@"bonsai_mm_pq2_tiled",@"bonsai_hadamard",@"bonsai_norm",@"bonsai_element",
-            @"bonsai_conv",@"bonsai_gdn",@"bonsai_conv_batch",@"bonsai_l2_batch",@"bonsai_gdn_batch",
-            @"bonsai_rope",@"bonsai_cache",@"bonsai_scores",@"bonsai_softmax",@"bonsai_attention"];
+            @"bonsai_conv",@"bonsai_gdn",@"bonsai_gdn_128",@"bonsai_conv_batch",@"bonsai_l2_batch",@"bonsai_gdn_batch",@"bonsai_gdn_batch_128",@"bonsai_mm_pq2_gate_up_tiled",
+            @"bonsai_rope",@"bonsai_cache",@"bonsai_scores",@"bonsai_softmax",@"bonsai_attention",
+            @"bonsai_scores_batch",@"bonsai_softmax_batch",@"bonsai_attention_batch",@"bonsai_bf16_pair_batch"];
         for (NSString *name in names) {
             id<MTLFunction> function=[s->library newFunctionWithName:name];
             id<MTLComputePipelineState> pipeline=function ? [s->device newComputePipelineStateWithFunction:function error:&error] : nil;
-            if (!pipeline || pipeline.threadExecutionWidth!=32 || pipeline.maxTotalThreadsPerThreadgroup<256) {
+            const NSUInteger requiredThreads=([name isEqualToString:@"bonsai_gdn_128"] ||
+                [name isEqualToString:@"bonsai_gdn_batch_128"] || [name isEqualToString:@"bonsai_mm_pq2_gate_up_tiled"] ||
+                [name isEqualToString:@"bonsai_bf16_pair_batch"]) ? 128u : 256u;
+            if (!pipeline || pipeline.threadExecutionWidth!=32 || pipeline.maxTotalThreadsPerThreadgroup<requiredThreads) {
                 fprintf(stderr,"ds4: Bonsai Metal pipeline unavailable: %s\n",name.UTF8String); return NULL;
             }
             s->pipelines[name]=pipeline;
@@ -781,10 +835,7 @@ bool ds4_bonsai_metal_prefill(ds4_bonsai_metal *handle, const int *tokens,
                 bsm_attention_batch(s,enc,il,count) : bsm_gdn_batch(s,enc,il,count);
             if (ok) ok=bsm_element_rows(s,enc,s->batch[BS_X],s->batch[BS_RESULT],s->batch[BS_X],count,m->n_embd,0) &&
                 bsm_norm(s,enc,&l->post_norm,s->batch[BS_X],s->batch[BS_NORM],count,m->n_embd,m->n_embd,false);
-            const ds4_bonsai_tensor *projections[]={&l->gate,&l->up};
-            const unsigned outputs[]={BS_GATE,BS_UP};
-            if (ok) ok=bsm_mm_siblings(s,enc,projections,s->batch[BS_NORM],outputs,2,count);
-            if (ok) ok=bsm_element_rows(s,enc,s->batch[BS_GATE],s->batch[BS_UP],s->batch[BS_MID],count,m->n_ff,1);
+            if (ok) ok=bsm_gate_up_batch(s,enc,l,count);
             if (ok) ok=bsm_mm(s,enc,&l->down,s->batch[BS_MID],s->batch[BS_RESULT],count,false);
             if (ok) ok=bsm_element_rows(s,enc,s->batch[BS_X],s->batch[BS_RESULT],s->batch[BS_X],count,m->n_embd,0);
         }

@@ -1033,6 +1033,8 @@ static ds4_context_memory bonsai_memory_estimate(ds4_backend backend, uint32_t c
         /* Sum of the fixed 27B graph's 17 per-row activation buffers.
          * Vocabulary logits and attention scores remain shared with decode. */
         m.scratch_bytes += UINT64_C(134240) * m.prefill_cap * sizeof(float);
+        m.scratch_bytes += (uint64_t)ctx*24*sizeof(float)*
+            (ctx ? ds4_bonsai_metal_score_capacity(ctx,24)-1u : 0u);
     }
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
     return m;
@@ -75993,6 +75995,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             }
             uint32_t count=(uint32_t)(prompt->len-i);
             if (count>s->prefill_cap) count=s->prefill_cap;
+            /* Coalesce complete legacy 32-token blocks. Keep their final
+             * short block separate: its scalar/four-token projections must
+             * not silently switch to the matrix path when the cap grows. */
+            if (count>32u) count-=count%32u;
             s->checkpoint_valid=false;
             float *logits=i+(int)count==prompt->len ? s->logits : NULL;
             bool ok;

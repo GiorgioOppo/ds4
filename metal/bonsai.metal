@@ -393,50 +393,60 @@ kernel void bonsai_mm_pq2_tiled(constant BonsaiArgs &a [[buffer(0)]],
     simdgroup_float8x8 wf[MR],xf[NR],acc[MR*NR];
 #pragma unroll
     for(uint i=0;i<MR*NR;i++)acc[i]=make_filled_simdgroup_matrix<float,8>(0.0f);
-    for(uint first_k=0;first_k<a.cols;first_k+=BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint row=tid/ROW_THREADS,start_k=(tid%ROW_THREADS)*COEFFS;
+    const uint row=tid/ROW_THREADS,start_k=(tid%ROW_THREADS)*COEFFS;
+    const uint source_row=first_row+row;
+    device const uchar *source_w=w;
+    for(uint block_index=0;block_index<a.cols/128u;++block_index) {
         float scale=0.0f;
-        uint4 bytes0=uint4(1u);
-        if(first_row+row<a.rows) {
-            device const uchar *block=w+ulong(first_row+row)*a.row_bytes+(first_k/128u)*34u;
-            const uint byte=2u+((first_k%128u)+start_k)/4u;
+        uint4 packed=uint4(0x55555555u);
+        if(source_row<a.rows) {
+            device const uchar *block=source_w+ulong(source_row)*a.row_bytes+block_index*34u;
+            const uint byte=2u+start_k/4u;
             scale=float(*(device const half*)block);
-            bytes0=uint4(block[byte],block[byte+1u],block[byte+2u],block[byte+3u]);
+            // Packed rows need only two-byte alignment. Retain the four
+            // 16-coefficient words across this block's four K32 passes.
+            device const ushort *halves=(device const ushort *)(block+byte);
+            packed=uint4(uint(halves[0])|(uint(halves[1])<<16u),
+                         uint(halves[4])|(uint(halves[5])<<16u),
+                         uint(halves[8])|(uint(halves[9])<<16u),
+                         uint(halves[12])|(uint(halves[13])<<16u));
         }
 #pragma unroll
-        for(uint j=0;j<COEFFS;j++) {
-            const uint k=start_k+j;
-            const uint byte=bytes0[j/4u];
-            const uint dst=64u*((k/8u)*(BM/8u)+row/8u)+(k%8u)*8u+row%8u;
-            weights[dst]=first_row+row<a.rows&&first_k+k<a.cols
-                ?scale*float(int((byte>>(2u*(j%4u)))&3u)-1):0.0f;
-        }
-        // Each thread loads a contiguous activation segment, then copies whole
-        // float4 vectors to the row-major rows of the packed 8x8 input tiles.
-        const uint token=tid/(BK/INPUT_RUN),input_k=(tid%(BK/INPUT_RUN))*INPUT_RUN;
+        for(uint part=0;part<4u;++part) {
+            const uint first_k=block_index*128u+part*BK;
+            const uint word=packed[part];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-        for(uint j=0;j<INPUT_RUN;j+=4u) {
-            const uint k=input_k+j;
-            float4 values=0.0f;
-            if(first_token+token<a.n && first_k+k+3u<a.cols)
-                values=*(device const float4*)(x+ulong(first_token+token)*a.cols+first_k+k);
-            const uint dst=64u*((k/8u)*(BN/8u)+token/8u)+(token%8u)*8u+k%8u;
-            *(threadgroup float4*)(inputs+dst)=values;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            for(uint j=0;j<COEFFS;j++) {
+                const uint k=start_k+j;
+                const uint dst=64u*((k/8u)*(BM/8u)+row/8u)+(k%8u)*8u+row%8u;
+                weights[dst]=source_row<a.rows
+                    ?scale*float(int((word>>(2u*j))&3u)-1):0.0f;
+            }
+            const uint token=tid/(BK/INPUT_RUN),input_k=(tid%(BK/INPUT_RUN))*INPUT_RUN;
 #pragma unroll
-        for(uint k=0;k<BK;k+=8u) {
+            for(uint j=0;j<INPUT_RUN;j+=4u) {
+                const uint k=input_k+j;
+                float4 values=0.0f;
+                if(first_token+token<a.n&&first_k+k+3u<a.cols)
+                    values=*(device const float4*)(x+ulong(first_token+token)*a.cols+first_k+k);
+                const uint dst=64u*((k/8u)*(BN/8u)+token/8u)+(token%8u)*8u+k%8u;
+                *(threadgroup float4*)(inputs+dst)=values;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-            for(uint i=0;i<MR;i++)
-                simdgroup_load(wf[i],weights+64u*((k/8u)*(BM/8u)+(sg%2u)*MR+i),8,0,false);
+            for(uint k=0;k<BK;k+=8u) {
 #pragma unroll
-            for(uint j=0;j<NR;j++)
-                simdgroup_load(xf[j],inputs+64u*((k/8u)*(BN/8u)+(sg/2u)*NR+j),8,0,false);
+                for(uint i=0;i<MR;i++)
+                    simdgroup_load(wf[i],weights+64u*((k/8u)*(BM/8u)+(sg%2u)*MR+i),8,0,false);
 #pragma unroll
-            for(uint j=0;j<NR;j++) {
+                for(uint j=0;j<NR;j++)
+                    simdgroup_load(xf[j],inputs+64u*((k/8u)*(BN/8u)+(sg/2u)*NR+j),8,0,false);
 #pragma unroll
-                for(uint i=0;i<MR;i++)simdgroup_multiply_accumulate(acc[j*MR+i],xf[j],wf[i],acc[j*MR+i]);
+                for(uint j=0;j<NR;j++) {
+#pragma unroll
+                    for(uint i=0;i<MR;i++)simdgroup_multiply_accumulate(acc[j*MR+i],xf[j],wf[i],acc[j*MR+i]);
+                }
             }
         }
     }
@@ -675,6 +685,72 @@ kernel void bonsai_gdn_batch(constant BonsaiArgs &a [[buffer(0)]],
     }
 }
 
+// D128 specialization: keep each value lane's state column private across
+// both dk passes and all tokens. Fully unrolled fixed-size dk loops let Metal
+// scalarize the array; state is read and written only at scan boundaries.
+// Preserve the generic kernel's FP32 expressions and ascending dk order.
+// The host selects these entrypoints only for dim=128, 128 threads/head.
+template<bool Batch>
+inline void bonsai_gdn_128_body(constant BonsaiArgs &a,
+    device const float *qkv, device const float *alpha, device const float *beta,
+    device const uchar *A, device const uchar *dt,
+    device float *state, device float *out, uint h, uint dv) {
+    if (dv>=128u) return;
+    const uint kh=h%a.kvheads;
+    const uint channels=(2u*a.kvheads+a.heads)*128u;
+    const ulong state_base=ulong(h)*128u*128u+dv;
+    float column[128];
+#pragma unroll
+    for (uint dk=0; dk<128u; ++dk) column[dk]=state[state_base+dk*128u];
+    const uint count=Batch?a.n:1u;
+    for (uint token=0; token<count; ++token) {
+        device const float *row=qkv+ulong(token)*channels;
+        device const float *q=row+kh*128u,*k=row+(a.kvheads+kh)*128u;
+        const float v=row[2u*a.kvheads*128u+h*128u+dv];
+        const float ab=alpha[ulong(token)*a.heads+h]+bs_scalar(dt,h,a.mode);
+        const float e=exp(-abs(ab)),u=1.0f+e;
+        const float softplus=max(ab,0.0f)+(u==1.0f?e:log(u)*(e/(u-1.0f)));
+        const float decay=exp(bs_scalar(A,h,a.type)*softplus);
+        const float b=1.0f/(1.0f+exp(-beta[ulong(token)*a.heads+h]));
+        float prediction=0;
+#pragma unroll
+        for (uint dk=0; dk<128u; ++dk) {
+            float s=column[dk]*decay;
+            column[dk]=s;
+            prediction += s*k[dk];
+        }
+        const float delta=(v-prediction)*b;
+        float result=0;
+#pragma unroll
+        for (uint dk=0; dk<128u; ++dk) {
+            float s=column[dk]+delta*k[dk];
+            column[dk]=s;
+            result += s*q[dk];
+        }
+        out[(ulong(token)*a.heads+h)*128u+dv]=result*rsqrt(float(a.dim));
+    }
+#pragma unroll
+    for (uint dk=0; dk<128u; ++dk) state[state_base+dk*128u]=column[dk];
+}
+
+kernel void bonsai_gdn_128(constant BonsaiArgs &a [[buffer(0)]],
+    device const float *qkv [[buffer(1)]], device const float *alpha [[buffer(2)]],
+    device const float *beta [[buffer(3)]], device const uchar *A [[buffer(4)]],
+    device const uchar *dt [[buffer(5)]], device float *state [[buffer(6)]],
+    device float *out [[buffer(7)]], uint h [[threadgroup_position_in_grid]],
+    uint dv [[thread_index_in_threadgroup]]) {
+    bonsai_gdn_128_body<false>(a,qkv,alpha,beta,A,dt,state,out,h,dv);
+}
+
+kernel void bonsai_gdn_batch_128(constant BonsaiArgs &a [[buffer(0)]],
+    device const float *qkv [[buffer(1)]], device const float *alpha [[buffer(2)]],
+    device const float *beta [[buffer(3)]], device const uchar *A [[buffer(4)]],
+    device const uchar *dt [[buffer(5)]], device float *state [[buffer(6)]],
+    device float *out [[buffer(7)]], uint h [[threadgroup_position_in_grid]],
+    uint dv [[thread_index_in_threadgroup]]) {
+    bonsai_gdn_128_body<true>(a,qkv,alpha,beta,A,dt,state,out,h,dv);
+}
+
 // Decode gate/up: retain bonsai_pq2_mv's centered coefficients, block/lane
 // walk, scalar accumulation and SIMD reduction for both projections. Four
 // output pairs give eight independent accumulators per lane, the
@@ -773,4 +849,199 @@ kernel void bonsai_bf16_pair(constant BonsaiArgs &a [[buffer(0)]],
     }
     sa=simd_sum(sa);sb=simd_sum(sb);
     if(!lane&&row<a.rows) {ya[row]=sa;yb[row]=sb;}
+}
+
+// Prefill gate/up/SiLU: the physical 64-row weight tile holds 32 gate rows
+// followed by the matching 32 up rows. Each SIMD group retains the existing
+// tiled kernel's 4x2 FP32 matrix accumulators and exact K walk; the two
+// projections share activation loads without doubling accumulator pressure.
+// The final weight scratch holds one 16-token half of both projections.
+// Requires matching type142 shapes/prepared inputs. Grid: ceil(rows/32),
+// ceil(n/32), 1; 128 threads. Declared threadgroup storage: 12 KiB.
+kernel void bonsai_mm_pq2_gate_up_tiled(constant BonsaiArgs &a [[buffer(0)]],
+    device const uchar *gate_w [[buffer(1)]], device const uchar *up_w [[buffer(2)]],
+    device const float *x [[buffer(3)]], device float *mid [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint BM=64u, BN=32u, BK=32u, PAIRS=BM/2u;
+    threadgroup float weights[BM*BK];
+    threadgroup float inputs[BN*BK];
+    constexpr uint MR=BM/16u, NR=BN/16u;
+    constexpr uint COEFFS=BM*BK/128u, ROW_THREADS=BK/COEFFS;
+    constexpr uint INPUT_RUN=BK*BN/128u;
+    const uint first_row=group.x*PAIRS,first_token=group.y*BN;
+    simdgroup_float8x8 wf[MR],xf[NR],acc[MR*NR];
+#pragma unroll
+    for(uint i=0;i<MR*NR;i++)acc[i]=make_filled_simdgroup_matrix<float,8>(0.0f);
+    const uint row=tid/ROW_THREADS,start_k=(tid%ROW_THREADS)*COEFFS;
+    const uint pair_row=row%PAIRS;
+    const uint source_row=first_row+pair_row;
+    device const uchar *source_w=row<PAIRS?gate_w:up_w;
+    for(uint block_index=0;block_index<a.cols/128u;++block_index) {
+        float scale=0.0f;
+        uint4 packed=uint4(0x55555555u);
+        if(source_row<a.rows) {
+            device const uchar *block=source_w+ulong(source_row)*a.row_bytes+block_index*34u;
+            const uint byte=2u+start_k/4u;
+            scale=float(*(device const half*)block);
+            // Packed rows need only two-byte alignment. Retain the four
+            // 16-coefficient words across this block's four K32 passes.
+            device const ushort *halves=(device const ushort *)(block+byte);
+            packed=uint4(uint(halves[0])|(uint(halves[1])<<16u),
+                         uint(halves[4])|(uint(halves[5])<<16u),
+                         uint(halves[8])|(uint(halves[9])<<16u),
+                         uint(halves[12])|(uint(halves[13])<<16u));
+        }
+#pragma unroll
+        for(uint part=0;part<4u;++part) {
+            const uint first_k=block_index*128u+part*BK;
+            const uint word=packed[part];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+            for(uint j=0;j<COEFFS;j++) {
+                const uint k=start_k+j;
+                const uint dst=64u*((k/8u)*(BM/8u)+row/8u)+(k%8u)*8u+row%8u;
+                weights[dst]=source_row<a.rows
+                    ?scale*float(int((word>>(2u*j))&3u)-1):0.0f;
+            }
+            const uint token=tid/(BK/INPUT_RUN),input_k=(tid%(BK/INPUT_RUN))*INPUT_RUN;
+#pragma unroll
+            for(uint j=0;j<INPUT_RUN;j+=4u) {
+                const uint k=input_k+j;
+                float4 values=0.0f;
+                if(first_token+token<a.n&&first_k+k+3u<a.cols)
+                    values=*(device const float4*)(x+ulong(first_token+token)*a.cols+first_k+k);
+                const uint dst=64u*((k/8u)*(BN/8u)+token/8u)+(token%8u)*8u+k%8u;
+                *(threadgroup float4*)(inputs+dst)=values;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+            for(uint k=0;k<BK;k+=8u) {
+#pragma unroll
+                for(uint i=0;i<MR;i++)
+                    simdgroup_load(wf[i],weights+64u*((k/8u)*(BM/8u)+(sg%2u)*MR+i),8,0,false);
+#pragma unroll
+                for(uint j=0;j<NR;j++)
+                    simdgroup_load(xf[j],inputs+64u*((k/8u)*(BN/8u)+(sg/2u)*NR+j),8,0,false);
+#pragma unroll
+                for(uint j=0;j<NR;j++) {
+#pragma unroll
+                    for(uint i=0;i<MR;i++)simdgroup_multiply_accumulate(acc[j*MR+i],xf[j],wf[i],acc[j*MR+i]);
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint part=0;part<2u;part++) {
+        if(sg/2u==part) {
+#pragma unroll
+            for(uint j=0;j<NR;j++) {
+#pragma unroll
+                for(uint i=0;i<MR;i++)
+                    simdgroup_store(acc[j*MR+i],weights+j*8u*BM+(sg%2u)*PAIRS+i*8u,BM,0,false);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<PAIRS*(BN/2u);i+=128u) {
+            const uint t=part*(BN/2u)+i/PAIRS,r=i%PAIRS;
+            if(first_token+t<a.n&&first_row+r<a.rows) {
+                const uint src=(i/PAIRS)*BM+r;
+                const float g=weights[src],u=weights[src+PAIRS];
+                mid[ulong(first_token+t)*a.rows+first_row+r]=(g/(1.0f+exp(-g)))*u;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Exact attention over independent causal queries. Args.n is the query
+// count, pos is the absolute first query position, and width is the cache
+// capacity. Scores are [query][head][width]; Q/output are [query][head][dim].
+// Preserve every scalar dot product, softmax reduction and value walk from
+// the single-query kernels. Only independent queries share each dispatch.
+// Grid: ceil((pos+n)/256), heads, n; 256 threads per group.
+kernel void bonsai_scores_batch(constant BonsaiArgs &a [[buffer(0)]],
+    device const float *q [[buffer(1)]], device const float *kc [[buffer(2)]],
+    device float *scores [[buffer(3)]], uint3 i [[thread_position_in_grid]]) {
+    if(i.z>=a.n||i.y>=a.heads||i.x>a.pos+i.z)return;
+    const uint kh=i.y/(a.heads/a.kvheads);
+    device const float *k=kc+(ulong(i.x)*a.kvheads+kh)*a.dim;
+    device const float *query=q+(ulong(i.z)*a.heads+i.y)*a.dim;
+    float sum=0;
+    for(uint d=0;d<a.dim;++d)sum+=query[d]*k[d];
+    scores[(ulong(i.z)*a.heads+i.y)*a.width+i.x]=sum*rsqrt(float(a.dim));
+}
+
+// Grid: heads, n, 1; 256 threads per group. This is the unchanged 256-lane
+// max/sum tree, including the ascending stride-256 per-lane token walk.
+kernel void bonsai_softmax_batch(constant BonsaiArgs &a [[buffer(0)]],
+    device float *scores [[buffer(1)]], uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if(group.x>=a.heads||group.y>=a.n)return;
+    threadgroup float tmp[256];
+    const uint pos=a.pos+group.y;
+    device float *row=scores+(ulong(group.y)*a.heads+group.x)*a.width;
+    float mx=-INFINITY;
+    for(ulong t=tid;t<=pos;t+=256)mx=max(mx,row[t]);
+    tmp[tid]=mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint d=128;d;d/=2) {if(tid<d)tmp[tid]=max(tmp[tid],tmp[tid+d]);threadgroup_barrier(mem_flags::mem_threadgroup);}
+    mx=tmp[0];
+    float sum=0;
+    for(ulong t=tid;t<=pos;t+=256) {float v=exp(row[t]-mx);row[t]=v;sum+=v;}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tmp[tid]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint d=128;d;d/=2) {if(tid<d)tmp[tid]+=tmp[tid+d];threadgroup_barrier(mem_flags::mem_threadgroup);}
+    sum=tmp[0];
+    for(ulong t=tid;t<=pos;t+=256)row[t]/=sum;
+}
+
+// Grid: ceil(heads*dim/256), n, 1; 256 threads per group.
+kernel void bonsai_attention_batch(constant BonsaiArgs &a [[buffer(0)]],
+    device const float *scores [[buffer(1)]], device const float *vc [[buffer(2)]],
+    device float *out [[buffer(3)]], uint2 i [[thread_position_in_grid]]) {
+    if(i.y>=a.n||i.x>=a.heads*a.dim)return;
+    const uint h=i.x/a.dim,d=i.x%a.dim,kh=h/(a.heads/a.kvheads);
+    const uint pos=a.pos+i.y;
+    float sum=0;
+    for(uint t=0;t<=pos;++t)
+        sum+=scores[(ulong(i.y)*a.heads+h)*a.width+t]*vc[(ulong(t)*a.kvheads+kh)*a.dim+d];
+    out[ulong(i.y)*a.heads*a.dim+i.x]=sum;
+}
+
+// Four-token BF16 alpha/beta pair. Both matrices have identical unrotated
+// shapes and compact BF16 rows. Share each activation load between the two
+// projections, retaining bonsai_mm's k=lane,k+=32 FP32 accumulation and
+// simd_sum independently for all eight sums. Args.n is the token count.
+// Grid: ceil(rows/4), ceil(n/4), 1; 128 threads per threadgroup.
+kernel void bonsai_bf16_pair_batch(constant BonsaiArgs &a [[buffer(0)]],
+    device const ushort *wa [[buffer(1)]], device const ushort *wb [[buffer(2)]],
+    device const float *x [[buffer(3)]], device float *ya [[buffer(4)]],
+    device float *yb [[buffer(5)]], uint2 group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint row=group.x*4u+sg,first=group.y*4u;
+    float sa[4]={0.0f,0.0f,0.0f,0.0f},sb[4]={0.0f,0.0f,0.0f,0.0f};
+    if(row<a.rows) {
+        const ulong offset=ulong(row)*a.cols;
+        for(uint k=lane;k<a.cols;k+=32u) {
+            const float alpha=as_type<float>(uint(wa[offset+k])<<16);
+            const float beta=as_type<float>(uint(wb[offset+k])<<16);
+#pragma unroll
+            for(uint t=0;t<4u;++t) {
+                if(first+t>=a.n)continue;
+                const float input=x[ulong(first+t)*a.cols+k];
+                sa[t]+=alpha*input;
+                sb[t]+=beta*input;
+            }
+        }
+    }
+#pragma unroll
+    for(uint t=0;t<4u;++t) {
+        const float alpha=simd_sum(sa[t]),beta=simd_sum(sb[t]);
+        if(!lane&&row<a.rows&&first+t<a.n) {
+            const ulong output=ulong(first+t)*a.rows+row;
+            ya[output]=alpha;yb[output]=beta;
+        }
+    }
 }

@@ -1,9 +1,10 @@
-/* Causal Bonsai prefill GDN against frozen single-token kernels; no model.
+/* Causal Bonsai prefill/decode GDN against frozen single-token kernels; no model.
  * make tests/test_bonsai_gdn_prefill
  * MTL_SHADER_VALIDATION=1 ./tests/test_bonsai_gdn_prefill
  * Optional --bench measures only synthetic GPU work, with validation disabled.
- * Every intermediate, final state/history and continued chunk must be bitwise
- * identical. Production source is embedded by the normal Makefile dependency.
+ * Generic and D128 register scans must match every intermediate, state/history,
+ * continued chunk and prefill-to-decode transition bitwise. Production source
+ * is embedded by the normal Makefile dependency.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -113,6 +114,7 @@ typedef struct {
 } Args;
 _Static_assert(sizeof(Args)==60,"Metal args layout");
 static const NSUInteger guard=64;
+enum { Frozen, GenericBatch, RegisterBatch, RegisterDecode, VariantCount };
 static void need(bool ok,const char *msg) {
     if (!ok) { fprintf(stderr,"FAIL %s\n",msg); exit(1); }
 }
@@ -129,7 +131,7 @@ static void same(id<MTLBuffer>a,id<MTLBuffer>b,const char*label) {
     need(a.length==b.length,"comparison size");
     const float*x=data(a),*y=data(b); const size_t n=(a.length-2*guard)/4;
     for(size_t i=0;i<n;++i) if (!isfinite(x[i]) || !isfinite(y[i]) || memcmp(x+i,y+i,4)) {
-        fprintf(stderr,"%s i=%zu serial=%.9g batch=%.9g\n",label,i,x[i],y[i]); need(false,"bitwise parity");
+        fprintf(stderr,"%s i=%zu reference=%.9g candidate=%.9g\n",label,i,x[i],y[i]); need(false,"bitwise parity");
     }
 }
 static void scalar_store(id<MTLBuffer>b,uint32_t type,uint32_t i,float value) {
@@ -142,7 +144,7 @@ static void scalar_store(id<MTLBuffer>b,uint32_t type,uint32_t i,float value) {
 @public
     uint32_t T,D,H,K,W,C,type,atype,dtype;
     id<MTLBuffer>x,w,alpha,beta,A,dt,initialHistory,initialState;
-    id<MTLBuffer>history[2],state[2],conv[2],out[2];
+    id<MTLBuffer>history[VariantCount],state[VariantCount],conv[VariantCount],out[VariantCount];
 }
 @end
 @implementation Fixture
@@ -174,7 +176,7 @@ static Fixture *fixture(id<MTLDevice>dev,uint32_t T,uint32_t D,uint32_t K,uint32
         ((float*)data(f->initialHistory))[i]=(i/(W-1)/D==0?0:sinf((float)(i%100003)*.021f)*.3f);
     for(size_t i=0;i<(size_t)H*D*D;++i)
         ((float*)data(f->initialState))[i]=sinf((float)(i%100003)*.017f)*.04f;
-    for(uint32_t v=0;v<2;++v) {
+    for(uint32_t v=0;v<(D==128?VariantCount:2);++v) {
         f->history[v]=alloc_buffer(dev,(size_t)f->C*(W-1));f->state[v]=alloc_buffer(dev,(size_t)H*D*D);
         f->conv[v]=alloc_buffer(dev,(size_t)T*f->C);f->out[v]=alloc_buffer(dev,(size_t)T*H*D);
     }
@@ -196,9 +198,9 @@ static void dispatch(id<MTLComputeCommandEncoder>enc,NSDictionary*ps,NSString*na
     [enc dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(nth,1,1)];
 }
 static void encode(id<MTLComputeCommandEncoder>enc,NSDictionary*ps,Fixture*f,uint32_t variant,
-                   uint32_t begin,uint32_t count,uint32_t phase) {
+                   uint32_t begin,uint32_t count,uint32_t phase,bool decode) {
     const uint32_t C=f->C,D=f->D,H=f->H,K=f->K;
-    if(variant) {
+    if(variant!=Frozen && !decode) {
         const NSUInteger co[]={(NSUInteger)begin*C*4,0,0,(NSUInteger)begin*C*4};
         dispatch(enc,ps,@"bonsai_conv_batch",(Args){.n=count,.cols=C,.width=f->W,.type=f->type},
                  @[f->x,f->w,f->history[variant],f->conv[variant]],co,MTLSizeMake((C+255u)/256u,1,1),256);
@@ -208,21 +210,22 @@ static void encode(id<MTLComputeCommandEncoder>enc,NSDictionary*ps,Fixture*f,uin
                  @[f->conv[variant]],no,MTLSizeMake(2*K,count,1),256);
         if(phase<3)return;
         const NSUInteger so[]={(NSUInteger)begin*C*4,(NSUInteger)begin*H*4,(NSUInteger)begin*H*4,0,0,0,(NSUInteger)begin*H*D*4};
-        NSString*scan=@"bonsai_gdn_batch";
+        NSString*scan=variant==GenericBatch?@"bonsai_gdn_batch":@"bonsai_gdn_batch_128";
         dispatch(enc,ps,scan,(Args){.n=count,.dim=D,.heads=H,.kvheads=K,.type=f->atype,.mode=f->dtype},
                  @[f->conv[variant],f->alpha,f->beta,f->A,f->dt,f->state[variant],f->out[variant]],so,MTLSizeMake(H,1,1),D);
     } else for(uint32_t row=begin;row<begin+count;++row) {
         const NSUInteger co[]={(NSUInteger)row*C*4,0,0,(NSUInteger)row*C*4};
         dispatch(enc,ps,@"frozen_bonsai_conv",(Args){.n=C,.width=f->W,.type=f->type},
-                 @[f->x,f->w,f->history[0],f->conv[0]],co,MTLSizeMake((C+255u)/256u,1,1),256);
+                 @[f->x,f->w,f->history[variant],f->conv[variant]],co,MTLSizeMake((C+255u)/256u,1,1),256);
         if(phase<2)continue;
         const NSUInteger no[]={(NSUInteger)row*C*4,(NSUInteger)row*C*4,(NSUInteger)row*C*4};
         dispatch(enc,ps,@"frozen_bonsai_norm",(Args){.cols=D,.width=D,.mode=1,.eps=1e-6f},
-                 @[f->conv[0],f->conv[0],f->conv[0]],no,MTLSizeMake(2*K,1,1),256);
+                 @[f->conv[variant],f->conv[variant],f->conv[variant]],no,MTLSizeMake(2*K,1,1),256);
         if(phase<3)continue;
         const NSUInteger so[]={(NSUInteger)row*C*4,(NSUInteger)row*H*4,(NSUInteger)row*H*4,0,0,0,(NSUInteger)row*H*D*4};
-        dispatch(enc,ps,@"frozen_bonsai_gdn",(Args){.dim=D,.heads=H,.kvheads=K,.type=f->atype,.mode=f->dtype},
-                 @[f->conv[0],f->alpha,f->beta,f->A,f->dt,f->state[0],f->out[0]],so,MTLSizeMake(H,1,1),D);
+        NSString*scan=variant==Frozen?@"frozen_bonsai_gdn":@"bonsai_gdn_128";
+        dispatch(enc,ps,scan,(Args){.dim=D,.heads=H,.kvheads=K,.type=f->atype,.mode=f->dtype},
+                 @[f->conv[variant],f->alpha,f->beta,f->A,f->dt,f->state[variant],f->out[variant]],so,MTLSizeMake(H,1,1),D);
     }
 }
 static double run(id<MTLCommandQueue>q,NSDictionary*ps,Fixture*f,uint32_t variant,uint32_t phase,
@@ -232,37 +235,66 @@ static double run(id<MTLCommandQueue>q,NSDictionary*ps,Fixture*f,uint32_t varian
     for(uint32_t repeat=0;repeat<repeats;++repeat) {
         if(chunks) {
             const uint32_t sizes[]={1,3,2,7,5,14}; uint32_t begin=0,i=0;
-            while(begin<f->T) { uint32_t n=MIN(sizes[i++%6],f->T-begin);encode(enc,ps,f,variant,begin,n,phase);begin+=n; }
-        } else encode(enc,ps,f,variant,0,f->T,phase);
+            while(begin<f->T) { uint32_t n=MIN(sizes[i++%6],f->T-begin);encode(enc,ps,f,variant,begin,n,phase,variant==RegisterDecode);begin+=n; }
+        } else encode(enc,ps,f,variant,0,f->T,phase,variant==RegisterDecode);
     }
     [enc endEncoding];[cb commit];[cb waitUntilCompleted];
     if(cb.status!=MTLCommandBufferStatusCompleted)fprintf(stderr,"%s\n",cb.error.localizedDescription.UTF8String);
     need(cb.status==MTLCommandBufferStatusCompleted,"GPU command completion");
     return (cb.GPUEndTime-cb.GPUStartTime)*1e6/repeats;
 }
-static void check(id<MTLCommandQueue>q,NSDictionary*ps,Fixture*f) {
-    for(uint32_t phase=1;phase<=3;++phase) {
-        reset(f,0);reset(f,1);run(q,ps,f,0,phase,false,1);run(q,ps,f,1,phase,false,1);
-        same(f->history[0],f->history[1],"history");same(f->conv[0],f->conv[1],phase==1?"raw conv":"L2 conv");
-        same(f->state[0],f->state[1],"state");if(phase==3)same(f->out[0],f->out[1],"GDN output");
+static void same_result(Fixture*f,uint32_t variant,uint32_t phase) {
+    same(f->history[Frozen],f->history[variant],"history");
+    same(f->conv[Frozen],f->conv[variant],phase==1?"raw conv":"L2 conv");
+    same(f->state[Frozen],f->state[variant],"state");
+    if(phase==3)same(f->out[Frozen],f->out[variant],"GDN output");
+}
+// Complete prefill and the following decode in separate command buffers, so
+// passing the test requires materializing all state/history at the boundary.
+static void check_decode_continuation(id<MTLCommandQueue>q,NSDictionary*ps,Fixture*f) {
+    if(f->D!=128 || f->T<2)return;
+    reset(f,RegisterBatch);
+    for(uint32_t part=0;part<2;++part) {
+        id<MTLCommandBuffer>cb=[q commandBuffer];id<MTLComputeCommandEncoder>enc=[cb computeCommandEncoder];
+        need(cb && enc,"continuation command creation");
+        encode(enc,ps,f,RegisterBatch,part?f->T-1:0,part?1:f->T-1,3,part!=0);
+        [enc endEncoding];[cb commit];[cb waitUntilCompleted];
+        if(cb.status!=MTLCommandBufferStatusCompleted)fprintf(stderr,"%s\n",cb.error.localizedDescription.UTF8String);
+        need(cb.status==MTLCommandBufferStatusCompleted,"continuation GPU completion");
     }
-    reset(f,1);run(q,ps,f,1,3,true,1);
-    same(f->history[0],f->history[1],"chunk history");same(f->conv[0],f->conv[1],"chunk L2");
-    same(f->state[0],f->state[1],"chunk state");same(f->out[0],f->out[1],"chunk output");
-    for(id<MTLBuffer>b in @[f->x,f->w,f->alpha,f->beta,f->A,f->dt,f->initialState,f->initialHistory,
-        f->history[0],f->history[1],f->state[0],f->state[1],f->conv[0],f->conv[1],f->out[0],f->out[1]])check_guard(b);
-    printf("PASS T%u D%u Hk%u Hv%u W%u types%u/%u/%u intermediates/state/chunks bitexact\n",
-           f->T,f->D,f->K,f->H,f->W,f->type,f->atype,f->dtype);fflush(stdout);
+    same_result(f,RegisterBatch,3);
+}
+static void check(id<MTLCommandQueue>q,NSDictionary*ps,Fixture*f) {
+    const uint32_t variants=f->D==128?VariantCount:2;
+    for(uint32_t phase=1;phase<=3;++phase) {
+        reset(f,Frozen);run(q,ps,f,Frozen,phase,false,1);
+        for(uint32_t v=1;v<variants;++v) {
+            reset(f,v);run(q,ps,f,v,phase,false,1);same_result(f,v,phase);
+        }
+    }
+    for(uint32_t v=1;v<variants;++v) {
+        reset(f,v);run(q,ps,f,v,3,true,1);same_result(f,v,3);
+    }
+    check_decode_continuation(q,ps,f);
+    for(id<MTLBuffer>b in @[f->x,f->w,f->alpha,f->beta,f->A,f->dt,f->initialState,f->initialHistory])check_guard(b);
+    for(uint32_t v=0;v<variants;++v)
+        for(id<MTLBuffer>b in @[f->history[v],f->state[v],f->conv[v],f->out[v]])check_guard(b);
+    printf("PASS T%u D%u Hk%u Hv%u W%u types%u/%u/%u variants%u intermediates/state/chunks/continuation bitexact\n",
+           f->T,f->D,f->K,f->H,f->W,f->type,f->atype,f->dtype,variants);fflush(stdout);
 }
 static int double_cmp(const void*a,const void*b) { double x=*(const double*)a,y=*(const double*)b;return(x>y)-(x<y); }
 static void bench(id<MTLCommandQueue>q,NSDictionary*ps,Fixture*f) {
-    double times[2][9];
-    for(uint32_t trial=0;trial<9;++trial)for(uint32_t order=0;order<2;++order) {
-        const uint32_t v=(trial+order)%2;reset(f,v);times[v][trial]=run(q,ps,f,v,3,false,3);
+    const uint32_t variants=f->D==128?VariantCount:2;
+    double times[VariantCount][9];
+    for(uint32_t trial=0;trial<9;++trial)for(uint32_t order=0;order<variants;++order) {
+        const uint32_t v=(trial+order)%variants;reset(f,v);times[v][trial]=run(q,ps,f,v,3,false,3);
     }
-    for(uint32_t v=0;v<2;++v)qsort(times[v],9,sizeof(double),double_cmp);
-    printf("BENCH T%u D%u Hk%u Hv%u serial_us=%.3f batch_us=%.3f speedup=%.3f dispatches=%u->3\n",
-           f->T,f->D,f->K,f->H,times[0][4],times[1][4],times[0][4]/times[1][4],3*f->T);fflush(stdout);
+    for(uint32_t v=0;v<variants;++v)qsort(times[v],9,sizeof(double),double_cmp);
+    printf("BENCH T%u D%u Hk%u Hv%u serial_us=%.3f batch_us=%.3f batch_speedup=%.3f",
+           f->T,f->D,f->K,f->H,times[Frozen][4],times[GenericBatch][4],times[Frozen][4]/times[GenericBatch][4]);
+    if(variants==VariantCount)printf(" register_batch_us=%.3f register_decode_us=%.3f register_batch_speedup=%.3f register_decode_speedup=%.3f",
+        times[RegisterBatch][4],times[RegisterDecode][4],times[GenericBatch][4]/times[RegisterBatch][4],times[Frozen][4]/times[RegisterDecode][4]);
+    putchar('\n');fflush(stdout);
 }
 int main(int argc,char**argv) { @autoreleasepool {
     const bool timing=argc==2 && !strcmp(argv[1],"--bench");
@@ -285,22 +317,25 @@ int main(int argc,char**argv) { @autoreleasepool {
     id<MTLLibrary>lib=[dev newLibraryWithSource:source options:options error:&err];
     if(!lib)fprintf(stderr,"%s\n",err.localizedDescription.UTF8String);need(lib!=nil,"compile Metal");
     NSMutableDictionary*ps=[NSMutableDictionary dictionary];
-    for(NSString*name in @[@"frozen_bonsai_conv",@"frozen_bonsai_norm",@"frozen_bonsai_gdn",@"bonsai_conv_batch",@"bonsai_l2_batch",@"bonsai_gdn_batch"]) {
+    for(NSString*name in @[@"frozen_bonsai_conv",@"frozen_bonsai_norm",@"frozen_bonsai_gdn",@"bonsai_conv_batch",@"bonsai_l2_batch",@"bonsai_gdn_batch",@"bonsai_gdn_128",@"bonsai_gdn_batch_128"]) {
         id<MTLComputePipelineState>p=[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:name] error:&err];
         need(p!=nil,"pipeline");ps[name]=p;
     }
-    const uint32_t counts[]={1,2,3,4,5,15,16,31,32};
+    const uint32_t counts[]={1,2,3,4,5,15,16,31,32,128,129};
+    size_t fixtures=0;
     for(size_t i=0;i<sizeof(counts)/sizeof(counts[0]);++i) {@autoreleasepool {
         check(q,ps,fixture(dev,counts[i],32,2,6,4,0,0,0));
+        // Uneven head sharing, width=1, and all scalar storage formats.
+        check(q,ps,fixture(dev,counts[i],128,2,3,1,30,1,30));fixtures+=2;
     }}
-    const uint32_t dims[]={8,64,128,256};
+    const uint32_t dims[]={8,31,64,127,128,129,256};
     for(size_t i=0;i<sizeof(dims)/sizeof(dims[0]);++i) {@autoreleasepool {
         check(q,ps,fixture(dev,5,dims[i],1,2,2,0,0,0));
-        check(q,ps,fixture(dev,7,dims[i],2,2,7,1,30,1));
+        check(q,ps,fixture(dev,7,dims[i],2,2,7,1,30,1));fixtures+=2;
     }}
-    const uint32_t realCounts[]={1,4,16,32};
+    const uint32_t realCounts[]={1,4,16,32,65,128,129};
     for(size_t i=0;i<sizeof(realCounts)/sizeof(realCounts[0]);++i) {@autoreleasepool {
-        Fixture*f=fixture(dev,realCounts[i],128,16,48,4,0,0,0);check(q,ps,f);if(timing)bench(q,ps,f);
+        Fixture*f=fixture(dev,realCounts[i],128,16,48,4,0,0,0);check(q,ps,f);if(timing)bench(q,ps,f);++fixtures;
     }}
-    puts("PASS 21 fixtures; three stages and continued chunks; no model used");return 0;
+    printf("PASS %zu fixtures; generic/register prefill/decode, three stages, continued chunks and tails; no model used\n",fixtures);return 0;
 }}

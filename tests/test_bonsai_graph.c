@@ -20,6 +20,20 @@ typedef struct {
 static void need(int ok, const char *what) {
     if (!ok) { fprintf(stderr, "Bonsai graph: %s failed\n", what); exit(1); }
 }
+static void test_score_capacity(void) {
+    need(ds4_bonsai_metal_score_capacity(0,24)==0 &&
+         ds4_bonsai_metal_score_capacity(4096,0)==0,"score workspace rejects zero dimensions");
+    need(ds4_bonsai_metal_score_capacity(1,24)==1 &&
+         ds4_bonsai_metal_score_capacity(3,24)==3 &&
+         ds4_bonsai_metal_score_capacity(4096,24)==8,"score workspace bounded by available queries");
+    // Eight rows fit immediately below this boundary, but only seven above it.
+    need(ds4_bonsai_metal_score_capacity(43690,24)==8 &&
+         ds4_bonsai_metal_score_capacity(43691,24)==7,"score workspace 32 MiB boundary");
+    need(ds4_bonsai_metal_score_capacity(300000,4)==6 &&
+         ds4_bonsai_metal_score_capacity(262144,24)==1,"long-context score workspace capacity");
+    need(ds4_bonsai_metal_score_capacity(UINT32_MAX,UINT32_MAX)==1,
+         "oversized single-query workspace retains one query without overflow");
+}
 static uint32_t rng = 0x512090u;
 static uint32_t random_u32(void) {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng;
@@ -152,7 +166,7 @@ static void check_metal(const ds4_bonsai_model *m, const int *tokens, size_t n, 
 
 static void test_prefill_chunks(void) {
     fixture f; fixture_init(&f,8,6,2);
-    enum { LONG_CTX=69 };
+    enum { LONG_CTX=259 };
     f.m.context=LONG_CTX;
     int tokens[LONG_CTX]; float serial[LONG_CTX*VOCAB],logits[VOCAB];
     for (unsigned i=0;i<LONG_CTX;++i) tokens[i]=(int)((i*7+3)%VOCAB);
@@ -160,7 +174,7 @@ static void test_prefill_chunks(void) {
     need(s!=NULL,"long synthetic Metal context");
     for (unsigned i=0;i<LONG_CTX;++i)
         need(ds4_bonsai_metal_eval(s,tokens[i],serial+i*VOCAB),"serial long synthetic sequence");
-    const uint32_t chunks[]={1,3,4,5,31,32};
+    const uint32_t chunks[]={1,3,4,5,31,32,33,63,64,65,127,128};
     for (unsigned c=0;c<sizeof(chunks)/sizeof(chunks[0]);++c) {
         ds4_bonsai_metal_reset(s);
         unsigned pos=0;
@@ -191,11 +205,59 @@ static void test_prefill_chunks(void) {
     need(ds4_bonsai_metal_prefill(s,tokens,5,NULL),"batched prefix skipping head");
     need(ds4_bonsai_metal_prefill(s,tokens+5,3,logits),"append after skipped batched head");
     need(!memcmp(logits,serial+7*VOCAB,sizeof(logits)),"invalid input and skipped head preserve state");
+    // Large batches also begin at nonaligned positions. Interleave short
+    // tails and a skipped vocabulary projection, then continue with decode.
+    ds4_bonsai_metal_reset(s);
+    const uint32_t mixed[]={3,128,5,64,32,25};
+    unsigned pos=0;
+    for(unsigned c=0;c<sizeof(mixed)/sizeof(mixed[0]);++c) {
+        if(c==1) {
+            float saved[VOCAB];memcpy(saved,logits,sizeof(saved));
+            need(!ds4_bonsai_metal_prefill(s,tokens+pos,DS4_BONSAI_METAL_PREFILL_CAP+1,logits) &&
+                 !memcmp(saved,logits,sizeof(saved)),"oversized batch preserves nonzero-position state");
+        }
+        const bool skip_head=c==2;
+        need(ds4_bonsai_metal_prefill(s,tokens+pos,mixed[c],skip_head?NULL:logits),
+             "mixed-size prefill at nonaligned positions");
+        pos+=mixed[c];
+        if(!skip_head)need(!memcmp(logits,serial+(pos-1)*VOCAB,sizeof(logits)),
+                          "mixed-size frontier bit parity");
+    }
+    need(pos==LONG_CTX-2,"mixed-size fixture leaves two decode tokens");
+    for(;pos<LONG_CTX;++pos) {
+        need(ds4_bonsai_metal_eval(s,tokens[pos],logits),"decode after mixed-size prefill");
+        need(!memcmp(logits,serial+pos*VOCAB,sizeof(logits)),"mixed-size recurrent state bit parity");
+    }
+    ds4_bonsai_metal_free(s); fixture_free(&f);
+}
+
+/* With four attention heads this context reduces the score workspace to
+ * six queries. Exercise host dispatch offsets and a partial query batch,
+ * using a short actual sequence so the fixture stays inexpensive. */
+static void test_attention_workspace(void) {
+    fixture f; fixture_init(&f,8,6,2);
+    enum { CAPACITY=300000, TOKENS=35 };
+    f.m.context=CAPACITY;
+    ds4_bonsai_metal *s=ds4_bonsai_metal_create(&f.m,CAPACITY);
+    need(s!=NULL,"bounded attention workspace context");
+    int tokens[TOKENS]; float serial[TOKENS*VOCAB],logits[VOCAB];
+    for (unsigned i=0;i<TOKENS;++i) {
+        tokens[i]=(int)((i*7+3)%VOCAB);
+        need(ds4_bonsai_metal_eval(s,tokens[i],serial+i*VOCAB),"workspace serial reference");
+    }
+    ds4_bonsai_metal_reset(s);
+    need(ds4_bonsai_metal_prefill(s,tokens,17,logits),"workspace partial query batch");
+    need(!memcmp(logits,serial+16*VOCAB,sizeof(logits)),"workspace first frontier bit parity");
+    need(ds4_bonsai_metal_prefill(s,tokens+17,17,logits),"workspace reuse and nonzero position");
+    need(!memcmp(logits,serial+33*VOCAB,sizeof(logits)),"workspace reused frontier bit parity");
+    need(ds4_bonsai_metal_eval(s,tokens[34],logits),"workspace decode continuation");
+    need(!memcmp(logits,serial+34*VOCAB,sizeof(logits)),"workspace decode bit parity");
     ds4_bonsai_metal_free(s); fixture_free(&f);
 }
 #else
 #define check_metal(m,t,n,e) ((void)0)
 #define test_prefill_chunks() ((void)0)
+#define test_attention_workspace() ((void)0)
 #endif
 
 static void test_sequence(fixture *f) {
@@ -470,10 +532,11 @@ static void test_invalid(fixture *f) {
 }
 
 int main(void) {
+    test_score_capacity();
     fixture f; fixture_init(&f, 8, 6, 2);
     test_invalid(&f); test_sequence(&f); fixture_free(&f);
     test_silu(); test_grouped(); test_packed_graph(); test_sibling_rotations();
-    test_packed_projection_batch(); test_prefill_chunks();
+    test_packed_projection_batch(); test_prefill_chunks(); test_attention_workspace();
     puts("PASS Bonsai graph: 3 GDN + 1 full attention, causal state/reset, SiLU, grouped output, packed Hadamard, validation");
     return 0;
 }

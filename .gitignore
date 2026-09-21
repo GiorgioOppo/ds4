@@ -115,3 +115,7 @@ __pycache__/
 /tests/test_bonsai_gdn_prefill
 
 /tests/test_bonsai_pairs
+/tests/test_bonsai_prefill_pair
+/tests/test_bonsai_attention_batch
+/tests/test_bonsai_bf16_pair_batch
+/tests/test_bonsai_pq2_prefill_load

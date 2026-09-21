@@ -8,7 +8,19 @@
 /* Native text-only Qwen3.5 dense graph used by Prism Ternary Bonsai 2.
  * Weights and signs are borrowed from the engine and outlive all sessions. */
 #define DS4_BONSAI_LAYERS 64
-#define DS4_BONSAI_METAL_PREFILL_CAP 32u
+#define DS4_BONSAI_METAL_PREFILL_CAP 128u
+
+/* Share score-workspace accounting between the public memory estimate and
+ * Metal allocation. The budget is 8M FP32 values (32 MiB); retain at least
+ * one query for very large valid contexts. */
+static inline uint32_t ds4_bonsai_metal_score_capacity(uint32_t context, uint32_t heads) {
+    if (!context || !heads) return 0;
+    uint32_t cap=context<DS4_BONSAI_METAL_PREFILL_CAP ? context : DS4_BONSAI_METAL_PREFILL_CAP;
+    if (cap>8u) cap=8u;
+    uint64_t fit=(UINT64_C(8)*1024u*1024u)/((uint64_t)context*heads);
+    if (!fit) fit=1;
+    return fit<cap ? (uint32_t)fit : cap;
+}
 typedef struct {
     const void *data;
     uint64_t bytes;
