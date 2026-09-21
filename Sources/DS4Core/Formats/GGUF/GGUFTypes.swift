@@ -82,6 +82,10 @@ public enum GGUF {
         28: .init(name: "f64",     blockElems: 1,   blockBytes: 8),
         29: .init(name: "iq1_m",   blockElems: 256, blockBytes: 56),
         30: .init(name: "bf16",    blockElems: 1,   blockBytes: 2),
+        39: .init(name: "mxfp4",   blockElems: 32,  blockBytes: 17),
+        // Prism Bonsai private formats, not GGML TQ1/TQ2 or Q2_K.
+        142: .init(name: "pq2_0",  blockElems: 128, blockBytes: 34),
+        143: .init(name: "ptq1_0", blockElems: 128, blockBytes: 28),
     ]
 
     public static func typeInfo(_ type: UInt32) -> GGUFTypeInfo? { typeTable[type] }

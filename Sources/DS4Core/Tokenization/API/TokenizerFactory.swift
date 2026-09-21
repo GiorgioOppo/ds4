@@ -4,7 +4,10 @@ import Foundation
 /// This is a frontend capability, not an inference-runtime availability claim.
 public enum TokenizerBackendID: String, Sendable, Codable, Equatable {
     case deepSeekV4
+    case deepSeekV41
     case glm52
+    case glm53Flash
+    case qwen35
     case laguna
 }
 
@@ -36,7 +39,10 @@ public enum TokenizerFactory {
     public static func backend(for detected: DetectedModelArchitecture) throws
         -> TokenizerBackendID {
         if detected.id == .deepSeekV4 { return .deepSeekV4 }
+        if detected.id == .deepSeekV41 { return .deepSeekV41 }
         if detected.id == .glmDSA { return .glm52 }
+        if detected.id == .glm53Flash { return .glm53Flash }
+        if detected.id == .bonsai2 || detected.id == .qwen38FlashNext { return .qwen35 }
         if detected.id == .laguna { return .laguna }
 
         switch detected.family {
@@ -81,8 +87,9 @@ public enum TokenizerFactory {
         let selected = try backend(for: detected)
         do {
             switch selected {
-            case .deepSeekV4: return try DeepSeekV4Tokenizer(model: model)
-            case .glm52: return try GLM52Tokenizer(model: model)
+            case .deepSeekV4, .deepSeekV41: return try DeepSeekV4Tokenizer(model: model)
+            case .glm52, .glm53Flash: return try GLM52Tokenizer(model: model)
+            case .qwen35: return try QwenTokenizer(model: model)
             case .laguna: return try LagunaTokenizer(model: model)
             }
         } catch {

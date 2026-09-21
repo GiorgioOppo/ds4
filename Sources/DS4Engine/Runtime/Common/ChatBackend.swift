@@ -8,11 +8,12 @@ import DS4Core
 /// distribuito) restano API dei tipi concreti, raggiunte con un cast
 /// esplicito dove servono.
 ///
-/// Nota firme: i metodi sincroni dell'actor testimoniano i requisiti
-/// (anche quelli `async`) e restano `async` per i chiamanti cross-actor —
-/// il contratto è identico da fuori per entrambi i backend.
+/// I requisiti di ingresso sono async anche se alcuni backend li implementano
+/// con metodi sincroni isolati. Questo lascia al witness la scelta di executor:
+/// il backend nativo può rifiutare una richiesta concorrente prima di accedere
+/// al decoder, senza aspettare un prefill che occupa l'actor.
 public protocol ChatBackend: Actor {
-    func modelInfo() -> ModelInfo
+    func modelInfo() async -> ModelInfo
     @discardableResult
     func warmup() async -> Bool
     func quiesceForTeardown() async
@@ -22,18 +23,18 @@ public protocol ChatBackend: Actor {
     func committedTokens() -> Int
     func send(userText: String, thinkMode: DS4ThinkMode,
               sampling: SamplingParams, maxTokens: Int)
-        -> AsyncThrowingStream<GenEvent, Error>
+        async -> AsyncThrowingStream<GenEvent, Error>
     func sendWithHistory(_ history: [ChatTurn], userText: String,
                          systemPrompt: String?, thinkMode: DS4ThinkMode,
                          sampling: SamplingParams, maxTokens: Int)
-        -> AsyncThrowingStream<GenEvent, Error>
+        async -> AsyncThrowingStream<GenEvent, Error>
     func provideToolResults(_ outputs: [ToolOutput],
                             thinkMode: DS4ThinkMode,
                             sampling: SamplingParams, maxTokens: Int)
-        -> AsyncThrowingStream<GenEvent, Error>
+        async -> AsyncThrowingStream<GenEvent, Error>
     func complete(turns: [ChatTurn], tools: [ToolSpec],
                   thinkMode: DS4ThinkMode, sampling: SamplingParams,
-                  maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error>
+                  maxTokens: Int) async -> AsyncThrowingStream<GenEvent, Error>
 }
 
 extension InferenceService: ChatBackend {}

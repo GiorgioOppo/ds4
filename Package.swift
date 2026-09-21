@@ -4,9 +4,9 @@ import Foundation
 
 // DwarfStar: a native Swift/SwiftUI front-end for local LLM backends. DeepSeek
 // V4 Flash and the single-file Pro Q2 profile are operational locally through
-// one geometry-driven backend; split Pro Q4 loading is not implemented. Qwen
-// and Kimi K3 are recognized but deliberately not executable until their own
-// tokenizer, tensor mapping and decoder exist. The engine is pure Swift
+// one geometry-driven backend. Bonsai2, Qwen3.8, DeepSeek4.1 and GLM5.3 Flash
+// have separate Swift/Metal decoders; other Qwen architectures and Kimi K3
+// remain unavailable. The engine is pure Swift
 // (DS4Core + DS4Metal): no
 // C engine, prebuilt static library
 // or external process, so everything builds in SwiftPM and the standalone

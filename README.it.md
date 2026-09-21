@@ -19,22 +19,17 @@ a file singolo girano localmente attraverso lo stesso decoder Metal guidato
 dalla geometria. Il pacchetto Pro Q4 a due shard resta solo scaricabile. Il Pro
 Q2 distribuito è collegato attraverso la pipeline guidata dalla geometria e i
 percorsi a shard di esperti; la validazione numerica multi-Mac con modello
-reale è ancora in sospeso. L'albero dei sorgenti e il loader dei modelli sono
-in preparazione per un backend Qwen indipendente. I file GGUF Qwen vengono
-riconosciuti ma rifiutati intenzionalmente finché tokenizer, mappatura dei
-tensori e decoder non saranno implementati. GLM 5.2 è in una fase di porting
-nativo a tappe: le tre varianti GGUF monolitiche di `antirez/glm-5.2-gguf`
-sono catalogate con dimensioni fissate e digest SHA-256; questa build
-riconosce `glm-dsa`, ne valida forma/tensori e ne fornisce il frontend di
-tokenizer/chat, ma rifiuta ancora l'inferenza finché il decoder Metal completo
-non supera i test end-to-end sui logits. Laguna S 2.1 (Poolside) è nella
-stessa fase a tappe, portata dal branch upstream `laguna-s2.1`: il Q4_K_M
-ufficiale e il requant misto Q2_K/Q3_K sono a catalogo come solo-download;
-questa build riconosce `laguna`, ne valida geometria e layout dei tensori e
-ne fornisce il frontend nativo di tokenizer, template chat con reasoning
-interlacciato e tool-call taggati, ma rifiuta l'inferenza finché il decoder
-Metal Laguna non è portato e non supera la parità dei logits (vedi
-`docs/PORTING-GAPS.it.md`). Il motore DeepSeek è un port fedele
+reale è ancora in sospeso.
+
+Quattro nuovi backend testuali sperimentali hanno loader e decoder dedicati
+interamente in Swift, con kernel Metal: **Ternary Bonsai 2 27B, Qwen3.8 Flash
+Next, DeepSeek V4.1 Flash e GLM5.3 Flash**. Chat, ragionamento, tool e server API
+condividono lo stesso modello caricato. Le altre architetture Qwen restano
+escluse; Bonsai richiede lo schema preciso del checkpoint Prism. La guida ai
+[decoder Swift](docs/NATIVE-SWIFT-MODELS.md) descrive kernel, memoria e limiti di
+validazione. GLM5.2 usa il proprio motore streaming nativo; Laguna mantiene il
+controllo di abilitazione del suo runtime.
+Il motore DeepSeek è un port fedele
 degli upstream `ds4.c` / `ds4_metal.m`: nessun motore runtime in C, nessuna
 libreria statica precompilata né processo esterno per l'inferenza normale. Il
 GGUF Flash a 2 bit gira su un MacBook da 16 GB facendo streaming dei pesi

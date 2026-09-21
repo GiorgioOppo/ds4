@@ -262,7 +262,7 @@ public final class GLM52Tokenizer: TokenizerProtocol {
         }
     }
 
-    public let architecture: ModelArchitectureID = .glmDSA
+    public let architecture: ModelArchitectureID
     public let tokens: [[UInt8]]
     public let nVocab: Int
     public let special: GLM52SpecialTokenIDs
@@ -273,7 +273,7 @@ public final class GLM52Tokenizer: TokenizerProtocol {
 
     public convenience init(model: GGUFModel) throws {
         let detected = try ModelArchitectureDetector.detect(in: model)
-        guard detected.id == .glmDSA else {
+        guard detected.id == .glmDSA || detected.id == .glm53Flash else {
             throw ModelArchitectureError.unsupportedArchitecture(detected.id)
         }
         if let tokenizerModel = model.string("tokenizer.ggml.model"),
@@ -292,12 +292,15 @@ public final class GLM52Tokenizer: TokenizerProtocol {
         }
         let bos = Self.metadataTokenID(model.u64Compat("tokenizer.ggml.bos_token_id"))
         let eos = Self.metadataTokenID(model.u64Compat("tokenizer.ggml.eos_token_id"))
-        try self.init(tokens: tokens, merges: merges, bosTokenID: bos, eosTokenID: eos)
+        try self.init(tokens: tokens, merges: merges, bosTokenID: bos, eosTokenID: eos,
+                      architecture: detected.id)
     }
 
     /// Model-free initializer used by deterministic tokenizer fixtures.
     init(tokens: [[UInt8]], merges: [[UInt8]],
-         bosTokenID: Int32? = nil, eosTokenID: Int32? = nil) throws {
+         bosTokenID: Int32? = nil, eosTokenID: Int32? = nil,
+         architecture: ModelArchitectureID = .glmDSA) throws {
+        self.architecture = architecture
         guard tokens.count <= Int(Int32.max) else { throw TokenizerError.vocabularyTooLarge }
         self.tokens = tokens
         self.nVocab = tokens.count

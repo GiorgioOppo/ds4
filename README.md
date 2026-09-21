@@ -18,21 +18,16 @@ models on Apple Silicon with a **pure-Swift Metal inference engine**.
 Pro Q2 profile run locally through the same geometry-driven Metal decoder.
 The two-shard Pro Q4 package remains download-only. Distributed Pro Q2 is wired
 through the geometry-driven pipeline and expert-shard paths; real-model
-multi-Mac numerical validation is still pending. The source tree and model loader are being
-prepared for an independent Qwen backend. Qwen GGUF files are recognized but
-intentionally refused until their tokenizer, tensor mapping and decoder are
-implemented. GLM 5.2 is in a staged native-port phase: the three monolithic
-GGUF variants from `antirez/glm-5.2-gguf` are cataloged with pinned sizes and
-SHA-256 digests; this build recognizes `glm-dsa`, validates its shape/tensors
-and provides its tokenizer/chat frontend, but still refuses inference until the
-complete Metal decoder passes end-to-end logits tests. Laguna S 2.1
-(Poolside) is in the same staged phase, ported from the upstream
-`laguna-s2.1` branch: the official Q4_K_M and the mixed Q2_K/Q3_K requant are
-cataloged as download-only; this build recognizes `laguna`, validates its
-geometry and tensor layout, and provides its native tokenizer, chat template
-with interleaved reasoning, and tagged tool-call frontend, but refuses
-inference until the Laguna Metal decoder is ported and passes logits parity
-(see `docs/PORTING-GAPS.md`). The DeepSeek engine is a faithful
+multi-Mac numerical validation is still pending.
+
+Four additional experimental text backends now have dedicated native Swift
+loaders and decoders with Metal kernels: **Ternary Bonsai 2 27B, Qwen3.8 Flash
+Next, DeepSeek V4.1 Flash and GLM5.3 Flash**. Chat, reasoning, tools and the local
+API share the same loaded model. Generic Qwen architectures remain unsupported;
+Bonsai requires its exact Prism tensor schema. See [native Swift model support](docs/NATIVE-SWIFT-MODELS.md)
+for kernel paths, memory behavior and validation limits. GLM5.2 uses its separate
+native streaming backend; Laguna remains behind its existing runtime gate.
+The DeepSeek engine is a faithful
 port of upstream `ds4.c` / `ds4_metal.m`: no C runtime engine, prebuilt static
 library or external process for normal inference. The Flash 2-bit GGUF runs on
 a 16 GB MacBook by streaming routed expert weights from SSD; that memory claim

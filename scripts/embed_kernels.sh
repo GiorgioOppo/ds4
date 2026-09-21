@@ -46,3 +46,4 @@ kernel_path() {
   echo "}"
 } > "$out"
 echo "wrote $out"
+python3 scripts/embed_backend_kernels.py

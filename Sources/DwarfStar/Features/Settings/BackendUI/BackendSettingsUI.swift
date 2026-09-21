@@ -34,6 +34,10 @@ class BackendSettingsUI {
             ?? store.inspectedModelDescriptor?.architecture else {
             return BackendSettingsUI(store: store, dist: dist)
         }
+        if [.bonsai2, .qwen38FlashNext, .deepSeekV41, .glm53Flash].contains(architecture),
+           store.modelCapabilities.contains(.generation) {
+            return NativeSwiftSettingsUI(store: store, dist: dist)
+        }
         if architecture == .deepSeekV4 {
             return DeepSeekSettingsUI(store: store, dist: dist)
         }
@@ -99,6 +103,29 @@ class BackendSettingsUI {
                     note: String?) -> AnyView {
         AnyView(DiskKVRows(store: store, showBudget: showBudget,
                            gbPerKTok: gbPerKTok, note: note))
+    }
+}
+
+/// These decoders expose chat, tools and reasoning through the common API.
+/// No DeepSeek or GLM 5.2 performance knobs are applied to their graphs.
+@MainActor
+final class NativeSwiftSettingsUI: BackendSettingsUI {
+    override func memorySection() -> AnyView {
+        AnyView(Section("Decoder Swift · testo") {
+            Label(store.info?.displayName ?? store.inspectedModelDescriptor?.displayName ?? "Modello",
+                  systemImage: "cpu")
+            Text("Chat, ragionamento, strumenti e server API condividono un solo modello. Il contesto selezionato si applica al prossimo caricamento.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(memoryDescription)
+                .font(.caption).foregroundStyle(.secondary)
+        })
+    }
+    private var memoryDescription: String {
+        let architecture = store.info?.architecture ?? store.inspectedModelDescriptor?.architecture
+        if architecture == .bonsai2 {
+            return "I pesi ternari occupano circa 6–7 GB su disco. Contesto, stato ricorrente e buffer di lavoro usano memoria aggiuntiva."
+        }
+        return "Gli esperti selezionati vengono letti dal file su SSD; cache del sistema, stato del decoder e contesto determinano la memoria effettiva. La dimensione del GGUF non è una stima della RAM, né una garanzia di velocità su questa macchina."
     }
 }
 

@@ -13,6 +13,10 @@ public struct RuntimeModelDescriptor: Sendable, Equatable {
         self.capabilities = capabilities
     }
 
+    public var usesSwiftModelDecoder: Bool {
+        backendAvailability == .implemented
+            && [.bonsai2, .qwen38FlashNext, .deepSeekV41, .glm53Flash].contains(architecture)
+    }
     public var architecture: ModelArchitectureID { model.architecture.id }
     public var family: ModelFamily { model.architecture.family }
     public var backendAvailability: ModelBackendAvailability {

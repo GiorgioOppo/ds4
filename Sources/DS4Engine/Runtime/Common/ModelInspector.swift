@@ -1,13 +1,19 @@
 import Foundation
 import DS4Core
 
-/// Reads only portable GGUF metadata. It never constructs a tokenizer, validates
-/// DeepSeek shapes or allocates Metal resources, so it is safe to call before a
-/// backend has been selected.
+/// Reads portable GGUF metadata and validates Bonsai's Prism tensor descriptors
+/// to distinguish it from ordinary Qwen3.5 checkpoints. It never constructs a
+/// tokenizer or allocates Metal resources, so inspection precedes backend load.
 public enum ModelInspector {
     public static func inspect(_ model: GGUFModel) throws -> RuntimeModelDescriptor {
-        let detected = gateAwareAvailability(
+        var detected = gateAwareAvailability(
             try ModelArchitectureDetector.detect(in: model))
+        // qwen35 also identifies ordinary Qwen checkpoints. Only the complete
+        // Prism schema identifies the folded Bonsai model this runtime admits.
+        if detected.id == .bonsai2, (try? BonsaiConfiguration(model: model)) == nil {
+            detected = .init(id: detected.id, family: detected.family,
+                             backendAvailability: .recognizedButNotImplemented)
+        }
         let prefix = detected.id.ggufMetadataNamespace
         let name = model.string("general.name").flatMap { $0.isEmpty ? nil : $0 }
             ?? fallbackName(for: detected)
@@ -15,12 +21,10 @@ public enum ModelInspector {
         let descriptor = ModelDescriptor(
             architecture: detected,
             name: name,
-            layerCount: model.u32("\(prefix).block_count").map(Int.init),
-            embeddingLength: model.u32("\(prefix).embedding_length").map(Int.init),
-            vocabularySize: (
-                model.u32("\(prefix).vocab_size")
-                    ?? model.u32("\(prefix).vocabulary_size")
-            ).map(Int.init),
+            layerCount: integer(model, "\(prefix).trunk_block_count", "\(prefix).block_count", "\(prefix).num_hidden_layers"),
+            embeddingLength: integer(model, "\(prefix).embedding_length", "\(prefix).hidden_size"),
+            vocabularySize: integer(model, "\(prefix).vocab_size", "\(prefix).vocabulary_size")
+                ?? model.array("tokenizer.ggml.tokens").flatMap { Int(exactly: $0.len) },
             capabilities: modelCapabilities(for: detected)
         )
         return RuntimeModelDescriptor(
@@ -34,10 +38,14 @@ public enum ModelInspector {
                                hasDeepSeekV4Metadata: Bool = false,
                                layerCount: Int? = nil) throws
         -> RuntimeModelDescriptor {
-        let detected = gateAwareAvailability(try ModelArchitectureDetector.detect(
+        var detected = gateAwareAvailability(try ModelArchitectureDetector.detect(
             generalArchitecture: generalArchitecture,
             hasDeepSeekV4Metadata: hasDeepSeekV4Metadata
         ))
+        if detected.id == .bonsai2 {
+            detected = .init(id: detected.id, family: detected.family,
+                             backendAvailability: .recognizedButNotImplemented)
+        }
         let descriptor = ModelDescriptor(
             architecture: detected,
             name: displayName.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName(for: detected),
@@ -50,8 +58,17 @@ public enum ModelInspector {
         )
     }
 
+    private static func integer(_ model: GGUFModel, _ keys: String...) -> Int? {
+        keys.lazy.compactMap { model.u64Compat($0).flatMap(Int.init(exactly:)) }.first
+    }
+
     private static func modelCapabilities(for detected: DetectedModelArchitecture)
         -> ModelCapabilities {
+        if [.bonsai2, .qwen38FlashNext, .deepSeekV41, .glm53Flash].contains(detected.id) {
+            var result: ModelCapabilities = [.chat, .tools, .reasoning]
+            if detected.id != .bonsai2 { result.insert(.mixtureOfExperts) }
+            return result
+        }
         switch detected.family {
         case .deepSeek:
             return DeepSeekV4BackendDefinition.modelCapabilities
@@ -70,6 +87,9 @@ public enum ModelInspector {
 
     private static func runtimeCapabilities(for detected: DetectedModelArchitecture)
         -> BackendCapabilities {
+        if [.bonsai2, .qwen38FlashNext, .deepSeekV41, .glm53Flash].contains(detected.id) {
+            return detected.backendAvailability == .implemented ? .nativeText : []
+        }
         switch detected.backendAvailability {
         case .implemented where detected.id == .deepSeekV4:
             return DeepSeekV4BackendDefinition.runtimeCapabilities
@@ -120,6 +140,13 @@ public enum ModelInspector {
     }
 
     private static func fallbackName(for detected: DetectedModelArchitecture) -> String {
+        switch detected.id {
+        case .bonsai2 where detected.backendAvailability == .implemented: return "Ternary Bonsai 2 27B"
+        case .qwen38FlashNext: return "Qwen 3.8 Flash Next"
+        case .deepSeekV41: return "DeepSeek V4.1 Flash"
+        case .glm53Flash: return "GLM 5.3 Flash"
+        default: break
+        }
         switch detected.family {
         case .deepSeek: return "DeepSeek V4"
         case .glm: return "GLM 5.2"

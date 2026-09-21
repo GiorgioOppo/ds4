@@ -67,10 +67,12 @@ public final class MetalRuntime {
     /// Default runtime: kernel sources are embedded in the binary (KernelSources.swift),
     /// so no on-disk metal/ folder is needed — works in SwiftPM, the .xcodeproj, and
     /// a shipped .app.
-    public init() throws {
+    public init(additionalSources: [String] = []) throws {
         guard let dev = MTLCreateSystemDefaultDevice() else { throw MetalError.noDevice }
         guard let q = dev.makeCommandQueue() else { throw MetalError.noQueue }
-        self.library = try dev.makeLibrary(source: MetalRuntime.buildSourceEmbedded(), options: MetalRuntime.compileOptions())
+        let source = try MetalRuntime.buildSourceEmbedded()
+            + additionalSources.map { "\n" + $0 + "\n" }.joined()
+        self.library = try dev.makeLibrary(source: source, options: MetalRuntime.compileOptions())
         self.device = dev
         self.queue = q
     }

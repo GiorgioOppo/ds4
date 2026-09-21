@@ -23,6 +23,7 @@ public enum ModelDownloadState: Sendable, Hashable {
     case resuming(fromByte: Int64)
     case downloading
     case verifying
+    case assembling
     case finalizing
     case completed(ModelDownloadDisposition)
 }

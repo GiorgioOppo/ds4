@@ -852,6 +852,8 @@ final class ChatStore {
     /// `glmService`. Chat-only in v1: the benchmark/tuning panels have no
     /// Laguna surface yet (the streaming profile lives in the demo CLI).
     var lagunaService: LagunaChatService?
+    /// One native Swift decoder shared by chat and the local API server.
+    var nativeService: SwiftModelChatService?
     /// Full load signature of `service`, including fixed knobs and context.
     var loadedEngineSignature: LoadedEngineSignature?
     var generation: Task<Void, Never>?
@@ -880,7 +882,8 @@ final class ChatStore {
     var chatBackend: (any ChatBackend)? {
         if let service { return service }
         if let glmService { return glmService }
-        return lagunaService
+        if let lagunaService { return lagunaService }
+        return nativeService
     }
     /// Shared engine gated for KV-mutating uses (benchmark): a run rewrites the
     /// KV, so it's refused while the chat is mid-generation.

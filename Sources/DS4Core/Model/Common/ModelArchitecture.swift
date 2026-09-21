@@ -18,7 +18,11 @@ public struct ModelArchitectureID: RawRepresentable, Hashable, Sendable, Codable
     }
 
     public static let deepSeekV4 = ModelArchitectureID("deepseek4")
+    public static let deepSeekV41 = ModelArchitectureID("deepseek41")
     public static let glmDSA = ModelArchitectureID("glm-dsa")
+    public static let glm53Flash = ModelArchitectureID("glm5-next")
+    public static let qwen38FlashNext = ModelArchitectureID("qwen4exp")
+    public static let bonsai2 = ModelArchitectureID("qwen35")
     public static let laguna = ModelArchitectureID("laguna")
     public static let kimiK3 = ModelArchitectureID("kimi-k3")
 
@@ -34,7 +38,9 @@ public struct ModelArchitectureID: RawRepresentable, Hashable, Sendable, Codable
     public var ggufMetadataNamespace: String {
         switch self {
         case .deepSeekV4: return "deepseek4"
+        case .deepSeekV41: return "deepseek41"
         case .glmDSA: return "glm-dsa"
+        case .glm53Flash: return "glm5-next"
         case .laguna: return "laguna"
         case .kimiK3: return "kimi-k3"
         default: return rawValue
@@ -181,7 +187,7 @@ public enum ModelArchitectureDetector {
 
     public static func family(for id: ModelArchitectureID) -> ModelFamily {
         if id == .deepSeekV4 || id.rawValue.hasPrefix("deepseek4") { return .deepSeek }
-        if id == .glmDSA { return .glm }
+        if id == .glmDSA || id == .glm53Flash { return .glm }
         if id == .laguna { return .laguna }
         if id == .kimiK3 { return .kimi }
         if id.rawValue.hasPrefix("qwen") { return .qwen }
@@ -191,7 +197,7 @@ public enum ModelArchitectureDetector {
     public static func backendAvailability(for id: ModelArchitectureID,
                                            family: ModelFamily? = nil)
         -> ModelBackendAvailability {
-        if id == .deepSeekV4 { return .implemented }
+        if [.deepSeekV4, .deepSeekV41, .glm53Flash, .bonsai2, .qwen38FlashNext].contains(id) { return .implemented }
         switch family ?? self.family(for: id) {
         case .glm, .laguna, .kimi, .qwen: return .recognizedButNotImplemented
         case .deepSeek, .unknown: return .unknown

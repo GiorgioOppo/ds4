@@ -21,7 +21,7 @@ public enum ModelDownloader {
     /// remote repositories and runtime availability. MTP and the Laguna
     /// DFlash draft remain addressable as optional accessories.
     public static var targets: [ModelTarget] {
-        ModelCatalogRegistry.allArtifacts
+        ModelCatalogRegistry.allArtifacts + NativeModelAccessoryCatalog.entries.flatMap(\.artifacts)
             + [DeepSeekV4AccessoryCatalog.mtp,
                DeepSeekV4AccessoryCatalog.dspark,
                DeepSeekV4AccessoryCatalog.dspark0731,
@@ -483,6 +483,7 @@ public enum ModelDownloader {
         case .resuming(let offset): return "Ripresa del download da \(offset) byte…"
         case .downloading: return "Download in corso…"
         case .verifying: return "Verifica SHA-256…"
+        case .assembling: return "Assemblaggio e verifica SHA-256…"
         case .finalizing: return "Finalizzazione del modello…"
         case .completed(.alreadyPresent): return "Modello già presente."
         case .completed(.downloaded): return "Download completato."

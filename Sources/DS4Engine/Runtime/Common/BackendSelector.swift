@@ -7,6 +7,10 @@ public enum RuntimeBackendKind: String, Sendable, Equatable {
     case deepSeekV4
     case glm52
     case laguna
+    case bonsai2
+    case qwen38
+    case deepSeek41
+    case glm53
 }
 
 public enum BackendSelectionError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -29,6 +33,15 @@ public enum BackendSelectionError: Error, Sendable, Equatable, CustomStringConve
 public enum BackendSelector {
     public static func select(_ descriptor: RuntimeModelDescriptor) throws
         -> RuntimeBackendKind {
+        if descriptor.backendAvailability == .implemented {
+            switch descriptor.architecture {
+            case .bonsai2: return .bonsai2
+            case .qwen38FlashNext: return .qwen38
+            case .deepSeekV41: return .deepSeek41
+            case .glm53Flash: return .glm53
+            default: break
+            }
+        }
         if descriptor.architecture == .deepSeekV4,
            descriptor.backendAvailability == .implemented {
             if let layerCount = descriptor.layerCount,

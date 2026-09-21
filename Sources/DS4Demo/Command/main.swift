@@ -146,6 +146,11 @@ do {
     // Select before constructing DeepSeek tokenizer/dims: Qwen must never fall
     // through into misleading errors about missing deepseek4.* metadata.
     let detectedArchitecture = try ModelArchitectureDetector.detect(in: model)
+    if [.bonsai2, .qwen38FlashNext, .deepSeekV41, .glm53Flash].contains(detectedArchitecture.id) {
+        try runNativeModelDemo(model: model, architecture: detectedArchitecture.id,
+                               contextSize: maxKeys, arguments: args)
+        exit(0)
+    }
     do {
         try ModelArchitectureDetector.requireImplemented(detectedArchitecture)
     } catch {

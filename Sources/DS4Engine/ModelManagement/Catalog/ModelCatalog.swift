@@ -21,6 +21,22 @@ public enum ModelCatalogID: String, CaseIterable, Identifiable, Sendable, Hashab
     case glm52IQ2XXS = "glm-5.2-iq2-xxs"
     case glm52Q2K = "glm-5.2-q2-k"
     case glm52Q4K = "glm-5.2-q4-k"
+    case bonsai2PQ2 = "bonsai-2-pq2"
+    case bonsai2PTQ1 = "bonsai-2-ptq1"
+    case qwen38Q2 = "qwen-3.8-flash-next-q2"
+    case qwen38Q4 = "qwen-3.8-flash-next-q4"
+    case deepSeek41Q2 = "deepseek-4.1-flash-q2"
+    case deepSeek41Q4 = "deepseek-4.1-flash-q4"
+    case bonsai2F16 = "bonsai-2-f16"
+    case bonsai2VisionBF16 = "bonsai-2-vision-bf16"
+    case bonsai2VisionQ8 = "bonsai-2-vision-q8"
+    case qwen38VisionQ8 = "qwen-3.8-vision-q8"
+    case deepSeek41Vision = "deepseek-4.1-vision"
+    case glm53Vision = "glm-5.3-vision"
+    case glm53FP8 = "glm-5.3-fp8"
+    case glm53FullIQ2 = "glm-5.3-full-iq2-xxs"
+    case glm53Q2 = "glm-5.3-flash-q2"
+    case glm53Q4 = "glm-5.3-flash-q4-k"
     case lagunaQ4 = "laguna-q4"
     case lagunaQ2Q3 = "laguna-q2-q3"
     case kimiK3IQ2XXSQ2K = "kimi-k3-iq2-xxs-q2-k"
@@ -44,6 +60,11 @@ public enum ModelCatalogProfile: Sendable, Hashable {
     case glm52
     case laguna
     case kimiK3
+    case bonsai2
+    case qwen38
+    case deepSeek41
+    case glm53
+    case glm53Full
 
     public var familyDisplayName: String {
         switch self {
@@ -51,6 +72,11 @@ public enum ModelCatalogProfile: Sendable, Hashable {
         case .glm52: "GLM 5.2"
         case .laguna: "Laguna S 2.1"
         case .kimiK3: "Kimi K3"
+        case .bonsai2: "Ternary Bonsai 2 27B"
+        case .qwen38: "Qwen 3.8 Flash Next"
+        case .deepSeek41: "DeepSeek V4.1 Flash"
+        case .glm53: "GLM 5.3 Flash"
+        case .glm53Full: "GLM 5.3 completo"
         }
     }
 }
@@ -127,9 +153,8 @@ public enum ModelRuntimeAvailability: Sendable, Hashable {
 public enum ModelArtifactRole: String, Sendable, Hashable {
     case mainModel
     case distributedShard
-    /// Consecutive byte fragment of one logical GGUF, not an independent GGUF
-    /// shard. Keep every fragment in catalog order for the future virtual file
-    /// reader; concatenating today would temporarily duplicate ~859 GB.
+    /// Consecutive bytes of one logical GGUF, not an independent GGUF shard.
+    /// Requires an explicit assembly recipe or a virtual reader, in catalog order.
     case splitFragment
     case optionalComponent
 }
@@ -168,10 +193,15 @@ public struct ModelCatalogEntry: Sendable, Identifiable, Hashable {
     public let summary: String
     public let artifacts: [ModelTarget]
     public let runtimeAvailability: ModelRuntimeAvailability
+    /// Final GGUF produced by verified concatenation of the ordered fragments.
+    /// This is a local output, never a separately downloaded remote target.
+    public let assemblyOutput: ModelTarget?
 
     public init(id: ModelCatalogID, displayName: String, profile: ModelCatalogProfile,
                 summary: String, artifacts: [ModelTarget],
-                runtimeAvailability: ModelRuntimeAvailability) {
+                runtimeAvailability: ModelRuntimeAvailability,
+                assemblyOutput: ModelTarget? = nil) {
+        self.assemblyOutput = assemblyOutput
         self.id = id
         self.displayName = displayName
         self.profile = profile
@@ -203,17 +233,32 @@ public struct ModelCatalogEntry: Sendable, Identifiable, Hashable {
         )
     }
 
-    /// Only a complete, single-file model supported by the current runtime may
-    /// become the active model in the GUI.
+    /// Selection always names one complete GGUF, downloaded directly or
+    /// published by the verified assembler; a fragment is never a model choice.
     public var isSelectable: Bool {
-        runtimeAvailability.isRunnable
-            && artifacts.count == 1
-            && artifacts[0].role == .mainModel
+        guard runtimeAvailability.isRunnable else { return false }
+        if let assemblyOutput {
+            return isSplitFragmentPackage && assemblyOutput.role == .mainModel
+        }
+        return artifacts.count == 1 && artifacts[0].role == .mainModel
     }
 
     public var primaryArtifact: ModelTarget? {
         guard isSelectable else { return nil }
-        return artifacts[0]
+        return assemblyOutput ?? artifacts[0]
+    }
+
+    /// Peak disk footprint while fragments and their verified final GGUF coexist.
+    public var assemblyPeakBytes: Int64? {
+        guard let input = expectedSizeBytes,
+              let output = assemblyOutput?.expectedSizeBytes else { return nil }
+        let (total, overflow) = input.addingReportingOverflow(output)
+        return overflow ? nil : total
+    }
+
+    public var isImageEncoder: Bool {
+        [.visionEncoder, .bonsai2VisionBF16, .bonsai2VisionQ8, .qwen38VisionQ8,
+         .deepSeek41Vision, .glm53Vision].contains(id)
     }
 
     /// Image understanding requires the matching encoder sidecar. The encoder
@@ -574,6 +619,8 @@ public enum ModelCatalogRegistry {
     public static let entries: [ModelCatalogEntry] =
         DeepSeekV4ModelCatalog.entries + DeepSeekV4VisionCatalog.entries + GLM52ModelCatalog.entries
             + LagunaModelCatalog.entries + KimiK3ModelCatalog.entries
+            + BonsaiModelCatalog.entries + Qwen38ModelCatalog.entries
+            + DeepSeek41ModelCatalog.entries + GLM53ModelCatalog.entries
 
     public static let selectableEntries: [ModelCatalogEntry] = entries.filter(\.isSelectable)
     public static let allArtifacts: [ModelTarget] = entries.flatMap(\.artifacts)
@@ -584,6 +631,7 @@ public enum ModelCatalogRegistry {
     public static let downloadEntries: [ModelCatalogEntry] =
         entries + DeepSeekV4AccessoryCatalog.downloadEntries
             + DeepSeekV4VisionCatalog.accessoryEntries
+            + NativeModelAccessoryCatalog.entries
 
     public static func entry(_ id: ModelCatalogID) -> ModelCatalogEntry? {
         entries.first { $0.id == id }

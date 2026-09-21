@@ -35,8 +35,8 @@ settings:
 # Pure-Swift multi-model stack — NO external links (no C engine, no prebuilt
 # static lib). DeepSeek V4 Flash and the single-file Pro Q2 profile are
 # operational locally through one geometry-driven backend; Pro Q4 split loading
-# is not implemented. GLM 5.2 has an isolated detector/frontend and staged
-# kernels but no executable decoder; Qwen has a recognized placeholder. The SwiftUI app
+# is not implemented. GLM 5.2, Bonsai 2, Qwen 3.8, DeepSeek V4.1 and GLM 5.3
+# Flash have dedicated native Swift/Metal decoders. The SwiftUI app
 # (DwarfStar) is driven by DS4Engine -> DS4Core + DS4Metal, so the whole thing
 # builds in this .xcodeproj.
 targets:

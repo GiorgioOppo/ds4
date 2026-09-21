@@ -10,6 +10,10 @@ public struct BackendCapabilities: OptionSet, Sendable, Hashable, Codable {
 
     public init(rawValue: UInt64) { self.rawValue = rawValue }
 
+    /// Shared text surface of the four native Swift decoders. Performance,
+    /// disk-KV and image controls require separate implemented API contracts.
+    public static let nativeText: BackendCapabilities = [.generation, .reasoning, .tools]
+
     public static let generation = BackendCapabilities(rawValue: 1 << 0)
     public static let reasoning = BackendCapabilities(rawValue: 1 << 1)
     public static let tools = BackendCapabilities(rawValue: 1 << 2)

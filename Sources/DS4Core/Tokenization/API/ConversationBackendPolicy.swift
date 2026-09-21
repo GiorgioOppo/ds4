@@ -5,6 +5,8 @@ public enum ConversationBackendID: String, Sendable, Codable, Equatable {
     case deepSeekDSML
     case glm52Native
     case lagunaNative
+    case deepSeek41DSML
+    case qwenChatML
 }
 
 public enum ConversationBackendSelectionError: Error, Sendable, Equatable,
@@ -31,6 +33,9 @@ public enum ConversationBackendPolicy {
     public static func backend(for detected: DetectedModelArchitecture) throws
         -> ConversationBackendID {
         if detected.id == .deepSeekV4 { return .deepSeekDSML }
+        if detected.id == .deepSeekV41 { return .deepSeek41DSML }
+        if detected.id == .bonsai2 || detected.id == .qwen38FlashNext { return .qwenChatML }
+        if detected.id == .glm53Flash { return .glm52Native }
         if detected.id == .glmDSA { return .glm52Native }
         if detected.id == .laguna { return .lagunaNative }
 

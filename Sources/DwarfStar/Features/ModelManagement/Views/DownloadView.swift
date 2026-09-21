@@ -23,7 +23,7 @@ struct DownloadView: View {
         ModelCatalogRegistry.downloadEntries.filter { entry in
             let matchesFilter = switch filter {
             case .runnable: entry.isSelectable
-            case .vision: entry.requiresVisionEncoder || entry.id == .visionEncoder || entry.id == .visionDSparkSupport
+            case .vision: entry.requiresVisionEncoder || entry.isImageEncoder || entry.id == .visionDSparkSupport
             case .accessories: entry.artifacts.allSatisfy { $0.role == .optionalComponent }
             case .all: true
             }
@@ -139,8 +139,8 @@ struct DownloadView: View {
                 VStack(alignment: .trailing, spacing: 5) {
                     Label(installation.state.title, systemImage: installation.state.symbol)
                         .foregroundStyle(installStateColor(installation.state))
-                    Text(entry.expectedSizeBytes.map(formatBytes)
-                         ?? "circa \(entry.approximateSizeGB) GB")
+                    Text("Disco: " + (entry.expectedSizeBytes.map(formatBytes)
+                         ?? "circa \(entry.approximateSizeGB) GB"))
                         .foregroundStyle(.secondary)
                 }
                 .font(.caption)
@@ -150,6 +150,8 @@ struct DownloadView: View {
                 if entry.artifacts.allSatisfy({ $0.role == .optionalComponent }) {
                     Label("Accessorio · non sostituisce il modello selezionato",
                           systemImage: "puzzlepiece.extension")
+                } else if entry.assemblyOutput != nil {
+                    Label("Frammenti da assemblare · si seleziona soltanto il GGUF finale", systemImage: "square.stack.3d.up")
                 } else if entry.isSplitFragmentPackage {
                     Label("GGUF diviso · \(entry.artifacts.count) parti consecutive",
                           systemImage: "rectangle.split.3x1")
@@ -204,7 +206,11 @@ struct DownloadView: View {
 
             updateLabel(for: entry)
 
-            let packageBytes = entry.expectedSizeBytes
+            if let peak = entry.assemblyPeakBytes {
+                Label("Assemblaggio: fino a \(formatBytes(peak)) su disco più riserva. Le parti originali vengono conservate.", systemImage: "internaldrive")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            let packageBytes = entry.assemblyPeakBytes ?? entry.expectedSizeBytes
                 ?? Int64(entry.approximateSizeGB) * 1_000_000_000
             let estimatedRequired = ModelDownloader.requiredFreeSpace(
                 totalBytes: packageBytes,
@@ -403,8 +409,7 @@ struct DownloadView: View {
 
     private func selectedPath(for entry: ModelCatalogEntry,
                               installation: CatalogInstallation) -> String? {
-        guard entry.isSelectable, entry.artifacts.count == 1,
-              let target = entry.artifacts.first else { return nil }
+        guard let target = entry.primaryArtifact else { return nil }
         return installation.pathsByTargetID[target.id]
     }
 

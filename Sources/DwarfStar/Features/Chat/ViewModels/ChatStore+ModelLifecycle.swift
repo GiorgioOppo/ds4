@@ -31,7 +31,7 @@ extension ChatStore {
     private func commitModelSelection(path: String) {
         guard modelPath != path else { return }
         if isGenerating { stop() }
-        let serviceToRetire = service
+        let serviceToRetire = chatBackend
         if serviceToRetire != nil {
             persistActiveSession()
         }
@@ -55,8 +55,11 @@ extension ChatStore {
                 await serviceToRetire.quiesceForTeardown()
                 // A new load may have installed another service while this task
                 // was suspended; never clear a newer owner.
-                if self.service === serviceToRetire {
+                if self.chatBackend === serviceToRetire {
                     self.service = nil
+                    self.glmService = nil
+                    self.lagunaService = nil
+                    self.nativeService = nil
                 }
             }
         }
@@ -202,14 +205,17 @@ extension ChatStore {
                 // Metal/VM a short window to release wired buffers. This avoids
                 // ever constructing two model-sized engines at once.
                 _ = await self.waitForEngineSetup()
-                let previousService = await MainActor.run { self.service }
-                await previousService?.quiesceForTeardown()
-                await MainActor.run {
-                    self.service = nil
-                    self.glmService = nil
-                    self.lagunaService = nil
-                    self.loadedEngineSignature = nil
-                    self.info = nil
+                do {
+                    let previousService = await MainActor.run { self.chatBackend }
+                    await previousService?.quiesceForTeardown()
+                    await MainActor.run {
+                        self.service = nil
+                        self.glmService = nil
+                        self.lagunaService = nil
+                        self.nativeService = nil
+                        self.loadedEngineSignature = nil
+                        self.info = nil
+                    }
                 }
                 try await Task.sleep(nanoseconds: 4_000_000_000)
 
@@ -218,6 +224,42 @@ extension ChatStore {
                 let inspected = try InferenceService.inspectModel(path: path)
                 await MainActor.run {
                     if self.modelPath == path { self.inspectedModelDescriptor = inspected }
+                }
+                _ = try BackendSelector.select(inspected)
+                if inspected.usesSwiftModelDecoder {
+                    let native = try await withCheckedThrowingContinuation {
+                        (cont: CheckedContinuation<SwiftModelChatService, Error>) in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                cont.resume(returning: try SwiftModelChatService(
+                                    modelPath: path, contextSize: ctx, systemPrompt: nil))
+                            } catch { cont.resume(throwing: error) }
+                        }
+                    }
+                    let nativeInfo = native.modelInfo()
+                    await MainActor.run {
+                        self.nativeService = native
+                        self.info = nativeInfo
+                        self.enginePrimed = false
+                        self.activate(self.activeSessionId)
+                    }
+                    guard await self.waitForEngineSetup() else {
+                        await native.quiesceForTeardown()
+                        await MainActor.run {
+                            if self.nativeService === native {
+                                self.nativeService = nil
+                                self.info = nil
+                            }
+                        }
+                        throw NSError(domain: "DwarfStar.EngineSetup", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "Preparazione del modello fallita. Consulta il log per il dettaglio del decoder."])
+                    }
+                    await MainActor.run {
+                        guard self.modelPath == path, self.nativeService === native else { return }
+                        self.phase = .ready
+                    }
+                    return
                 }
                 // GLM 5.2: chat served by the GLM resident/streaming engine,
                 // not the DeepSeek loop — with tools, disk-KV store,
@@ -422,7 +464,7 @@ extension ChatStore {
     /// MCP specs, which exist only while their server is connected.
     func syncTools() {
         guard EngineActivityGate.shared.activeOwner == nil else { return }
-        guard let service else { return }
+        guard let service = chatBackend else { return }
         let tools = toolsEnabled ? ToolRegistry.autoSpecs(enabled: enabledToolNames) : []
         // Before the first prompt (also when a persisted chat still needs to be
         // re-primed), this selection is exactly what the model will see. Once a

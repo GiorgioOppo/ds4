@@ -35,15 +35,17 @@ final class ModelDownloaderTests: XCTestCase {
         XCTAssertEqual(GLM52ModelCatalog.entries.count, 3)
         XCTAssertEqual(LagunaModelCatalog.entries.count, 2)
         XCTAssertEqual(KimiK3ModelCatalog.entries.count, 1)
-        XCTAssertEqual(ModelCatalogRegistry.entries.count, 18)
-        XCTAssertEqual(ModelCatalogRegistry.downloadEntries.count, 22)
+        XCTAssertEqual(ModelCatalogRegistry.entries.count, 26)
+        XCTAssertEqual(ModelCatalogRegistry.downloadEntries.count, 38)
         XCTAssertEqual(
             Set(ModelCatalogRegistry.selectableEntries.map(\.id)),
             Set([.flashQ2Imatrix, .flashQ2Imatrix0731,
                  .flashQ2Q4Imatrix, .flashQ2Q4Imatrix0731,
                  .flashQ4Imatrix, .flashQ4Imatrix0731, .proQ2Imatrix,
                  .flashVisionQ2, .flashVisionQ2Q4,
-                 .glm52IQ2XXS, .glm52Q2K, .glm52Q4K])
+                 .glm52IQ2XXS, .glm52Q2K, .glm52Q4K,
+                 .bonsai2PQ2, .bonsai2PTQ1, .qwen38Q2, .qwen38Q4,
+                 .deepSeek41Q2, .deepSeek41Q4, .glm53Q2, .glm53Q4])
         )
 
         let expected0731: [(ModelCatalogID, String, Int64, String)] = [

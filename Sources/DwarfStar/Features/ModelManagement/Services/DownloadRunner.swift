@@ -267,6 +267,13 @@ final class DownloadRunner {
                 self.refresh()
             }
             do {
+                if let peak = entry.assemblyPeakBytes, self.availableBytes > 0 {
+                    let required = ModelDownloader.requiredFreeSpace(totalBytes: peak,
+                        existingPartialBytes: initial.localBytes + initial.partialBytes)
+                    guard self.availableBytes >= required else {
+                        throw ModelDownloader.DownloadError.insufficientDiskSpace(required: required, available: self.availableBytes)
+                    }
+                }
                 var downloaded = false
                 for (index, target) in entry.artifacts.enumerated() {
                     try Task.checkCancellation()
@@ -280,6 +287,10 @@ final class DownloadRunner {
                     downloaded = true
                     try await self.acquireArtifact(target, entry: entry, index: index,
                                                    replacing: replaceArtifact)
+                }
+                if entry.assemblyOutput != nil {
+                    try await self.assemble(entry)
+                    downloaded = true
                 }
                 self.updates[key] = .current
 
@@ -296,6 +307,8 @@ final class DownloadRunner {
                     } else {
                         self.notices[key] = "Download completato, ma la validazione del runtime ne ha impedito la selezione."
                     }
+                } else if entry.assemblyOutput != nil {
+                    self.notices[key] = "GGUF assemblato e verificato. " + (entry.runtimeAvailability.unavailableReason ?? "")
                 } else if entry.isSplitFragmentPackage {
                     self.notices[key] = "Download delle parti completato. Il futuro lettore Kimi le esporrà come un unico GGUF senza duplicarle."
                 } else if entry.artifacts.count > 1 {
@@ -324,7 +337,7 @@ final class DownloadRunner {
                                  entry: ModelCatalogEntry,
                                  index: Int,
                                  replacing: Bool = false) async throws {
-        let count = max(entry.artifacts.count, 1)
+        let count = max(entry.artifacts.count + (entry.assemblyOutput == nil ? 0 : 1), 1)
         active = ActiveProgress(
             entryID: entry.id.rawValue,
             artifactName: target.file,
@@ -426,6 +439,40 @@ final class DownloadRunner {
         rememberInstalled(target)
     }
 
+    private func assemble(_ entry: ModelCatalogEntry) async throws {
+        guard let output = entry.assemblyOutput else { return }
+        let sources = try entry.artifacts.map { target -> URL in
+            guard let url = existingFile(for: target) else { throw RunnerError.incompletePackage }
+            return url
+        }
+        let count = entry.artifacts.count + 1
+        active = ActiveProgress(entryID: entry.id.rawValue, artifactName: output.file,
+            artifactIndex: count, artifactCount: count, completedBytes: 0,
+            totalBytes: output.expectedSizeBytes ?? 0,
+            overallFraction: Double(count - 1) / Double(count), phase: "Assemblaggio e verifica SHA-256")
+        let (stream, continuation) = AsyncStream<DownloadUIEvent>.makeStream(bufferingPolicy: .bufferingNewest(4))
+        let relay = DownloadCallbackRelay(continuation), directory = destination
+        async let result: ModelDownloadResult = {
+            defer { continuation.finish() }
+            return try await ModelDownloader.assemble(entry: entry, fragmentURLs: sources, in: directory,
+                onProgress: { relay.yield(progress: $0) }, onState: { relay.yield(state: $0) })
+        }()
+        for await event in stream {
+            if case .snapshot(let progress, let state) = event, var next = active {
+                next.phase = Self.friendlyPhase(state)
+                if let progress {
+                    next.completedBytes = progress.completedBytes
+                    next.totalBytes = progress.totalBytes ?? 0
+                    next.overallFraction = (Double(count - 1) + (progress.fractionCompleted ?? 0)) / Double(count)
+                }
+                active = next
+            }
+            try? await Task.sleep(for: .milliseconds(125))
+        }
+        _ = try await result
+        rememberInstalled(output)
+    }
+
     private static let receiptDefaultsKey = "ds4.modelArtifactReceipts.v1"
 
     private func rememberInstalled(_ target: ModelTarget) {
@@ -460,7 +507,7 @@ final class DownloadRunner {
         return ModelCatalogEntry(
             id: entry.id, displayName: entry.displayName, profile: entry.profile,
             summary: entry.summary, artifacts: artifacts,
-            runtimeAvailability: entry.runtimeAvailability)
+            runtimeAvailability: entry.runtimeAvailability, assemblyOutput: entry.assemblyOutput)
     }
 
     private struct HFManifest: Decodable {
@@ -516,15 +563,20 @@ final class DownloadRunner {
                 sha256: digest, expectedSizeBytes: byteCount,
                 role: target.role, source: target.source))
         }
+        if entry.assemblyOutput != nil, artifacts != entry.artifacts {
+            // Fragment checksums and the assembled checksum form one immutable
+            // recipe. Never silently refresh half of that recipe from a server.
+            throw ModelDownloader.DownloadError.remoteObjectChanged
+        }
         return ModelCatalogEntry(id: entry.id, displayName: entry.displayName,
             profile: entry.profile, summary: entry.summary, artifacts: artifacts,
-            runtimeAvailability: entry.runtimeAvailability)
+            runtimeAvailability: entry.runtimeAvailability, assemblyOutput: entry.assemblyOutput)
     }
 
     private func updateSkippedArtifact(entry: ModelCatalogEntry,
                                        target: ModelTarget,
                                        index: Int) {
-        let count = max(entry.artifacts.count, 1)
+        let count = max(entry.artifacts.count + (entry.assemblyOutput == nil ? 0 : 1), 1)
         active = ActiveProgress(
             entryID: entry.id.rawValue,
             artifactName: target.file,
@@ -539,7 +591,8 @@ final class DownloadRunner {
 
     // MARK: - Local installation state
 
-    private func inspect(_ entry: ModelCatalogEntry) -> CatalogInstallation {
+    // Internal for filesystem-only installation-state regression fixtures.
+    func inspect(_ entry: ModelCatalogEntry) -> CatalogInstallation {
         var paths: [String: String] = [:]
         var installedBytes: Int64 = 0
         var partialBytes: Int64 = 0
@@ -558,12 +611,26 @@ final class DownloadRunner {
             }
         }
 
+        var hasAssembly = false
+        if let output = entry.assemblyOutput {
+            if let existing = existingFile(for: output) {
+                paths[output.id] = existing.path
+                installedBytes += Self.fileSize(existing)
+                hasAssembly = true
+                // Once the final GGUF exists, old fragment files are optional
+                // leftovers. A missing or damaged fragment must not hide it.
+                invalidArtifacts.removeAll()
+            } else if let invalid = invalidManagedArtifact(for: output) {
+                invalidArtifacts[output.id] = invalid
+            }
+            partialBytes += Self.fileSize(destination.appendingPathComponent(output.file + ".assembling.part"))
+        }
         let installed = paths.count
-        let count = entry.artifacts.count
+        let count = hasAssembly ? installed : entry.artifacts.count + (entry.assemblyOutput == nil ? 0 : 1)
         let state: CatalogInstallState
         if !invalidArtifacts.isEmpty {
             state = .invalidLocalFile
-        } else if count > 0, installed == count {
+        } else if hasAssembly || (count > 0 && installed == count) {
             state = .installed
         } else if installed > 0 || partialBytes > 0 {
             state = .partial
@@ -583,8 +650,7 @@ final class DownloadRunner {
 
     private func selectablePath(for entry: ModelCatalogEntry,
                                 installation: CatalogInstallation) -> String? {
-        guard entry.isSelectable, entry.artifacts.count == 1,
-              let target = entry.artifacts.first else { return nil }
+        guard let target = entry.primaryArtifact else { return nil }
         return installation.pathsByTargetID[target.id]
     }
 
@@ -665,6 +731,7 @@ final class DownloadRunner {
             "Ripresa da \(ByteCountFormatter.string(fromByteCount: byte, countStyle: .file))"
         case .downloading: "Download"
         case .verifying: "Verifica integrità"
+        case .assembling: "Assemblaggio e verifica SHA-256"
         case .finalizing: "Finalizzazione"
         case .completed(.alreadyPresent): "Già presente"
         case .completed(.downloaded): "Completato"

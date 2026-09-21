@@ -287,7 +287,8 @@ public final class GGUFModel {
         return tensors[i]
     }
 
-    /// Read a GGUF array whose elements are u32 or i32, sign-preserved as Int64.
+    /// Read integer metadata without truncation. UInt64 values outside Int64
+    /// are refused rather than wrapped into a negative hash multiplier.
     public func intArray(_ key: String) -> [Int64]? {
         guard let (t, n, dataPos) = array(key) else { return nil }
         var c = cursor(at: dataPos)
@@ -299,6 +300,10 @@ public final class GGUFModel {
                 guard let v = try? c.u32() else { return nil }; out.append(Int64(v))
             case GGUFValueType.int32.rawValue:
                 guard let v = try? c.read(as: Int32.self) else { return nil }; out.append(Int64(v))
+            case GGUFValueType.uint64.rawValue:
+                guard let v = try? c.read(as: UInt64.self), v <= UInt64(Int64.max) else { return nil }; out.append(Int64(v))
+            case GGUFValueType.int64.rawValue:
+                guard let v = try? c.read(as: Int64.self) else { return nil }; out.append(v)
             default: return nil
             }
         }
@@ -336,4 +341,3 @@ public final class GGUFModel {
         return out
     }
 }
-

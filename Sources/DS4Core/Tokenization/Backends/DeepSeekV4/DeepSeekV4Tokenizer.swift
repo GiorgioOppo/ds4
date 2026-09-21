@@ -12,10 +12,11 @@ import Foundation
 // MARK: - Vocabulary
 
 public final class DeepSeekV4Tokenizer: TokenizerProtocol {
-    public let architecture: ModelArchitectureID = .deepSeekV4
+    public let architecture: ModelArchitectureID
     public let tokens: [[UInt8]]          // id -> raw byte string
     public let nVocab: Int
     public let bosId, eosId, userId, assistantId, thinkStartId, thinkEndId, dsmlId: Int32
+    public let systemId: Int32?
 
     private let tokenToId: [[UInt8]: Int32]
     private let mergeRank: [[UInt8]: Int32]
@@ -37,10 +38,13 @@ public final class DeepSeekV4Tokenizer: TokenizerProtocol {
 
     public init(model: GGUFModel) throws {
         let detected = try ModelArchitectureDetector.detect(in: model)
-        try ModelArchitectureDetector.requireImplemented(detected)
-        guard detected.id == .deepSeekV4 else {
+        if detected.id != .deepSeekV41 {
+            try ModelArchitectureDetector.requireImplemented(detected)
+        }
+        guard detected.id == .deepSeekV4 || detected.id == .deepSeekV41 else {
             throw ModelArchitectureError.unsupportedArchitecture(detected.id)
         }
+        self.architecture = detected.id
 
         guard let tokenBytes = model.stringArrayBytes("tokenizer.ggml.tokens") else {
             throw TokError.missingTable("tokenizer.ggml.tokens")
@@ -71,6 +75,7 @@ public final class DeepSeekV4Tokenizer: TokenizerProtocol {
         self.thinkStartId = try lookup("<think>")
         self.thinkEndId = try lookup("</think>")
         self.dsmlId = try lookup("｜DSML｜")
+        self.systemId = detected.id == .deepSeekV41 ? try lookup("<｜System｜>") : nil
 
         // Collect the full set of CONTROL (type 3) tokens from
         // tokenizer.ggml.token_type, so chat/tool markup (role markers, tool-call
@@ -87,7 +92,7 @@ public final class DeepSeekV4Tokenizer: TokenizerProtocol {
         // CONTROL (type 3); if ｜DSML｜ were missing here, the rendered tool example
         // "<｜DSML｜tool_calls>" in the prompt would BPE-split into "DS"+"ML" and the
         // model would learn to emit those two text pieces instead of the atomic id.
-        let named: [(bytes: [UInt8], id: Int32)] = [
+        var named: [(bytes: [UInt8], id: Int32)] = [
             (Array("<｜begin▁of▁sentence｜>".utf8), bosId),
             (Array("<｜end▁of▁sentence｜>".utf8), eosId),
             (Array("<｜User｜>".utf8), userId),
@@ -96,6 +101,7 @@ public final class DeepSeekV4Tokenizer: TokenizerProtocol {
             (Array("</think>".utf8), thinkEndId),
             (Array("｜DSML｜".utf8), dsmlId),
         ]
+        if let systemId { named.append((Array("<｜System｜>".utf8), systemId)) }
         var seen = Set(sp.map { $0.id })
         for n in named where !seen.contains(n.id) { sp.append(n); seen.insert(n.id) }
         // Longest-first: at each position the longest matching special wins.
@@ -418,7 +424,12 @@ public final class DeepSeekV4Tokenizer: TokenizerProtocol {
     /// prompt, assistant marker, and <think>/</think> per mode.
     public func encodeChatPrompt(system: String?, prompt: String, think: ThinkMode) -> [Int32] {
         var out: [Int32] = [bosId]
-        if think == .max { preTokenize(Array(DS4ReasoningEffortMaxPrefix.utf8), into: &out) }
+        if let systemId {
+            if let effort = DeepSeek41ChatRenderer.effort(think) {
+                out.append(systemId)
+                preTokenize(Array(effort.utf8), into: &out)
+            } else if let system, !system.isEmpty { out.append(systemId) }
+        } else if think == .max { preTokenize(Array(DS4ReasoningEffortMaxPrefix.utf8), into: &out) }
         if let system, !system.isEmpty { preTokenize(Array(system.utf8), into: &out) }
         out.append(userId)
         preTokenize(Array(prompt.utf8), into: &out)
