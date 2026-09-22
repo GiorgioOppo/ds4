@@ -24,6 +24,7 @@ recovery. Existing upstream backend controls retain their upstream semantics.
 
 | Variable | Default and interpretation | Purpose / implementation |
 | --- | --- | --- |
+| `DS4_METAL_DISABLE_V41_Q4_BF16` | presence rollback; unset enables eligible single-token V4.1 Q4_K projections on M1; any defined value including 0 disables | Restore separate projection and BF16 passes for Q-A, KV, Q-B and grouped output-A. Quality mode, concurrent encoding, tensor parallelism, other GPU families and Q4 MV classic rollback retain the separate passes. [Source](../ds4_metal.m). |
 | `DS4_METAL_DISABLE_Q8_MV_SINGLE_BARRIER` | presence rollback; any defined value disables the automatic four-SIMD-group Q8 matvec/pair variant | Restore the second barrier; quality, tensor-parallel, and other SIMD-group counts retain the reference kernels. [Source](../ds4_metal.m). |
 | `DS4_METAL_DISABLE_SSD_Q8_SINGLE_BARRIER` | presence rollback; any defined value disables the automatic SSD Q8 shared-expert variant | Restore the second barrier in the four/eight-SIMD-group gate/up SwiGLU producer. [Source](../ds4_metal.m). |
 | `DS4_METAL_DISABLE_PRE_M5_BATCH_ATTN_OUT_HC_FUSION` | presence rollback; unset enables the exact resident pre-M5 Q4_K output-B-to-HC4 tail when all shape and safety gates pass; any value including 0 disables | Restore the separate attention output-B materialization and HC expansion dispatches. [Source](../ds4_metal.m). |

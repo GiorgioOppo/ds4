@@ -169,6 +169,18 @@ int ds4_gpu_dsv41_q8_bf16_rows(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_rows);
+/* Metal Q4 projections with the same BF16 boundary as matmul + quantize.
+ * K must be divisible by 256, M by 4, and 1 <= n_rows <= 8. Single-row
+ * M1 decode may fuse the store; other supported cases retain both passes. */
+int ds4_gpu_dsv41_q4_bf16_rows(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows);
+/* Fixed V4.1 grouped output-A projection, including its BF16 boundary. */
+int ds4_gpu_dsv41_q4_output_low_bf16(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t group0, uint32_t groups,
+        const ds4_gpu_tensor *heads);
 /* Single-row Q8 shared gate/up with BF16 boundaries before SwiGLU and at
  * its output. Admits K5120/M2304, NSG4, non-quality, single-device execution.
  * Returns 1 on success, 0 before encoding when unsupported, -1 on GPU error. */

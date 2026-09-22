@@ -2791,7 +2791,7 @@ void kernel_mul_mv_q2_K_f32_impl(
     }
 }
 
-template<int nr0, typename args_t>
+template<int nr0, typename args_t, bool BF16 = false>
 void kernel_mul_mv_q4_K_f32_impl(
         args_t args,
         device const char *src0,
@@ -2893,7 +2893,8 @@ void kernel_mul_mv_q4_K_f32_impl(
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
+            // Preserve the classic reduction; only V4.1's final store rounds.
+            dst_f32[first_row + row] = BF16 ? shared_q8_bf16(sum_all) : sum_all;
         }
     }
 
@@ -3486,6 +3487,20 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Same dense ABI and arithmetic, with the existing V4.1 BF16 output boundary.
+kernel void kernel_dsv41_mul_mv_q4_K_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, ds4_metal_args_mul_mv, true>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //
@@ -3667,16 +3682,17 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         sgitg);
 }
 
-kernel void kernel_dsv4_attn_out_low_q4_K_f32(
+template<bool BF16 = false>
+void ds4_attn_out_low_q4_K_impl(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg) {
     (void)tiitg;
 
     const int iid1 = tgpig.z / args.nei0;
@@ -3713,7 +3729,7 @@ kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         /*.r3   =*/ 1,
     };
 
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, ds4_metal_args_mul_mv, BF16>(
         args0,
         src0_cur,
         src1_cur,
@@ -3722,6 +3738,34 @@ kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         tgpig,
         tiisg,
         sgitg);
+}
+
+kernel void kernel_dsv4_attn_out_low_q4_K_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_attn_out_low_q4_K_impl<>(
+        args, src0s, src1, dst, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+
+kernel void kernel_dsv41_attn_out_low_q4_K_bf16(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_attn_out_low_q4_K_impl<true>(
+        args, src0s, src1, dst, shmem, tgpig, tiitg, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(

@@ -420,6 +420,19 @@ tests/test_deepseek41_q4_attention: tests/test_deepseek41_q4_attention.o $(CORE_
 test-deepseek41-q4-attention: tests/test_deepseek41_q4_attention
 	./tests/test_deepseek41_q4_attention
 
+tests/test_deepseek41_q4_bf16.o: tests/test_deepseek41_q4_bf16.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_deepseek41_q4_bf16: tests/test_deepseek41_q4_bf16.o $(CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-q4-bf16 bench-deepseek41-q4-bf16
+test-deepseek41-q4-bf16: tests/test_deepseek41_q4_bf16
+	./tests/test_deepseek41_q4_bf16
+
+bench-deepseek41-q4-bf16: tests/test_deepseek41_q4_bf16
+	./tests/test_deepseek41_q4_bf16 --bench
+
 tests/test_deepseek41_bf16_rhs.o: tests/test_deepseek41_bf16_rhs.c ds4_gpu.h ds4_deepseek41_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
@@ -1438,7 +1451,7 @@ clean:
 	rm -f tests/test_cuda_tp_repack
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_q4_attention tests/test_deepseek41_imatrix_release
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_q4_attention tests/test_deepseek41_q4_bf16 tests/test_deepseek41_imatrix_release
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch

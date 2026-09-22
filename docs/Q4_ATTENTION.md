@@ -78,6 +78,43 @@ Their tile scratch is fixed-size, while activation storage grows with the
 batch. The separate Q-A/KV shared-input path retains its 256-token limit
 because it uses a fixed 2 MiB staging buffer. Metal4 dispatch is unchanged.
 
+### V4.1 BF16 decode on Metal M1
+
+DeepSeek V4.1 Q4_K decode fuses the existing BF16 rounding into the final
+store of Q-A, KV, Q-B and grouped output-A on Apple M1-family GPUs. This
+removes one dispatch and one output read/write per projection, retaining
+the original accumulation and reduction order. It adds no weight cache or
+activation scratch and works with SSD streaming.
+
+The fused path requires one token, a single GPU, the classic Q4 matvec,
+non-concurrent encoding and quality mode disabled. Other cases retain the
+separate projection and BF16 passes. Output-B retains its existing rounding
+boundary after the tensor-parallel sum. Set
+`DS4_METAL_DISABLE_V41_Q4_BF16=1` before launch to restore the separate passes.
+
+`make test-deepseek41-q4-bf16` checks bitwise agreement, BF16 rounding ties,
+signed zero, buffer guards, rejected dense inputs, rows 1..8 and both
+output-A tensor-parallel slices. The test needs Metal but no model file;
+`DS4_METAL_MATH_SAFE=1` repeats it with strict shader arithmetic.
+`make bench-deepseek41-q4-bf16` additionally measures resident projections.
+
+On M1 Max, alternating A/B/B/A and B/A/A/B samples (11 per path, 128
+dispatches per sample) measured these median times, including the BF16
+boundary in each path:
+
+| V4.1 projection | Separate passes | Fused store | Speedup |
+| --- | ---: | ---: | ---: |
+| Q-A, 5120 → 1280 | 32.90 µs | 29.60 µs | 1.11× |
+| KV, 5120 → 512 | 19.34 µs | 17.88 µs | 1.08× |
+| Q-B, 1280 → 32768 | 204.36 µs | 201.25 µs | 1.02× |
+| Output-A, eight 4096 → 1024 groups | 113.42 µs | 108.54 µs | 1.04× |
+
+Q-B's difference is within observed run variability. These isolated timings
+exclude SSD reads and do not establish a full-model throughput gain.
+Both strict and default shader arithmetic passed bitwise checks. Four
+32-token SSD-streaming runs with the converted V4.1 Q2/AProjQ4 model also
+produced identical text before and after the change.
+
 ### Q-B F16 staging and memory
 
 The automatic path expands one layer's Q4_K Q-B weights into reusable F16

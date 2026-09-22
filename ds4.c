@@ -41438,6 +41438,9 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
     if (round && weight->type == DS4_TENSOR_Q8_0 && !(weight->dim[1] & 1u))
         return ds4_gpu_dsv41_q8_bf16_rows(out, m->map, m->size,
             weight->abs_offset, weight->dim[0], weight->dim[1], in, 1);
+    if (round && weight->type == DS4_TENSOR_Q4_K && !(weight->dim[1] & 3u))
+        return ds4_gpu_dsv41_q4_bf16_rows(out, m->map, m->size,
+            weight->abs_offset, weight->dim[0], weight->dim[1], in, 1);
 #endif
 #ifdef DS4_ROCM_BUILD
     if (weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_Q8_0) {
@@ -41654,10 +41657,12 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
 #ifdef __APPLE__
-    const bool ok = l->attn_output_a->type == DS4_TENSOR_Q4_K ?
-        ds4_gpu_attention_output_low_q4_K_slice_tensor(g->low, m->map, m->size,
-            l->attn_output_a->abs_offset, 4096, 1024, group0, groups, g->heads, 0) > 0 :
+    const bool low_is_bf16 = l->attn_output_a->type == DS4_TENSOR_Q4_K;
+    const bool ok = low_is_bf16 ?
+        ds4_gpu_dsv41_q4_output_low_bf16(g->low, m->map, m->size,
+            l->attn_output_a->abs_offset, group0, groups, g->heads) > 0 :
 #else
+    const bool low_is_bf16 = false;
     /* CUDA's grouped Q4 kernel is shape/device dependent. A zero admission
      * result must retain the generic typed projection on other GPUs. */
     const bool ok = l->attn_output_a->type == DS4_TENSOR_Q4_K ?
@@ -41669,7 +41674,7 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
             l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
             4096, 1024, groups, g->heads);
-    return ok && ds41_bf16(g->low, groups * DS4_N_LORA_O) &&
+    return ok && (low_is_bf16 || ds41_bf16(g->low, groups * DS4_N_LORA_O)) &&
         (!g->imatrix || ds4_gpu_tensor_copy(g->imatrix->attention_input[3], 0,
             g->low, 0, (uint64_t)groups * DS4_N_LORA_O * sizeof(float)));
 }

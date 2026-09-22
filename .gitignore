@@ -83,6 +83,7 @@
 /tests/test_qwen4_ngram_state
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_q4_attention
+/tests/test_deepseek41_q4_bf16
 /tests/test_deepseek41_imatrix_release
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
