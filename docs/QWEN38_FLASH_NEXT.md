@@ -53,8 +53,10 @@ During single-token decode, cache misses overlap with gate/up computation
 for cached experts and the shared expert. Once the reads finish, the missing
 gate/up slots are computed, followed by one down pass and the original ordered
 reduction. Private address snapshots keep the running GPU work independent of
-cache updates. Fully cached selections use one gate/up pass. Batched prefill
-and temporary staging retain their existing schedule; an MTP layer whose
+cache updates. Fully cached selections use one gate/up pass. Cached batched
+prefill uses overlap on every Metal device: resident experts run while missing
+weights load, then missing gate/up computation overlaps the down-weight reads.
+Temporary staging retains its existing schedule; an MTP layer whose
 expert size differs from the main model is staged again on each invocation,
 without replacing the main model's cache entries.
 

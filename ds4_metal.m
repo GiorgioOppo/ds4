@@ -51037,8 +51037,8 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         id<MTLBuffer> gate = nil, up = nil, down = nil;
         id<MTLBuffer> overflow_gate = nil, overflow_up = nil, overflow_down = nil;
         uint32_t prepared_unique = 0;
-        /* The MM overlap is measured on M1 Max; other devices keep their
-         * existing prefill schedule, including the Metal 4 scratch path. */
+        /* Run cached experts while missing payloads load, then submit their
+         * gate/up work before reading down weights on every Metal device. */
         g_stream_prefill_batch_selected_addr_building++;
         ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 table->model_map, table->model_size, table->layer, selected, n_tokens,
@@ -51046,9 +51046,9 @@ int ds4_gpu_qwen4_moe_stream_tensor(
                 table->gate_expert_bytes, table->down_expert_bytes,
                 &gate, &up, &down, stream.entries, &stream.n_entries,
                 &prepared_unique, &overflow_gate, &overflow_up, &overflow_down, false,
-                (n_tokens <= 3u && !mm) || (mm && ds4_gpu_device_name_contains("M1 Max")) ?
+                (n_tokens <= 3u || mm) ?
                     qwen4_stream_mid_before_read : NULL, &overlap,
-                mm && ds4_gpu_device_name_contains("M1 Max") ? qwen4_stream_missing_gate_up_ready : NULL);
+                mm ? qwen4_stream_missing_gate_up_ready : NULL);
         g_stream_prefill_batch_selected_addr_building--;
         stream.gate = gate;
         stream.up = up;

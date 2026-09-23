@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
 
 /* Real SSD reads with a sparse 512-expert file. Only 24 experts contain data;
@@ -256,15 +255,6 @@ static int project_split(const weights *w, uint32_t T, uint32_t slots, int share
     if (!lists) return project_rows(w, T, slots, shared, streamed, mid, part, x, ids);
     need(slots == S && !shared, "routed-only MM split shape");
     return project(w, T, streamed, mid, part, x, ids, lists, counts);
-}
-
-/* The automatic prefill overlap currently targets M1 Max. Other devices
- * still run these numerical and I/O cases, but have no prefix on read failure. */
-static int mm_overlap_expected(void) {
-    char brand[128] = {0}; size_t bytes = sizeof(brand);
-    need(sysctlbyname("machdep.cpu.brand_string", brand, &bytes, NULL, 0) == 0,
-         "read MM overlap device policy");
-    return strstr(brand, "M1 Max") != NULL;
 }
 
 /* Both arms use the same row/MM arithmetic and the same final reduction/HC.
@@ -542,7 +532,7 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         if (fail_first == 2) {
             pthread_mutex_lock(&probe_mutex);
             probe.fail_projection = 2;
-            probe.require_gate_up_first = mm_overlap_expected();
+            probe.require_gate_up_first = 1;
             pthread_mutex_unlock(&probe_mutex);
         }
         need(!project_split(w, T, slots, shared, 1, outputs[0].view, outputs[1].view,
@@ -552,14 +542,13 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         need(reads.calls && reads.bytes == (fail_first == 2 ?
              (uint64_t)n_missing * 2u * w->table.gate_expert_bytes : 0u),
              "split failure consumes only complete gate/up or no payload");
-        const int prefix = !mm || mm_overlap_expected();
         for (unsigned stage = 0; stage < 2; stage++) {
             const uint32_t dim = stage ? D : F;
             float *got = read_output(outputs + stage);
             for (uint32_t t = 0; t < T; t++) for (uint32_t s = 0; s < stride; s++) {
                 const uint64_t off = GUARD + ((uint64_t)t * stride + s) * dim;
-                if (prefix && (s == slots || cached[ids[t * slots + s]] ||
-                               (stage == 0 && mm && fail_first == 2)))
+                if (s == slots || cached[ids[t * slots + s]] ||
+                    (stage == 0 && mm && fail_first == 2))
                     exact("completed early mid/down slot", reference[stage] + off, got + off, dim);
                 else for (uint32_t i = 0; i < dim; i++)
                     need(!memcmp(got + off + i, &poison, 4), "unavailable projection untouched on failure");
@@ -717,10 +706,9 @@ int main(void) {
     check_split_one(formats, 33, S, 0, 0, 0, 1, fileno(file), fileno(empty));
     check_split_one(formats + 1, 33, S, 0, 12, 0, 0, fileno(file), fileno(empty));
     check_split_one(formats + 2, 29, S, 0, 12, 0, 0, fileno(file), fileno(empty));
-    /* Gate/up completion must precede down reads on the enabled device.
-     * Other GPUs keep the single read batch and may stop before all gate/up
-     * tasks finish. Repeated failure also checks reservation cleanup. */
-    for (uint32_t f = 0; mm_overlap_expected() && f < 3; f++) {
+    /* Gate/up completion must precede down reads on every device.
+     * Repeated failure also checks reservation cleanup. */
+    for (uint32_t f = 0; f < 3; f++) {
         const uint32_t shapes[] = {29, 33, 128};
         for (uint32_t i = 0; i < 3; i++) {
             check_split_one(formats + f, shapes[i], S, 0, 0, 0, 2, fileno(file), fileno(empty));
