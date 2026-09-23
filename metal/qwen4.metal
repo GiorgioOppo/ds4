@@ -241,7 +241,20 @@ kernel void kernel_qwen4_hc_gate_mix(
     const W w(w_up);
     const uint64_t row = (uint64_t)(s * E + d) * args.n_rank;
     float acc = 0.0f;
-    for (uint r = lane; r < args.n_rank; r += 8) acc += w.at(row + r) * qwen4_silu(l[r] / (float)hc);
+    for (uint r = lane; r < args.n_rank; r += 8) {
+        if constexpr (is_same<W, qwen4_w_f16>::value) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            /* Match the F16 prefetch/reuse kernels without depending on
+             * the device compiler to reassociate weight * silu(x). */
+            const float x = l[r] * (1.0f / (float)hc);
+            const float t = x * w.at(row + r);
+            const float u = t * qwen4_sigmoid(x);
+            acc = acc + u;
+        } else {
+            acc += w.at(row + r) * qwen4_silu(l[r] / (float)hc);
+        }
+    }
     acc += simd_shuffle_xor(acc, 1);
     acc += simd_shuffle_xor(acc, 2);
     acc += simd_shuffle_xor(acc, 4);
@@ -259,13 +272,9 @@ QWEN4_HC_MIX_INSTANCE(f16, qwen4_w_f16)
 QWEN4_HC_MIX_INSTANCE(f32, qwen4_w_f32)
 QWEN4_HC_MIX_INSTANCE(q8, qwen4_w_q8)
 
-/* F16 gate/mix with eight terms loaded ahead per lane round.  Under the
- * library's fast math the shipped loop compiles to x = l*(1/hc);
- * sig = sigmoid(x); acc += (x*w)*sig (the compiler reassociates
- * w*silu(x)) with no fused multiply-add; this kernel spells that op order
- * out with reassociation and contraction pinned off, so its rows are
- * byte-identical to kernel_qwen4_hc_gate_mix_f16 (tests/test_qwen4_kernels.c
- * pins it) while the loads overlap the sigmoid chain. */
+/* F16 gate/mix with eight terms loaded ahead per lane round. The generic,
+ * prefetched and reuse kernels all pin acc += (x*w)*sigmoid(x) without FMA;
+ * loading ahead only overlaps memory reads with the sigmoid chain. */
 kernel void kernel_qwen4_hc_gate_mix_f16_pf(
         constant ds4_metal_args_qwen4_hc_gate_mix & args,
         device const float *xn,
@@ -408,7 +417,16 @@ kernel void kernel_qwen4_hc_gate_mix_pair(
     const W w(w_up);
     const uint64_t row = (uint64_t)(s * E + d) * rank;
     float2 acc = 0.0f;
-    for (uint r = lane; r < rank; r += 8) acc += w.at(row + r) * activated[r];
+    for (uint r = lane; r < rank; r += 8) {
+        if constexpr (is_same<W, qwen4_w_f16>::value) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            /* Paired F16 rows retain their original fused accumulation. */
+            acc = fma(float2(w.at(row + r)), activated[r], acc);
+        } else {
+            acc += w.at(row + r) * activated[r];
+        }
+    }
     acc += simd_shuffle_xor(acc, 1);
     acc += simd_shuffle_xor(acc, 2);
     acc += simd_shuffle_xor(acc, 4);
@@ -422,12 +440,8 @@ kernel void kernel_qwen4_hc_gate_mix_pair(
     }
 }
 
-/* Paired F16 gate/mix with eight weights and eight activated pairs loaded
- * ahead per lane round.  The shipped pair loop runs as a fused multiply-add
- * chain acc = fma(w, act, acc) per element (unlike the single-row mixer,
- * which the backend leaves unfused); that chain is spelled out here with
- * reassociation pinned off, so both rows are byte-identical to
- * kernel_qwen4_hc_gate_mix_pair_f16 (tests/test_qwen4_kernels.c pins them). */
+/* Paired F16 gate/mix with eight weights and activated pairs loaded ahead.
+ * Both paired kernels pin the same FMA chain, unlike the single-row mixer. */
 kernel void kernel_qwen4_hc_gate_mix_pair_f16_pf(
         constant ds4_metal_args_qwen4_hc_gate_mix & args,
         device const float *xn,

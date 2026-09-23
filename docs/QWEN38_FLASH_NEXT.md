@@ -221,11 +221,20 @@ yet. SSD expert streaming is supported on Metal only. ROCm is not supported.
 CPU code is a correctness reference, not a general inference backend.
 
 
+M6 uses the same Metal dispatch defaults as M5, including the Qwen indexer,
+attention merge, HC mixers and MoE scheduling. Existing M5 diagnostic rollback
+switches apply to both generations; tensor kernels still require runtime
+capability support. The F16 HC mixers explicitly preserve their accumulation
+order in both normal and safe shader math modes. This does not guarantee
+bit-identical logits across GPU generations: tensor matmuls retain their own
+accumulation order.
+
 ## Validation
 
 ```sh
 make test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-reuse test-q8-prefill-variants
 make test-qwen4-ssd-experts test-qwen4-memory
+make test-qwen4-hc-math test-metal-device-policy
 make test-frontends
 make test-qwen4-ngrams
 make tests/test_qwen4_ngram_state

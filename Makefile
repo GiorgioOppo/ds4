@@ -256,7 +256,7 @@ check-metal-qwen4-moe-down: tests/test_metal_qwen4_moe_down
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_qwen4_vision.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
+tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_qwen4_vision.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
 	$(CC) $(OBJCFLAGS) -include tests/qwen4_ssd_pread_probe.h -c -o $@ ds4_metal.m
 
 tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(filter-out ds4_metal.o,$(CORE_OBJS)) tests/ds4_metal_qwen_ssd.o
@@ -299,7 +299,7 @@ test-metal-ssd-experts: tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts --q4
 	./tests/test_metal_ssd_experts --mxfp4
 
-tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h $(METAL_SRCS)
+tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 
 tests/test_metal_ssd_reuse: tests/test_metal_ssd_reuse.o ds4_image.o
@@ -667,7 +667,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4_eval_cases.h ds4.h ds4_ssd.h ds4_distributed.h ds
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
@@ -733,6 +733,18 @@ endif
 .PHONY: test-qwen4-kernels test-qwen4-q2 test-qwen4-vision
 test-qwen4-kernels: $(QWEN4_KERNEL_TEST)
 	./$(QWEN4_KERNEL_TEST)
+
+.PHONY: test-qwen4-hc-math
+test-qwen4-hc-math: $(QWEN4_KERNEL_TEST)
+	DS4_METAL_MATH_SAFE=0 DS4_TEST_QWEN4_M1_REUSE_ONLY=hc ./$(QWEN4_KERNEL_TEST)
+	DS4_METAL_MATH_SAFE=1 DS4_TEST_QWEN4_M1_REUSE_ONLY=hc ./$(QWEN4_KERNEL_TEST)
+
+tests/test_metal_device_policy: tests/test_metal_device_policy.c ds4_metal_device.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+.PHONY: test-metal-device-policy
+test-metal-device-policy: tests/test_metal_device_policy
+	./tests/test_metal_device_policy
 
 test-qwen4-q2: $(QWEN4_KERNEL_TEST) tests/test_qwen4_moe_mm_specialize
 	DS4_TEST_QWEN4_MV_EXACT=1 ./$(QWEN4_KERNEL_TEST)
@@ -1205,6 +1217,7 @@ clean:
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache tests/test_engram
+	rm -f tests/test_metal_device_policy
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec

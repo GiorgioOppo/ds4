@@ -3428,9 +3428,11 @@ static void m1_reuse_compare(m1_reuse_case *c, bool benchmark) {
 
 static void test_m1_reuse(arena_t *a, bool benchmark, const char *only) {
     const char *env[] = {"DS4_QWEN4_MOE_MV_SPECIALIZE", "DS4_QWEN4_MOE_MV_NR",
-        "DS4_QWEN4_MOE_MV_NSG", "DS4_QWEN4_HC_MIX_PREFETCH", "DS4_QWEN4_HC_PAIR_NSG"};
-    char *saved[5];
-    for (uint32_t i = 0; i < 5u; i++) {
+        "DS4_QWEN4_MOE_MV_NSG", "DS4_QWEN4_HC_MIX_PREFETCH", "DS4_QWEN4_HC_PAIR_NSG",
+        "DS4_QWEN4_NO_HC_PAIR"};
+    enum { ENV_COUNT = sizeof(env) / sizeof(env[0]) };
+    char *saved[ENV_COUNT];
+    for (uint32_t i = 0; i < ENV_COUNT; i++) {
         const char *value = getenv(env[i]);
         saved[i] = value ? strdup(value) : NULL;
         require_ok(!value || saved[i] != NULL, "save reuse environment");
@@ -3490,20 +3492,25 @@ static void test_m1_reuse(arena_t *a, bool benchmark, const char *only) {
         }
     }
     if (all || strcmp(only, "hc") == 0) {
-        const uint32_t widths[] = {33u, 2560u};
+        const uint32_t widths[] = {33u, 2560u}, tokens[] = {1u, 2u, 3u, 33u, 128u};
         for (uint32_t shape = 0; shape < 2u; shape++) {
             m1_reuse_case c = { .arena = a, .hc = true, .E = widths[shape], .F = 320u };
             double *shadow;
             c.up = arena_f16(a, (uint64_t)4u * c.E * c.F, &shadow, 0.3f); free(shadow);
-            float *x = rand_vec(3u * 4u * c.E, 1.0f), *low = rand_vec(3u * c.F, 6.0f);
-            c.x = upload(x, 3u * 4u * c.E); c.low = upload(low, 3u * c.F);
+            float *x = rand_vec(128u * 4u * c.E, 1.0f), *low = rand_vec(128u * c.F, 6.0f);
+            c.x = upload(x, 128u * 4u * c.E); c.low = upload(low, 128u * c.F);
             free(x); free(low);
-            for (c.T = 1u; c.T <= 3u; c.T++)
-                m1_reuse_compare(&c, benchmark && shape == 1u && c.T != 2u);
+            for (uint32_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+                c.T = tokens[i];
+                m1_reuse_compare(&c, benchmark && shape == 1u && (c.T == 1u || c.T == 3u));
+            }
             ds4_gpu_tensor_free(c.low); ds4_gpu_tensor_free(c.x);
         }
+        /* Tail ranks and paired rows must agree in both fast and safe
+         * shader builds, independently of the host device's default. */
+        test_hc_mix_prefetch(a);
     }
-    for (uint32_t i = 0; i < 5u; i++) {
+    for (uint32_t i = 0; i < ENV_COUNT; i++) {
         require_ok(saved[i] ? setenv(env[i], saved[i], 1) == 0 : unsetenv(env[i]) == 0, "restore reuse environment");
         free(saved[i]);
     }

@@ -242,7 +242,8 @@ void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
-int ds4_gpu_device_is_m5_apple_silicon(void);
+/* M6 shares the M5 dispatch defaults and existing M5 rollback switches. */
+int ds4_gpu_device_is_m5_or_m6_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
@@ -264,7 +265,7 @@ void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
-static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
+static inline int ds4_gpu_device_is_m5_or_m6_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);

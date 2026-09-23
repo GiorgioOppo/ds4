@@ -57,6 +57,7 @@
 /tests/test_linux_memory
 /tests/test_rocm_memory
 /tests/test_qwen4_kernels
+/tests/test_metal_device_policy
 /tests/test_metal_q8_reduction
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_qwen4_ssd_experts

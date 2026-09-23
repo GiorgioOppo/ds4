@@ -25,6 +25,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "ds4_metal_device.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -817,7 +818,7 @@ static int g_glm_streaming_prefill_full_layer_runtime;
 static int g_metal4_runtime_available;
 static int g_metal4_family_supported;
 static int g_metal4_queue_supported;
-static int g_metal4_m5_neural_accelerators_hint;
+static int g_metal4_neural_accelerators_hint;
 static int g_metal4_tensor_api_enabled;
 static int g_metal4_tensor_api_compile_supported;
 static char g_metal_device_name[128];
@@ -1610,11 +1611,11 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
 
 static int ds4_gpu_device_name_contains(const char *needle);
 
-static int ds4_gpu_use_m5_private_scratch(void) {
+static int ds4_gpu_use_m5_or_m6_private_scratch(void) {
     static int initialized;
     static int enabled;
     if (!initialized) {
-        enabled = ds4_gpu_device_name_contains("M5");
+        enabled = ds4_gpu_device_is_m5_or_m6_apple_silicon();
         initialized = 1;
     }
     return enabled;
@@ -1644,10 +1645,10 @@ static int ds4_gpu_ensure_scratch_buffer(
     if (bytes > NSUIntegerMax) return 0;
 
     MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (ds4_gpu_use_m5_private_scratch() &&
+    if (ds4_gpu_use_m5_or_m6_private_scratch() &&
         !ds4_gpu_scratch_needs_cpu_access(label)) {
         /*
-         * M5 scratch buffers that only flow between Metal kernels do not need
+         * M5/M6 scratch buffers that only flow between Metal kernels do not need
          * CPU-visible shared storage. This reduces shared-memory traffic and
          * residency pressure for the long prefill scratch pools without
          * changing the public buffer lifetime model. Keep default hazard
@@ -2793,10 +2794,10 @@ int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
             g_metal_device_name[8] == ' ');
 }
 
-int ds4_gpu_device_is_m5_apple_silicon(void) {
-    return strncmp(g_metal_device_name, "Apple M5", 8) == 0 &&
-           (g_metal_device_name[8] == '\0' ||
-            g_metal_device_name[8] == ' ');
+/* M6 inherits the M5 tuning policy. The existing DS4_*_M5 rollback names
+ * control both generations; runtime, pipeline and shape guards still apply. */
+int ds4_gpu_device_is_m5_or_m6_apple_silicon(void) {
+    return ds4_metal_device_name_is_m5_or_m6(g_metal_device_name);
 }
 
 static bool ds4_gpu_ported_m5_decode_feature_enabled(
@@ -2809,7 +2810,7 @@ static bool ds4_gpu_ported_m5_decode_feature_enabled(
          (pre_m5_disable_env && getenv(pre_m5_disable_env) != NULL))) {
         return false;
     }
-    return pre_m5 || ds4_gpu_device_is_m5_apple_silicon();
+    return pre_m5 || ds4_gpu_device_is_m5_or_m6_apple_silicon();
 }
 
 static int ds4_gpu_compile_tensor_probe(void) {
@@ -2868,7 +2869,7 @@ static void ds4_gpu_detect_metal4_features(void) {
     g_metal4_runtime_available = 0;
     g_metal4_family_supported = 0;
     g_metal4_queue_supported = 0;
-    g_metal4_m5_neural_accelerators_hint = 0;
+    g_metal4_neural_accelerators_hint = 0;
     g_metal4_tensor_api_enabled = 0;
     g_metal4_tensor_api_compile_supported = 0;
     g_metal_device_name[0] = '\0';
@@ -2891,17 +2892,16 @@ static void ds4_gpu_detect_metal4_features(void) {
 
         /*
          * Apple does not currently expose a separate "Neural Accelerator" bit
-         * through Metal. On public M5 systems the hardware signal is the device
+         * through Metal. On M5/M6 systems the hardware signal is the device
          * generation plus Metal 4 support, so keep this as a conservative hint.
          */
-        if (g_metal4_family_supported && ds4_gpu_device_name_contains("M5")) {
-            g_metal4_m5_neural_accelerators_hint = 1;
+        if (g_metal4_family_supported && ds4_gpu_device_is_m5_or_m6_apple_silicon()) {
+            g_metal4_neural_accelerators_hint = 1;
         }
 
         if (g_metal4_family_supported) {
             const int default_enable =
-                ds4_gpu_device_name_contains("M5") ||
-                ds4_gpu_device_name_contains("M6") ||
+                ds4_gpu_device_is_m5_or_m6_apple_silicon() ||
                 ds4_gpu_device_name_contains("A19") ||
                 ds4_gpu_device_name_contains("A20");
 
@@ -3825,7 +3825,7 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_is_m5_or_m6_apple_silicon()) return 0;
     return 1;
 }
 
@@ -4549,28 +4549,28 @@ void ds4_gpu_print_memory_report(const char *label) {
             g_ssd_streaming_mode ? " (ssd-streaming)" :
             (getenv("DS4_METAL_NO_RESIDENCY") != NULL ? " (disabled)" : ""));
     fprintf(stderr,
-            "ds4:   device %s, Metal 4 runtime %s, family %s, MTL4 queue %s, tensor API %s, M5 neural accelerators %s\n",
+            "ds4:   device %s, Metal 4 runtime %s, family %s, MTL4 queue %s, tensor API %s, neural accelerators %s\n",
             g_metal_device_name[0] ? g_metal_device_name : "(unknown)",
             g_metal4_runtime_available ? "yes" : "no",
             g_metal4_family_supported ? "yes" : "no",
             g_metal4_queue_supported ? "yes" : "no",
             g_metal4_tensor_api_enabled ? "enabled" :
                 (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
-            g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
+            g_metal4_neural_accelerators_hint ? "likely" : "not detected");
     fprintf(stderr,
             "ds4:   accelerated Metal path %s%s\n",
             ds4_gpu_mpp_available() ? "enabled" : "disabled",
             g_quality_mode ? " by --quality" :
                 (!g_metal4_tensor_api_enabled ? " (tensor API unavailable)" : ""));
     fprintf(stderr,
-            "ds4:   device %s, Metal 4 runtime %s, family %s, MTL4 queue %s, tensor API %s, M5 neural accelerators %s\n",
+            "ds4:   device %s, Metal 4 runtime %s, family %s, MTL4 queue %s, tensor API %s, neural accelerators %s\n",
             g_metal_device_name[0] ? g_metal_device_name : "(unknown)",
             g_metal4_runtime_available ? "yes" : "no",
             g_metal4_family_supported ? "yes" : "no",
             g_metal4_queue_supported ? "yes" : "no",
             g_metal4_tensor_api_enabled ? "enabled" :
                 (g_metal4_tensor_api_compile_supported ? "available" : "disabled"),
-            g_metal4_m5_neural_accelerators_hint ? "likely" : "not detected");
+            g_metal4_neural_accelerators_hint ? "likely" : "not detected");
     fprintf(stderr,
             "ds4:   scratch %.2f MiB (flash mask %.2f, pad %.2f, tmp %.2f, blk %.2f, ring %.2f, kv %.2f, compressor %.2f, router %.2f, indexer %.2f, moe %.2f, f16 %.2f, raw-store %.2f)\n",
             ds4_gpu_mib(scratch),
@@ -5405,14 +5405,14 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
 }
 
 /* Single-token F16/F32 matvecs with few output rows (the Qwen hyper-connection
- * low-rank down projections and routers) launch one row per SIMD group on M5,
- * where two-row tiles leave most of the 40 cores idle.  The per-row K walk,
+ * low-rank down projections and routers) launch one row per SIMD group on
+ * M5/M6. Two-row tiles left most cores idle in the M5 measurements. The per-row K walk,
  * simdgroup count and reduction tree are unchanged.  DS4_METAL_PLAIN_MV_NR0
  * forces 1 or 2 rows on any device. */
 static bool ds4_gpu_plain_mv_single_row(uint64_t out_dim) {
     const uint64_t override = ds4_gpu_env_u64("DS4_METAL_PLAIN_MV_NR0", 0u, 0u, 2u);
     if (override) return override == 1u;
-    return out_dim <= 1024u && ds4_gpu_device_is_m5_apple_silicon();
+    return out_dim <= 1024u && ds4_gpu_device_is_m5_or_m6_apple_silicon();
 }
 
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
@@ -6167,7 +6167,7 @@ static int ds4_gpu_encode_rope_tail_inplace(
         args->mode == 0 && !args->src2 &&
         lane_compatible &&
         (ds4_gpu_device_name_contains("M3") ||
-         (ds4_gpu_device_name_contains("M5") && n_tok == 1u));
+         (ds4_gpu_device_is_m5_or_m6_apple_silicon() && n_tok == 1u));
     const bool use_shared_coeff =
         use_inplace_pair &&
         g_rope_tail_inplace_pair_shared4_pipeline != nil &&
@@ -6184,7 +6184,7 @@ static int ds4_gpu_encode_rope_tail_inplace(
         getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") == NULL &&
         n_tok == 1u &&
         (ds4_gpu_device_name_contains("M3") ||
-         ds4_gpu_device_name_contains("M5"));
+         ds4_gpu_device_is_m5_or_m6_apple_silicon());
 
     int32_t pos_stack[256];
     int32_t *pos = NULL;
@@ -21514,7 +21514,7 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
     if (!g_initialized && !ds4_gpu_init()) return -1;
     if ((g_quality_mode ||
          (!ds4_gpu_device_name_contains("M3") &&
-          !ds4_gpu_device_name_contains("M5"))) ||
+          !ds4_gpu_device_is_m5_or_m6_apple_silicon())) ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ") != NULL ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE") != NULL) {
         return 0;
@@ -23538,7 +23538,7 @@ int ds4_gpu_kv_rope_fp8_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_is_m5_or_m6_apple_silicon()) return 0;
     return 1;
 }
 
@@ -24263,7 +24263,7 @@ static int ds4_gpu_encode_dsv4_softmax_pool_one_comp_ggml_reduce(
     const bool use_pre_m5_exact_reduction_fusion_default =
         !g_ssd_streaming_mode &&
         (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-         ds4_gpu_device_is_m5_apple_silicon()) &&
+         ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
         getenv("DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_EXACT_REDUCTION_FUSION") == NULL;
     const bool request_exact_reduction_fusion =
         decode_ratio4_one_comp &&
@@ -24570,7 +24570,7 @@ static int ds4_gpu_compressor_ratio4_decode_pack_mode(uint32_t head_dim) {
     const bool default_shape = head_dim == 128u || head_dim == 512u;
     const bool default_pre_m5 =
         (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-         ds4_gpu_device_is_m5_apple_silicon()) && default_shape;
+         ds4_gpu_device_is_m5_or_m6_apple_silicon()) && default_shape;
     if (getenv("DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_RATIO4_DECODE_PACK_FUSION") != NULL ||
         !default_pre_m5) {
         return 0;
@@ -27803,7 +27803,7 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         getenv("DS4_METAL_DISABLE_GATHERED_KV_STAGE") == NULL &&
         g_flash_kv_stage_f16_pipeline != nil &&
         (ds4_gpu_device_name_contains("M3") ||
-         ds4_gpu_device_name_contains("M5"));
+         ds4_gpu_device_is_m5_or_m6_apple_silicon());
     const bool component_disabled = eligible &&
         (ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F32_F16_COPY") > 0 ||
          ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F16_F16_COPY") > 0);
@@ -29649,7 +29649,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         g_decode_attn_rope_args.row_bytes == 2048 &&
         g_decode_attn_rope_args.inverse != 0;
     const bool m5_persistent_zero_mask =
-        ds4_gpu_device_is_m5_apple_silicon() &&
+        ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_M5_PERSISTENT_ZERO_ATTN_MASK") == NULL &&
         (!packed_shape ||
          getenv("DS4_METAL_DISABLE_M5_PACKED_ZERO_MASK") == NULL);
@@ -34199,7 +34199,7 @@ static int ds4_gpu_encode_router_select(
             g_dsv4_router_finalize_one_simd_pipeline.threadExecutionWidth == 32u &&
             g_dsv4_router_finalize_one_simd_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
             (pre_m5_device ||
-             ds4_gpu_device_name_contains("M5")) &&
+             ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
             (!pre_m5_device ||
              getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_SIMD_FINALIZE") == NULL);
         const bool use_simd_weights_fusion =
@@ -34208,19 +34208,19 @@ static int ds4_gpu_encode_router_select(
             g_dsv4_router_finalize_weights_one_simd_pipeline.threadExecutionWidth == 32u &&
             g_dsv4_router_finalize_weights_one_simd_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
             (pre_m5_device ||
-             ds4_gpu_device_name_contains("M5")) &&
+             ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
             (!pre_m5_device ||
              getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_SIMD_WEIGHTS_FUSION") == NULL);
         const bool use_pre_m5_transform_finalize_fusion_default =
             !g_ssd_streaming_mode &&
-            (pre_m5_device || ds4_gpu_device_name_contains("M5")) &&
+            (pre_m5_device || ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
             getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_TRANSFORM_FINALIZE_FUSION") == NULL;
         const bool use_transform_finalize_fusion =
             use_simd_weights_fusion &&
             !hash_mode &&
             use_pre_m5_transform_finalize_fusion_default &&
             (pre_m5_device ||
-             ds4_gpu_device_name_contains("M5")) &&
+             ds4_gpu_device_is_m5_or_m6_apple_silicon()) &&
             g_dsv4_router_transform_finalize_weights_one_simd_pipeline != nil &&
             g_dsv4_router_transform_finalize_weights_one_simd_pipeline.threadExecutionWidth == 32u &&
             g_dsv4_router_transform_finalize_weights_one_simd_pipeline.maxTotalThreadsPerThreadgroup >= 256u;
@@ -40871,7 +40871,7 @@ int ds4_gpu_routed_moe_one_tensor(
             down_args.nei0 == 6 &&
             g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 != nil;
         const bool use_m5_tp_mxfp4_static =
-            ds4_gpu_device_is_m5_apple_silicon() &&
+            ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
             getenv("DS4_METAL_DISABLE_M5_TP_MXFP4_STATIC") == NULL &&
             gate_type == DS4_METAL_TENSOR_MXFP4 &&
             down_type == DS4_METAL_TENSOR_MXFP4 &&
@@ -40919,7 +40919,7 @@ int ds4_gpu_routed_moe_one_tensor(
             n_expert == 6 && n_total_expert == 256 &&
             expert_in_dim == 4096 && expert_mid_dim == 2048 &&
             getenv("DS4_METAL_DISABLE_M5_IQ2_PAIR_PACK2") == NULL &&
-            ds4_gpu_device_is_m5_apple_silicon();
+            ds4_gpu_device_is_m5_or_m6_apple_silicon();
         if (use_iq2_pair_pack2 &&
             g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pack2_pipeline) {
             pair_swiglu_pipeline =
@@ -43629,7 +43629,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
             (n_tokens <= 5u || v41_decode_batch ||
-             (n_tokens == 6u && ds4_gpu_device_is_m5_apple_silicon() &&
+             (n_tokens == 6u && ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
               (gate_type == DS4_METAL_TENSOR_IQ2_XXS ||
                gate_type == DS4_METAL_TENSOR_Q4_K ||
                (g_tp_split_world == 2 && gate_type == DS4_METAL_TENSOR_MXFP4)))) &&
@@ -43643,7 +43643,7 @@ int ds4_gpu_routed_moe_batch_tensor(
               getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL));
         id<MTLComputePipelineState> tiny_pair_swiglu_pipeline = nil;
         const bool use_tp_mxfp4_static_batch = use_tiny_pair_mv &&
-            ds4_gpu_device_is_m5_apple_silicon() && g_tp_split_world == 2 &&
+            ds4_gpu_device_is_m5_or_m6_apple_silicon() && g_tp_split_world == 2 &&
             gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4 &&
             n_expert == 6 && n_total_expert == 256 &&
             expert_in_dim == 4096 && expert_mid_dim == 2048 && out_dim == 4096 &&
@@ -45263,7 +45263,7 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         if (!wbuf) return 0;
 
         const bool use_cluster2 =
-            ds4_gpu_device_is_m5_apple_silicon() &&
+            ds4_gpu_device_is_m5_or_m6_apple_silicon() &&
             getenv("DS4_METAL_DISABLE_M5_HC_NORM_MIX_CLUSTER2") == NULL;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_cluster2 ? "kernel_dsv4_hc_rms_norm_mix_f16_cluster2" :
@@ -46571,7 +46571,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const bool vec_hc =
             (split_offset & 15u) == 0u &&
             getenv("DS4_METAL_DISABLE_M5_Q8_HC_VEC") == NULL &&
-            ds4_gpu_device_is_m5_apple_silicon();
+            ds4_gpu_device_is_m5_or_m6_apple_silicon();
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(
                 vec_hc ? "kernel_dsv4_q8_hc_expand4_q8_0_vec_hc" :
@@ -48626,7 +48626,7 @@ _Static_assert(offsetof(qwen4_moe_mm_args, active_expert) == 60u, "Qwen MM activ
  * stay cache-resident across its tiles. */
 static uint32_t qwen4_moe_mm_expert_major(void) {
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_ORDER");
-    return override >= 0 ? (uint32_t)override : ds4_gpu_device_is_m5_apple_silicon() ? 1u : 0u;
+    return override >= 0 ? (uint32_t)override : ds4_gpu_device_is_m5_or_m6_apple_silicon() ? 1u : 0u;
 }
 
 static MTLSize qwen4_moe_mm_grid(uint32_t row_blocks, uint32_t n_expert, uint32_t tiles, uint32_t expert_major) {
@@ -48696,11 +48696,11 @@ static uint32_t qwen4_moe_dispatch_slots(qwen4_moe_args *args, uint32_t n_out) {
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
+     * M3 Ultra uses low-bit and MXFP4 down rows; M5/M6 use MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
         ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
+        (type == 39u && ds4_gpu_device_is_m5_or_m6_apple_silicon());
 }
 
 static uint32_t qwen4_moe_mv_rows(void) {
@@ -48708,11 +48708,11 @@ static uint32_t qwen4_moe_mv_rows(void) {
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
-    /* Q2_K and MXFP4 use sixteen groups on M3 Ultra; MXFP4 also does on M5.
+    /* Q2_K and MXFP4 use sixteen groups on M3 Ultra; MXFP4 also does on M5/M6.
      * Each group keeps its own rows and unchanged per-lane reduction order. */
     const uint32_t default_nsg =
         ((type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        (type == 39u && ds4_gpu_device_is_m5_apple_silicon()) ? 16u : 8u;
+        (type == 39u && ds4_gpu_device_is_m5_or_m6_apple_silicon()) ? 16u : 8u;
     return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u);
 }
 
@@ -48761,7 +48761,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_SPECIALIZE");
             const bool specialize = override >= 0 ? override != 0 :
                 ds4_gpu_device_name_contains("M3 Ultra") ||
-                ds4_gpu_device_is_m5_apple_silicon() ||
+                ds4_gpu_device_is_m5_or_m6_apple_silicon() ||
                 qwen4_moe_mm_m1_ssd(mm->n_tokens, mm->weight_type);
             const uint32_t type = specialize ? mm->weight_type : 0u;
             if (type >= 40u) return 0;
@@ -48956,7 +48956,7 @@ int ds4_gpu_qwen4_hc_norm_tensor(
             const bool m1_prefill = weight_type == 1u && n_tokens >= 48u && n_tokens <= 256u &&
                                    ds4_gpu_device_name_contains("M1 Max");
             const bool large_prefill = n_tokens >= 8192u &&
-                (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_apple_silicon());
+                (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_or_m6_apple_silicon());
             reuse = n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
                     (m1_prefill || large_prefill);
         }
@@ -48985,7 +48985,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     }
     const bool pair = n_tokens == 2u && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
-     * against the plain kernel by tests/test_qwen4_kernels.c); M5 default. */
+     * against the plain kernel by tests/test_qwen4_kernels.c); M5/M6 default. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");
     /* M1 Max shares each low-rank activation and sigmoid across the four
      * output rows in a threadgroup. The existing override retains both
@@ -48993,7 +48993,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     const bool reuse = !pair && weight_type == 1u && n_rank == 320u &&
         prefetch_override < 0 && ds4_gpu_device_name_contains("M1 Max");
     const bool prefetch = weight_type == 1u &&
-        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
                                               QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
@@ -49595,11 +49595,11 @@ int ds4_gpu_qwen4_idx_score_tensor(
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
     /* staged queries and vector key loads, plus the tile maxima the
-     * prefiltered selector needs; measured on M5, other devices keep the
-     * scalar scorer */
+     * prefiltered selector needs; measured on M5 and also enabled on M6.
+     * Other devices keep the scalar scorer. */
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
     const bool vec = tile_max && n_idx_head * idx_dim <= 512u && (idx_dim & 3u) == 0u &&
-        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
     if (vec) {
         if (!qwen4_bind_tensor(&b[3], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
@@ -49627,9 +49627,9 @@ int ds4_gpu_qwen4_idx_select_tensor(
     /* Scalar/MM scorers do not populate tile maxima. An independent
      * scorer override must also disable their consumer. */
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
-    const bool vec = vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon();
+    const bool vec = vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon();
     const bool pre = tile_max && vec && n_tokens <= 2u && n_blocks > 8u * top_k &&
-        (pre_override >= 0 ? pre_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (pre_override >= 0 ? pre_override != 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
     if (pre) {
         if (!qwen4_bind_tensor(&b[1], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
@@ -49734,10 +49734,11 @@ static int qwen4_attn_tensor_impl(
     if (n_splits == 1) return 1;
     qwen4_bind mb[3] = { b[7], b[1], b[6] };
     /* One thread per dim merges the same split chain with eight times the
-     * threads; measured on M5, other devices keep the simdgroup merge. */
+     * threads; measured on M5 and also enabled on M6. Other devices keep the
+     * simdgroup merge. */
     const int wide_override = ds4_gpu_env_bool("DS4_QWEN4_ATTN_MERGE_WIDE");
     const bool wide = head_dim >= 128u &&
-        (wide_override >= 0 ? wide_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (wide_override >= 0 ? wide_override != 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
     if (wide) {
         return qwen4_dispatch(head_dim == 256u ? QWEN4_K_ATTN_MERGE_WIDE_NPT8 : QWEN4_K_ATTN_MERGE_WIDE_NPT4,
                               &args, sizeof(args), mb, 3,
@@ -50030,16 +50031,16 @@ int ds4_gpu_qwen4_moe_mid_tensor(
      * two-token MTP verifier on M3 Ultra without changing dot-product order.
      * M5 measured the single-token case with four groups per threadgroup and
      * the two-row MTP passes with four. */
-    const bool m5_single = q4k && (n_tokens <= 2u || (n_tokens == 3u && g_qwen4_verify_rows_exact)) &&
-        ds4_gpu_device_is_m5_apple_silicon();
-    const uint32_t default_nr = (m3_ultra && n_tokens <= 2u) || m5_single ? 1u : 2u;
+    const bool m5_m6_single = q4k && (n_tokens <= 2u || (n_tokens == 3u && g_qwen4_verify_rows_exact)) &&
+        ds4_gpu_device_is_m5_or_m6_apple_silicon();
+    const uint32_t default_nr = (m3_ultra && n_tokens <= 2u) || m5_m6_single ? 1u : 2u;
     const bool specialize = !q4k && qwen4_moe_mv_specialize(weight_type);
     const uint64_t nr_env = q4k ?
         ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NR", default_nr, 1u, UINT64_MAX) :
         (specialize ? qwen4_moe_mv_rows() : 2u);
     const uint32_t nr = nr_env >= 1u && nr_env <= (q4k ? 2u : 4u) ? (uint32_t)nr_env : default_nr;
     /* NR2 without an NSG override restores the former ordered dispatch. */
-    const uint32_t default_nsg = nr != 1u ? 2u : m3_ultra ? 8u : m5_single ? 4u : 2u;
+    const uint32_t default_nsg = nr != 1u ? 2u : m3_ultra ? 8u : m5_m6_single ? 4u : 2u;
     const uint32_t nsg = q4k ?
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) :
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
@@ -50104,11 +50105,11 @@ int ds4_gpu_qwen4_moe_down_tensor(
         ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE") != 0 &&
         ds4_gpu_device_name_contains("M1 Max");
     /* MXFP4 rows with four blocks per lane requested ahead (same lane map and
-     * chain order, byte-identical); M5 default, DS4_QWEN4_MOE_DOWN_PREFETCH=0/1
+     * chain order, byte-identical); M5/M6 default, DS4_QWEN4_MOE_DOWN_PREFETCH=0/1
      * overrides on any device. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_MOE_DOWN_PREFETCH");
     const bool prefetch = weight_type == 39u && (ff_dim % 32u) == 0 &&
-        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
     const uint32_t dispatch_slots = qwen4_moe_dispatch_slots(&args, n_out);
     if (!dispatch_slots) return 1;
     return qwen4_dispatch(q2 ? QWEN4_K_MOE_DOWN_Q2K : prefetch ? QWEN4_K_MOE_DOWN_MXFP4_PF : QWEN4_K_MOE_DOWN, &args, sizeof(args), b, 5,
@@ -50264,7 +50265,7 @@ static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens, uint32_t type, bool mid) {
      * (gate/up and down) and on M5 (gate/up; the down tiles measured flat).
      * Each tile keeps the same K loop and accumulation order. */
     const bool spread = ds4_gpu_device_name_contains("M3 Ultra") ||
-                        (mid && ds4_gpu_device_is_m5_apple_silicon());
+                        (mid && ds4_gpu_device_is_m5_or_m6_apple_silicon());
     const uint32_t default_cap = qwen4_moe_mm_sparse_ssd(n_tokens, type) ? 1u : spread ?
         (n_tokens >= 8192u ? 32u : n_tokens >= 4096u ? 16u : 8u) : 8u;
     const uint32_t cap = (uint32_t)ds4_gpu_env_u64(
@@ -50289,7 +50290,7 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
      * chunk-sized batches (same tile arithmetic; remainders take the
      * 8/16/32-token kernels).  Measured on M5 Max, see
      * speed-bench/qwen38-m5-round4.md. */
-    if ((type == 12u || type == 39u) && n_tokens >= 4096u && ds4_gpu_device_is_m5_apple_silicon()) default_nt = 8u;
+    if ((type == 12u || type == 39u) && n_tokens >= 4096u && ds4_gpu_device_is_m5_or_m6_apple_silicon()) default_nt = 8u;
     const uint32_t nt = (uint32_t)ds4_gpu_env_u64(env_name, default_nt, 1u, 8u);
     return nt == 1u || nt == 2u || nt == 4u || nt == 8u ? nt : default_nt;
 }
@@ -50390,7 +50391,7 @@ static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
         ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_apple_silicon()));
+        ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_or_m6_apple_silicon()));
 }
 
 int ds4_gpu_qwen4_moe_mm_mid_tensor(
@@ -51327,7 +51328,7 @@ int ds4_gpu_qwen4_gdn_front_tensor(
      * the alpha/beta rows, and every channel's conv stays on one thread, so
      * the thread count only spreads the conv wider.  M5 measured 1024. */
     const uint64_t nth = ds4_gpu_env_u64("DS4_QWEN4_GDN_FRONT_THREADS",
-                                         ds4_gpu_device_is_m5_apple_silicon() ? 1024u : 256u, 96u, 1024u);
+                                         ds4_gpu_device_is_m5_or_m6_apple_silicon() ? 1024u : 256u, 96u, 1024u);
     return qwen4_dispatch(QWEN4_K_GDN_FRONT, &args, sizeof(args), b, 12,
                           MTLSizeMake(n_k_head, 1, 1), MTLSizeMake((NSUInteger)(nth / 32u * 32u), 1, 1), 0);
 }
