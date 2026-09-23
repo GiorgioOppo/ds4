@@ -3381,6 +3381,45 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Qwen attention Q4_K: share the activation loads across four output rows.
+// The classic dot's K walk, per-row accumulation and SIMD reduction stay the
+// same. The host requires rows divisible by NSG * 4: this helper reads all
+// four weight rows unconditionally, even though it guards output stores.
+kernel void kernel_qwen4_attn_q4_K_nr4_f32(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_impl<4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// QKV and gate are independent products of the same input. Concatenate their
+// row grids in one dispatch, retaining each matrix's output stride and dot.
+kernel void kernel_qwen4_attn_q4_K_pair_f32(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        device const char * w0,
+        device const char * w1,
+        device const char * x,
+        device       char * out0,
+        device       char * out1,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint split = uint(args0.ne0) / (uint(FC_mul_mv_nsg) * 4u);
+    if (tgpig.x < split) {
+        kernel_mul_mv_q4_K_f32_impl<4>(args0, w0, x, out0, shmem, tgpig, tiisg, sgitg);
+    } else {
+        tgpig.x -= split;
+        kernel_mul_mv_q4_K_f32_impl<4>(args1, w1, x, out1, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //

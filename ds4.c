@@ -5574,6 +5574,19 @@ static void tensor_expect_qwen4_dense_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
+/* Q4_K is supported for the attention projections, including GDN and MTP.
+ * Keep the other dense tensors on their existing paths: HC mixers and token
+ * embeddings have more restrictive kernels than these matrix products. */
+static void tensor_expect_qwen4_attention_layout(
+        const ds4_tensor *t, uint64_t d0, uint64_t d1) {
+    if (t && t->type == DS4_TENSOR_Q4_K) {
+        if (d0 % 256u != 0) ds4_die("Qwen Q4_K attention rows must align to 256 values");
+        tensor_expect_layout(t, DS4_TENSOR_Q4_K, 2, d0, d1, 0);
+        return;
+    }
+    tensor_expect_qwen4_dense_layout(t, 2, d0, d1, 0);
+}
+
 static void tensor_expect_qwen4_expert_layout(
         const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
@@ -5655,20 +5668,20 @@ static void weights_validate_qwen4_layout(
         tensor_expect_qwen4_dense_layout(l->hc_ffn_inject, 2, hc_dim, DS4_N_HC, 0);
 
         if (ds4_qwen4_layer_is_linear(il)) {
-            tensor_expect_qwen4_dense_layout(l->lin_qkv, 2, DS4_N_EMBD, 2u * lin_k_dim + lin_v_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_gate, 2, DS4_N_EMBD, lin_v_dim, 0);
+            tensor_expect_qwen4_attention_layout(l->lin_qkv, DS4_N_EMBD, 2u * lin_k_dim + lin_v_dim);
+            tensor_expect_qwen4_attention_layout(l->lin_gate, DS4_N_EMBD, lin_v_dim);
             tensor_expect_layout(l->lin_conv, DS4_TENSOR_F32, 2, DS4_N_LIN_CONV, 2u * lin_k_dim + lin_v_dim, 0);
             tensor_expect_layout(l->lin_dt_bias, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
             tensor_expect_layout(l->lin_a, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
             tensor_expect_qwen4_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
             tensor_expect_qwen4_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
             tensor_expect_layout(l->lin_norm, DS4_TENSOR_F32, 1, DS4_N_LIN_HEAD_DIM, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
+            tensor_expect_qwen4_attention_layout(l->lin_out, lin_v_dim, DS4_N_EMBD);
         } else {
-            tensor_expect_qwen4_dense_layout(l->attn_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_k, 2, DS4_N_EMBD, kv_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_v, 2, DS4_N_EMBD, kv_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+            tensor_expect_qwen4_attention_layout(l->attn_q, DS4_N_EMBD, 2u * q_dim);
+            tensor_expect_qwen4_attention_layout(l->attn_k, DS4_N_EMBD, kv_dim);
+            tensor_expect_qwen4_attention_layout(l->attn_v, DS4_N_EMBD, kv_dim);
+            tensor_expect_qwen4_attention_layout(l->attn_output, q_dim, DS4_N_EMBD);
             tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
             tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
             tensor_expect_qwen4_dense_layout(l->indexer_q_proj, 2, DS4_N_EMBD, index_q_dim, 0);
@@ -57738,6 +57751,12 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
                  t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
 }
 
+static bool qwen4_graph_attention_ok(const ds4_tensor *t) {
+    return qwen4_graph_dense_ok(t) ||
+           (t && t->type == DS4_TENSOR_Q4_K && t->ndim == 2 &&
+            t->dim[0] != 0 && t->dim[0] % 256u == 0);
+}
+
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
@@ -57794,11 +57813,20 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph needs matching alpha/beta projection types (layer %u)\n", il);
             return false;
         }
-        const ds4_tensor *dense[16] = {
-            l->lin_qkv, l->lin_gate, l->lin_beta, l->lin_alpha, l->lin_out,
-            l->attn_q, l->attn_k, l->attn_v, l->attn_output, l->indexer_q_proj, l->indexer_k_proj,
+        const ds4_tensor *attention[7] = {
+            l->lin_qkv, l->lin_gate, l->lin_out,
+            l->attn_q, l->attn_k, l->attn_v, l->attn_output };
+        for (int i = 0; i < 7; i++) {
+            if (attention[i] && !qwen4_graph_attention_ok(attention[i])) {
+                fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported attention weight type %u in layer %u\n",
+                        attention[i]->type, il);
+                return false;
+            }
+        }
+        const ds4_tensor *dense[9] = {
+            l->lin_beta, l->lin_alpha, l->indexer_q_proj, l->indexer_k_proj,
             l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp, l->ple_key, l->ple_value };
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < 9; i++) {
             if (dense[i] && !qwen4_graph_dense_ok(dense[i])) {
                 fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported dense weight type %u in layer %u\n",
                         dense[i]->type, il);
@@ -58269,7 +58297,14 @@ static bool qwen4_gemv_rows(const ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, c
     case DS4_TENSOR_Q8_0: rc = ds4_gpu_qwen4_matmul_q8_0_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_F16:  rc = ds4_gpu_matmul_f16_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_F32:  rc = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
-    case DS4_TENSOR_Q4_0: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
+    case DS4_TENSOR_Q4_K:
+        rc = ds4_gpu_qwen4_attention_q4_tensor(out, NULL, m->map, m->size,
+            w->abs_offset, 0, in_dim, out_dim, 0, x, n_tok);
+        if (rc) break;
+        /* Fall through to the existing path for other GPUs/shapes/batches. */
+        /* fallthrough */
+    case DS4_TENSOR_Q4_0:
+        rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_BF16: {
         ds4_gpu_tensor *outs[1] = { out };
         const uint64_t offs[1] = { w->abs_offset };
@@ -58281,11 +58316,11 @@ static bool qwen4_gemv_rows(const ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, c
     default: break;
     }
 #endif
-    if (!rc) {
+    if (rc <= 0) {
         fprintf(stderr, "ds4: Qwen3.8 matmul failed for %.*s (type %u, %" PRIu64 "x%" PRIu64 ", %u tokens)\n",
                 (int)w->name.len, w->name.ptr, w->type, in_dim, out_dim, n_tok);
     }
-    return rc != 0;
+    return rc > 0;
 }
 
 static bool qwen4_gemv(const ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
@@ -58430,6 +58465,15 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                uint32_t il, uint32_t T) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
     bool paired = false;
+#ifdef __APPLE__
+    if (l->lin_qkv->type == DS4_TENSOR_Q4_K && l->lin_gate->type == DS4_TENSOR_Q4_K) {
+        const int pair_rc = ds4_gpu_qwen4_attention_q4_tensor(g->qkv, g->z, m->map, m->size,
+            l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
+            l->lin_qkv->dim[1], l->lin_gate->dim[1], g->mixed, T);
+        if (pair_rc < 0) return false;
+        paired = pair_rc > 0;
+    }
+#endif
     if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
         l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0) {
         paired = ds4_gpu_qwen4_q8_pair_tensor(g->qkv, g->z, m->map, m->size,

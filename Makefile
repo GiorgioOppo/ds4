@@ -213,6 +213,13 @@ test-metal-q8-gemv-reference: tests/test_metal_q8_gemv_reference
 check-metal-q8-gemv-reference: tests/test_metal_q8_gemv_reference
 	./tests/test_metal_q8_gemv_reference --compile-only
 
+tests/test_metal_qwen4_q4_attention: tests/test_metal_qwen4_q4_attention.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-qwen4-q4-attention
+test-metal-qwen4-q4-attention: tests/test_metal_qwen4_q4_attention
+	./tests/test_metal_qwen4_q4_attention
+
 tests/test_metal_qwen4_moe_half: tests/test_metal_qwen4_moe_half.m
 	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
 
@@ -1235,6 +1242,7 @@ clean:
 	rm -f speed-bench/session_concurrency_bench
 	rm -f tests/test_metal_q8_reduction
 	rm -f tests/test_metal_q8_gemv_reference
+	rm -f tests/test_metal_qwen4_q4_attention
 	rm -f tests/test_metal_qwen4_moe_half
 	rm -f tests/test_metal_qwen4_hc
 	rm -f tests/test_metal_qwen4_moe_mid

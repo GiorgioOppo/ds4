@@ -99,4 +99,5 @@ __pycache__/
 
 /tests/test_metal_qwen4_moe_down
 /tests/test_metal_q8_gemv_reference
+/tests/test_metal_qwen4_q4_attention
 /tests/test_metal_qwen4_moe_half

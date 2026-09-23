@@ -216,6 +216,8 @@ the responses and diagnostics for inspection; it does not grade image content.
 The Metal and CUDA graphs accept Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and the original BF16 n-gram table.
+Core attention projections also accept Q4_K weights, including the GDN
+QKV/gate/output and full-attention Q/K/V/output matrices.
 Tensor parallelism and pipeline execution are not implemented for this model
 yet. SSD expert streaming is supported on Metal only. ROCm is not supported.
 CPU code is a correctness reference, not a general inference backend.
@@ -229,12 +231,27 @@ order in both normal and safe shader math modes. This does not guarantee
 bit-identical logits across GPU generations: tensor matmuls retain their own
 accumulation order.
 
+On M1 Max, Q4_K attention batches of 1–8 tokens reuse each activation load
+across four output rows, retaining the classic kernel's per-row arithmetic.
+GDN QKV/gate share one dispatch. Selection is limited to the measured 2560
+and 6144 input widths and their complete output tiles; larger prefill batches
+and other devices keep their existing dispatch. Set
+`DS4_QWEN4_Q4_ATTN_LEGACY=1` to compare with the previous attention kernels.
+No GGUF repack is required.
+
+Resident-kernel measurements on M1 Max (balanced ABBA/BAAB GPU timings,
+16 rounds, 64 iterations per sample) gave about 6% higher throughput for
+the QKV/gate pair, 3–5% for the full-attention Q projection and 26–37% for
+the output projection, across 1/2/3/8 tokens. These are kernel timings;
+SSD reads and the other model operations still contribute to generation time.
+
 ## Validation
 
 ```sh
 make test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-reuse test-q8-prefill-variants
 make test-qwen4-ssd-experts test-qwen4-memory
 make test-qwen4-hc-math test-metal-device-policy
+make test-metal-qwen4-q4-attention
 make test-frontends
 make test-qwen4-ngrams
 make tests/test_qwen4_ngram_state
@@ -242,6 +259,22 @@ make -B -C gguf-tools quants-shared
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_pack.py
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py
 ```
+
+`tests/test_metal_qwen4_q4_attention --benchmark` compares Q4_K NR2, NR4
+and paired kernels with identical weights and balanced timing order. Its
+numerical fixtures compare every output bit in both default and safe Metal
+math modes, including real projection shapes, cancellation, padded tails
+and unaligned-to-vector views. Pass `--reference-repo /path/to/snapshot` to
+compile the NR2 oracle from an independent, frozen `metal/` source tree.
+For real Q4-attention weights, also run:
+
+```sh
+./tests/test_qwen4_generation gguf/Qwen3.8-Flash-Next-Q2-AProjQ4.gguf \
+  --ssd-streaming --q4-attention-reference --chunk 8 --ctx 128 --tokens 11
+```
+
+This compares all vocabulary logits against the legacy attention path at
+nine frontiers, covering prefill and eight decode steps.
 
 The kernel tests exercise the active Metal API. Vision and end-to-end model
 checks additionally require the checkpoints described above.

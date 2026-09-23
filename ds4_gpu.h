@@ -3366,6 +3366,19 @@ int ds4_gpu_qwen4_q8_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+#ifdef __APPLE__
+/* Small-batch Q4_K attention on measured M1 Max shapes. out1 == NULL selects
+ * a single projection; otherwise fuse QKV/gate. Returns 1 on success, 0
+ * without encoding when ineligible, or -1 on error (must not fall back).
+ * Weights require 2-byte alignment; F32 views require 4-byte alignment and
+ * outputs must not overlap the input, weights or each other. */
+int ds4_gpu_qwen4_attention_q4_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset,
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok);
+#endif
 int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
