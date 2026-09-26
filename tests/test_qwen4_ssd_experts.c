@@ -192,6 +192,33 @@ static void mm_variant(unsigned nt) {
     }
 }
 
+static const char *q4_mv_env[] = {"DS4_QWEN4_NO_Q4K_MID", "DS4_QWEN4_Q4K_MID_NR",
+                                "DS4_QWEN4_Q4K_MID_NSG", "DS4_QWEN4_MOE_DOWN_PREFETCH"};
+static void q4_mv_save(char *saved[4]) {
+    for (unsigned i = 0; i < 4; i++) {
+        const char *v = getenv(q4_mv_env[i]);
+        saved[i] = v ? strdup(v) : NULL;
+        need(!v || saved[i], "save Q4 row dispatch environment");
+    }
+}
+static void q4_mv_variant(int reference) {
+    /* Pin the oracle independently of device defaults. The candidate forces
+     * NR1/NSG1 even at this fixture's small width, exercising addressed and
+     * masked rows as well as the real model's automatic dispatch elsewhere. */
+    const char *values[] = {reference ? "1" : NULL, reference ? NULL : "1",
+                           reference ? NULL : "1", reference ? "0" : "1"};
+    for (unsigned i = 0; i < 4; i++)
+        need((values[i] ? setenv(q4_mv_env[i], values[i], 1) : unsetenv(q4_mv_env[i])) == 0,
+             "select original/optimized Q4 row dispatch");
+}
+static void q4_mv_restore(char *saved[4]) {
+    for (unsigned i = 0; i < 4; i++) {
+        need((saved[i] ? setenv(q4_mv_env[i], saved[i], 1) : unsetenv(q4_mv_env[i])) == 0,
+             "restore Q4 row dispatch environment");
+        free(saved[i]);
+    }
+}
+
 /* Check the real GPU-built lists against the frozen router IDs, without
  * assuming the order in which GPU atomics append a token's slot. */
 static void check_mm_lists(const int32_t *ids, uint32_t T, unsigned route,
@@ -264,7 +291,15 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
                             int empty_fd, int fail_first, int warm_probe,
                             uint32_t reuse_seed_count) {
     const int mm = T > 8;
-    const int compare_mm = mm && T <= 128 && w->gate_type == 16 && w->down_type == 10;
+    const int compare_mm = mm && T <= 128 &&
+        ((w->gate_type == 16 && w->down_type == 10) ||
+         (w->gate_type == 12 && w->down_type == 39));
+    const int compare_q4_mv = !mm && w->gate_type == 12 && w->down_type == 39;
+    char *saved_q4_mv_env[4] = {NULL, NULL, NULL, NULL};
+    if (compare_q4_mv) {
+        q4_mv_save(saved_q4_mv_env);
+        q4_mv_variant(0);  /* Failed-read probes also exercise the candidate. */
+    }
     char *saved_mm_env[5] = {NULL, NULL, NULL, NULL, NULL};
     if (compare_mm) {
         for (unsigned i = 0; i < 5; i++) {
@@ -369,13 +404,14 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
             need(ds4_gpu_stream_expert_cache_current_count() == reuse_seed_count,
                  "reuse cache full before selected batch");
         }
-        /* Preserve the independent generic resident reference. Low-bit MM runs
+        /* Preserve the independent generic resident reference. Q2/Q4 MM runs
          * default SSD cold -> old NT4 SSD on these same buffers, followed by
          * NT1/grid4 -> default -> NT1/grid4. This covers both automatic tile
          * widths and specialization against forced generic kernels. Warm
          * cases remove the readable fd; overflow cases must reread only the
          * selected union on every arm. TILES alone does not force old NT4. */
         if (compare_mm) mm_variant(variants[run]);
+        if (compare_q4_mv) q4_mv_variant(run == 0);
         const int warm = warm_probe && run >= 2;
         if (warm) need(ds4_gpu_set_model_fd(empty_fd), "warm-cache empty fd");
         for (unsigned i = 0; i < 4; i++) reset(outputs + i);
@@ -425,6 +461,7 @@ static void check_case_impl(const weights *w, uint32_t T, unsigned route, int go
              "restore MM dispatch environment");
         free(saved_mm_env[i]);
     }
+    if (compare_q4_mv) q4_mv_restore(saved_q4_mv_env);
     free(x); free(mix); free(r); free(inj); free(sg); free(ids); free(read_x); free(read_ids);
 }
 
@@ -445,6 +482,12 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
     need(slots <= MAX_SLOTS && slots >= 4 &&
          (mm ? T <= 16384 && slots == S && !shared && !duplicates && (seed_count == 0 || seed_count == 12) :
                T >= 1 && T <= 3 && seed_count <= 4), "split fixture shape");
+    const int compare_q4_mv = !mm && w->gate_type == 12 && w->down_type == 39;
+    char *saved_q4_mv_env[4] = {NULL, NULL, NULL, NULL};
+    if (compare_q4_mv) {
+        q4_mv_save(saved_q4_mv_env);
+        q4_mv_variant(1);
+    }
     const uint32_t unique = mm ? 24u : slots - (duplicates ? 3u : 0u), stride = slots + shared;
     const uint32_t budget = unique > BUDGET ? unique : BUDGET;
     int32_t *ids = malloc((size_t)T * slots * sizeof(*ids)), seeds[24], missing[24];
@@ -515,6 +558,7 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
          shared ? inputs[3].view : NULL, NULL, outputs[3].view, inputs[4].view,
          T, slots, stride, D, HC) && ds4_gpu_end_commands(), "split reference reduce");
     for (unsigned i = 0; i < 4; i++) reference[i] = read_output(outputs + i);
+    if (compare_q4_mv) q4_mv_variant(0);
 
     ds4_gpu_set_streaming_expert_cache_budget(budget);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * w->table.gate_expert_bytes + w->table.down_expert_bytes);
@@ -606,6 +650,7 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         free(got); free(routing_copy[i]); free_output(routing + i);
     }
     for (unsigned i = 0; i < 4; i++) { free(reference[i]); free_output(outputs + i); }
+    if (compare_q4_mv) q4_mv_restore(saved_q4_mv_env);
     free(ids); free(x); free(mix); free(r); free(inj); free(shared_gate);
     printf("PASS Qwen SSD split T%u %s %u/%u slots=%u shared=%d seeded=%u unique=%u retry=%d: exact all stages, missing-only %llu bytes, warm0\n",
            T, mm ? "MM" : "rows", w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes);
@@ -651,7 +696,7 @@ int main(void) {
     ds4_gpu_set_quality(false); ds4_gpu_set_ssd_streaming(true);
     need(ds4_gpu_set_model_map(map, bytes) && ds4_gpu_set_model_fd(fileno(file)), "model registration");
     const uint32_t shapes[][2] = {{0,1}, {0,2}, {0,3}, {0,9}, {0,128},
-                                  {1,1}, {1,17}, {2,2}, {2,9}};
+                                  {1,1}, {1,17}, {1,128}, {2,2}, {2,9}};
     for (unsigned c = 0; c < sizeof(shapes) / sizeof(*shapes); c++) {
         const weights *w = formats + shapes[c][0]; const uint32_t T = shapes[c][1];
         ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
@@ -664,8 +709,9 @@ int main(void) {
             /* Eight experts appear in all 29 rows, sixteen in only 3/4 rows:
              * both >8-token counts and partial tiles, with 488 inactive. */
             check_case(w, 29, 4, fileno(file), fileno(empty), 0, 0);
-            if (w->gate_type == 16) {
-                /* Both sides of the measured M1 SSD batch-size boundary. */
+            if (w->gate_type == 16 || w->gate_type == 12) {
+                /* Q2 and Q4 straddle the M1 SSD batch-size boundary with
+                 * more selected experts than fit in the cache. */
                 check_case(w, 32, 3, fileno(file), fileno(empty), 0, 0);
                 check_case(w, 33, 3, fileno(file), fileno(empty), 0, 0);
             }

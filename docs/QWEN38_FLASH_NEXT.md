@@ -75,6 +75,30 @@ variation between runs does not establish a 10% improvement. Prefill medians
 were 9.98 and 10.05 t/s; its execution path is unchanged. These are local
 warm-file measurements, not a guarantee for other Macs or cold SSD reads.
 
+Q4_K gate/up shares activation reads between the shared expert's Q8
+projections and uses packed activation/scale loads while preserving the
+original FP32 accumulation order. On M1 Max, the 640-to-2560 MXFP4 down
+projection also enables prefetch by default. `DS4_QWEN4_MOE_DOWN_PREFETCH=0`
+restores the plain down kernel for diagnostics. Safe math always retains that
+plain kernel, including when prefetch is explicitly requested, because its
+noncontracted arithmetic differs from the prefetched kernel's explicit FMA.
+
+A local Q4 SSD check on M1 Max 32 GiB used `--ctx 32768`,
+`--prefill-chunk 1024`, `--temp 0 --nothink`, `-n 100`, and the prompt
+`Narrami in italiano la storia di Roma`. Three alternating pairs comparing
+the previous kernels with these changes produced:
+
+| Decode | Runs (t/s) | Median (t/s) |
+| --- | --- | --- |
+| Before | 6.02, 6.07, 6.26 | 6.07 |
+| Q4 kernel updates | 6.42, 6.03, 7.27 | 6.42 |
+
+All generated output was identical. The observed median gain was 5.8%; SSD
+and system variation remained substantial. Prefill medians were 6.94 and
+6.91 t/s. These changes retain the existing prefill and row-dispatch policies;
+Q2's smaller sparse-prefill tiles did not show a stable benefit for Q4 in
+local comparisons. The measurements do not establish gains on other devices.
+
 Leave the expert-cache budget automatic initially. A plain count passed to
 `--ssd-streaming-cache-experts` requests dynamic cache slots; an `NGB` budget
 also includes the reserved layer-staging space. Startup accounts for the

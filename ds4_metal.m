@@ -889,6 +889,7 @@ static NSUInteger g_moe_q4_up_slots_bytes;
 static NSUInteger g_moe_q4_down_slots_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
+static bool g_metal_math_safe;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
 #define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
@@ -6909,6 +6910,7 @@ int ds4_gpu_init(void) {
         const int drift_kv_raw_f32       = ds4_gpu_env_bool("DS4_METAL_KV_RAW_F32")         >  0; // default OFF
         const int drift_rope_exp2_log2   = ds4_gpu_env_bool("DS4_METAL_ROPE_EXP2_LOG2")     >  0; // default OFF
         const int drift_math_safe        = ds4_gpu_env_bool("DS4_METAL_MATH_SAFE")          >  0; // default OFF
+        g_metal_math_safe = drift_math_safe;
 
         if (drift_math_safe) {
             // MTLCompileOptions.fastMathEnabled defaults to YES and Apple's
@@ -50104,12 +50106,15 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const bool q2 = weight_type == 10u && ff_dim == 640u && rows_per_tg == nsg * 2u &&
         ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE") != 0 &&
         ds4_gpu_device_name_contains("M1 Max");
-    /* MXFP4 rows with four blocks per lane requested ahead (same lane map and
-     * chain order, byte-identical); M5/M6 default, DS4_QWEN4_MOE_DOWN_PREFETCH=0/1
-     * overrides on any device. */
+    /* Request four MXFP4 blocks per lane ahead. Explicit FMA matches the
+     * plain kernel in fast math; strict math keeps its noncontracted path,
+     * even with the diagnostic override. Use the compiled library's mode.
+     * M1 Max uses the measured 640x2560 shape; M5/M6 retain their policy. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_MOE_DOWN_PREFETCH");
-    const bool prefetch = weight_type == 39u && (ff_dim % 32u) == 0 &&
-        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
+    const bool prefetch = !g_metal_math_safe && weight_type == 39u && (ff_dim % 32u) == 0 &&
+        (prefetch_override >= 0 ? prefetch_override > 0 :
+         ds4_gpu_device_is_m5_or_m6_apple_silicon() ||
+         (ff_dim == 640u && out_dim == 2560u && ds4_gpu_device_name_contains("M1 Max")));
     const uint32_t dispatch_slots = qwen4_moe_dispatch_slots(&args, n_out);
     if (!dispatch_slots) return 1;
     return qwen4_dispatch(q2 ? QWEN4_K_MOE_DOWN_Q2K : prefetch ? QWEN4_K_MOE_DOWN_MXFP4_PF : QWEN4_K_MOE_DOWN, &args, sizeof(args), b, 5,

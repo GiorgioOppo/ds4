@@ -2856,6 +2856,30 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
     return simd_sum(acc);
 }
 
+/* Two Q8 projections share only activation loads. Keep each qwen4_row_dot
+ * lane's block order, four-term expression and final SIMD reduction. */
+static inline float2 qwen4_q8_pair_dot(device const char *gr, device const char *ur,
+                                      device const float *x, uint in_dim, ushort tiisg) {
+    const short ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = in_dim / 32u;
+    float sumg = 0.0f, sumu = 0.0f;
+    for (uint ib = (uint)ix; ib < nb; ib += 4) {
+        device const char *bg = gr + (uint64_t)ib * 34;
+        device const char *bu = ur + (uint64_t)ib * 34;
+        device const float *y = x + ib * 32 + (uint)it * 2;
+        const float dg = (float)(*(device const half *)bg);
+        const float du = (float)(*(device const half *)bu);
+        device const char *qg = bg + 2 + it * 2;
+        device const char *qu = bu + 2 + it * 2;
+        const float y0 = y[0], y1 = y[1], y16 = y[16], y17 = y[17];
+        sumg += dg * (y0 * (float)qg[0] + y1 * (float)qg[1] +
+                      y16 * (float)qg[16] + y17 * (float)qg[17]);
+        sumu += du * (y0 * (float)qu[0] + y1 * (float)qu[1] +
+                      y16 * (float)qu[16] + y17 * (float)qu[17]);
+    }
+    return float2(simd_sum(sumg), simd_sum(sumu));
+}
+
 /* --- small multi-output GEMV (rows via the generic row dot) ------------- */
 
 struct ds4_metal_args_qwen4_gemv {
@@ -2972,32 +2996,10 @@ kernel void kernel_qwen4_moe_mid_iq2(
     const uint64_t mid_base = ((uint64_t)tok * n_out + slot) * args.out_rows;
     if (slot == args.n_slots) {
         if (args.shared_type == 8u) {
-            // Same Q8 lane mapping, block order, four-term expression and
-            // final SIMD sums as two qwen4_row_dot calls; share only x loads.
-            const short ix = tiisg / 8, it = tiisg % 8;
-            const uint nb = args.in_dim / 32u;
             for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
                 const uint64_t off = (uint64_t)r * args.shared_row_bytes;
-                device const char *gr = sh_gate + off;
-                device const char *ur = sh_up + off;
-                float sumg = 0.0f, sumu = 0.0f;
-                for (uint ib = (uint)ix; ib < nb; ib += 4) {
-                    device const char *bg = gr + (uint64_t)ib * 34;
-                    device const char *bu = ur + (uint64_t)ib * 34;
-                    device const float *y = xt + ib * 32 + (uint)it * 2;
-                    const float dg = (float)(*(device const half *)bg);
-                    const float du = (float)(*(device const half *)bu);
-                    device const char *qg = bg + 2 + it * 2;
-                    device const char *qu = bu + 2 + it * 2;
-                    const float y0 = y[0], y1 = y[1], y16 = y[16], y17 = y[17];
-                    sumg += dg * (y0 * (float)qg[0] + y1 * (float)qg[1] +
-                                  y16 * (float)qg[16] + y17 * (float)qg[17]);
-                    sumu += du * (y0 * (float)qu[0] + y1 * (float)qu[1] +
-                                  y16 * (float)qu[16] + y17 * (float)qu[17]);
-                }
-                const float g = simd_sum(sumg);
-                const float u = simd_sum(sumu);
-                if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+                const float2 gu = qwen4_q8_pair_dot(sh_gate + off, sh_up + off, xt, args.in_dim, tiisg);
+                if (tiisg == 0) mid[mid_base + r] = qwen4_silu(gu.x) * gu.y;
             }
         } else {
             for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
@@ -3098,9 +3100,11 @@ kernel void kernel_qwen4_moe_mid_q4k(
     if (slot == args.n_slots) {
         for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
             const uint64_t off = (uint64_t)r * args.shared_row_bytes;
-            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
-            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
-            if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+            const float2 gu = args.shared_type == 8u ?
+                qwen4_q8_pair_dot(sh_gate + off, sh_up + off, xt, args.in_dim, tiisg) :
+                float2(qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg),
+                       qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg));
+            if (tiisg == 0) mid[mid_base + r] = qwen4_silu(gu.x) * gu.y;
         }
         return;
     }
@@ -3120,16 +3124,19 @@ kernel void kernel_qwen4_moe_mid_q4k(
     float sumg[NR] = {0.0f}, sumu[NR] = {0.0f};
     for (uint ib = 0; ib < nb; ib++) {
         device const float *yp = xt + ib * 256 + group * 32 + l;
-        float y[8];
-        for (uint i = 0; i < 8; i++) y[i] = yp[i];
+        /* Widen memory operations while preserving the scalar FP32 chain.
+         * Packed types keep the original float/half alignment contract. */
+        const packed_float4 y0 = *(device const packed_float4 *)yp;
+        const packed_float4 y1 = *(device const packed_float4 *)(yp + 4u);
+        const float y[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
         for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
             const uint64_t off = (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
             device const uchar *bg = (device const uchar *)(gb + off);
             device const uchar *bu = (device const uchar *)(ub + off);
-            const float dg = (float)(*(device const half *)bg);
-            const float dmg = (float)(*(device const half *)(bg + 2));
-            const float du = (float)(*(device const half *)bu);
-            const float dmu = (float)(*(device const half *)(bu + 2));
+            const packed_half2 scales_g = *(device const packed_half2 *)bg;
+            const packed_half2 scales_u = *(device const packed_half2 *)bu;
+            const float dg = (float)scales_g.x, dmg = (float)scales_g.y;
+            const float du = (float)scales_u.x, dmu = (float)scales_u.y;
             device const uchar *scg = bg + 4;
             device const uchar *scu = bu + 4;
             uint sg, mg, su, mu;
@@ -3144,6 +3151,8 @@ kernel void kernel_qwen4_moe_mid_q4k(
             }
             const float dsg = dg * (float)sg, dmin_g = dmg * (float)mg;
             const float dsu = du * (float)su, dmin_u = dmu * (float)mu;
+            /* Packed code loads change fast-math contraction on M1 Max.
+             * Keep scalar bytes to match the original dot bit for bit. */
             device const uchar *qg = bg + 16 + (group >> 1) * 32 + l;
             device const uchar *qu = bu + 16 + (group >> 1) * 32 + l;
             for (uint i = 0; i < 8; i++) {

@@ -1848,7 +1848,11 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
                 unsetenv("DS4_QWEN4_MOE_MV_SPECIALIZE");
                 unsetenv("DS4_QWEN4_MOE_MV_NR");
                 unsetenv("DS4_QWEN4_MOE_MV_NSG");
+                unsetenv("DS4_QWEN4_MOE_DOWN_PREFETCH");
             } else {
+                /* Mode zero remains the original plain-kernel oracle when
+                 * automatic MXFP4 dispatch starts using prefetch. */
+                setenv("DS4_QWEN4_MOE_DOWN_PREFETCH", "0", 1);
                 setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", mode ? "1" : "0", 1);
                 setenv("DS4_QWEN4_MOE_MV_NR", nr[mode], 1);
                 setenv("DS4_QWEN4_MOE_MV_NSG", nsg[mode], 1);
@@ -1869,20 +1873,23 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         free(bm); free(bp); free(am); free(ap);
     }
     if (dtype == 39u && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
-        /* The prefetched MXFP4 down rows must match the plain kernel byte for
-         * bit, shared Q8 slot included, at the default and generic geometries. */
+        /* Fast math: prefetched MXFP4 must match the plain kernel bit for
+         * bit, including shared Q8. Safe math: even a forced prefetch request
+         * must retain the noncontracted plain kernel. Check both geometries. */
         const uint64_t np = (uint64_t)T * n_out * E;
         float *bp = malloc(np * sizeof(float)), *ap = malloc(np * sizeof(float));
         require_ok(bp && ap, "down prefetch allocation");
         for (uint32_t spec = 0; spec < 2u; spec++) {
             setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", spec ? "1" : "0", 1);
-            for (uint32_t mode = 0; mode < 2u; mode++) {
-                setenv("DS4_QWEN4_MOE_DOWN_PREFETCH", mode ? "1" : "0", 1);
+            for (uint32_t mode = 0; mode < 3u; mode++) {
+                if (mode == 2u) unsetenv("DS4_QWEN4_MOE_DOWN_PREFETCH");
+                else setenv("DS4_QWEN4_MOE_DOWN_PREFETCH", mode ? "1" : "0", 1);
                 require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size,
                     down_off, dtype, NE, T, slots, F, E, sd_off, shared_type), "down prefetch dispatch");
                 require_ok(ds4_gpu_tensor_read(gpart, 0, mode ? ap : bp, np * sizeof(float)), "down prefetch read");
+                if (mode) check_exact_f32(spec ? "MXFP4 down prefetch/default, specialized" :
+                    "MXFP4 down prefetch/default, generic", ap, bp, np);
             }
-            check_exact_f32(spec ? "prefetched MXFP4 down, specialized" : "prefetched MXFP4 down, generic", ap, bp, np);
         }
         unsetenv("DS4_QWEN4_MOE_MV_SPECIALIZE");
         unsetenv("DS4_QWEN4_MOE_DOWN_PREFETCH");
@@ -3597,7 +3604,7 @@ static double bench_run(const char *name, bench_fn fn, void *ud, uint32_t reps) 
 
 typedef struct {
     arena_t *a;
-    uint64_t off[14];
+    uint64_t off[15];
     ds4_gpu_tensor *t[43];
     uint32_t n[3];
 } bench_ctx;
@@ -3640,6 +3647,11 @@ static int bench_moe_mid_q4k(void *ud) {
 static int bench_moe_down(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_moe_down_tensor(c->t[17], c->t[1], c->t[16], c->a->base, c->a->size, c->off[10], 8u, 16, 1, 10, 640, 2560, c->off[10], 8u);
+}
+static int bench_moe_down_mxfp4(void *ud) {
+    bench_ctx *c = ud;
+    return ds4_gpu_qwen4_moe_down_tensor(c->t[17], c->t[1], c->t[16], c->a->base, c->a->size,
+        c->off[14], 39u, 16, c->n[0], 10, 640, 2560, c->off[10], 8u);
 }
 static int bench_router_gemv(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_f32_tensor(c->t[17], c->a->base, c->a->size, c->off[11], 2560, 512, c->t[0], 1); }
 static int bench_router_topk(void *ud) {
@@ -3776,6 +3788,7 @@ static void bench_dispatch(arena_t *a) {
     c.off[11] = arena_f32(a, 512ull * 2560, &sh, -0.05f, 0.05f); free(sh);
     c.off[12] = arena_q4_K(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);
     c.off[13] = arena_q4_K(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);
+    c.off[14] = arena_mxfp4(a, 16ull * 2560, 640, &sh); free(sh);
     c.t[18] = upload(NULL, 256ull * 2560);        /* x for 256 tokens */
     c.t[19] = upload(NULL, 256ull * 10240);       /* wide scratch */
     c.t[1] = upload(NULL, 256ull * 10240);        /* scratch (also the GDN state) */
@@ -3931,6 +3944,10 @@ static void bench_dispatch(arena_t *a) {
     bench_run("moe_mid q4_K 10+1 slots T=1", bench_moe_mid_q4k, &c, 100);
     c.n[0] = 2;
     bench_run("moe_mid q4_K 10+1 slots T=2", bench_moe_mid_q4k, &c, 100);
+    c.n[0] = 1;
+    bench_run("moe_down mxfp4 10+1 slots T=1", bench_moe_down_mxfp4, &c, 100);
+    c.n[0] = 2;
+    bench_run("moe_down mxfp4 10+1 slots T=2", bench_moe_down_mxfp4, &c, 100);
 }
 
 /* four projections of one input, mixed weight types (q8_0, bf16, q4_0, f16) */
