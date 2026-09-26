@@ -1117,6 +1117,18 @@ static int g_ds4_lock_fd = -1;
 #define DS4_MAYBE_UNUSED
 #endif
 
+/* This controls prompt-time predictor cache preparation, not speculation.
+ * Keep the established predictor history by default; auto is an explicit
+ * streaming-only policy until resident acceptance/wall-time is measured. */
+static DS4_MAYBE_UNUSED int qwen4_mtp_prefill_resolve(bool mtp_enabled, bool streaming,
+                                                    const char *value) {
+    if (!mtp_enabled) return 0;
+    if (!value || !value[0] || !strcmp(value, "on") || !strcmp(value, "1")) return 1;
+    if (!strcmp(value, "off") || !strcmp(value, "0")) return 0;
+    if (!strcmp(value, "auto")) return streaming ? 1 : 0;
+    return -1;
+}
+
 /* =========================================================================
  * GGUF Quant Block Formats.
  * =========================================================================
@@ -57710,7 +57722,7 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t snap0_pos;
     int32_t snap0_mrope_delta;
     bool snap0_valid;
-    uint32_t mtp_pos;
+    uint32_t mtp_pos;        /* initialized predictor prefix, including cold rows */
     uint32_t n_logit_rows;
     bool snap_after_first;   /* set by the caller for a 2-token verify: snapshot the state after row 0 */
     bool snap_after_second;  /* 3-token verify: also snapshot the state after row 1 */
@@ -59427,6 +59439,47 @@ static bool qwen4_graph_mtp_cache_steps(ds4_qwen4_gpu_graph *g, const ds4_model 
         }
     }
     g->projection_phase = saved_phase;
+    return ok;
+}
+
+/* Skip historical projections without exposing stale or unwritten rows to
+ * predictor attention. Zero keys still participate in its softmax: this is
+ * a cold draft prefix, not an exact replacement for the prepared history.
+ * Target caches/logits and subsequent draft verification are unchanged. */
+static bool qwen4_graph_mtp_cache_cold(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                      const ds4_weights *w, uint32_t idx, uint32_t T) {
+    if (!g->mtp_R || !T || idx > g->mtp_pos || idx > g->ctx_cap ||
+        T > g->ctx_cap - idx) return false;
+    /* Metal fills shared tensors on the host. Drain prior work before
+     * clearing them; CUDA fills are ordered before the pooling dispatch. */
+    if (!ds4_gpu_synchronize()) return false;
+    const uint32_t il = DS4_N_LAYER - 1u;
+    const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+    const uint64_t ik_bytes = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    ds4_gpu_tensor *cache[] = {g->layer_k_cache[il], g->layer_v_cache[il], g->layer_ik_cache[il]};
+    const uint64_t row_bytes[] = {kv_bytes, kv_bytes, ik_bytes};
+    bool ok = true;
+    for (uint32_t i = 0; i < 3u && ok; i++) {
+        const uint64_t bytes = T * row_bytes[i];
+        ds4_gpu_tensor *view = ds4_gpu_tensor_view(cache[i], idx * row_bytes[i], bytes);
+        /* IEEE half and float share the all-zero representation. */
+        ok = view && bytes % sizeof(float) == 0 &&
+             ds4_gpu_tensor_fill_f32(view, 0.0f, bytes / sizeof(float));
+        ds4_gpu_tensor_free(view);
+    }
+    const uint32_t first_block = idx / 4u, n_blocks_after = (idx + T) / 4u;
+    if (ok && n_blocks_after > first_block) {
+        /* An append may complete a block containing real, retained keys.
+         * Re-pool it rather than erasing that part of the existing prefix. */
+        ok = glm_graph_begin_commands_if_needed() &&
+             ds4_gpu_qwen4_idx_block_key_tensor(g->layer_block_key[il], g->layer_ik_cache[il],
+                 g->pos3, m->map, m->size, w->layer[il].indexer_k_norm->abs_offset,
+                 first_block, n_blocks_after - first_block, 4u, DS4_N_INDEXER_HEAD_DIM,
+                 DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+    }
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    g->mtp_last_rows = 0;
+    if (ok) g->mtp_pos = idx + T;
     return ok;
 }
 
@@ -63013,7 +63066,8 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * pooled block keys (attention layers, incl. the MTP block), then the PLE
  * conv history and n-gram context.  The header's raw_live field carries the
  * family tag so a DeepSeek payload is never read as a Qwen one. */
-/* v3 stores a contiguous canonical MTP prefix and its pending trunk row. */
+/* v3 stores the initialized MTP prefix (prepared or cold) and its pending
+ * trunk row. Restoring a prefix preserves its actual cache contents. */
 #define DS4_QWEN4_PAYLOAD_TAG 0x51573803u
 
 static uint64_t qwen4_payload_lin_state_bytes(void) {
@@ -75849,6 +75903,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
+        const int prepare_mtp = qwen4_mtp_prefill_resolve(s->qwen4_graph.mtp_R != NULL,
+            s->qwen4_graph.ssd_streaming, getenv("DS4_QWEN4_MTP_PREFILL"));
+        if (prepare_mtp < 0) {
+            snprintf(err, errlen, "DS4_QWEN4_MTP_PREFILL must be on, off, or auto");
+            return 1;
+        }
         int start = 0;
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
@@ -75898,11 +75958,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 break;
             }
             if (s->qwen4_graph.mtp_R) {
-                /* Prompt lookahead covers chunk boundaries. The final row
-                 * waits in mtp_tail_R for the actual next sampled token. */
+                /* Full preparation uses lookahead across chunk boundaries.
+                 * Cold preparation defers each chunk's final row: snapshots
+                 * store that hidden tail separately and repair it on resume,
+                 * so uninterrupted prefill must use the same real boundary. */
                 uint32_t known = chunk;
-                if (i + (int)chunk == prompt->len) known--;
-                for (uint32_t row = 0; row < known;) {
+                if (!prepare_mtp || i + (int)chunk == prompt->len) known--;
+                if (!prepare_mtp && known &&
+                    !qwen4_graph_mtp_cache_cold(&s->qwen4_graph, &e->model, &e->weights,
+                        (uint32_t)i, known)) {
+                    snprintf(err, errlen, "Qwen3.8 cold predictor cache prefill failed at token %d", i);
+                    prefill_rc = 1;
+                }
+                for (uint32_t row = 0; prepare_mtp && row < known;) {
                     const uint32_t n = known - row > 3u ? 3u : known - row;
                     if (!qwen4_graph_mtp_cache_steps(&s->qwen4_graph, &e->model, &e->weights,
                             row, prompt->v + i + row + 1u, n, (uint32_t)i + row)) {

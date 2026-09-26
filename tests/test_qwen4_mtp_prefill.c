@@ -479,6 +479,206 @@ static void check_payload_modes(ds4_session *live, ds4_session *reference,
     puts("PASS MTP on/off payload compatibility, prefix replay and legacy-tag rejection");
 }
 
+/* Cold preparation initializes prompt rows deterministically without running
+ * the predictor projections. It changes the draft context, not the target
+ * model or whether speculative verification remains available. */
+static void check_cold_rows(ds4_session *s, uint32_t first, uint32_t rows) {
+    const uint32_t il = DS4_N_LAYER - 1u;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const uint64_t kv_row = qwen4_payload_kv_bytes(1u);
+    const uint64_t ik_row = qwen4_payload_ik_bytes(1u);
+    ds4_gpu_tensor *t[] = {g->layer_k_cache[il], g->layer_v_cache[il], g->layer_ik_cache[il]};
+    const uint64_t row_bytes[] = {kv_row, kv_row, ik_row};
+    for (unsigned i = 0; i < 3u; i++) {
+        const uint64_t bytes = (uint64_t)rows * row_bytes[i];
+        unsigned char *p = malloc(bytes ? (size_t)bytes : 1u);
+        need(p != NULL && (!bytes || ds4_gpu_tensor_read(t[i],
+             (uint64_t)first * row_bytes[i], p, bytes)), "read cold predictor rows");
+        for (uint64_t j = 0; j < bytes; j++) need(p[j] == 0, "cold K/V/raw indexer rows are zero");
+        free(p);
+    }
+    /* Only wholly cold, completed blocks have a zero pooled key. Half
+     * signed zeros are valid after the ordinary norm/RoPE pool kernel. */
+    const uint32_t first_block = (first + 3u) / 4u, end_block = (first + rows) / 4u;
+    if (end_block > first_block) {
+        const uint64_t n = (uint64_t)(end_block - first_block) * DS4_N_INDEXER_HEAD_DIM;
+        uint16_t *p = malloc((size_t)n * sizeof(*p));
+        need(p && ds4_gpu_tensor_read(g->layer_block_key[il],
+             (uint64_t)first_block * DS4_N_INDEXER_HEAD_DIM * sizeof(*p), p, n * sizeof(*p)),
+             "read cold pooled indexer keys");
+        for (uint64_t i = 0; i < n; i++) need(f16_to_f32(p[i]) == 0.0f, "cold pooled keys are zero");
+        free(p);
+    }
+}
+
+typedef struct { ds4_session *s; unsigned callbacks; bool stop_after_chunk, cancelled; } cold_progress;
+static void check_cold_progress(void *opaque, const char *phase, int completed, int total) {
+    cold_progress *p = opaque;
+    if (strcmp(phase, "prefill_chunk")) return;
+    ds4_qwen4_gpu_graph *g = &p->s->qwen4_graph;
+    const uint32_t known = (uint32_t)completed - 1u;
+    need(completed <= total, "cold progress remains within the prompt");
+    need(p->s->checkpoint_valid && g->pos == (uint32_t)completed && g->mtp_pos == known,
+         "cold chunk publishes an initialized predictor frontier");
+    need(g->mtp_R && p->s->engine->glm_mtp && g->mtp_tail_valid &&
+         g->mtp_tail_pos + 1u == g->pos && g->mtp_last_rows == 0u,
+         "cold preparation retains enabled MTP and the final trunk row");
+    for (uint32_t start = 0u; start < known; start += TEST_CHUNK) {
+        const uint32_t rows = known - start < TEST_CHUNK - 1u ? known - start : TEST_CHUNK - 1u;
+        check_cold_rows(p->s, start, rows);
+    }
+    p->callbacks++;
+    if (p->stop_after_chunk) p->cancelled = true;
+}
+
+static bool cancel_cold_prefill(void *opaque) {
+    return ((cold_progress *)opaque)->cancelled;
+}
+
+static void check_cold_prefill(ds4_session *live, ds4_session *reference,
+                               const ds4_tokens *prompt, const frontier *eager13,
+                               const ds4_session_snapshot *eager16) {
+    const bool exact_sampling = live->engine->dspark_exact_sampling;
+    live->engine->dspark_exact_sampling = false;
+    need(setenv("DS4_QWEN4_MTP_PREFILL", "off", 1) == 0 &&
+         unsetenv("DS4_QWEN4_SPEC_FORCE_ACCEPT") == 0 &&
+         unsetenv("DS4_QWEN4_MTP_DEPTH") == 0, "select cold predictor preparation");
+    ds4_tokens prefix = *prompt; prefix.len = TEST_PREFIX;
+    ds4_session_invalidate(live);
+    poison_nextn(live, 0xa5);
+    cold_progress p = {.s = live};
+    ds4_session_set_progress(live, check_cold_progress, &p);
+    need(ds4_session_sync(live, &prefix, error, sizeof(error)) == 0 && p.callbacks == 2u,
+         "cold prefix crosses a prefill chunk boundary");
+    ds4_session_set_progress(live, NULL, NULL);
+    frontier cold13 = capture(live, 0u);
+    exact("cold/eager target prefix logits", cold13.logits, eager13->logits,
+          (size_t)DS4_N_VOCAB * sizeof(float));
+    exact("cold/eager retained target row", cold13.tail, eager13->tail,
+          (size_t)DS4_N_EMBD * DS4_N_HC * sizeof(float));
+
+    p.callbacks = 0u;
+    ds4_session_set_progress(live, check_cold_progress, &p);
+    need(ds4_session_sync(live, &prefix, error, sizeof(error)) == 0 && p.callbacks == 0u,
+         "identical cold prompt reuses its checkpoint without replay");
+    ds4_session_set_progress(live, NULL, NULL);
+    compare_frontier(live, &cold13, false);
+    /* Reject a typo before it can consume pending drafts or append rows. */
+    live->glm_mtp_have = 1;
+    live->glm_mtp_have2 = true;
+    ds4_tokens invalid_append = *prompt; invalid_append.len = TEST_APPEND;
+    need(setenv("DS4_QWEN4_MTP_PREFILL", "invalid", 1) == 0 &&
+         ds4_session_sync(live, &invalid_append, error, sizeof(error)) != 0 &&
+         strstr(error, "DS4_QWEN4_MTP_PREFILL") != NULL,
+         "invalid preparation policy is rejected");
+    need(live->glm_mtp_have == 1 && live->glm_mtp_have2 &&
+         live->checkpoint.len == TEST_PREFIX &&
+         !memcmp(live->checkpoint.v, prompt->v, TEST_PREFIX * sizeof(*prompt->v)),
+         "invalid preparation policy leaves pending drafts and checkpoint untouched");
+    compare_frontier(live, &cold13, false);
+    live->glm_mtp_have = 0;
+    live->glm_mtp_have2 = false;
+    error[0] = '\0';
+    need(setenv("DS4_QWEN4_MTP_PREFILL", "off", 1) == 0, "restore cold preparation policy");
+    ds4_session_snapshot cold_snapshot = {0}, partial = {0}, appended = {0};
+    need(ds4_session_save_snapshot(live, &cold_snapshot, error, sizeof(error)) == 0,
+         "save cold predictor prefix");
+    poison_nextn(live, 0x3c);
+    need(ds4_session_load_snapshot(live, &cold_snapshot, error, sizeof(error)) == 0,
+         "restore cold prefix over stale predictor cache");
+    compare_frontier(live, &cold13, false);
+
+    /* Each cold chunk leaves its tail deferred. Cancellation and snapshot
+     * restore therefore prepare exactly the same real boundary row as an
+     * uninterrupted prefill, including the resulting predictor caches. */
+    ds4_session_invalidate(live);
+    poison_nextn(live, 0x5a);
+    p = (cold_progress){.s = live, .stop_after_chunk = true};
+    ds4_session_set_progress(live, check_cold_progress, &p);
+    ds4_session_set_cancel(live, cancel_cold_prefill, &p);
+    need(ds4_session_sync(live, &prefix, error, sizeof(error)) == DS4_SESSION_SYNC_INTERRUPTED &&
+         p.callbacks == 1u && ds4_session_pos(live) == TEST_CHUNK,
+         "cold prefill cancellation retains a completed chunk");
+    ds4_session_set_cancel(live, NULL, NULL);
+    ds4_session_set_progress(live, NULL, NULL);
+    error[0] = '\0';
+    need(ds4_session_save_snapshot(live, &partial, error, sizeof(error)) == 0,
+         "save cancelled cold prefill frontier");
+    need(ds4_session_sync(live, &prefix, error, sizeof(error)) == 0, "resume cold prefill in place");
+    compare_frontier(live, &cold13, false);
+    poison_nextn(reference, 0x69);
+    need(ds4_session_load_snapshot(reference, &partial, error, sizeof(error)) == 0 &&
+         ds4_session_sync(reference, &prefix, error, sizeof(error)) == 0,
+         "resume serialized cancelled cold prefill");
+    compare_frontier(reference, &cold13, false);
+
+    prefix.len = TEST_APPEND;
+    need(ds4_session_sync(live, &prefix, error, sizeof(error)) == 0 &&
+         ds4_session_load_snapshot(reference, eager16, error, sizeof(error)) == 0,
+         "append to cold prefix and restore independent eager target");
+    exact("cold/eager appended target logits", live->logits, reference->logits,
+          (size_t)DS4_N_VOCAB * sizeof(float));
+    check_cold_rows(live, 0u, TEST_CHUNK - 1u);
+    check_cold_rows(live, TEST_CHUNK, TEST_PREFIX - TEST_CHUNK - 1u);
+    check_cold_rows(live, TEST_PREFIX, TEST_APPEND - TEST_PREFIX - 1u);
+    /* The deferred row 12 is filled by ordinary boundary preparation before
+     * append. The cold helper must preserve it while clearing rows 13/14. */
+    const uint32_t il = DS4_N_LAYER - 1u;
+    const uint64_t kv_row = qwen4_payload_kv_bytes(1u), ik_row = qwen4_payload_ik_bytes(1u);
+    compare_tensor("preserved append boundary K", live->qwen4_graph.layer_k_cache[il],
+                   reference->qwen4_graph.layer_k_cache[il], (TEST_PREFIX - 1u) * kv_row, kv_row);
+    compare_tensor("preserved append boundary V", live->qwen4_graph.layer_v_cache[il],
+                   reference->qwen4_graph.layer_v_cache[il], (TEST_PREFIX - 1u) * kv_row, kv_row);
+    compare_tensor("preserved append boundary indexer", live->qwen4_graph.layer_ik_cache[il],
+                   reference->qwen4_graph.layer_ik_cache[il], (TEST_PREFIX - 1u) * ik_row, ik_row);
+    need(ds4_session_save_snapshot(live, &appended, error, sizeof(error)) == 0,
+         "save appended cold predictor prefix");
+    need(ds4_session_eval(live, prompt->v[TEST_APPEND], error, sizeof(error)) == 0 &&
+         ds4_session_eval(reference, prompt->v[TEST_APPEND], error, sizeof(error)) == 0,
+         "ordinary decode continues after cold prefill");
+    exact("cold/eager ordinary target continuation", live->logits, reference->logits,
+          (size_t)DS4_N_VOCAB * sizeof(float));
+
+    /* A longer append closes block [12,16): its first key is real and its
+     * other three keys are cold. Recompute an independent output buffer
+     * with the ordinary pool kernel to catch erasing the whole mixed block. */
+    ds4_tokens mixed = {0};
+    for (int i = 0; i < 18; i++) ds4_tokens_push(&mixed, prompt->v[i % prompt->len]);
+    need(ds4_session_load_snapshot(live, &cold_snapshot, error, sizeof(error)) == 0 &&
+         ds4_session_load_snapshot(reference, &cold_snapshot, error, sizeof(error)) == 0 &&
+         ds4_session_sync(live, &mixed, error, sizeof(error)) == 0 &&
+         setenv("DS4_QWEN4_MTP_PREFILL", "on", 1) == 0 &&
+         ds4_session_sync(reference, &mixed, error, sizeof(error)) == 0 &&
+         setenv("DS4_QWEN4_MTP_PREFILL", "off", 1) == 0,
+         "cold and eager append complete a mixed predictor block");
+    exact("mixed-block target logits", live->logits, reference->logits,
+          (size_t)DS4_N_VOCAB * sizeof(float));
+    check_cold_rows(live, TEST_PREFIX, 4u);
+    compare_tensor("mixed-block retained real indexer key", live->qwen4_graph.layer_ik_cache[il],
+                   reference->qwen4_graph.layer_ik_cache[il], (TEST_PREFIX - 1u) * ik_row, ik_row);
+    const uint64_t block_bytes = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t);
+    ds4_gpu_tensor *pooled = ds4_gpu_tensor_alloc(4u * block_bytes);
+    ds4_engine *e = live->engine;
+    need(pooled && glm_graph_begin_commands_if_needed() &&
+         ds4_gpu_qwen4_idx_block_key_tensor(pooled, live->qwen4_graph.layer_ik_cache[il],
+             live->qwen4_graph.pos3, e->model.map, e->model.size,
+             e->weights.layer[il].indexer_k_norm->abs_offset, 3u, 1u, 4u,
+             DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
+         ds4_gpu_end_commands(), "ordinary pooled-key oracle for mixed cold/real block");
+    compare_tensor("mixed cold/real pooled block", live->qwen4_graph.layer_block_key[il],
+                   pooled, 3u * block_bytes, block_bytes);
+    ds4_gpu_tensor_free(pooled);
+    ds4_tokens_free(&mixed);
+    for (unsigned mode = 0; mode < 3u; mode++) check_cycles(live, reference, &appended, mode);
+    ds4_session_snapshot_free(&appended);
+    ds4_session_snapshot_free(&partial);
+    ds4_session_snapshot_free(&cold_snapshot);
+    free_frontier(&cold13);
+    live->engine->dspark_exact_sampling = exact_sampling;
+    need(setenv("DS4_QWEN4_MTP_PREFILL", "on", 1) == 0, "restore eager oracle policy");
+    puts("PASS cold predictor prefix: deterministic initialization, reuse, append, restore, cancellation and active MTP");
+}
+
 /* The long fixture runs the trunk only once. At the first sparse query and
  * at the deep prefix, replay one predictor layer over three actual trunk
  * rows. Saving only the predictor cache keeps this feasible with SSD model
@@ -832,12 +1032,13 @@ int main(int argc, char **argv) {
     }
     const char *names[] = {"DS4_QWEN4_SPEC_FORCE_ACCEPT", "DS4_QWEN4_MTP_DEPTH",
                           "DS4_QWEN4_MTP_DRAFT_ROWS", "DS4_QWEN4_MTP_DRAFT_VOCAB",
-                          "DS4_QWEN4_MTP_GPU_ARGMAX"};
+                          "DS4_QWEN4_MTP_GPU_ARGMAX", "DS4_QWEN4_MTP_PREFILL"};
     char *saved[sizeof(names) / sizeof(names[0])] = {0};
     for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         const char *v = getenv(names[i]); saved[i] = v ? strdup(v) : NULL;
         need(!v || saved[i], "save test environment"); need(unsetenv(names[i]) == 0, "clear test override");
     }
+    need(setenv("DS4_QWEN4_MTP_PREFILL", "on", 1) == 0, "select eager full-layer oracle policy");
     ds4_engine_options opt = {.model_path = argv[1], .backend = DS4_BACKEND_METAL,
         .context_size = long_context ? prefix_rows + 8u : TEST_CTX,
         .prefill_chunk = long_context ? chunk : TEST_CHUNK, .glm_mtp = true,
@@ -870,6 +1071,7 @@ int main(int argc, char **argv) {
     poison_nextn(live, 0xaa);
     checked_sync(live, &prefix, frames, n);
     need(live->qwen4_graph.mtp_pos + 1u == TEST_PREFIX, "last unknown token is not guessed");
+    frontier eager13 = capture(reference, 0u);
     for (unsigned i = 0; i < n; i++) free_frontier(frames + i);
     puts("PASS cache-only prefix against full MTP: chunk lookahead and final retained row");
 
@@ -895,6 +1097,8 @@ int main(int argc, char **argv) {
 
     check_payload_modes(live, reference, &prefix, &snapshot);
     for (unsigned mode = 0; mode < 3; mode++) check_cycles(live, reference, &snapshot, mode);
+    check_cold_prefill(live, reference, &prompt, &eager13, &snapshot);
+    free_frontier(&eager13);
     ds4_session_snapshot_free(&snapshot);
     ds4_tokens_free(&other); ds4_tokens_free(&prompt);
     ds4_session_free(reference); ds4_session_free(live); ds4_engine_close(engine);
