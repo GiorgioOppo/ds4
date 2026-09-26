@@ -81,6 +81,10 @@ also includes the reserved layer-staging space. Startup accounts for the
 context, prefill chunk, static weights, vision weights when present, and
 staging before choosing the cache size. Reduce the context or prefill chunk
 if those fixed requirements leave insufficient memory.
+The total budget is the smaller of 87.5% of physical RAM and Metal's
+recommended working set, with a further 2 GiB reserved for runtime overhead.
+The recommendation is not discounted again, and admitted static weights stay
+eligible for locking in RAM as the expert cache grows.
 
 Qwen fills its expert cache on demand, so `--ssd-streaming-cold` does not
 change its preload behavior. Popularity preloading and the GLM-specific

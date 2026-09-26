@@ -62,6 +62,20 @@ static void monotonic(void) {
     assert(largest.prefill_cap == INT_MAX && largest.total_bytes > previous);
 }
 
+static void streaming_budget(void) {
+    const uint64_t gib = UINT64_C(1073741824);
+    /* Metal's recommendation can already leave more host headroom than our
+     * policy requires. Do not reduce that smaller recommendation a second time. */
+    assert(qwen4_streaming_memory_budget(32u * gib, 24u * gib) == 24u * gib);
+    assert(qwen4_streaming_memory_budget(32u * gib, 32u * gib) == 28u * gib);
+    assert(qwen4_streaming_memory_budget(32u * gib, 64u * gib) == 28u * gib);
+    assert(qwen4_streaming_memory_budget(0, 24u * gib) == 0);
+    assert(qwen4_streaming_memory_budget(32u * gib, 0) == 0);
+    const uint64_t large = qwen4_streaming_memory_budget(UINT64_MAX, UINT64_MAX);
+    assert(large > UINT64_MAX / 2u && large < UINT64_MAX);
+    assert(UINT64_MAX - large >= UINT64_MAX / 8u);
+}
+
 static void streaming_staging(void) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
@@ -186,6 +200,7 @@ int main(void) {
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
     chunk_resolution();
     monotonic();
+    streaming_budget();
     streaming_staging();
     attention_query_planning();
 

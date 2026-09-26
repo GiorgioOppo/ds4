@@ -70900,6 +70900,15 @@ static DS4_MAYBE_UNUSED bool qwen4_streaming_staging_bytes(
     return true;
 }
 
+/* Leave host headroom while respecting Metal's working-set recommendation.
+ * Do not discount that recommendation again: admission separately reserves
+ * graph/staging storage and another 2 GiB for the runtime. */
+static DS4_MAYBE_UNUSED uint64_t qwen4_streaming_memory_budget(
+        uint64_t host, uint64_t recommended) {
+    const uint64_t host_budget = host / 8u * 7u;
+    return host_budget < recommended ? host_budget : recommended;
+}
+
 #ifdef DS4_HAS_QWEN4_METAL
 /* Dense/GDN/HC weights stay mapped; bound routed staging before assigning the
  * remaining working set to the persistent expert cache. */
@@ -70912,8 +70921,7 @@ static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bo
         fprintf(stderr, "ds4: cannot determine Qwen SSD memory budget\n");
         return false;
     }
-    uint64_t budget = host / 8u * 7u;
-    if (recommended / 8u * 7u < budget) budget = recommended / 8u * 7u;
+    const uint64_t budget = qwen4_streaming_memory_budget(host, recommended);
     uint64_t statics = 0, expert_bytes = 0, max_experts = 0, staging = 0;
     if (!weights_streaming_non_routed_bytes(&e->weights, &statics) ||
         !ds4_streaming_routed_expert_bytes(&e->weights, &expert_bytes) ||
@@ -71566,7 +71574,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
+#ifdef DS4_HAS_QWEN4_METAL
+    const bool qwen4_ssd = e->ssd_streaming &&
+        e->backend == DS4_BACKEND_METAL && ds4_model_is_qwen4();
+#else
+    const bool qwen4_ssd = false;
+#endif
+    /* Qwen admission below fits explicit and automatic cache requests against
+     * one complete budget, including static weights and every session graph. */
+    if (!qwen4_ssd && e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
         const uint64_t safe_cache_bytes =
             ds4_streaming_manual_cache_safe_bytes(e->backend,
@@ -71849,7 +71865,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
 #ifdef DS4_HAS_QWEN4_METAL
-        if (ds4_model_is_qwen4() && e->ssd_streaming) {
+        if (qwen4_ssd) {
             const ds4_context_memory memory = ds4_context_memory_estimate_with_prefill_mode(
                 e->backend, opt->context_size > 0 ? opt->context_size : 4096, e->prefill_chunk, true);
             const uint32_t sessions = e->placement_session_count_hint > 0 ?
@@ -71909,16 +71925,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (e->ssd_streaming && !load_slice && !tp_shard &&
             getenv("DS4_METAL_DISABLE_STREAMING_STATIC_LOCK") == NULL) {
             ds4_model_map_span_vec spans;
-            uint64_t static_bytes = 0;
-            const uint64_t budget = ds4_streaming_manual_cache_safe_bytes(
-                    e->backend, opt->context_size, e->prefill_chunk, true);
-            const uint64_t experts = ds4_add_sat_u64(
-                    ds4_engine_dynamic_expert_cache_bytes(e),
-                    ds4_add_sat_u64(e->ssd_streaming_prefill_headroom_bytes,
-                                   e->ssd_streaming_full_layer_bytes));
-            const bool fits =
-                weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
-                static_bytes <= budget && experts <= budget - static_bytes;
+            /* Qwen's admission already includes these static bytes. Applying
+             * the generic cache cap again would make admitted weights pageable. */
+            bool fits = qwen4_ssd;
+            if (!fits) {
+                uint64_t static_bytes = 0;
+                const uint64_t budget = ds4_streaming_manual_cache_safe_bytes(
+                        e->backend, opt->context_size, e->prefill_chunk, true);
+                const uint64_t experts = ds4_add_sat_u64(
+                        ds4_engine_dynamic_expert_cache_bytes(e),
+                        ds4_add_sat_u64(e->ssd_streaming_prefill_headroom_bytes,
+                                       e->ssd_streaming_full_layer_bytes));
+                fits = weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
+                    static_bytes <= budget && experts <= budget - static_bytes;
+            }
             if (!fits) {
                 fprintf(stderr, "ds4: Metal SSD static weights remain pageable"
                         " to preserve runtime headroom\n");
