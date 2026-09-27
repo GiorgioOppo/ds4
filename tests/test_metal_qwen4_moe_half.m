@@ -6,6 +6,9 @@
  * Run from the repository root. --compile-only creates pipelines but no queue
  * or GPU dispatch. --bench includes x conversion and the dual mid write in
  * every candidate timing; alternating ABBA/BAAB rounds share the same fixture.
+ * --q4-k32 adds Q4_K/MXFP4 float and half K32 NT4 kernels, while checking
+ * that every existing K64 entry point still matches the frozen baseline.
+ * K32 binds quantization constants as the runtime does.
  * Generic weight types (function constant 900 = 0) match M1 large-prefill
  * production dispatch. --specialized-types retains the specialized comparison.
  */
@@ -29,7 +32,7 @@ _Static_assert(offsetof(mm_args, active_expert) == 60, "production active expert
 static const NSUInteger kOffset = 256;
 static const unsigned kNT[] = {1, 2, 4, 8};
 static uint64_t comparisons, half_comparisons, fixtures;
-static bool specialized_types;
+static bool specialized_types, q4_k32;
 
 static void fail(NSString *message) {
     fprintf(stderr, "FAIL Qwen MoE half: %s\n", message.UTF8String);
@@ -89,13 +92,17 @@ static void fill_weights(id<MTLBuffer> b, unsigned type, unsigned seed) {
     uint8_t *p = data(b);
     const size_t bytes = b.length - 2 * kOffset;
     for (size_t i = 0; i < bytes; i++) p[i] = (uint8_t)mix((uint32_t)i + seed);
-    const unsigned block = type == 16 ? 66 : 84;
+    if (type == 39u) {
+        for (size_t i = 0; i < bytes; i += 17u) p[i] = 116u + mix((uint32_t)i + seed) % 5u;
+        return;
+    }
+    const unsigned block = type == 12 ? 144 : type == 16 ? 66 : 84;
     for (size_t i = 0; i < bytes; i += block) {
         /* Small normal scales keep the complete fixture finite. Alternating
          * signs and very different magnitudes still exercise cancellation. */
         uint16_t h = (uint16_t)(0x1000u | (mix((uint32_t)i + seed) & 0x83ffu));
-        memcpy(p + i + (type == 16 ? 0 : 80), &h, 2);
-        if (type == 10) { h ^= 0x0195u; memcpy(p + i + 82, &h, 2); }
+        memcpy(p + i + (type == 10 ? 80 : 0), &h, 2);
+        if (type == 10 || type == 12) { h ^= 0x0195u; memcpy(p + i + (type == 10 ? 82 : 2), &h, 2); }
     }
 }
 
@@ -113,12 +120,13 @@ static Fixture *fixture(id<MTLDevice> device, unsigned tokens, unsigned dim,
     Fixture *f = [Fixture new];
     f.tokens = tokens; f.dim = dim; f.ff = 640; f.experts = experts; f.slots = 10;
     mm_args m = {.n_tokens=tokens, .n_slots=f.slots, .n_out=f.slots,
-        .in_dim=dim, .out_rows=f.ff, .weight_type=16, .row_bytes=dim/256*66,
+        .in_dim=dim, .out_rows=f.ff, .weight_type=q4_k32?12u:16u, .row_bytes=dim/256*(q4_k32?144u:66u),
         .list_cap=tokens, .n_expert=experts, .tiles_per_launch=MIN(8u,(tokens+31u)/32u),
         .expert_major=expertMajor};
     m.expert_bytes = (uint64_t)m.row_bytes * m.out_rows;
     mm_args d = m;
-    d.in_dim = f.ff; d.out_rows = dim; d.weight_type = 10; d.row_bytes = 252;
+    d.in_dim = f.ff; d.out_rows = dim + (q4_k32 && sparse ? 4u : 0u);
+    d.weight_type = q4_k32 ? 39u : 10u; d.row_bytes = q4_k32 ? f.ff/32u*17u : 252u;
     d.expert_bytes = (uint64_t)d.row_bytes * d.out_rows;
     if (sparse) {
         m.n_active_expert = d.n_active_expert = experts - 2;
@@ -127,7 +135,7 @@ static Fixture *fixture(id<MTLDevice> device, unsigned tokens, unsigned dim,
     f.midArgs = m; f.downArgs = d;
     f.gate = buffer(device, m.expert_bytes * experts); f.up = buffer(device, m.expert_bytes * experts);
     f.down = buffer(device, d.expert_bytes * experts);
-    fill_weights(f.gate, 16, 17); fill_weights(f.up, 16, 59); fill_weights(f.down, 10, 117);
+    fill_weights(f.gate, m.weight_type, 17); fill_weights(f.up, m.weight_type, 59); fill_weights(f.down, d.weight_type, 117);
     f.lists = buffer(device, (size_t)experts * tokens * sizeof(int32_t));
     f.counts = buffer(device, experts * sizeof(int32_t));
     int32_t *lists = data(f.lists), *counts = data(f.counts);
@@ -143,7 +151,7 @@ static Fixture *fixture(id<MTLDevice> device, unsigned tokens, unsigned dim,
     float *x = data(f.x);
     for (size_t i = 0; i < (size_t)tokens * dim; i++)
         x[i] = ((int)(mix((uint32_t)i + 31) % 16385) - 8192) / 8192.f;
-    const size_t nm = (size_t)tokens * f.slots * f.ff, np = (size_t)tokens * f.slots * dim;
+    const size_t nm = (size_t)tokens * f.slots * f.ff, np = (size_t)tokens * f.slots * d.out_rows;
     f.refMid = buffer(device, nm * 4); f.gotMid = buffer(device, nm * 4); f.midHalf = buffer(device, nm * 2);
     f.refPart = buffer(device, np * 4); f.gotPart = buffer(device, np * 4);
     return f;
@@ -165,12 +173,11 @@ static id<MTLLibrary> library(id<MTLDevice> device, NSString *source, bool safe)
     if (!lib) fail(error.description);
     return lib;
 }
-static id<MTLComputePipelineState> pipeline(id<MTLDevice> device, id<MTLLibrary> lib,
-                                           NSString *name, unsigned type) {
+static id<MTLComputePipelineState> pipeline_with_type(id<MTLDevice> device, id<MTLLibrary> lib,
+                                                     NSString *name, unsigned bound_type) {
     NSError *error = nil;
     MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
     unsigned tail = 0; bool addressed = false;
-    const unsigned bound_type = specialized_types ? type : 0u;
     [constants setConstantValue:&bound_type type:MTLDataTypeUInt atIndex:900];
     [constants setConstantValue:&tail type:MTLDataTypeUInt atIndex:905];
     [constants setConstantValue:&addressed type:MTLDataTypeBool atIndex:906];
@@ -181,6 +188,10 @@ static id<MTLComputePipelineState> pipeline(id<MTLDevice> device, id<MTLLibrary>
     if (p.threadExecutionWidth != 32 || p.maxTotalThreadsPerThreadgroup < 128) fail(@"unsupported execution geometry");
     return p;
 }
+static id<MTLComputePipelineState> pipeline(id<MTLDevice> device, id<MTLLibrary> lib,
+                                           NSString *name, unsigned type) {
+    return pipeline_with_type(device, lib, name, specialized_types ? type : 0u);
+}
 static NSString *kernel_name(bool mid, bool half, unsigned nt) {
     NSString *kind = mid ? @"mid" : @"down";
     if (half) return [NSString stringWithFormat:@"kernel_qwen4_moe_mm_%@_f16_nt%u", kind, nt];
@@ -188,8 +199,13 @@ static NSString *kernel_name(bool mid, bool half, unsigned nt) {
         nt == 4 ? @"" : [NSString stringWithFormat:@"_nt%u", nt]];
 }
 static NSArray *pair(id<MTLDevice> device, id<MTLLibrary> lib, bool half, unsigned midNT, unsigned downNT) {
-    return @[pipeline(device, lib, kernel_name(true, half, midNT), 16),
-             pipeline(device, lib, kernel_name(false, half, downNT), 10)];
+    return @[pipeline(device, lib, kernel_name(true, half, midNT), q4_k32?12u:16u),
+             pipeline(device, lib, kernel_name(false, half, downNT), q4_k32?39u:10u)];
+}
+static NSArray *pair_k32(id<MTLDevice> device, id<MTLLibrary> lib, bool half) {
+    NSString *mid = half ? @"kernel_qwen4_moe_mm_mid_f16_k32_nt4" : @"kernel_qwen4_moe_mm_mid_k32_nt4";
+    NSString *down = half ? @"kernel_qwen4_moe_mm_down_f16_k32_nt4" : @"kernel_qwen4_moe_mm_down_k32_nt4";
+    return @[pipeline_with_type(device, lib, mid, 12u), pipeline_with_type(device, lib, down, 39u)];
 }
 static void bind(id<MTLComputeCommandEncoder> e, id<MTLBuffer> b, unsigned index) {
     [e setBuffer:b offset:kOffset atIndex:index];
@@ -349,6 +365,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--compile-only")) compileOnly = true;
         else if (!strcmp(argv[i], "--bench")) bench = true;
+        else if (!strcmp(argv[i], "--q4-k32")) q4_k32 = true;
         else if (!strcmp(argv[i], "--safe-math")) safe = true;
         else if (!strcmp(argv[i], "--generic-types")) specialized_types = false;
         else if (!strcmp(argv[i], "--specialized-types")) specialized_types = true;
@@ -357,7 +374,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
         else if (!strcmp(argv[i], "--baseline-source") && i+1 < argc) baselinePath = [NSString stringWithUTF8String:argv[++i]];
         else if (!strcmp(argv[i], "--output") && i+1 < argc) output = [NSString stringWithUTF8String:argv[++i]];
         else if (!strcmp(argv[i], "--reps") && i+1 < argc) reps = (unsigned)strtoul(argv[++i],NULL,10);
-        else { fprintf(stderr,"usage: %s [--compile-only] [--bench] [--safe-math] [--generic-types|--specialized-types] [--reps N] [--repo PATH] [--qwen-source FILE] [--baseline-source FILE] [--output JSON]\n",argv[0]); return 2; }
+        else { fprintf(stderr,"usage: %s [--compile-only] [--bench] [--safe-math] [--q4-k32] [--generic-types|--specialized-types] [--reps N] [--repo PATH] [--qwen-source FILE] [--baseline-source FILE] [--output JSON]\n",argv[0]); return 2; }
     }
     if (reps < 3 || reps > 100) fail(@"--reps must be in [3,100]");
     candidatePath = candidatePath ?: [repo stringByAppendingPathComponent:@"metal/qwen4.metal"];
@@ -374,13 +391,16 @@ int main(int argc, const char **argv) { @autoreleasepool {
         [currents addObject:pair(device,candidateLib,false,kNT[i],kNT[i])];
         [halves addObject:pair(device,candidateLib,true,kNT[i],kNT[i])];
     }
+    NSArray *k32Float = q4_k32 ? pair_k32(device,candidateLib,false) : nil;
+    NSArray *k32Half = q4_k32 ? pair_k32(device,candidateLib,true) : nil;
     id<MTLComputePipelineState> convert = pipeline(device,candidateLib,@"kernel_qwen4_rows_f32_to_f16",0);
     NSMutableDictionary *report = [@{@"device":device.name,@"safe_math":@(safe),@"compile_only":@(compileOnly),
         @"baseline_source":baselinePath,@"candidate_source":candidatePath,
         @"explicit_baseline":@(explicit_baseline),@"independent_baseline":@(independent_baseline),
         @"weight_type_mode":specialized_types ? @"specialized" : @"generic",
-        @"function_constant_900_mid":@(specialized_types ? 16u : 0u),
-        @"function_constant_900_down":@(specialized_types ? 10u : 0u),
+        @"function_constant_900_mid":@(specialized_types ? (q4_k32?12u:16u) : 0u),
+        @"function_constant_900_down":@(specialized_types ? (q4_k32?39u:10u) : 0u),
+        @"q4_k32":@(q4_k32),@"k32_specialized":@(q4_k32),
         @"poisoned_validation_outputs":@YES,@"half_payload_cpu_reference":@YES,
         @"baseline_fnv1a64":[NSString stringWithFormat:@"%016llx",(unsigned long long)source_hash(baselineSource)],
         @"candidate_fnv1a64":[NSString stringWithFormat:@"%016llx",(unsigned long long)source_hash(candidateSource)]} mutableCopy];
@@ -388,18 +408,29 @@ int main(int argc, const char **argv) { @autoreleasepool {
         id<MTLCommandQueue> queue = [device newCommandQueue]; if (!queue) fail(@"command queue");
         const unsigned ts[] = {1,7,9,31,33,67,131};
         for (unsigned s = 0; s < sizeof(ts)/sizeof(ts[0]); s++) @autoreleasepool {
-            Fixture *f = fixture(device,ts[s],256,13,(s&1)!=0,(s&2)!=0);
+            Fixture *f = fixture(device,ts[s],q4_k32 && s%3==2 ? 768u : 256u,13,(s&1)!=0,(s&2)!=0);
             for (unsigned n = 0; n < 4; n++) validate(queue,bases[n],currents[n],halves[n],convert,f);
-            printf("PASS T=%u NT=1/2/4/8 sparse=%u expert-major=%u\n",ts[s],s&1,(s&2)!=0); fflush(stdout);
+            if (q4_k32) validate(queue,bases[2],k32Float,k32Half,convert,f);
+            printf("PASS T=%u NT=1/2/4/8%s sparse=%u expert-major=%u\n",ts[s],
+                q4_k32 ? " plus K32 NT4" : "",s&1,(s&2)!=0); fflush(stdout);
+        }
+        if (q4_k32) {
+            const unsigned sizes[] = {439,8191,8192};
+            for (unsigned i = 0; i < 3; i++) @autoreleasepool {
+                Fixture *f = fixture(device,sizes[i],256,13,true,(i&1)!=0);
+                validate(queue,bases[2],k32Float,k32Half,convert,f);
+                printf("PASS Q4 K32 float/half T=%u, row and token tails\n",sizes[i]); fflush(stdout);
+            }
         }
         NSMutableArray *times = [NSMutableArray new];
         if (bench) {
             const unsigned bt[] = {128,2048,8192};
             for (unsigned i = 0; i < 3; i++) @autoreleasepool {
-                const unsigned midNT = i==0 ? 1 : 4, downNT = i==0 ? 1 : 4;
+                const unsigned midNT = !q4_k32 && i==0 ? 1 : 4, downNT = !q4_k32 && i==0 ? 1 : 4;
                 Fixture *f = fixture(device,bt[i],2560,512,false,false);
                 NSArray *bp = pair(device,baselineLib,false,midNT,downNT), *cp = pair(device,candidateLib,false,midNT,downNT),
                         *hp = pair(device,candidateLib,true,midNT,downNT);
+                if (q4_k32) { cp = k32Float; hp = k32Half; }
                 [times addObject:benchmark(queue,bp,cp,hp,convert,f,midNT,downNT,reps)];
             }
         }

@@ -19715,7 +19715,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         const bool bc_out =
             (out_dim % 64u) != 0 || (generic_rows % 32u) != 0;
         /* Amortize dequantization across token tiles with identical half
-         * operands. Default is scoped by the Qwen entry point to M3 Ultra. */
+         * operands. The Qwen entry point scopes the default by device and
+         * batch size; a failed optional allocation keeps the direct path. */
         const int unpack_override = ds4_gpu_env_bool("DS4_QWEN4_Q8_PREFILL_UNPACK");
         const bool prefill_unpack = generic_rows >= 32u &&
             (unpack_override >= 0 ? unpack_override == 1 : prefill_default);
@@ -19725,9 +19726,12 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         uint64_t mat_row_bytes = row_bytes;
         const bool unpack_fits = in_dim > 0u && out_dim > 0u && out_dim <= (64u << 20) / in_dim;
         const uint64_t unpack_bytes = unpack_fits ? in_dim * out_dim * sizeof(uint16_t) : 0u;
-        if (prefill_unpack && unpack_fits) {
-            if (!ds4_gpu_ensure_scratch_buffer(&g_q8_prefill_scratch_buffer,
-                    &g_q8_prefill_scratch_bytes, (NSUInteger)unpack_bytes, "q8 prefill weights")) return 0;
+        if (prefill_unpack && unpack_fits &&
+            ds4_gpu_ensure_scratch_buffer(&g_q8_prefill_scratch_buffer,
+                &g_q8_prefill_scratch_bytes, (NSUInteger)unpack_bytes, "q8 prefill weights")) {
+            /* A later projection can grow the shared scratch in this batch.
+             * Keep earlier storage alive with unretained command buffers. */
+            [g_transient_buffers addObject:g_q8_prefill_scratch_buffer];
             id<MTLComputePipelineState> unpack = ds4_gpu_get_pipeline("kernel_q8_prefill_unpack");
             if (!unpack) return 0;
             const uint32_t n_blocks = (uint32_t)(in_dim * out_dim / 32u);
@@ -19870,7 +19874,8 @@ int ds4_gpu_qwen4_matmul_q8_0_tensor(
         uint64_t                n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     return ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
-        ds4_gpu_device_name_contains("M3 Ultra"), true);
+        ds4_gpu_device_name_contains("M3 Ultra") ||
+        (g_ssd_streaming_mode && n_tok >= 8192u && ds4_gpu_device_name_contains("M1 Max")), true);
 }
 
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
@@ -48453,6 +48458,10 @@ enum {
     QWEN4_K_MOE_MM_DOWN_F16_NT2,
     QWEN4_K_MOE_MM_DOWN_F16_NT4,
     QWEN4_K_MOE_MM_DOWN_F16_NT8,
+    QWEN4_K_MOE_MM_MID_K32_NT4,
+    QWEN4_K_MOE_MM_MID_F16_K32_NT4,
+    QWEN4_K_MOE_MM_DOWN_K32_NT4,
+    QWEN4_K_MOE_MM_DOWN_F16_K32_NT4,
     QWEN4_K_MOE_MM_MID_NAX,
     QWEN4_K_MOE_MM_DOWN_NAX,
     QWEN4_K_MOE_MM_MID_NAX64,
@@ -48571,6 +48580,10 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_f16_nt2",
     "kernel_qwen4_moe_mm_down_f16_nt4",
     "kernel_qwen4_moe_mm_down_f16_nt8",
+    "kernel_qwen4_moe_mm_mid_k32_nt4",
+    "kernel_qwen4_moe_mm_mid_f16_k32_nt4",
+    "kernel_qwen4_moe_mm_down_k32_nt4",
+    "kernel_qwen4_moe_mm_down_f16_k32_nt4",
     "kernel_qwen4_moe_mm_mid_nax",
     "kernel_qwen4_moe_mm_down_nax",
     "kernel_qwen4_moe_mm_mid_nax64",
@@ -48770,6 +48783,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             const bool specialize = override >= 0 ? override != 0 :
                 ds4_gpu_device_name_contains("M3 Ultra") ||
                 ds4_gpu_device_is_m5_or_m6_apple_silicon() ||
+                (kernel >= QWEN4_K_MOE_MM_MID_K32_NT4 && kernel <= QWEN4_K_MOE_MM_DOWN_F16_K32_NT4) ||
                 qwen4_moe_mm_m1_ssd(mm->n_tokens, mm->weight_type);
             const uint32_t type = specialize ? mm->weight_type : 0u;
             if (type >= 40u) return 0;
@@ -50253,6 +50267,14 @@ static bool qwen4_moe_mm_m1_ssd(uint32_t n_tokens, uint32_t type) {
         (type == 16u || type == 10u) && ds4_gpu_device_name_contains("M1 Max");
 }
 
+/* Q4 SSD prefill on M1 Max benefits from smaller K staging while retaining
+ * 32-token tiles. Include partial chunks: the measured long prompt ends in
+ * a 439-token float pass after its 8192-token half pass. */
+static bool qwen4_moe_mm_k32(uint32_t type) {
+    return g_qwen4_stream_weights && (type == 12u || type == 39u) &&
+        ds4_gpu_device_name_contains("M1 Max");
+}
+
 /* Short SSD chunks can route only a few tokens to each of 512 experts.
  * Use eight-token matrix tiles when they cut padded token work by more than
  * half. Concentrated routing keeps the wider tile's weight reuse. Restrict
@@ -50359,11 +50381,14 @@ static uint64_t g_qwen4_nax_half_mid_count;
  * its original accumulation and only shares already-half-rounded operands. */
 static ds4_gpu_tensor *g_qwen4_half_x, *g_qwen4_half_mid;
 static uint64_t g_qwen4_half_x_bytes, g_qwen4_half_mid_bytes;
-static void qwen4_nax_release_scratch(void) {
+static void qwen4_half_release_scratch(void) {
     ds4_gpu_tensor_free(g_qwen4_half_x);
     ds4_gpu_tensor_free(g_qwen4_half_mid);
     g_qwen4_half_x = g_qwen4_half_mid = NULL;
     g_qwen4_half_x_bytes = g_qwen4_half_mid_bytes = 0;
+}
+static void qwen4_nax_release_scratch(void) {
+    qwen4_half_release_scratch();
     if (g_qwen4_nax_half_x) ds4_gpu_tensor_free(g_qwen4_nax_half_x);
     if (g_qwen4_nax_half_mid) ds4_gpu_tensor_free(g_qwen4_nax_half_mid);
     if (g_qwen4_nax_half_midr) ds4_gpu_tensor_free(g_qwen4_nax_half_midr);
@@ -50416,6 +50441,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, weight_type, true);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_MID_NT");
+    const bool k32 = nt == 4u && qwen4_moe_mm_k32(weight_type);
     int kernel = nt == 1u ? QWEN4_K_MOE_MM_MID_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_MID_NT2 :
                        nt == 8u ? QWEN4_K_MOE_MM_MID_NT8 : QWEN4_K_MOE_MM_MID;
@@ -50507,6 +50533,11 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         kernel = nt == 1u ? QWEN4_K_MOE_MM_MID_F16_NT1 : nt == 2u ? QWEN4_K_MOE_MM_MID_F16_NT2 :
                  nt == 8u ? QWEN4_K_MOE_MM_MID_F16_NT8 : QWEN4_K_MOE_MM_MID_F16_NT4;
     }
+    if (k32) kernel = half ? QWEN4_K_MOE_MM_MID_F16_K32_NT4 : QWEN4_K_MOE_MM_MID_K32_NT4;
+#ifdef DS4_TEST_QWEN4_SSD_MM
+    DS4_TEST_QWEN4_SSD_MM(n_tokens, weight_type, k32, half,
+                         g_qwen4_stream_weights != NULL, ds4_gpu_device_name_contains("M1 Max"));
+#endif
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, half ? 7 : 6,
                           qwen4_moe_mm_grid((ff_dim + 31u) / 32u, dispatch_experts, tiles, args.expert_major),
                           MTLSizeMake(128, 1, 1), 0)) return 0;
@@ -50533,6 +50564,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, weight_type, false);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
+    const bool k32 = nt == 4u && qwen4_moe_mm_k32(weight_type);
     int kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_DOWN_NT2 :
                        nt == 8u ? QWEN4_K_MOE_MM_DOWN_NT8 : QWEN4_K_MOE_MM_DOWN;
@@ -50616,6 +50648,11 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_F16_NT1 : nt == 2u ? QWEN4_K_MOE_MM_DOWN_F16_NT2 :
                  nt == 8u ? QWEN4_K_MOE_MM_DOWN_F16_NT8 : QWEN4_K_MOE_MM_DOWN_F16_NT4;
     }
+    if (k32) kernel = half ? QWEN4_K_MOE_MM_DOWN_F16_K32_NT4 : QWEN4_K_MOE_MM_DOWN_K32_NT4;
+#ifdef DS4_TEST_QWEN4_SSD_MM
+    DS4_TEST_QWEN4_SSD_MM(n_tokens, weight_type, k32, half,
+                         g_qwen4_stream_weights != NULL, ds4_gpu_device_name_contains("M1 Max"));
+#endif
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
                           qwen4_moe_mm_grid((out_dim + 31u) / 32u, dispatch_experts, tiles, args.expert_major),
                           MTLSizeMake(128, 1, 1), 0)) return 0;
@@ -50987,11 +51024,12 @@ int ds4_gpu_qwen4_moe_stream_tensor(
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
     if (!ids) return 0;
     qwen4_moe_half_pass half_pass = {0};
-    /* The complete SSD workload benefits at 8192 tokens. The 2048-token
-     * microbenchmark gain did not translate into a reliable total gain;
-     * smaller chunks retain the original path without extra scratch. */
-    const bool half_prefill = mm && gate_type == 16u && down_type == 10u && n_tokens >= 8192u &&
-                              ds4_gpu_device_name_contains("M1 Max");
+    /* Half shadows avoid repeated activation conversion in large IQ2/Q2
+     * and Q4/MXFP4 SSD chunks. Smaller chunks retain float operands without
+     * extra scratch; both paths perform the same half-rounded products. */
+    const bool half_prefill = mm && n_tokens >= 8192u &&
+        ((gate_type == 16u && down_type == 10u) || (gate_type == 12u && down_type == 39u)) &&
+        ds4_gpu_device_name_contains("M1 Max");
     qwen4_stream_weights stream = { .table = table, .half_pass = half_prefill ? &half_pass : NULL };
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = {0};
     qwen4_stream_mid_overlap overlap = {
@@ -51009,6 +51047,16 @@ int ds4_gpu_qwen4_moe_stream_tensor(
     int ok = ds4_gpu_synchronize();
     if (timing) { sync_ms = ds4_gpu_now_ms() - t0; t0 = ds4_gpu_now_ms(); }
     if (!ok) goto done;
+    /* The row path cannot consume prefill shadows or unpacked Q8 weights.
+     * Its existing synchronization has joined all readers: return this
+     * storage before Q4 decode starts loading missing experts from SSD. */
+    if (!mm && n_tokens <= 3u && gate_type == 12u && down_type == 39u &&
+        (g_qwen4_half_x || g_qwen4_half_mid || g_q8_prefill_scratch_buffer) &&
+        ds4_gpu_device_name_contains("M1 Max")) {
+        qwen4_half_release_scratch();
+        g_q8_prefill_scratch_buffer = nil;
+        g_q8_prefill_scratch_bytes = 0;
+    }
     /* No CPU access to router results or cache mutation before all prior GPU
      * work completes. Also join a previous explicit-load job before reusing
      * its worker pool or replacing cache entries. */

@@ -36,9 +36,34 @@ static struct {
 } probe;
 typedef struct { uint64_t bytes, calls; } read_stats;
 
+static struct {
+    int enabled;
+    uint32_t tokens, gate_type, down_type, nt, calls[2][2];
+} mm_probe;
+
 static void need(int ok, const char *what) {
     if (!ok) { fprintf(stderr, "Qwen SSD: %s failed\n", what); exit(1); }
 }
+/* Check dispatch decisions as well as outputs: parity alone also passes
+ * when an optimized path is accidentally never selected. */
+void ds4_test_qwen4_ssd_mm(uint32_t n_tokens, uint32_t weight_type,
+                          int k32, int half, int streaming, int m1_max) {
+    if (!mm_probe.enabled) return;
+    need(n_tokens == mm_probe.tokens &&
+         (weight_type == mm_probe.gate_type || weight_type == mm_probe.down_type),
+         "observed MM fixture");
+    const int expected_k32 = m1_max && streaming && mm_probe.nt == 4u &&
+                             (weight_type == 12u || weight_type == 39u);
+    const int expected_half = m1_max && streaming && n_tokens >= 8192u;
+    if (!!k32 != expected_k32 || !!half != expected_half) {
+        fprintf(stderr, "Qwen SSD dispatch T%u type%u NT%u stream=%d M1=%d: "
+                "K32=%d expected=%d, half=%d expected=%d\n", n_tokens, weight_type,
+                mm_probe.nt, streaming, m1_max, k32, expected_k32, half, expected_half);
+        need(0, "MM policy selection");
+    }
+    mm_probe.calls[!!streaming][weight_type == mm_probe.down_type]++;
+}
+
 ssize_t ds4_test_pread(int fd, void *dst, size_t bytes, off_t offset) {
     pthread_mutex_lock(&probe_mutex);
     if (!probe.enabled || (fd != probe.fd && fd != probe.empty_fd)) {
@@ -500,7 +525,10 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
         const float values[] = {0.375f, -0.125f, 0.5f};
         shared_gate[t] = values[t % 3u];
     }
-    rng = 0x5618u + slots * 3u + w->gate_type;
+    /* Every invocation changes x, including the same-size pass after a
+     * larger half-scratch allocation. Reusing an old half copy must fail. */
+    static uint32_t fixture_serial;
+    rng = 0x5618u + slots * 3u + w->gate_type + ++fixture_serial * 0x9e3779b9u;
     for (uint32_t i = 0; i < T * D; i++) x[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
     for (uint32_t i = 0; i < T * D * HC; i++) r[i] = ((int)(random_u32() % 257) - 128) / 256.f;
     for (uint32_t i = 0; i < T * INJ; i++) inj[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
@@ -656,6 +684,21 @@ static void check_split_one(const weights *w, uint32_t T, uint32_t slots, int sh
            T, mm ? "MM" : "rows", w->gate_type, w->down_type, slots, shared, seed_count, unique, fail_first, (unsigned long long)first.bytes);
 }
 
+static void check_half_split(const weights *w, uint32_t T, uint32_t nt,
+                             uint32_t seeded, int failure, int fd, int empty_fd) {
+    memset(&mm_probe, 0, sizeof(mm_probe));
+    mm_probe.enabled = 1;
+    mm_probe.tokens = T;
+    mm_probe.gate_type = w->gate_type;
+    mm_probe.down_type = w->down_type;
+    mm_probe.nt = nt;
+    check_split_one(w, T, S, 0, seeded, 0, failure, fd, empty_fd);
+    mm_probe.enabled = 0;
+    for (unsigned stream = 0; stream < 2; stream++)
+        for (unsigned down = 0; down < 2; down++)
+            need(mm_probe.calls[stream][down] != 0, "resident and streamed MM dispatch observed");
+}
+
 int main(void) {
     weights formats[] = {{.gate_type=16, .down_type=10, .shared_down_type=8},
                          {.gate_type=12, .down_type=39, .shared_down_type=39},
@@ -764,11 +807,45 @@ int main(void) {
     /* Half operands are private to each large SSD pass. Cross the policy
      * boundary, grow scratch, then shrink/reuse it with new input contents.
      * References use the public float path; down I/O failure tests leave an
-     * early half-producing mid in flight before the retry. */
+     * early half-producing mid in flight before the retry. Pin the simdgroup
+     * family and NT4 so the callback verifies its default K32/half policy. */
+    /* Keep the established IQ2/Q2 sequence on its original dispatch policy. */
     check_split_one(formats, 8191, S, 0, 12, 0, 0, fileno(file), fileno(empty));
     check_split_one(formats, 8192, S, 0, 12, 0, 2, fileno(file), fileno(empty));
     check_split_one(formats, 16384, S, 0, 0, 0, 0, fileno(file), fileno(empty));
     check_split_one(formats, 8192, S, 0, 12, 0, 0, fileno(file), fileno(empty));
+    const char *policy_env[] = {"DS4_QWEN4_MOE_MID_NT", "DS4_QWEN4_MOE_DOWN_NT",
+        "DS4_QWEN4_MOE_TAILS", "DS4_QWEN4_MOE_MM_SPECIALIZE", "DS4_QWEN4_MOE_MM_NAX"};
+    char *saved_policy[5] = {0};
+    for (unsigned i = 0; i < 5; i++) {
+        const char *value = getenv(policy_env[i]);
+        saved_policy[i] = value ? strdup(value) : NULL;
+        need(!value || saved_policy[i], "save MM policy override");
+        need(unsetenv(policy_env[i]) == 0, "clear MM policy override");
+    }
+    need(setenv(policy_env[0], "4", 1) == 0 && setenv(policy_env[1], "4", 1) == 0 &&
+         setenv(policy_env[4], "0", 1) == 0, "select NT4 simdgroup policy");
+    check_half_split(formats + 1, 8191, 4, 12, 0, fileno(file), fileno(empty));
+    check_half_split(formats + 1, 8192, 4, 12, 2, fileno(file), fileno(empty));
+    check_half_split(formats + 1, 16384, 4, 0, 0, fileno(file), fileno(empty));
+    check_half_split(formats + 1, 8192, 4, 12, 0, fileno(file), fileno(empty));
+    /* Decode releases private prefill buffers after joining their readers;
+     * a later prefill must allocate and populate them from fresh inputs. */
+    check_split_one(formats + 1, 1, S, 1, 4, 0, 0, fileno(file), fileno(empty));
+    check_half_split(formats + 1, 8192, 4, 12, 0, fileno(file), fileno(empty));
+    /* Diagnostics choosing other token tiles keep the original K64 family. */
+    const char *other_nt[] = {"1", "2", "8"};
+    for (unsigned i = 0; i < 3; i++) {
+        need(setenv(policy_env[0], other_nt[i], 1) == 0 &&
+             setenv(policy_env[1], other_nt[i], 1) == 0, "select diagnostic token tile");
+        check_half_split(formats + 1, 33, (uint32_t)strtoul(other_nt[i], NULL, 10),
+                         12, 0, fileno(file), fileno(empty));
+    }
+    for (unsigned i = 0; i < 5; i++) {
+        need((saved_policy[i] ? setenv(policy_env[i], saved_policy[i], 1) : unsetenv(policy_env[i])) == 0,
+             "restore MM policy override");
+        free(saved_policy[i]);
+    }
     ds4_gpu_cleanup(); munmap(map, bytes); fclose(empty); fclose(file);
     puts("PASS Qwen SSD: cache, exact selected-only reads, full-selection fallback and retry");
     return 0;

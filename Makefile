@@ -219,9 +219,11 @@ tests/test_metal_qwen4_moe_half: tests/test_metal_qwen4_moe_half.m
 .PHONY: test-metal-qwen4-moe-half check-metal-qwen4-moe-half
 test-metal-qwen4-moe-half: tests/test_metal_qwen4_moe_half
 	./tests/test_metal_qwen4_moe_half
+	./tests/test_metal_qwen4_moe_half --q4-k32
 
 check-metal-qwen4-moe-half: tests/test_metal_qwen4_moe_half
 	./tests/test_metal_qwen4_moe_half --compile-only
+	./tests/test_metal_qwen4_moe_half --q4-k32 --compile-only
 
 tests/test_metal_qwen4_hc: tests/test_metal_qwen4_hc.m
 	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
