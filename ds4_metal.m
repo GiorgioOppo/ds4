@@ -48736,12 +48736,18 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             const qwen4_moe_args *a = args;
             const bool specialize = !q4_mid && !iq2_mid && !q2_down && qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
-            NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%u",
-                             qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addresses];
+            /* M1 batched MXFP4 benefits from sharing loads across two rows.
+             * Compile it out of single-token decode to retain its occupancy. */
+            const bool pair_rows = kernel == QWEN4_K_MOE_DOWN_MXFP4_PF && a->n_tokens > 1u &&
+                (!specialize || values[3] == 2u) && ds4_gpu_device_name_contains("M1 Max");
+            NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%u_pair=%u",
+                             qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addresses, pair_rows];
             pipeline = [g_pipeline_cache objectForKey:key];
             if (!pipeline) {
                 MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
                 [constants setConstantValue:&addresses type:MTLDataTypeBool atIndex:906];
+                if (kernel == QWEN4_K_MOE_DOWN_MXFP4_PF)
+                    [constants setConstantValue:&pair_rows type:MTLDataTypeBool atIndex:907];
                 for (uint32_t i = 0; specialize && i < 4u; i++)
                     [constants setConstantValue:&values[i] type:MTLDataTypeUInt atIndex:901u+i];
                 NSError *error = nil;

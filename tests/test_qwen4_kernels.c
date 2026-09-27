@@ -1967,6 +1967,86 @@ static void test_moe(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32
     test_moe_types(a, NE, slots, E, F, T, wtype, wtype ? 8u : 0u);
 }
 
+/* A down-only fixture allows odd output rows, unlike the complete Q4 MoE
+ * fixture whose gate input must be a multiple of 256. Exercise both row
+ * reuse and its single-row tail with guarded, unaligned output views. */
+static void test_mxfp4_down_exact(arena_t *a) {
+    const char *env[] = {"DS4_QWEN4_MOE_MV_SPECIALIZE", "DS4_QWEN4_MOE_MV_NR",
+        "DS4_QWEN4_MOE_MV_NSG", "DS4_QWEN4_MOE_DOWN_PREFETCH"};
+    char *saved[4];
+    for (uint32_t i = 0; i < 4u; i++) {
+        const char *value = getenv(env[i]);
+        saved[i] = value ? strdup(value) : NULL;
+        require_ok(!value || saved[i], "save MXFP4 down environment");
+        require_ok(unsetenv(env[i]) == 0, "clear MXFP4 down environment");
+    }
+    const uint32_t widths[] = {640u, 640u, 672u, 32u};
+    const uint32_t rows[] = {2560u, 2561u, 257u, 1u};
+    const uint32_t shared_types[] = {UINT32_MAX, 8u, 39u};
+    const uint32_t NE = 4u, slots = 3u, guard = 17u;
+    const float sentinel = 127.25f;
+    for (uint32_t shape = 0; shape < 4u; shape++) {
+        const uint32_t F = widths[shape], E = rows[shape];
+        double *shadow;
+        const uint64_t down = arena_mxfp4(a, (uint64_t)NE * E, F, &shadow); free(shadow);
+        const uint64_t sh_q8 = arena_q8_0(a, E, F, &shadow, 0.05f); free(shadow);
+        const uint64_t sh_mx = arena_mxfp4(a, E, F, &shadow); free(shadow);
+        int32_t selected[9];
+        for (uint32_t t = 0; t < 3u; t++) for (uint32_t s = 0; s < slots; s++)
+            selected[t * slots + s] = (int32_t)((t + s * 3u) % NE);
+        ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc(sizeof(selected));
+        require_ok(gsel && ds4_gpu_tensor_write(gsel, 0, selected, sizeof(selected)), "MXFP4 selected IDs");
+        for (uint32_t shared = 0; shared < 3u; shared++) for (uint32_t T = 1; T <= 3u; T++) {
+            const uint32_t st = shared_types[shared], n_out = slots + (shared != 0u);
+            const uint64_t nx = (uint64_t)T * n_out * F, n = (uint64_t)T * n_out * E;
+            const uint64_t total = n + 2u * guard, sh = st == 8u ? sh_q8 : sh_mx;
+            float *x = rand_vec(nx, 1.0f);
+            for (uint64_t i = 0; i < nx; i++) x[i] *= i % 7u == 0u ? 8.0f : i % 7u == 1u ? 0.125f : 1.0f;
+            ds4_gpu_tensor *gx = upload(x, nx); free(x);
+            ds4_gpu_tensor *storage = upload(NULL, total);
+            ds4_gpu_tensor *out = ds4_gpu_tensor_view(storage, guard * sizeof(float), n * sizeof(float));
+            require_ok(out != NULL, "MXFP4 guarded output view");
+            float *reference = NULL;
+            char label[128];
+            snprintf(label, sizeof(label), "MXFP4 down E=%u F=%u T=%u shared=%u", E, F, T, st);
+            for (uint32_t mode = 0; mode < 5u; mode++) {
+                /* Compare NR2 reuse and specialized NR1/2/4 fallbacks with
+                 * the original plain, unspecialized down kernel. */
+                const char *nr[] = {"2", "2", "2", "1", "4"};
+                require_ok(setenv(env[0], mode >= 2u ? "1" : "0", 1) == 0 &&
+                    setenv(env[1], nr[mode], 1) == 0 && setenv(env[2], "4", 1) == 0 &&
+                    setenv(env[3], mode ? "1" : "0", 1) == 0, "select MXFP4 down oracle or prefetch");
+                require_ok(ds4_gpu_tensor_fill_f32(storage, sentinel, total) &&
+                    ds4_gpu_begin_commands() &&
+                    ds4_gpu_qwen4_moe_down_tensor(out, gx, gsel, a->base, a->size,
+                        down, 39u, NE, T, slots, F, E, sh, st) && ds4_gpu_end_commands(),
+                    "MXFP4 down guarded dispatch");
+                float *got = download(storage, total);
+                for (uint32_t i = 0; i < guard; i++)
+                    require_ok(got[i] == sentinel && got[guard + n + i] == sentinel, "MXFP4 down guards");
+                if (!mode) {
+                    reference = got;
+                    check_exact_f32(label, reference, reference, total);
+                    for (uint64_t i = guard; i < guard + n; i++)
+                        require_ok(got[i] != sentinel, "MXFP4 oracle wrote every output");
+                } else {
+                    check_exact_f32(label, got, reference, total);
+                    free(got);
+                }
+            }
+            free(reference);
+            ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(storage); ds4_gpu_tensor_free(gx);
+        }
+        ds4_gpu_tensor_free(gsel);
+    }
+    for (uint32_t i = 0; i < 4u; i++) {
+        require_ok(saved[i] ? setenv(env[i], saved[i], 1) == 0 : unsetenv(env[i]) == 0,
+            "restore MXFP4 down environment");
+        free(saved[i]);
+    }
+    printf("MXFP4 down: exact NR1/2/4, odd rows, block tails and shared slots; guards intact\n");
+}
+
 static void check_exact_f32(const char *what, const float *got, const float *ref, uint64_t n) {
     for (uint64_t i = 0; i < n; i++) {
         uint32_t gb, rb;
@@ -4234,6 +4314,7 @@ int main(void) {
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
+        test_mxfp4_down_exact(&arena);
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
         test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);

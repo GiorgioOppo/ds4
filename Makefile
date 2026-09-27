@@ -253,6 +253,13 @@ test-metal-qwen4-moe-down: tests/test_metal_qwen4_moe_down
 check-metal-qwen4-moe-down: tests/test_metal_qwen4_moe_down
 	./tests/test_metal_qwen4_moe_down --compile-only
 
+tests/test_metal_qwen4_mxfp4_stage: tests/test_metal_qwen4_mxfp4_stage.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-qwen4-mxfp4-stage
+test-metal-qwen4-mxfp4-stage: tests/test_metal_qwen4_mxfp4_stage
+	./tests/test_metal_qwen4_mxfp4_stage
+
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
@@ -1249,6 +1256,7 @@ clean:
 	rm -f tests/test_metal_qwen4_hc
 	rm -f tests/test_metal_qwen4_moe_mid
 	rm -f tests/test_metal_qwen4_moe_down
+	rm -f tests/test_metal_qwen4_mxfp4_stage
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc

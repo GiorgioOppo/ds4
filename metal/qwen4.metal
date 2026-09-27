@@ -3471,8 +3471,8 @@ kernel void kernel_qwen4_moe_down_q2k(
  * accumulation chain.  The shipped qwen4_row_dot loop for type 39 compiles
  * to s = t0*y0 + t1*y1 + t2*y16 + t3*y17 (left to right), acc += s*d; that
  * order is spelled out with reassociation pinned off (tests/test_qwen4_kernels.c
- * pins the rows against kernel_qwen4_moe_down).  The shared Q8 slot keeps the
- * generic row dot. */
+ * pins the rows against kernel_qwen4_moe_down). Shared slots retain their
+ * original quantization and per-row accumulation order. */
 #define QWEN4_MXFP4_PF_ACC_TO(ACC_, E_, Q0_, Q1_, Y0_, Y1_, Y16_, Y17_) do { \
     const float d_ = ds4_metal_e8m0_to_f32(E_); \
     const float t0_ = ds4_metal_mxfp4_values[(Q0_) & 0xfu], t1_ = ds4_metal_mxfp4_values[(Q1_) & 0xfu]; \
@@ -3485,6 +3485,8 @@ kernel void kernel_qwen4_moe_down_q2k(
 } while (0)
 #define QWEN4_MXFP4_PF_ACC(E_, Q0_, Q1_, Y0_, Y1_, Y16_, Y17_) \
     QWEN4_MXFP4_PF_ACC_TO(acc, E_, Q0_, Q1_, Y0_, Y1_, Y16_, Y17_)
+
+constant bool qwen4_mxfp4_pair_rows [[function_constant(907)]];
 
 kernel void kernel_qwen4_moe_down_mxfp4_pf(
         constant ds4_metal_args_qwen4_moe & args,
@@ -3507,10 +3509,21 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
     if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
     const uint64_t pair = (uint64_t)tok * n_out + slot;
     device const float *m = mid + pair * args.in_dim;
+    const bool pair_rows = is_function_constant_defined(qwen4_mxfp4_pair_rows) && qwen4_mxfp4_pair_rows;
     if (slot == args.n_slots) {
-        for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
-            const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, st, dim, tiisg);
-            if (tiisg == 0) part[pair * args.out_rows + r] = v;
+        if (pair_rows && nr == 2u && st == 8u && row0 + 1u < args.out_rows) {
+            const uint64_t off = (uint64_t)row0 * args.shared_row_bytes;
+            const float2 v = qwen4_q8_pair_dot(sh_down + off,
+                sh_down + off + args.shared_row_bytes, m, dim, tiisg);
+            if (tiisg == 0) {
+                part[pair * args.out_rows + row0] = v.x;
+                part[pair * args.out_rows + row0 + 1u] = v.y;
+            }
+        } else {
+            for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+                const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, st, dim, tiisg);
+                if (tiisg == 0) part[pair * args.out_rows + r] = v;
+            }
         }
         return;
     }
@@ -3518,6 +3531,65 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
         (uint)selected[(uint64_t)tok * args.n_slots + slot], args.expert_bytes);
     const uint ix = tiisg / 8, it = tiisg % 8;
     const uint nb = dim / 32;
+    if (pair_rows && nr == 2u) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        /* Batched rows benefit from interleaving independent chains. The
+         * function constant removes this register footprint from single-token
+         * decode. Activation loads are shared; block/FMA order is unchanged. */
+        const bool two = row0 + 1u < args.out_rows;
+        device const uchar *rowa = (device const uchar *)(db + (uint64_t)row0 * args.row_bytes);
+        device const uchar *rowb = rowa + (two ? args.row_bytes : 0u);
+        float acca = 0.0f, accb = 0.0f;
+        uint ib = ix;
+        for (; ib + 12u < nb; ib += 16u) {
+            device const uchar *a0 = rowa + (uint64_t)ib * 17u;
+            device const uchar *a1 = a0 + 4u * 17u, *a2 = a0 + 8u * 17u, *a3 = a0 + 12u * 17u;
+            device const uchar *c0 = rowb + (uint64_t)ib * 17u;
+            device const uchar *c1 = c0 + 4u * 17u, *c2 = c0 + 8u * 17u, *c3 = c0 + 12u * 17u;
+            const uchar ea0 = a0[0], ea1 = a1[0], ea2 = a2[0], ea3 = a3[0];
+            const uint pa0 = a0[1 + it * 2u], qa0 = a0[2 + it * 2u];
+            const uint pa1 = a1[1 + it * 2u], qa1 = a1[2 + it * 2u];
+            const uint pa2 = a2[1 + it * 2u], qa2 = a2[2 + it * 2u];
+            const uint pa3 = a3[1 + it * 2u], qa3 = a3[2 + it * 2u];
+            const uchar eb0 = c0[0], eb1 = c1[0], eb2 = c2[0], eb3 = c3[0];
+            const uint pb0 = c0[1 + it * 2u], qb0 = c0[2 + it * 2u];
+            const uint pb1 = c1[1 + it * 2u], qb1 = c1[2 + it * 2u];
+            const uint pb2 = c2[1 + it * 2u], qb2 = c2[2 + it * 2u];
+            const uint pb3 = c3[1 + it * 2u], qb3 = c3[2 + it * 2u];
+            device const float *y0 = m + ib * 32u + it * 2u;
+            device const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u;
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            const float y1a = y1[0], y1b = y1[1], y1c = y1[16], y1d = y1[17];
+            const float y2a = y2[0], y2b = y2[1], y2c = y2[16], y2d = y2[17];
+            const float y3a = y3[0], y3b = y3[1], y3c = y3[16], y3d = y3[17];
+            QWEN4_MXFP4_PF_ACC_TO(acca, ea0, pa0, qa0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(acca, ea1, pa1, qa1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(acca, ea2, pa2, qa2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(acca, ea3, pa3, qa3, y3a, y3b, y3c, y3d);
+            QWEN4_MXFP4_PF_ACC_TO(accb, eb0, pb0, qb0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accb, eb1, pb1, qb1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(accb, eb2, pb2, qb2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(accb, eb3, pb3, qb3, y3a, y3b, y3c, y3d);
+        }
+        for (; ib < nb; ib += 4u) {
+            device const uchar *a0 = rowa + (uint64_t)ib * 17u;
+            device const uchar *c0 = rowb + (uint64_t)ib * 17u;
+            const uchar ea0 = a0[0], eb0 = c0[0];
+            const uint pa0 = a0[1 + it * 2u], qa0 = a0[2 + it * 2u];
+            const uint pb0 = c0[1 + it * 2u], qb0 = c0[2 + it * 2u];
+            device const float *y0 = m + ib * 32u + it * 2u;
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            QWEN4_MXFP4_PF_ACC_TO(acca, ea0, pa0, qa0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accb, eb0, pb0, qb0, y0a, y0b, y0c, y0d);
+        }
+        const float va = simd_sum(acca), vb = simd_sum(accb);
+        if (tiisg == 0) {
+            part[pair * args.out_rows + row0] = va;
+            if (two) part[pair * args.out_rows + row0 + 1u] = vb;
+        }
+        return;
+    }
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
 #pragma clang fp reassociate(off)
 #pragma clang fp contract(off)
@@ -3962,6 +4034,24 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
             for (uint i = 0; i < 4; i++) dst[h * 8 + i] = (D)(dl * (float)lo[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
 #pragma unroll
             for (uint i = 0; i < 4; i++) dst[h * 8 + 4 + i] = (D)(dl * (float)hi[i] * ((signs >> (i + 4)) & 1u ? -1.0f : 1.0f));
+        }
+        return;
+    }
+    if (type == 39) {
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 17);
+        const float d = ds4_metal_e8m0_to_f32(blk[0]);
+        const bool hi = q0 >= 2;
+        /* Seventeen-byte blocks have no wider alignment guarantee. Read the
+         * sixteen packed code bytes once, retaining stage8's multiplication
+         * and final storage conversion for each low/high nibble. */
+#pragma unroll
+        for (uint j = 0; j < 4; j++) {
+            const packed_uchar4 codes = *(device const packed_uchar4 *)(blk + 1 + j * 4);
+#pragma unroll
+            for (uint i = 0; i < 4; i++) {
+                const uint byte = codes[i];
+                dst[j * 4 + i] = (D)(d * ds4_metal_mxfp4_values[hi ? (byte >> 4) : (byte & 0xfu)]);
+            }
         }
         return;
     }

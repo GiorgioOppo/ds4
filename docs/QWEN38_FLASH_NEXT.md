@@ -99,6 +99,34 @@ and system variation remained substantial. Prefill medians were 6.94 and
 Q2's smaller sparse-prefill tiles did not show a stable benefit for Q4 in
 local comparisons. The measurements do not establish gains on other devices.
 
+MXFP4 prefill also decodes each 16-value half-block with one exponent read
+and packed byte loads, retaining the original multiplication and final
+half/float conversion. Compared with `46425263`, alternating resident-kernel
+benchmarks on M1 Max at 2048 tokens and 10 routed slots reduced median
+gate/up-plus-down time from 70.65 to 66.31 ms with 32 experts and from 81.57
+to 77.34 ms with 256 experts (6.1% and 5.2% less time).
+The staging oracle checks all exponent bytes, nibble codes and byte
+alignments against two original 8-value decoders in both math modes.
+
+On M1 Max, batched MXFP4 down rows also reuse activations across two output
+rows. A function constant enables this only for multi-token NR2 dispatches;
+single-token decode and NR1/NR4 retain the original row loop. A warmed
+same-process comparison with 16 alternating samples per variant, 128 calls
+per sample, width 640, 2560 output rows and 10 routed slots measured:
+
+| Two-token down kernel | Before GPU time | After GPU time |
+| --- | --- | --- |
+| Q8 shared expert | 176.62 us | 150.70 us |
+| MXFP4 shared expert | 216.20 us | 188.48 us |
+
+Outputs were bit-identical, and single-token GPU timings did not regress.
+Full Q4 SSD runs remain sensitive to I/O: two alternating pairs at context
+32768 and chunk 1024 gave prefill medians of 22.94 and 23.41 t/s on a
+201-token prompt, with all 100 generated tokens unchanged. With MTP and two
+draft tokens on the Rome prompt, median generation remained 7.65 t/s despite
+the faster down kernel. These checks compare against `46425263`; they do
+not imply the same percentage gain for complete inference or other devices.
+
 Leave the expert-cache budget automatic initially. A plain count passed to
 `--ssd-streaming-cache-experts` requests dynamic cache slots; an `NGB` budget
 also includes the reserved layer-staging space. Startup accounts for the
