@@ -2787,6 +2787,18 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* Share the established simdgroup paths with M2-M4 without selecting the
+ * separate M5/M6 tensor policy. Shape and diagnostic guards stay at callers. */
+static bool ds4_gpu_qwen4_legacy_tuning(void) {
+    return ds4_metal_device_name_uses_qwen_legacy_tuning(g_metal_device_name);
+}
+
+/* M3 Ultra already has dedicated routed-expert geometry and specialization.
+ * Keep that policy ahead of the M1-derived MoE choices. */
+static bool ds4_gpu_qwen4_legacy_moe_tuning(void) {
+    return ds4_metal_device_name_uses_qwen_legacy_moe_tuning(g_metal_device_name);
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -19572,7 +19584,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
-            /* The measured Qwen projections reuse x across four rows on M1.
+            /* These Qwen projections reuse x across four rows on M1 Max and M2-M4.
              * Keep the original NSG/K walk/reduction; complete tiles avoid
              * reading past unpadded weight rows. Vocabulary and other shapes
              * retain their existing dispatch. */
@@ -19580,7 +19592,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 (in_dim == 2560u && (out_dim == 6144u || out_dim == 10240u || out_dim == 12288u)) ||
                 (in_dim == 6144u && out_dim == 2560u);
             if (qwen_rows4 && wide_qwen && mv_dispatch.nsg == 4 &&
-                !ds4_gpu_tp_world_is_two() && ds4_gpu_device_name_contains("M1 Max")) {
+                !ds4_gpu_tp_world_is_two() && ds4_gpu_qwen4_legacy_tuning()) {
                 mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_nr4";
                 mv_dispatch.nr0 = 4;
                 mv_dispatch.smem = 32u * 4u * sizeof(float);
@@ -19875,7 +19887,7 @@ int ds4_gpu_qwen4_matmul_q8_0_tensor(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     return ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
         ds4_gpu_device_name_contains("M3 Ultra") ||
-        (g_ssd_streaming_mode && n_tok >= 8192u && ds4_gpu_device_name_contains("M1 Max")), true);
+        (g_ssd_streaming_mode && n_tok >= 8192u && ds4_gpu_qwen4_legacy_tuning()), true);
 }
 
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
@@ -21364,11 +21376,11 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         }
 
         /* HC-down produces only 320 channels. A smaller tile raises the
-         * M1 Max grid from 20 to 80 groups at T=128, preserving the K32
-         * accumulation order. Leave other devices and larger batches on
-         * the generic tile until their parallelism tradeoff is measured. */
+         * grid from 20 to 80 groups at T=128 on the legacy tuning family,
+         * preserving the K32 accumulation order. Larger batches retain
+         * their existing tile. */
         const bool hc_down = in_dim == 10240u && out_dim == 320u &&
-            n_tok > 8u && n_tok <= 128u && ds4_gpu_device_name_contains("M1 Max");
+            n_tok > 8u && n_tok <= 128u && ds4_gpu_qwen4_legacy_tuning();
         const NSUInteger tile_rows = hc_down ? 32u : 64u;
         const NSUInteger tile_tokens = hc_down ? 16u : 32u;
         const bool bc_inp = (in_dim % 32u) != 0;
@@ -48363,7 +48375,7 @@ typedef struct {
     qwen4_moe_half_pass *half_pass;
 } qwen4_stream_weights;
 static qwen4_stream_weights *g_qwen4_stream_weights;
-static bool qwen4_moe_mm_m1_ssd(uint32_t n_tokens, uint32_t type);
+static bool qwen4_moe_mm_legacy_ssd(uint32_t n_tokens, uint32_t type);
 
 static bool qwen4_bind_experts(qwen4_bind *b, const void *map, uint64_t size,
                                uint64_t offset, uint64_t bytes, const char *what) {
@@ -48749,10 +48761,10 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             const qwen4_moe_args *a = args;
             const bool specialize = !q4_mid && !iq2_mid && !q2_down && qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
-            /* M1 batched MXFP4 benefits from sharing loads across two rows.
+            /* Legacy batched MXFP4 shares loads across two rows.
              * Compile it out of single-token decode to retain its occupancy. */
             const bool pair_rows = kernel == QWEN4_K_MOE_DOWN_MXFP4_PF && a->n_tokens > 1u &&
-                (!specialize || values[3] == 2u) && ds4_gpu_device_name_contains("M1 Max");
+                (!specialize || values[3] == 2u) && ds4_gpu_qwen4_legacy_moe_tuning();
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%u_pair=%u",
                              qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addresses, pair_rows];
             pipeline = [g_pipeline_cache objectForKey:key];
@@ -48776,7 +48788,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             }
         } else if (kernel >= QWEN4_K_MOE_MM_MID && kernel <= QWEN4_K_MOE_MM_DOWN_NAXC64) {
             /* Keep each quantization's dequantizer constant through the K
-             * loop. Also measured for short IQ2/Q2 SSD batches on M1 Max;
+             * loop. Include short IQ2/Q2 SSD batches on the legacy family;
              * zero restores the generic kernel for numerical/perf comparison. */
             const qwen4_moe_mm_args *mm = args;
             const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_SPECIALIZE");
@@ -48784,7 +48796,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 ds4_gpu_device_name_contains("M3 Ultra") ||
                 ds4_gpu_device_is_m5_or_m6_apple_silicon() ||
                 (kernel >= QWEN4_K_MOE_MM_MID_K32_NT4 && kernel <= QWEN4_K_MOE_MM_DOWN_F16_K32_NT4) ||
-                qwen4_moe_mm_m1_ssd(mm->n_tokens, mm->weight_type);
+                qwen4_moe_mm_legacy_ssd(mm->n_tokens, mm->weight_type);
             const uint32_t type = specialize ? mm->weight_type : 0u;
             if (type >= 40u) return 0;
             const uint32_t tail_base = ((const qwen4_moe_mm_args *)args)->tail_base;
@@ -48966,7 +48978,7 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         b[2] = b[1];
         b[4] = b[3];
     }
-    /* Reuse wins for the measured M1 Max F16 chunks and large M3/M5
+    /* Reuse F16 inputs for small legacy-device chunks and large M3/M5/M6
      * prefills. Decode and MTP keep the original chunk parallelism,
      * including with an explicit override. */
     bool reuse = false;
@@ -48975,12 +48987,12 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         if (reuse_env != NULL && strcmp(reuse_env, "1") == 0) {
             reuse = true;
         } else if (reuse_env == NULL || strcmp(reuse_env, "0") != 0) {
-            const bool m1_prefill = weight_type == 1u && n_tokens >= 48u && n_tokens <= 256u &&
-                                   ds4_gpu_device_name_contains("M1 Max");
+            const bool small_prefill = weight_type == 1u && n_tokens >= 48u && n_tokens <= 256u &&
+                                   ds4_gpu_qwen4_legacy_tuning();
             const bool large_prefill = n_tokens >= 8192u &&
                 (ds4_gpu_device_name_contains("M3 Ultra") || ds4_gpu_device_is_m5_or_m6_apple_silicon());
             reuse = n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
-                    (m1_prefill || large_prefill);
+                    (small_prefill || large_prefill);
         }
     }
     const int kernel = reuse
@@ -49009,11 +49021,11 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
      * against the plain kernel by tests/test_qwen4_kernels.c); M5/M6 default. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");
-    /* M1 Max shares each low-rank activation and sigmoid across the four
+    /* Legacy devices share each low-rank activation and sigmoid across the four
      * output rows in a threadgroup. The existing override retains both
      * original kernels for numerical and timing comparisons. */
     const bool reuse = !pair && weight_type == 1u && n_rank == 320u &&
-        prefetch_override < 0 && ds4_gpu_device_name_contains("M1 Max");
+        prefetch_override < 0 && ds4_gpu_qwen4_legacy_tuning();
     const bool prefetch = weight_type == 1u &&
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
@@ -49024,7 +49036,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
                             : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
                                        QWEN4_K_HC_GATE_MIX_Q8);
     /* More independent output rows share the activated inputs in MTP and
-     * the M1 Max single-token mixer. Each SIMD still owns exactly one row
+     * the legacy single-token mixer. Each SIMD still owns exactly one row
      * with the original lane mapping and reduction order. */
     const uint32_t default_nsg = n_embd == 2560u && n_rank == 320u &&
         ds4_gpu_device_name_contains("M3 Ultra") ? 16u : 4u;
@@ -50070,12 +50082,12 @@ int ds4_gpu_qwen4_moe_mid_tensor(
      * the narrower single-row dispatch policy below. */
     const bool iq2 = weight_type == 16u && nr == 2u &&
         ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE") != 0 &&
-        ds4_gpu_device_name_contains("M1 Max");
+        ds4_gpu_qwen4_legacy_moe_tuning();
     /* Masked dispatches compact only the grid. The kernel restores original
      * slot indices, so shared placement and output strides stay unchanged. */
     const uint32_t dispatch_slots = qwen4_moe_dispatch_slots(&args, n_out);
     if (!dispatch_slots) return 1;
-    /* M1 Max IQ2: spread the measured single-token, wide-slot shape over
+    /* Legacy IQ2: spread the single-token, wide-slot shape over
      * one row per SIMD group. Small resident/missing passes retain NR2.
      * Keep explicit generic-specialization settings on their existing path. */
     const bool iq2_nr1 = iq2 && !specialize && nsg == 4u &&
@@ -50125,16 +50137,17 @@ int ds4_gpu_qwen4_moe_down_tensor(
      * accumulation order. Keep other widths, row tiles and devices unchanged. */
     const bool q2 = weight_type == 10u && ff_dim == 640u && rows_per_tg == nsg * 2u &&
         ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE") != 0 &&
-        ds4_gpu_device_name_contains("M1 Max");
+        ds4_gpu_qwen4_legacy_moe_tuning();
     /* Request four MXFP4 blocks per lane ahead. Explicit FMA matches the
      * plain kernel in fast math; strict math keeps its noncontracted path,
      * even with the diagnostic override. Use the compiled library's mode.
-     * M1 Max uses the measured 640x2560 shape; M5/M6 retain their policy. */
+     * Legacy devices use the 640x2560 shape; M3 Ultra and M5/M6 retain
+     * their dedicated default policies. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_MOE_DOWN_PREFETCH");
     const bool prefetch = !g_metal_math_safe && weight_type == 39u && (ff_dim % 32u) == 0 &&
         (prefetch_override >= 0 ? prefetch_override > 0 :
          ds4_gpu_device_is_m5_or_m6_apple_silicon() ||
-         (ff_dim == 640u && out_dim == 2560u && ds4_gpu_device_name_contains("M1 Max")));
+         (ff_dim == 640u && out_dim == 2560u && ds4_gpu_qwen4_legacy_moe_tuning()));
     const uint32_t dispatch_slots = qwen4_moe_dispatch_slots(&args, n_out);
     if (!dispatch_slots) return 1;
     return qwen4_dispatch(q2 ? QWEN4_K_MOE_DOWN_Q2K : prefetch ? QWEN4_K_MOE_DOWN_MXFP4_PF : QWEN4_K_MOE_DOWN, &args, sizeof(args), b, 5,
@@ -50258,31 +50271,31 @@ int ds4_gpu_qwen4_moe_build_lists_tensor(
                           MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1), 0);
 }
 
-/* Scope the M1 policy to the measured SSD model shape. Prompt-sized batches
+/* Scope the legacy policy to the established SSD model shape. Prompt-sized batches
  * up to one 32-token tile showed no stable end-to-end gain; keep their old
  * pipelines, as well as resident inference and other devices/types. */
-static bool qwen4_moe_mm_m1_ssd(uint32_t n_tokens, uint32_t type) {
+static bool qwen4_moe_mm_legacy_ssd(uint32_t n_tokens, uint32_t type) {
     const qwen4_stream_weights *s = g_qwen4_stream_weights;
     return s && s->frequency && n_tokens > 32u && n_tokens <= 128u && s->table->n_total_expert == 512u &&
-        (type == 16u || type == 10u) && ds4_gpu_device_name_contains("M1 Max");
+        (type == 16u || type == 10u) && ds4_gpu_qwen4_legacy_moe_tuning();
 }
 
-/* Q4 SSD prefill on M1 Max benefits from smaller K staging while retaining
+/* Legacy Q4 SSD prefill uses smaller K staging while retaining
  * 32-token tiles. Include partial chunks: the measured long prompt ends in
  * a 439-token float pass after its 8192-token half pass. */
 static bool qwen4_moe_mm_k32(uint32_t type) {
     return g_qwen4_stream_weights && (type == 12u || type == 39u) &&
-        ds4_gpu_device_name_contains("M1 Max");
+        ds4_gpu_qwen4_legacy_moe_tuning();
 }
 
 /* Short SSD chunks can route only a few tokens to each of 512 experts.
  * Use eight-token matrix tiles when they cut padded token work by more than
  * half. Concentrated routing keeps the wider tile's weight reuse. Restrict
- * this policy to the measured M1 Max IQ2/Q2 path; resident inference retains
+ * this policy to the legacy IQ2/Q2 path; resident inference retains
  * its existing defaults. Counts have already been checked against the GPU
  * lists and selected IDs, so this adds no synchronization or readback. */
 static bool qwen4_moe_mm_sparse_ssd(uint32_t n_tokens, uint32_t type) {
-    if (!qwen4_moe_mm_m1_ssd(n_tokens, type)) return false;
+    if (!qwen4_moe_mm_legacy_ssd(n_tokens, type)) return false;
     const qwen4_stream_weights *s = g_qwen4_stream_weights;
     uint32_t tiles8 = 0, tiles32 = 0;
     for (uint32_t e = 0; e < s->table->n_total_expert; e++) {
@@ -50536,7 +50549,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     if (k32) kernel = half ? QWEN4_K_MOE_MM_MID_F16_K32_NT4 : QWEN4_K_MOE_MM_MID_K32_NT4;
 #ifdef DS4_TEST_QWEN4_SSD_MM
     DS4_TEST_QWEN4_SSD_MM(n_tokens, weight_type, k32, half,
-                         g_qwen4_stream_weights != NULL, ds4_gpu_device_name_contains("M1 Max"));
+                         g_qwen4_stream_weights != NULL, ds4_gpu_qwen4_legacy_moe_tuning());
 #endif
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, half ? 7 : 6,
                           qwen4_moe_mm_grid((ff_dim + 31u) / 32u, dispatch_experts, tiles, args.expert_major),
@@ -50651,7 +50664,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     if (k32) kernel = half ? QWEN4_K_MOE_MM_DOWN_F16_K32_NT4 : QWEN4_K_MOE_MM_DOWN_K32_NT4;
 #ifdef DS4_TEST_QWEN4_SSD_MM
     DS4_TEST_QWEN4_SSD_MM(n_tokens, weight_type, k32, half,
-                         g_qwen4_stream_weights != NULL, ds4_gpu_device_name_contains("M1 Max"));
+                         g_qwen4_stream_weights != NULL, ds4_gpu_qwen4_legacy_moe_tuning());
 #endif
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
                           qwen4_moe_mm_grid((out_dim + 31u) / 32u, dispatch_experts, tiles, args.expert_major),
@@ -51029,7 +51042,7 @@ int ds4_gpu_qwen4_moe_stream_tensor(
      * extra scratch; both paths perform the same half-rounded products. */
     const bool half_prefill = mm && n_tokens >= 8192u &&
         ((gate_type == 16u && down_type == 10u) || (gate_type == 12u && down_type == 39u)) &&
-        ds4_gpu_device_name_contains("M1 Max");
+        ds4_gpu_qwen4_legacy_moe_tuning();
     qwen4_stream_weights stream = { .table = table, .half_pass = half_prefill ? &half_pass : NULL };
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = {0};
     qwen4_stream_mid_overlap overlap = {
@@ -51052,7 +51065,7 @@ int ds4_gpu_qwen4_moe_stream_tensor(
      * storage before Q4 decode starts loading missing experts from SSD. */
     if (!mm && n_tokens <= 3u && gate_type == 12u && down_type == 39u &&
         (g_qwen4_half_x || g_qwen4_half_mid || g_q8_prefill_scratch_buffer) &&
-        ds4_gpu_device_name_contains("M1 Max")) {
+        ds4_gpu_qwen4_legacy_moe_tuning()) {
         qwen4_half_release_scratch();
         g_q8_prefill_scratch_buffer = nil;
         g_q8_prefill_scratch_bytes = 0;
@@ -51295,7 +51308,7 @@ int ds4_gpu_qwen4_mtp_project_tensor(
      * existing dispatch. The optimized layout is emitted by mtp_stage. */
     if (n_embd != 2560u || n_hc != 4u || n_tokens > 3u || rows > mv_max ||
         (rows > 8u && ds4_gpu_env_bool("DS4_METAL_Q8_PREFILL_PROFILE") > 0) ||
-        !ds4_gpu_device_name_contains("M1 Max")) {
+        !ds4_gpu_qwen4_legacy_tuning()) {
         return ds4_gpu_qwen4_matmul_q8_0_tensor(out, model_map, model_size, weight_offset,
                                                in_dim, n_embd, cat, rows);
     }

@@ -214,6 +214,30 @@ replays the retained prefix on the next evaluation. The native context is
 262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for
 longer contexts, with a possible quality cost on shorter prompts.
 
+## Metal tuning on M1 Max and M2-M4
+
+The established M1 Max simdgroup optimizations also apply to Apple M2, M3
+and M4, including their Pro, Max and Ultra variants, within the same tensor
+shapes, batch sizes, math modes and diagnostic overrides:
+
+- Wide Q8 decode projections, HC gate/mix reuse and short MTP Q8 projections.
+- IQ2 gate/up, Q2_K down-row reuse and the Q4 model's MXFP4 down prefetch.
+- Small HC-down and HC-normalization prefill batches, and large Q8 SSD prefill.
+- Sparse IQ2/Q2 SSD tiles, Q4/MXFP4 K32 tiles, optional half-operand staging
+  for large SSD batches and release of that scratch before Q4 decode.
+
+M3 Ultra retains its dedicated MoE specialization, row/group geometry and
+prefill tile policy; the other shared Q8, HC and MTP choices still apply.
+M5/M6 retain their existing policy. The selection does not expand to M1
+base/Pro/Ultra or to future generation names.
+
+This widens device selection, not the kernel arithmetic or GGUF formats.
+Local validation uses M1 Max. An independent M4 Max Q2 resident test reported
+about 7% more decode throughput after widening the decode gates, with matching
+outputs; it did not validate M2/M3, other M4 variants, or SSD performance.
+See the [M4 Max test report](https://github.com/antirez/ds4/pull/1056#issuecomment-5922543210).
+Device eligibility therefore does not imply a measured speedup on every chip.
+
 ## DGX Spark performance
 
 Measured on a single Spark with resident weights and disk-only n-grams:

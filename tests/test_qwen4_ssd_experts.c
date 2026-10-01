@@ -47,18 +47,18 @@ static void need(int ok, const char *what) {
 /* Check dispatch decisions as well as outputs: parity alone also passes
  * when an optimized path is accidentally never selected. */
 void ds4_test_qwen4_ssd_mm(uint32_t n_tokens, uint32_t weight_type,
-                          int k32, int half, int streaming, int m1_max) {
+                          int k32, int half, int streaming, int legacy_moe) {
     if (!mm_probe.enabled) return;
     need(n_tokens == mm_probe.tokens &&
          (weight_type == mm_probe.gate_type || weight_type == mm_probe.down_type),
          "observed MM fixture");
-    const int expected_k32 = m1_max && streaming && mm_probe.nt == 4u &&
+    const int expected_k32 = legacy_moe && streaming && mm_probe.nt == 4u &&
                              (weight_type == 12u || weight_type == 39u);
-    const int expected_half = m1_max && streaming && n_tokens >= 8192u;
+    const int expected_half = legacy_moe && streaming && n_tokens >= 8192u;
     if (!!k32 != expected_k32 || !!half != expected_half) {
-        fprintf(stderr, "Qwen SSD dispatch T%u type%u NT%u stream=%d M1=%d: "
+        fprintf(stderr, "Qwen SSD dispatch T%u type%u NT%u stream=%d legacy=%d: "
                 "K32=%d expected=%d, half=%d expected=%d\n", n_tokens, weight_type,
-                mm_probe.nt, streaming, m1_max, k32, expected_k32, half, expected_half);
+                mm_probe.nt, streaming, legacy_moe, k32, expected_k32, half, expected_half);
         need(0, "MM policy selection");
     }
     mm_probe.calls[!!streaming][weight_type == mm_probe.down_type]++;
