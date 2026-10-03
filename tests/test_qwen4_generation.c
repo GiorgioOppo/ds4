@@ -1,6 +1,6 @@
 /* Real-model one-shot/session parity with identical effective prefill chunks.
  * --prefill-reference compares automatic dispatch with the diagnostic
- * legacy, unsplit prefill path, then uses automatic dispatch for both decodes.
+ * SSD legacy, unsplit prefill path, then uses automatic dispatch for both decodes.
  * Usage: test_qwen4_generation MODEL [--ssd-streaming] [--prefill-reference]
  *        [--chunk N --ctx N [--tokens N]]
  * SSD mode bounds the expert cache to 1024 entries. At most two graphs are
@@ -222,6 +222,11 @@ int main(int argc, char **argv) {
             tokens = generation_number(argv[++i], 1, 32768);
             if (!tokens) goto usage;
         } else goto usage;
+    }
+    if (prefill_reference && !streaming) {
+        fputs("Qwen generation: --prefill-reference requires --ssd-streaming; "
+              "resident arithmetic uses the main reference, not SSD legacy unsplit\n", stderr);
+        return 2;
     }
     if ((chunk == 0) != (ctx == 0)) goto usage;
     if (tokens && (!ctx || tokens > ctx - GENERATION_STEPS - 1)) goto usage;

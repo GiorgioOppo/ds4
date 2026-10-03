@@ -377,6 +377,19 @@ make tests/test_qwen4_generation
   --ssd-streaming --chunk 128 --ctx 8192 --tokens 5760
 ```
 
+Resident Metal prefill preserves main's FP32 small-batch projections and
+split-K reductions. SSD streaming keeps its original half/unsplit prefill
+reference and the parent attention policy across internal partitions. Applying
+the SSD reference to resident GDN alpha/beta changed prompt state and later
+greedy tokens; these policies are now scoped to the graph's streaming mode.
+The decode tuning shared by M1-M4 is retained.
+
+`make test-qwen4-resident-arithmetic` compares actual-shaped resident
+projections and internal attention partitions with an independent main
+`0aaea5a` dispatch reference, without a GGUF. It also checks the SSD reference
+and ordinary decode. `test_qwen4_generation --prefill-reference` selects the
+legacy unsplit SSD reference and requires `--ssd-streaming`.
+
 Omit `--ssd-streaming` on a machine that can keep the model resident. The
 test checks explicit chunk precedence, progress frontiers, greedy tokens and
 full logits. Different chunk sizes can change reduction order and routed

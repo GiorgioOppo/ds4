@@ -899,6 +899,21 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+ifeq ($(UNAME_S),Darwin)
+tests/test_qwen4_resident_arithmetic.o: tests/test_qwen4_resident_arithmetic.c ds4.c ds4.h ds4_gpu.h ds4_qwen4_vision.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen4_resident_arithmetic: tests/test_qwen4_resident_arithmetic.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-qwen4-resident-arithmetic
+test-qwen4-resident-arithmetic: tests/test_qwen4_resident_arithmetic
+	env -u DS4_METAL_UNRETAINED MTL_DEBUG_LAYER=1 DS4_METAL_MATH_SAFE=0 ./tests/test_qwen4_resident_arithmetic
+	env -u DS4_METAL_UNRETAINED MTL_DEBUG_LAYER=1 DS4_METAL_MATH_SAFE=1 ./tests/test_qwen4_resident_arithmetic
+	MTL_DEBUG_LAYER=1 DS4_METAL_UNRETAINED=1 DS4_METAL_MATH_SAFE=0 ./tests/test_qwen4_resident_arithmetic
+	MTL_DEBUG_LAYER=1 DS4_METAL_UNRETAINED=1 DS4_METAL_MATH_SAFE=1 ./tests/test_qwen4_resident_arithmetic
+endif
+
 tests/test_qwen4_prefill.o: tests/test_qwen4_prefill.c ds4.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
@@ -1219,6 +1234,7 @@ clean:
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_qwen4_mtp_prefill
 	rm -f tests/test_qwen4_generation
+	rm -f tests/test_qwen4_resident_arithmetic
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_ssd_reuse

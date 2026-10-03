@@ -58235,11 +58235,12 @@ static bool qwen4_gemv_rows(const ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, c
                                            w->type, n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
 #else
 
-    /* Prefill keeps the reference operand precision and K accumulation even
-     * for short prompt tails. Float-operand F16/Q8 tiles and split-K belong
-     * to decode batches; selecting them only by row count moves prompt logits.
-     * The legacy switch remains a diagnostic control for decode batches. */
-    const bool prefill = g->projection_phase == QWEN4_PROJECTION_PREFILL;
+    /* SSD prompts retain their original half/unsplit reference. Resident
+     * prompts retain main's FP32 small-batch and split-K policy: applying the
+     * SSD policy to resident alpha/beta projections changes GDN state and
+     * subsequent greedy tokens. Decode batches use the same policy as main. */
+    const bool prefill = g->ssd_streaming &&
+                         g->projection_phase == QWEN4_PROJECTION_PREFILL;
     const bool legacy = getenv("DS4_QWEN4_DENSE_MM_LEGACY") != NULL;
     const bool f16_batch = !prefill && !legacy && n_tok > 3u && w->type == DS4_TENSOR_F16 &&
         n_tok <= 64u && (out_dim <= 512u || n_tok > 8u);
@@ -58483,16 +58484,15 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     return ok;
 }
 
-/* Preserve the parent attention policy across dense/sparse subranges. In a
- * large prefill the three dense rows at positions 2048..2050 still belong
- * to matrix attention; their short internal range must not select decode
- * arithmetic. Real short prefill tails and speculative rows are unchanged. */
+/* SSD prefill retains its single-pass attention reference across internal
+ * partitions. Resident inference retains main's per-range dispatch, including
+ * the three scalar dense rows at positions 2048..2050 in a 2048-row chunk. */
 static bool qwen4_graph_attention_dispatch(ds4_qwen4_gpu_graph *g, uint32_t il,
         ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
         uint32_t rows, uint32_t pos0, bool use_sel, uint32_t parent_rows) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
 #ifdef __APPLE__
-    if (g->projection_phase == QWEN4_PROJECTION_PREFILL && parent_rows > 8u) {
+    if (g->ssd_streaming && g->projection_phase == QWEN4_PROJECTION_PREFILL && parent_rows > 8u) {
         return ds4_gpu_qwen4_attn_prefill_tensor(out, q, gate, g->layer_k_cache[il],
                 g->layer_v_cache[il], g->sel_tokens, g->n_sel, rows, DS4_N_HEAD,
                 DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, use_sel, g->sel_stride, scale) != 0;
